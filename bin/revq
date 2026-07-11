@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+revq — rev 정적 배치 (RUNNER 아키텍처 §6.1 rev 루프).
+
+`recon`(pwn triage)·`decomp`(함수 덤프)의 **rev 대칭 보완**. 큰 정적 읽기
+(함수 목록·문자열·xref·call graph)를 **컨텍스트 밖으로** 빼서 한 번 추출·캐시하고,
+오케스트레이터/scout 는 슬라이스만 회수한다 (컨텍스트 위생 = 아키텍처 §1.3).
+
+킬러 기능: **string↔function xref + interesting-function 휴리스틱**
+  → "Correct/flag/license" 문자열을 참조하고 strcmp/memcmp 를 부르는 함수를
+     자동 지목 → `decomp <bin> <그 함수>` 로 바로 직행.
+
+엔진 (같은 revmap 스키마 방출):
+  - **angr** (기본, 정확) — CFGFast + xrefs. 순수 Python (angr 설치 venv 사용, SETUP.md 참고).
+  - **binutils** (`--fast`) — readelf/nm/strings/objdump. xref 없음(빠른 훑기용).
+
+angr 는 lazy-import → angr 없는 환경에선 `revq selftest`(순수 로직)·`--fast` 만 되고,
+deep 추출은 angr 필요. 실행:  python3 bin/revq <bin> [...]  (venv 활성 or angr 설치)
+
+사용:
+  revq <bin>                     # 요약 (triage 표 + interesting 지목)
+  revq <bin> --funcs [-n N] [--sort size|xrefs|name]
+  revq <bin> --strings [--grep RE]
+  revq <bin> --imports
+  revq <bin> --interesting       # check-루틴 후보만
+  revq <bin> --func <name|addr>  # 한 함수의 이웃(calls/callers/strings) 컨텍스트 카드
+  revq <bin> --xrefs <name|addr> # 이 심볼/주소를 참조/호출하는 곳
+  revq <bin> --json              # revmap 원본
+  revq <bin> --fast              # binutils 엔진 (xref 없음, 빠름)
+  revq <bin> --refresh           # 캐시 무시하고 재추출
+  revq selftest                  # 네트워크·바이너리 무관 순수 로직 검증
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+SCHEMA = 1
+
+# ─────────────────────────── 휴리스틱 사전 ───────────────────────────
+# check-루틴을 가리키는 신호. recon 의 SINK 사전과 목적이 다르다(rev = 판별 로직).
+INTERESTING_STR = re.compile(
+    r"correct|incorrect|wrong|valid|invalid|success|fail|denied|granted|"
+    r"accept|reject|flag|license|licen[cs]e|serial|passwo?rd|passphrase|"
+    r"congrat|nice|good\s*job|try\s*again|access|unlock|key|secret|token",
+    re.I,
+)
+FLAG_STR = re.compile(r"flag|\bctf\b|\}$|\{.*\}", re.I)
+CMP_FUNCS = {
+    "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "strstr",
+    "strcoll", "bcmp", "wcscmp", "wcsncmp",
+}
+INPUT_FUNCS = {
+    "scanf", "__isoc99_scanf", "sscanf", "__isoc99_sscanf", "read", "fgets",
+    "gets", "getline", "fread", "getchar", "fgetc", "recv", "getenv",
+}
+CRYPTO_HINTS = re.compile(r"aes|des|rc4|md5|sha[0-9]|base64|xor|rsa|hmac|crc", re.I)
+
+# 회피/난독화 신호 — 정적 분석 신뢰를 떨어뜨리는 것 (anti-debug / packing / 런타임 복호화).
+# h4c.team "AI가 리버싱 못 푸는 이유" 실패원인 ①⑤(정적결과 과신) 대응: 감지 시 동적 교차검증 유도.
+EVASION_IMPORTS = {"ptrace", "personality", "prctl", "mprotect", "getppid"}
+EVASION_STR = re.compile(
+    r"ptrace|tracerpid|/proc/self/status|ld_preload|anti.?debug|/proc/self/maps",
+    re.I,
+)
+
+
+def _entropy(data):
+    """Shannon 엔트로피(bit/byte, 0~8). packing/암호화 판별."""
+    import math
+    if not data:
+        return 0.0
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    n = len(data)
+    ent = 0.0
+    for c in freq:
+        if c:
+            p = c / n
+            ent -= p * math.log2(p)
+    return ent
+
+
+def classify_evasion(imports, strings, entropy, sections):
+    """revmap 신호로 회피 기법 후보 나열. 엔진 무관(순수) → selftest 가능."""
+    imp = set(imports)
+    out = []
+    for name in ("ptrace", "personality", "prctl", "mprotect"):
+        if name in imp:
+            out.append("import %s" % name)
+    joined = " ".join(strings)
+    m = EVASION_STR.search(joined)
+    if m:
+        out.append("문자열 '%s'" % m.group(0).lower())
+    if entropy is not None and entropy >= 7.2:
+        out.append("고엔트로피 %.2f/8 (packing/암호화 의심)" % entropy)
+    for s in sections or []:
+        su = (s or "").upper()
+        if su.startswith("UPX") or "PACKED" in su:
+            out.append("패커 섹션 %s" % s)
+    # 중복 제거(순서 유지)
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x); uniq.append(x)
+    return uniq
+
+
+def _file_evasion(binpath, imports, strings, sections):
+    """파일 바이트 엔트로피까지 포함해 evasion 신호 계산 (추출기 공용)."""
+    try:
+        with open(binpath, "rb") as f:
+            ent = _entropy(f.read())
+    except Exception:
+        ent = None
+    return classify_evasion(imports, [s["val"] for s in strings], ent, sections)
+
+
+# ─────────────────────────── 유틸 ───────────────────────────
+def die(msg, code=1):
+    print("[revq:err] " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print("[revq] " + msg, file=sys.stderr)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sh(cmd):
+    """리스트 인자 실행 → stdout (실패 시 빈 문자열)."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+    except Exception:
+        return ""
+
+
+def sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cache_path(binpath):
+    return binpath + ".revq.json"
+
+
+def parse_int(s):
+    """'0x1234' / '4660' / 심볼주소 문자열 → int|None."""
+    if s is None:
+        return None
+    s = s.strip()
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(s, 0)
+    except (ValueError, TypeError):
+        return None
+
+
+# ─────────────────────────── 엔진 A: angr (정확) ───────────────────────────
+def extract_angr(binpath):
+    """CFGFast + xrefs 로 revmap 추출. angr 는 여기서만 import (Mac selftest 격리)."""
+    try:
+        import angr  # noqa: F401
+        import logging
+        logging.getLogger("angr").setLevel(logging.ERROR)
+        logging.getLogger("cle").setLevel(logging.ERROR)
+        logging.getLogger("pyvex").setLevel(logging.ERROR)
+    except ImportError:
+        die("angr 미설치 — SETUP.md 대로 venv 세팅 후 실행하거나 `--fast`(binutils) 사용.\n"
+            "  예: python3 bin/revq %s" % binpath)
+
+    import angr
+    info("angr CFGFast 분석 중 (최초 1회, 크기에 따라 수초~수분)...")
+    proj = angr.Project(binpath, auto_load_libs=False)
+    obj = proj.loader.main_object
+    cfg = proj.analyses.CFGFast(
+        cross_references=True, data_references=True, normalize=True,
+        show_progressbar=False,
+    )
+    funcs_mgr = cfg.kb.functions
+
+    # 콜그래프 (caller 계산). networkx DiGraph, 노드=함수 addr.
+    callgraph = getattr(cfg.kb, "callgraph", None)
+
+    # 문자열: .rodata/.data* 섹션 바이트에서 직접 추출 (angr string-sort 버전편차 회피).
+    strings = _extract_strings_from_loader(proj)
+    str_by_addr = {s["addr"]: s for s in strings}
+
+    # xref 맵: dst-addr → [ins_addr...] (kb.xrefs). 버전에 따라 API 다름 → 방어적.
+    xref_dst = _angr_xrefs_by_dst(proj)
+
+    # 문자열 xref 를 함수에 귀속.
+    for s in strings:
+        s["xrefs"] = []
+    for saddr, srec in str_by_addr.items():
+        for ins in xref_dst.get(saddr, ()):
+            fn = _floor_func_name(funcs_mgr, ins)
+            srec["xrefs"].append({"func": fn, "addr": ins})
+
+    imports = sorted(set(obj.imports.keys())) if getattr(obj, "imports", None) else []
+    if not imports and getattr(obj, "plt", None):
+        imports = sorted(obj.plt.keys())
+
+    functions = []
+    for f in funcs_mgr.values():
+        if f.is_simprocedure or f.is_plt:
+            continue
+        calls = _func_call_targets(f, funcs_mgr)
+        # 이 함수가 참조하는 문자열 (xref 역인덱스)
+        fstrs = sorted({srec["val"] for srec in strings
+                        for xr in srec["xrefs"] if xr["func"] == f.name})
+        ncallers = 0
+        if callgraph is not None and f.addr in callgraph:
+            try:
+                ncallers = len(set(callgraph.predecessors(f.addr)))
+            except Exception:
+                ncallers = 0
+        functions.append({
+            "name": f.name,
+            "addr": f.addr,
+            "size": int(f.size or 0),
+            "ninstr": sum(1 for _ in f.blocks) if hasattr(f, "blocks") else 0,
+            "calls": calls,
+            "strings": fstrs,
+            "ncallers": ncallers,
+        })
+
+    sec_names = [s.name for s in getattr(obj, "sections", []) if getattr(s, "name", None)]
+    return {
+        "schema": SCHEMA,
+        "engine": "angr",
+        "arch": obj.arch.name,
+        "pie": bool(getattr(obj, "pic", False)),
+        "stripped": _is_stripped(binpath),
+        "functions": functions,
+        "strings": strings,
+        "imports": imports,
+        "evasion": _file_evasion(binpath, imports, strings, sec_names),
+    }
+
+
+def _extract_strings_from_loader(proj):
+    """loader 메모리의 .rodata/.data 계열에서 printable run(≥4) 추출 → vaddr 부여."""
+    out = []
+    obj = proj.loader.main_object
+    want = (".rodata", ".data", ".data.rel.ro", ".rdata")
+    for sec in getattr(obj, "sections", []):
+        if sec.name not in want or not sec.memsize:
+            continue
+        try:
+            blob = proj.loader.memory.load(sec.vaddr, sec.memsize)
+        except Exception:
+            continue
+        for off, s in _iter_cstrings(blob, minlen=4):
+            out.append({"addr": sec.vaddr + off, "val": s, "sec": sec.name, "xrefs": []})
+    return out
+
+
+def _iter_cstrings(blob, minlen=4):
+    """bytes → (offset, str) 생성. NUL 로 끝나는 printable run."""
+    cur = bytearray()
+    start = 0
+    for i, b in enumerate(blob):
+        if 0x20 <= b < 0x7f or b in (9,):  # printable + tab
+            if not cur:
+                start = i
+            cur.append(b)
+        else:
+            if len(cur) >= minlen:
+                yield start, cur.decode("latin-1")
+            cur = bytearray()
+    if len(cur) >= minlen:
+        yield start, cur.decode("latin-1")
+
+
+def _angr_xrefs_by_dst(proj):
+    """kb.xrefs → {dst_addr: [ins_addr,...]}. 버전별 API 차이 방어."""
+    out = {}
+    xm = getattr(proj.kb, "xrefs", None)
+    if xm is None:
+        return out
+    # 흔한 형태: xm.xrefs_by_dst (dict addr->set(XRef)), XRef.ins_addr
+    by_dst = getattr(xm, "xrefs_by_dst", None)
+    if isinstance(by_dst, dict):
+        for dst, refs in by_dst.items():
+            for r in refs:
+                ins = getattr(r, "ins_addr", None)
+                if ins is not None:
+                    out.setdefault(dst, []).append(ins)
+        return out
+    # 폴백: 전체 순회
+    try:
+        for r in xm.get_xrefs():  # type: ignore[attr-defined]
+            dst = getattr(r, "dst", None)
+            ins = getattr(r, "ins_addr", None)
+            if dst is not None and ins is not None:
+                out.setdefault(dst, []).append(ins)
+    except Exception:
+        pass
+    return out
+
+
+def _floor_func_name(funcs_mgr, addr):
+    try:
+        f = funcs_mgr.floor_func(addr)
+        return f.name if f is not None else "?"
+    except Exception:
+        return "?"
+
+
+def _func_call_targets(f, funcs_mgr):
+    names = []
+    try:
+        for site in f.get_call_sites():
+            tgt = f.get_call_target(site)
+            if tgt is None:
+                continue
+            g = funcs_mgr.get(tgt) if hasattr(funcs_mgr, "get") else None
+            names.append(g.name if g is not None else hex(tgt))
+    except Exception:
+        pass
+    return sorted(set(names))
+
+
+def _is_stripped(binpath):
+    return "not stripped" not in sh(["file", binpath])
+
+
+# ─────────────────────────── 엔진 B: binutils (빠름, xref 없음) ───────────────────────────
+def extract_binutils(binpath):
+    """readelf/nm/strings 로 빠른 map. stripped 면 함수 목록 빈약 + xref 없음."""
+    ftype = sh(["file", binpath])
+    if "ELF" not in ftype:
+        die("ELF 아님(binutils 엔진은 ELF 전용): %s" % ftype.strip()[:80])
+    arch = "amd64" if "x86-64" in ftype else ("i386" if "80386" in ftype else "?")
+    pie = "pie executable" in ftype or "shared object" in ftype
+    stripped = "not stripped" not in ftype
+
+    # 심볼(함수) — stripped 면 거의 없음.
+    functions = []
+    nm = sh(["nm", "-C", "--defined-only", binpath])
+    for line in nm.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[1] in ("t", "T"):
+            addr = parse_int("0x" + parts[0]) if re.fullmatch(r"[0-9a-fA-F]+", parts[0]) else None
+            functions.append({"name": parts[2], "addr": addr or 0, "size": 0,
+                              "ninstr": 0, "calls": [], "strings": [], "ncallers": 0})
+
+    # 문자열 (파일 오프셋; fast 티어는 정밀 vaddr/xref 미제공).
+    strings = []
+    for line in sh(["strings", "-t", "d", "-n", "4", binpath]).splitlines():
+        m = re.match(r"\s*(\d+)\s(.*)", line)
+        if m:
+            strings.append({"addr": int(m.group(1)), "val": m.group(2),
+                            "sec": "?", "xrefs": []})
+
+    # imports (동적 UND 심볼).
+    imports = []
+    for line in sh(["readelf", "-W", "--dyn-syms", binpath]).splitlines():
+        if " UND " in line:
+            tok = line.split()
+            if tok and tok[-1] not in ("", "UND"):
+                nm2 = tok[-1].split("@")[0]
+                if nm2:
+                    imports.append(nm2)
+    imports = sorted(set(imports))
+
+    sec_names = re.findall(r"\]\s+(\.\S+)", sh(["readelf", "-SW", binpath]))
+    return {
+        "schema": SCHEMA, "engine": "binutils", "arch": arch, "pie": pie,
+        "stripped": stripped, "functions": functions, "strings": strings,
+        "imports": imports,
+        "evasion": _file_evasion(binpath, imports, strings, sec_names),
+    }
+
+
+# ─────────────────────────── 분석: interesting-function ───────────────────────────
+def compute_interesting(rev):
+    """check-루틴 후보 스코어링. 엔진 무관(revmap 만 봄) → selftest 가능."""
+    imports = set(rev.get("imports", []))
+    has_cmp = CMP_FUNCS & imports
+    out = []
+    for f in rev.get("functions", []):
+        score, why = 0, []
+        istrs = [s for s in f.get("strings", []) if INTERESTING_STR.search(s)]
+        if istrs:
+            score += min(3 * len(istrs), 6)
+            why.append("판별 문자열 참조: " + ", ".join(_q(s) for s in istrs[:3]))
+        fstrs = [s for s in f.get("strings", []) if FLAG_STR.search(s)]
+        if fstrs:
+            score += 2
+            why.append("flag류 문자열")
+        calls = set(f.get("calls", []))
+        cmp_called = calls & CMP_FUNCS
+        if cmp_called:
+            score += 2
+            why.append("비교함수 호출: " + ", ".join(sorted(cmp_called)))
+        in_called = calls & INPUT_FUNCS
+        if in_called:
+            score += 1
+            why.append("입력함수 호출: " + ", ".join(sorted(in_called)))
+        crypto = [c for c in calls if CRYPTO_HINTS.search(c)]
+        if crypto:
+            score += 1
+            why.append("crypto 힌트: " + ", ".join(sorted(crypto)[:3]))
+        if score > 0:
+            out.append({"func": f["name"], "addr": f.get("addr", 0),
+                        "size": f.get("size", 0), "score": score, "why": why})
+    out.sort(key=lambda x: (-x["score"], -x["size"]))
+    # 정보성: 후보가 하나도 없고 cmp import 만 있을 때 힌트
+    if not out and has_cmp:
+        out.append({"func": "(미귀속)", "addr": 0, "size": 0, "score": 0,
+                    "why": ["비교함수(%s) import 됨 — --xrefs 로 호출부 확인"
+                            % ", ".join(sorted(has_cmp))]})
+    return out
+
+
+def _q(s):
+    s = s if len(s) <= 40 else s[:37] + "..."
+    return '"%s"' % s.replace("\n", "\\n")
+
+
+# ─────────────────────────── 렌더러 ───────────────────────────
+def render_summary(rev):
+    L = []
+    L.append("=" * 64)
+    L.append("BIN   : %s" % rev.get("bin", "?"))
+    L.append("PROF  : engine=%s arch=%s pie=%s stripped=%s | funcs=%d strings=%d imports=%d"
+             % (rev["engine"], rev["arch"], rev["pie"], rev["stripped"],
+                len(rev["functions"]), len(rev["strings"]), len(rev["imports"])))
+    imp = set(rev["imports"])
+    hot = sorted((imp & CMP_FUNCS) | (imp & INPUT_FUNCS)
+                 | {i for i in imp if CRYPTO_HINTS.search(i)}
+                 | (imp & {"system", "execve", "ptrace", "fork"}))
+    L.append("IMPORT: " + (", ".join(hot) if hot else "(판별/입력/crypto 관련 없음)"))
+    if rev["engine"] == "binutils":
+        L.append("[!] binutils 엔진 — xref/interesting 부정확. 정밀분석은 angr(기본, --fast 빼기).")
+
+    # evasion (정적 신뢰 하향 신호)
+    ev = rev.get("evasion", [])
+    if ev:
+        L.append("EVASION: " + "; ".join(ev))
+        L.append("  ⚠️ 정적 신뢰 하향 — 동적 교차검증(ltrace/strace/gdb, symsolve --verify) 권장")
+
+    # interesting
+    inter = compute_interesting(rev)
+    L.append("-" * 64)
+    L.append("INTERESTING (check-루틴 후보, 점수 내림차순):")
+    if inter:
+        for it in inter[:8]:
+            head = "  [%d] %s" % (it["score"], it["func"])
+            if it["addr"]:
+                head += " @%#x" % it["addr"]
+            if it["size"]:
+                head += " (size %d)" % it["size"]
+            L.append(head)
+            for w in it["why"]:
+                L.append("        - " + w)
+    else:
+        L.append("  (신호 없음 — --strings/--funcs 수동 탐색 or VM 가능성)")
+
+    # 판별 문자열 하이라이트
+    isr = [s for s in rev["strings"] if INTERESTING_STR.search(s["val"])]
+    if isr:
+        L.append("-" * 64)
+        L.append("판별 문자열 (%d):" % len(isr))
+        for s in isr[:12]:
+            xf = ",".join(sorted({x["func"] for x in s.get("xrefs", [])})) or "-"
+            L.append("  %-42s  ← %s" % (_q(s["val"]), xf))
+
+    L.append("-" * 64)
+    top = _sorted_funcs(rev["functions"], "size")[:1]
+    tf = (" 최대함수 %s(size %d)" % (top[0]["name"], top[0]["size"])) if top else ""
+    L.append("다음: revq %s --func <후보>  |  decomp %s <후보>%s"
+             % (rev.get("bin", "?"), rev.get("bin", "?"), tf))
+    L.append("=" * 64)
+    return "\n".join(L)
+
+
+def _sorted_funcs(funcs, key):
+    if key == "name":
+        return sorted(funcs, key=lambda f: f["name"])
+    if key == "xrefs":
+        return sorted(funcs, key=lambda f: -f.get("ncallers", 0))
+    return sorted(funcs, key=lambda f: -f.get("size", 0))
+
+
+def render_funcs(rev, sort="size", limit=40):
+    L = ["# 함수 %d개 (sort=%s)  개별: revq <bin> --func <name>" % (len(rev["functions"]), sort)]
+    L.append("%-28s %-12s %6s %5s %4s  %s" % ("NAME", "ADDR", "SIZE", "xref", "call", "STR"))
+    for f in _sorted_funcs(rev["functions"], sort)[:limit]:
+        addr = ("%#x" % f["addr"]) if f.get("addr") else "-"
+        s = ",".join(_q(x) for x in f.get("strings", [])[:2])
+        L.append("%-28s %-12s %6d %5d %4d  %s"
+                 % (f["name"][:28], addr, f.get("size", 0), f.get("ncallers", 0),
+                    len(f.get("calls", [])), s[:40]))
+    return "\n".join(L)
+
+
+def render_strings(rev, grep=None, limit=200):
+    rx = re.compile(grep, re.I) if grep else None
+    rows = [s for s in rev["strings"] if (rx.search(s["val"]) if rx else True)]
+    L = ["# 문자열 %d개%s (xref = 참조 함수)" % (len(rows), " grep=%s" % grep if grep else "")]
+    for s in rows[:limit]:
+        xf = ",".join(sorted({x["func"] for x in s.get("xrefs", [])})) or "-"
+        L.append("%#010x  %-6s  %-44s  ← %s" % (s.get("addr", 0), s.get("sec", "?"),
+                                                _q(s["val"]), xf))
+    if len(rows) > limit:
+        L.append("... (+%d, --grep 로 좁히기)" % (len(rows) - limit))
+    return "\n".join(L)
+
+
+def render_imports(rev):
+    imp = sorted(rev["imports"])
+    L = ["# imports %d개" % len(imp)]
+    buckets = [("판별/비교", CMP_FUNCS), ("입력", INPUT_FUNCS)]
+    seen = set()
+    for label, group in buckets:
+        hit = sorted(set(imp) & group)
+        if hit:
+            L.append("  [%s] %s" % (label, ", ".join(hit)))
+            seen |= set(hit)
+    crypto = sorted(i for i in imp if CRYPTO_HINTS.search(i))
+    if crypto:
+        L.append("  [crypto?] %s" % ", ".join(crypto)); seen |= set(crypto)
+    rest = [i for i in imp if i not in seen]
+    if rest:
+        L.append("  [기타] " + ", ".join(rest))
+    return "\n".join(L)
+
+
+def render_func(rev, target):
+    f = _find_func(rev, target)
+    if not f:
+        return "[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % target
+    L = ["== FUNC %s @%#x (size %d, %d instr) ==" % (f["name"], f.get("addr", 0),
+                                                     f.get("size", 0), f.get("ninstr", 0))]
+    L.append("callers: %d" % f.get("ncallers", 0))
+    L.append("calls  : " + (", ".join(f.get("calls", [])) or "-"))
+    L.append("strings: " + ("; ".join(_q(s) for s in f.get("strings", [])) or "-"))
+    L.append("→ 본문: decomp <bin> %s" % f["name"])
+    return "\n".join(L)
+
+
+def _find_func(rev, target):
+    ti = parse_int(target)
+    for f in rev["functions"]:
+        if f["name"] == target or (ti is not None and f.get("addr") == ti):
+            return f
+    # 부분일치
+    for f in rev["functions"]:
+        if target.lower() in f["name"].lower():
+            return f
+    return None
+
+
+def render_xrefs(rev, target):
+    """target(함수명/주소/문자열)을 참조·호출하는 곳."""
+    L = ["== XREFS → %s ==" % target]
+    # 1) 이 함수를 호출하는 함수
+    callers = [f["name"] for f in rev["functions"] if target in f.get("calls", [])]
+    if callers:
+        L.append("호출자(callers): " + ", ".join(sorted(set(callers))))
+    # 2) 이 문자열을 참조하는 함수
+    for s in rev["strings"]:
+        if target.lower() in s["val"].lower():
+            xf = sorted({x["func"] for x in s.get("xrefs", [])})
+            L.append("문자열 %s ← %s" % (_q(s["val"]), ", ".join(xf) or "-"))
+    if len(L) == 1:
+        L.append("(참조처 없음 — angr 엔진인지/이름 정확한지 확인)")
+    return "\n".join(L)
+
+
+# ─────────────────────────── 오케스트레이션 ───────────────────────────
+def load_or_extract(binpath, want_engine, refresh):
+    cp = cache_path(binpath)
+    cur_sha = sha256(binpath)
+    if not refresh and os.path.isfile(cp):
+        try:
+            with open(cp) as f:
+                rev = json.load(f)
+            # 캐시 유효: 해시 일치 + (요청 엔진과 같거나, 캐시가 정밀 angr)
+            if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
+                    and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
+                info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
+                return rev
+        except Exception:
+            pass
+    rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
+    rev["bin"] = binpath
+    rev["sha256"] = cur_sha
+    rev["generated_at"] = now_iso()
+    try:
+        with open(cp, "w") as f:
+            json.dump(rev, f)
+        info("캐시 기록: %s" % cp)
+    except Exception as e:
+        info("캐시 기록 실패(무시): %s" % e)
+    return rev
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="revq", add_help=True,
+                                description="rev 정적 배치 (함수/문자열/xref/interesting)")
+    p.add_argument("binary", nargs="?", help="분석할 ELF (또는 'selftest')")
+    p.add_argument("--fast", action="store_true", help="binutils 엔진(빠름, xref 없음)")
+    p.add_argument("--refresh", action="store_true", help="캐시 무시 재추출")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--funcs", action="store_true", help="함수 목록")
+    g.add_argument("--strings", action="store_true", help="문자열 + 참조함수")
+    g.add_argument("--imports", action="store_true", help="import 분류")
+    g.add_argument("--interesting", action="store_true", help="check-루틴 후보만")
+    g.add_argument("--func", metavar="NAME", help="한 함수 컨텍스트 카드")
+    g.add_argument("--xrefs", metavar="TARGET", help="심볼/문자열 참조처")
+    g.add_argument("--json", action="store_true", help="revmap 원본")
+    p.add_argument("-n", "--limit", type=int, default=40, help="목록 상한(기본 40)")
+    p.add_argument("--sort", choices=["size", "xrefs", "name"], default="size")
+    p.add_argument("--grep", metavar="RE", help="--strings 필터 정규식")
+    p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    return p
+
+
+def main(argv):
+    # ctfpull 관례: 'selftest' 단어도 지원
+    if argv and argv[0] == "selftest":
+        return selftest()
+    args = build_parser().parse_args(argv)
+    if args.selftest:
+        return selftest()
+    if not args.binary:
+        build_parser().print_help()
+        return 2
+    if not os.path.isfile(args.binary):
+        die("파일 없음: %s" % args.binary)
+
+    rev = load_or_extract(args.binary, "binutils" if args.fast else "angr", args.refresh)
+
+    if args.json:
+        print(json.dumps(rev, indent=2, ensure_ascii=False))
+    elif args.funcs:
+        print(render_funcs(rev, args.sort, args.limit))
+    elif args.strings:
+        print(render_strings(rev, args.grep, args.limit))
+    elif args.imports:
+        print(render_imports(rev))
+    elif args.interesting:
+        inter = compute_interesting(rev)
+        if not inter:
+            print("(interesting 후보 없음 — VM/난독화 가능성. --strings 확인)")
+        for it in inter[:args.limit]:
+            print("[%d] %s @%#x (size %d)" % (it["score"], it["func"], it["addr"], it["size"]))
+            for w in it["why"]:
+                print("     - " + w)
+    elif args.func:
+        print(render_func(rev, args.func))
+    elif args.xrefs:
+        print(render_xrefs(rev, args.xrefs))
+    else:
+        print(render_summary(rev))
+    return 0
+
+
+# ─────────────────────────── selftest (순수 로직, 바이너리/네트워크 무관) ───────────────────────────
+def _fixture():
+    """합성 revmap: crackme 형태(check 함수가 memcmp + 'Correct!' 참조)."""
+    return {
+        "schema": SCHEMA, "engine": "angr", "arch": "AMD64", "pie": True,
+        "stripped": True, "bin": "/fix/crackme",
+        "imports": ["memcmp", "printf", "__isoc99_scanf", "puts", "strlen", "malloc"],
+        "strings": [
+            {"addr": 0x2008, "val": "Correct! The flag is here", "sec": ".rodata",
+             "xrefs": [{"func": "check", "addr": 0x11a0}]},
+            {"addr": 0x2028, "val": "Wrong password, try again", "sec": ".rodata",
+             "xrefs": [{"func": "check", "addr": 0x11b0}]},
+            {"addr": 0x2048, "val": "Enter license: ", "sec": ".rodata",
+             "xrefs": [{"func": "main", "addr": 0x1250}]},
+            {"addr": 0x2060, "val": "%31s", "sec": ".rodata",
+             "xrefs": [{"func": "main", "addr": 0x1260}]},
+        ],
+        "functions": [
+            {"name": "main", "addr": 0x1230, "size": 120, "ninstr": 30,
+             "calls": ["__isoc99_scanf", "check", "printf"],
+             "strings": ["Enter license: ", "%31s"], "ncallers": 1},
+            {"name": "check", "addr": 0x1180, "size": 90, "ninstr": 24,
+             "calls": ["memcmp", "strlen"],
+             "strings": ["Correct! The flag is here", "Wrong password, try again"],
+             "ncallers": 1},
+            {"name": "helper_noise", "addr": 0x1300, "size": 40, "ninstr": 12,
+             "calls": ["malloc"], "strings": [], "ncallers": 3},
+        ],
+    }
+
+
+def selftest():
+    fails = []
+
+    def chk(cond, name):
+        (print("  ✅ " + name) if cond else fails.append(name) or print("  ❌ " + name))
+
+    print("== revq selftest (순수 로직) ==")
+
+    rev = _fixture()
+    inter = compute_interesting(rev)
+    top = inter[0] if inter else {}
+    chk(top.get("func") == "check", "interesting top = check (memcmp+Correct 참조)")
+    chk(top.get("score", 0) >= 5, "check 점수 >= 5 (판별문자열+비교함수)")
+    chk(all(i["func"] != "helper_noise" for i in inter), "noise 함수 제외")
+
+    # 문자열 유틸
+    chk(list(_iter_cstrings(b"ab\x00hello\x00\x01\x02worldd", 4)) ==
+        [(3, "hello"), (11, "worldd")], "_iter_cstrings offset/필터")
+    chk(parse_int("0x1180") == 0x1180 and parse_int("4660") == 4660
+        and parse_int("nope") is None, "parse_int hex/dec/invalid")
+
+    # 렌더러 (예외 없이 + 핵심 토큰 포함)
+    s = render_summary(rev)
+    chk("check" in s and "INTERESTING" in s, "render_summary: check 지목")
+    chk("Correct" in s, "render_summary: 판별문자열 하이라이트")
+    chk("check" in render_funcs(rev) and "main" in render_funcs(rev), "render_funcs")
+    chk("Correct" in render_strings(rev, grep="correct"), "render_strings grep")
+    fc = render_func(rev, "check")
+    chk("memcmp" in fc and "decomp" in fc, "render_func: calls + decomp 안내")
+    chk("Correct" in render_xrefs(rev, "Correct"), "render_xrefs: 문자열 참조처")
+    chk("main" in render_xrefs(rev, "check"), "render_xrefs: 호출자(main→check)")
+    chk("memcmp" in render_imports(rev), "render_imports: 분류")
+
+    # 캐시 유효성 판정 로직 (angr 캐시는 --fast 요청에도 유효)
+    chk("__isoc99_scanf" in INPUT_FUNCS and "memcmp" in CMP_FUNCS, "사전 상수")
+
+    # evasion 분류 (Gap A: 정적 신뢰 하향 신호)
+    ev = classify_evasion(["ptrace", "memcmp"], ["please no TracerPid here"], 7.6, ["UPX0", ".text"])
+    chk(any("ptrace" in x for x in ev), "evasion: ptrace import 탐지")
+    chk(any("TracerPid" in x or "tracerpid" in x for x in ev), "evasion: anti-debug 문자열 탐지")
+    chk(any("고엔트로피" in x for x in ev), "evasion: 고엔트로피 탐지")
+    chk(any("UPX" in x for x in ev), "evasion: 패커 섹션 탐지")
+    chk(classify_evasion(["memcmp"], ["hello world"], 5.0, [".text", ".data"]) == [],
+        "evasion: 정상 바이너리 무신호")
+    chk(_entropy(b"\x00\x00\x00\x00") == 0.0 and _entropy(bytes(range(256))) > 7.9, "_entropy 계산")
+
+    print("-" * 40)
+    if fails:
+        print("FAIL %d: %s" % (len(fails), ", ".join(fails)))
+        return 1
+    print("ALL GREEN ✅")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

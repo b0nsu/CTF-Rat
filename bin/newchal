@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# newchal <name> <binary> [libc.so.6] [host:port] — solve 디렉토리 스캐폴딩
+set -euo pipefail
+CTF="$CTF_HOME"; NAME="$1"; BIN="$2"; LIBC="${3:-}"; REMOTE="${4:-}"
+D="$CTF/solve/$NAME"; mkdir -p "$D"; cd "$D"
+cp "$BIN" ./ 2>/dev/null || true
+BN="$(basename "$BIN")"
+[ -n "$LIBC" ] && cp "$LIBC" ./libc.so.6 2>/dev/null || true
+# pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
+if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
+  echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
+  timeout 60 pwninit --bin "$BN" --libc ./libc.so.6 --no-template 2>&1 \
+     | grep -vE 'unstripping|launchpad|failed unstripping' || echo "[!] pwninit timeout/실패 → glibc-aio 로 수동 patchelf 필요"
+fi
+HOST="${REMOTE%%:*}"; PORT="${REMOTE##*:}"
+python3 - "$D" "$BN" "$HOST" "$PORT" <<'PY'
+import sys,os
+D,BN,HOST,PORT=sys.argv[1:5]
+exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
+haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
+open(os.path.join(D,"exploit.py"),"w").write('''#!/usr/bin/env python3
+from pwn import *
+context.binary = exe = ELF("./%s", checksec=False)
+%scontext.log_level = "info"
+HOST, PORT = "%s", %s
+GS = """
+b main
+continue
+"""
+def conn():
+    if args.REMOTE: return remote(HOST, PORT)
+    if args.GDB:    return gdb.debug([exe.path], gdbscript=GS)   # heap/인터랙티브 디버깅 주력
+    return process([exe.path])
+
+io = conn()
+# offset = cyclic_find(...)   # cyclic 으로 확정
+# === exploit ===
+
+io.interactive()
+''' % (exe, ('libc = ELF("./libc.so.6", checksec=False)\\n' if haslibc else ''), HOST, PORT))
+PY
+sed "s/{{NAME}}/$NAME/; s#{{BIN}}#$BN#; s#{{REMOTE}}#${REMOTE:-'-'}#" "$CTF/solve/_template/state.md" > state.md 2>/dev/null || cp "$CTF/solve/_template/state.md" state.md
+echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC:+./libc.so.6} | tee -a state.md
+echo; echo "[+] $D 생성. 다음: cd $D; decomp ./$BN <func>"

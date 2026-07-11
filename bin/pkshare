@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# STATE.jsonl -> 팀 공유물. 풀이과정(진행 순서=append 순서) + 최종 요약. SOLVED->WRITEUP.md, else->SHARE.md
+import sys, os, json, glob
+F="STATE.jsonl"
+def load():
+    chal=os.path.basename(os.path.abspath(os.getcwd())); events=[]
+    if os.path.exists(F):
+        for ln in open(F):
+            ln=ln.strip()
+            if not ln: continue
+            try: e=json.loads(ln)
+            except: continue
+            if e.get("t")=="init": chal=e.get("chal",chal)
+            events.append(e)
+    return chal,events
+def main():
+    chal,events=load()
+    ok=[e["text"] for e in events if e.get("t")=="ok"]
+    offs=[(e["k"],e.get("v"),e.get("src","")) for e in events if e.get("t")=="offset"]
+    no=[(e["text"],e.get("reason","")) for e in events if e.get("t")=="no"]
+    nxt=[e["text"] for e in events if e.get("t")=="next"]
+    solved=("--solved" in sys.argv) or any(("SOLVED" in x.upper() or "flag" in x.lower() or "shell" in x.lower()) for x in ok)
+    if "--handoff" in sys.argv: solved=False
+    flag=""
+    if os.path.exists("flag"):
+        try: flag=open("flag").read().strip()
+        except: pass
+    scripts=sorted(glob.glob("solve*.py")+glob.glob("exploit*.py"))
+    tag={"note":"🔎 정찰/맥락","ok":"✓ 됨","no":"✗ 배제","alert":"⚠ 전환점","offset":"📏 측정","next":"→ 다음"}
+    L=["# %s — %s"%(chal,"SOLVED ✅" if solved else "IN PROGRESS / STUCK ⏸"),""]
+    L.append("> 팀 공유용 %s. **풀이과정(어떻게 도달했나) 포함.**"%("writeup" if solved else "handoff"))
+    L.append("\n## 풀이과정 (진행 순서 — 시도·배제·핵심착상)")
+    n=0
+    for e in events:
+        t=e.get("t")
+        if t=="init": continue
+        n+=1
+        if t=="offset": L.append("%d. **[%s]** `%s = %s`%s"%(n,tag[t],e["k"],e.get("v"),"  (%s)"%e.get("src") if e.get("src") else ""))
+        elif t=="no": L.append("%d. **[%s]** %s%s"%(n,tag[t],e["text"]," — %s"%e.get("reason") if e.get("reason") else ""))
+        elif t in tag: L.append("%d. **[%s]** %s"%(n,tag[t],e.get("text","")))
+    if n==0: L.append("(STATE 기록 없음 — 진행하며 state ok/no/alert/offset 로 과정 남길 것)")
+    if offs:
+        L.append("\n## 검증된 오프셋/상수 (live 측정)"); L.append("| key | value | src |"); L.append("|---|---|---|")
+        for k,v,s in offs: L.append("| `%s` | `%s` | %s |"%(k,v,s))
+    if no:
+        L.append("\n## 배제된 것 (재시도 금지)")
+        for x,r in no: L.append("- ❌ %s%s"%(x," — %s"%r if r else ""))
+    if (not solved) and nxt:
+        L.append("\n## 막힌 지점 / 다음 단계")
+        for x in nxt: L.append("- %s"%x)
+    L.append("\n## 재현")
+    if scripts: L.append("- 스크립트: "+", ".join("`%s`"%s for s in scripts))
+    if flag: L.append("- flag/proof: `%s`"%flag)
+    L.append("- 실행: `cd %s && python3 %s`"%(os.path.basename(os.getcwd()),scripts[-1] if scripts else "solve.py"))
+    fn="WRITEUP.md" if solved else "SHARE.md"
+    open(fn,"w").write("\n".join(L)+"\n")
+    print("[pkshare] %s 생성 (%d줄, 풀이과정 %d스텝, solved=%s)"%(fn,len(L),n,solved))
+main()

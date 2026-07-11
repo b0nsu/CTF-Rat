@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# repack.sh — the Phase-2 automated initramfs rebuild loop (HANDOFF item 3)
+# ---------------------------------------------------------------------------
+# Turns "edit exploit.c -> get a bootable test image" into ONE command:
+#   1. static-compile the exploit C source (or take a prebuilt static binary)
+#   2. inject it into the extracted initramfs cpio tree
+#   3. re-pack + re-compress, matching the SOURCE image's compression
+# Output is a fresh initramfs ready to hand to run_qemu.sh.
+#
+# Usage:
+#   repack.sh -i initramfs.cpio.gz -e exploit.c [options]
+#   repack.sh -i initramfs.cpio.gz --bin ./exploit_prebuilt
+#
+#   -i, --initrd FILE   SOURCE initramfs (.cpio[.gz|.xz|.zst]) [required]
+#   -e, --exploit FILE  C source to static-compile and inject
+#       --bin FILE      pre-built static binary to inject (instead of -e)
+#   -o, --out FILE      output image (default: <initrd basename>.repacked.<ext>)
+#       --dest PATH     path INSIDE the guest fs (default: /<name>)
+#       --name NAME     binary name in guest (default: exploit)
+#       --cc CMD        compiler override (default: 'gcc -static -O2 -s -no-pie')
+#       --owner U:G     cpio owner for repacked files (default root:root)
+#   -w, --workdir DIR   extraction dir (default: mktemp; removed unless --keep)
+#       --keep          keep the extraction dir for inspection
+set -euo pipefail
+
+INITRD=""; SRC=""; BIN=""; OUT=""; DEST=""; NAME="exploit"
+CC="gcc -static -O2 -s -no-pie"; OWNER="root:root"; WORKDIR=""; KEEP=0
+
+die(){ echo "repack.sh: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--initrd)  INITRD="$2"; shift 2;;
+    -e|--exploit) SRC="$2"; shift 2;;
+    --bin)        BIN="$2"; shift 2;;
+    -o|--out)     OUT="$2"; shift 2;;
+    --dest)       DEST="$2"; shift 2;;
+    --name)       NAME="$2"; shift 2;;
+    --cc)         CC="$2"; shift 2;;
+    --owner)      OWNER="$2"; shift 2;;
+    -w|--workdir) WORKDIR="$2"; shift 2;;
+    --keep)       KEEP=1; shift;;
+    -h|--help)    sed -n '2,30p' "$0"; exit 0;;
+    *) die "unknown arg: $1";;
+  esac
+done
+
+[ -n "$INITRD" ] && [ -f "$INITRD" ] || die "source initramfs not found (pass -i)"
+[ -n "$SRC" ] || [ -n "$BIN" ] || die "give -e exploit.c OR --bin prebuilt"
+[ -n "$SRC" ] && [ -n "$BIN" ] && die "give only one of -e / --bin"
+[ -z "$DEST" ] && DEST="/$NAME"
+
+# --- detect source compression -------------------------------------------
+FT=$(file -b "$INITRD")
+case "$FT" in
+  *gzip*)      DECOMP="gzip -dc";  COMP="gzip";              EXT="cpio.gz";;
+  *XZ*|*xz*)   DECOMP="xz -dc";    COMP="xz --check=crc32";  EXT="cpio.xz";;
+  *Zstandard*) DECOMP="zstd -dc";  COMP="zstd -q";           EXT="cpio.zst";
+               command -v zstd >/dev/null || die "initramfs is zstd but 'zstd' not installed (sudo apt install zstd)";;
+  *cpio*)      DECOMP="cat";       COMP="cat";               EXT="cpio";;
+  *)           die "unrecognized initramfs format: $FT";;
+esac
+echo "[*] source: $INITRD  ($FT)" >&2
+
+# --- workdir --------------------------------------------------------------
+CLEANUP=0
+if [ -z "$WORKDIR" ]; then WORKDIR=$(mktemp -d); CLEANUP=1; fi
+mkdir -p "$WORKDIR"
+INITRD_ABS=$(readlink -f "$INITRD")
+cleanup(){ [ "$CLEANUP" -eq 1 ] && [ "$KEEP" -eq 0 ] && rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+# --- extract --------------------------------------------------------------
+echo "[*] extracting -> $WORKDIR" >&2
+( cd "$WORKDIR" && eval "$DECOMP '$INITRD_ABS'" | cpio -idm --quiet )
+
+# --- build / stage the binary ---------------------------------------------
+# ensure the destination's parent dir exists inside the extracted tree
+# (a real initramfs usually has /tmp etc., but don't assume it)
+mkdir -p "$(dirname "$WORKDIR/.$DEST")"
+if [ -n "$SRC" ]; then
+  [ -f "$SRC" ] || die "exploit source not found: $SRC"
+  SRC_ABS=$(readlink -f "$SRC")
+  echo "[*] compiling: $CC $SRC -o $NAME" >&2
+  ( cd "$WORKDIR" && eval "$CC '$SRC_ABS' -o '.$DEST'" )
+else
+  [ -f "$BIN" ] || die "prebuilt binary not found: $BIN"
+  file -b "$BIN" | grep -q 'statically linked' || echo "[!] warning: $BIN is not statically linked" >&2
+  cp "$BIN" "$WORKDIR/.$DEST"
+fi
+chmod 0755 "$WORKDIR/.$DEST"
+echo "[*] injected -> guest:$DEST" >&2
+
+# --- repack ---------------------------------------------------------------
+[ -z "$OUT" ] && OUT="$(basename "${INITRD%.cpio*}").repacked.$EXT"
+OUT_ABS=$(readlink -f "$(dirname "$OUT")")/$(basename "$OUT")
+( cd "$WORKDIR" && find . -mindepth 1 -print0 \
+    | cpio --null --create --format=newc --owner="$OWNER" --quiet \
+    | eval "$COMP" > "$OUT_ABS" )
+
+echo "[+] repacked -> $OUT  ($(du -h "$OUT_ABS" | cut -f1))" >&2
+echo "[+] boot it:  run_qemu.sh -i '$OUT' -k <bzImage>" >&2
+echo "$OUT"

@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""dump_heap — large kernel memory/state -> a FILE, via batch GDB over the QEMU gdbstub.
+
+The kernel-side sibling of ~/ctf/bin/gdbq's "ask GDB in batch, strip the noise" pattern,
+specialised for *large* state that must NOT be dumped inline into an LLM conversation
+(HANDOFF item 4 + the "메모리 조회 → 파일로 빼고 grep" To-Be rule). It attaches to the
+QEMU gdbstub, runs the requested reads, ANSI-strips the output, writes it to a timestamped
+file under ~/ctf/kernel/dumps/, and prints ONLY the path + a short preview to stdout.
+
+Runs plain gdb with -nx (no pwndbg) for fast, deterministic, noise-free dumps — pwndbg's
+context panels are exactly what we don't want in a bulk memory dump.
+
+Usage:
+  dump_heap.py --regs                          # full register set -> file
+  dump_heap.py --addr 0xffffffff81e00000 --len 512
+  dump_heap.py --vmlinux ./vmlinux --sym modprobe_path --len 32
+  dump_heap.py --cmd "info registers" --cmd "x/40gx \$rsp"   # arbitrary batch cmds
+
+Options:
+  --host HOST      gdbstub host (default localhost)
+  -p, --port N     gdbstub port (default 1234)
+  --vmlinux FILE   vmlinux/ELF with symbols (enables --sym and source-level cmds)
+  --addr 0xADDR    dump memory starting at this address
+  --sym NAME       dump memory starting at symbol NAME (requires --vmlinux)
+  --len N          bytes to dump for --addr/--sym (default 256; accepts 0x..)
+  --regs           dump the full register set
+  --cmd "CMD"      run an arbitrary batch gdb command (repeatable), appended in order
+  -o, --out FILE   output file (default dumps/<tag>-<timestamp>.txt)
+  --tag STR        filename tag (default 'dump')
+  --timeout SEC    kill gdb after SEC seconds (default 30)
+  --preview N      lines of the dump to echo to stdout (default 15)
+"""
+import argparse
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+GDBINIT_KERNEL = os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "kernel/.gdbinit-kernel")
+DUMPDIR = os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "kernel/dumps")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="dump_heap", add_help=True,
+                                 description="kernel state -> file via batch GDB")
+    ap.add_argument("--host", default="localhost")
+    ap.add_argument("-p", "--port", default="1234")
+    ap.add_argument("--vmlinux", default=None)
+    ap.add_argument("--addr", default=None)
+    ap.add_argument("--sym", default=None)
+    ap.add_argument("--len", default="256")
+    ap.add_argument("--regs", action="store_true")
+    ap.add_argument("--cmd", action="append", default=[])
+    ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--tag", default="dump")
+    ap.add_argument("--timeout", type=int, default=30)
+    ap.add_argument("--preview", type=int, default=15)
+    args = ap.parse_args(argv)
+
+    try:
+        nbytes = int(args.len, 0)
+    except ValueError:
+        ap.error("--len must be an integer (decimal or 0x..)")
+
+    if args.sym and not args.vmlinux:
+        ap.error("--sym needs --vmlinux (symbol table to resolve against)")
+    if args.vmlinux and not os.path.exists(args.vmlinux):
+        ap.error("vmlinux not found: %s" % args.vmlinux)
+
+    # --- assemble the ordered gdb command list ---
+    cmds = ["set pagination off", "set style enabled off",
+            "target remote %s:%s" % (args.host, args.port)]
+    if args.regs:
+        cmds.append("info registers")
+    if args.addr:
+        cmds.append("x/%dxb %s" % (nbytes, args.addr))
+    if args.sym:
+        cmds.append("x/%dxb &%s" % (nbytes, args.sym))
+    cmds.extend(args.cmd)
+    if len(cmds) == 3:  # only the 3 setup cmds -> nothing to actually dump
+        ap.error("nothing to dump: pass --regs / --addr / --sym / --cmd")
+
+    gdb_argv = ["gdb", "-q", "-batch", "-nx"]
+    if args.vmlinux:
+        gdb_argv.append(args.vmlinux)
+    for c in cmds:
+        gdb_argv += ["-ex", c]
+
+    # --- run it, bounded ---
+    try:
+        proc = subprocess.run(gdb_argv, capture_output=True, text=True,
+                              timeout=args.timeout)
+        raw = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        raw = (e.stdout or "") + (e.stderr or "")
+        raw += "\n[dump_heap] TIMEOUT after %ds — is QEMU's gdbstub up on %s:%s?\n" % (
+            args.timeout, args.host, args.port)
+    except FileNotFoundError:
+        ap.error("gdb not found on PATH")
+
+    clean = ANSI.sub("", raw)
+
+    # --- write to file, print path + preview ---
+    os.makedirs(DUMPDIR, exist_ok=True)
+    if args.out:
+        out_path = args.out
+    else:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = os.path.join(DUMPDIR, "%s-%s.txt" % (args.tag, stamp))
+    header = ("# dump_heap %s\n# target %s:%s  vmlinux=%s\n# cmds: %s\n%s\n" % (
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        args.host, args.port, args.vmlinux or "(none)",
+        " | ".join(cmds[2:]), "-" * 60))
+    with open(out_path, "w") as fh:
+        fh.write(header + clean + "\n")
+
+    lines = clean.splitlines()
+    print("[+] dumped %d lines -> %s" % (len(lines), out_path))
+    print("    grep it, e.g.:  grep -n <hex> %s" % out_path)
+    if args.preview > 0 and lines:
+        print("--- first %d lines ---" % min(args.preview, len(lines)))
+        print("\n".join(lines[:args.preview]))
+    if "Connection timed out" in clean or "TIMEOUT" in clean or "Remote connection closed" in clean:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

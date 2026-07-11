@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# run_qemu.sh — QEMU boot wrapper for kernel-pwn (HANDOFF item 2)
+# ---------------------------------------------------------------------------
+# Kernel-side sibling of the $CTF_HOME/bin/ wrapper convention: instead of the LLM
+# typing a 12-flag qemu-system-x86_64 line by hand, it invokes this. Boots a
+# challenge kernel + initramfs with the gdbstub open (:1234), backgrounds QEMU,
+# and sends the console to a LOG FILE (not the terminal) — same "big output ->
+# file, grep it" rule as decomp/gdbq/dump_heap.
+#
+# Usage:
+#   run_qemu.sh [-k bzImage] [-i initramfs] [options]
+#
+#   -k, --kernel FILE   bzImage / vmlinuz (auto-detected in cwd if omitted)
+#   -i, --initrd FILE   initramfs image  (auto-detected in cwd if omitted)
+#   -a, --append STR    FULL kernel cmdline override (replaces the default)
+#   -d, --debug         debug boot: add 'nokaslr earlyprintk=serial,ttyS0'
+#   -S, --halt          pass -S: freeze CPU at startup for an early gdb attach
+#   -m, --mem SIZE      guest RAM (default 256M)
+#   -p, --port N        gdbstub TCP port (default 1234)
+#       --smp N         vCPUs (default 1)
+#       --cpu STR       -cpu value (default 'kvm64,+smep,+smap' -- PLACEHOLDER ONLY,
+#                       used when no challenge run.sh is found. kvm64 avoids a documented
+#                       qemu64+smep+smap boot-panic quirk on some kernels and matches the
+#                       convention seen in real kernel-CTF run.sh files (K3RN3LCTF,
+#                       0CTF/TCTF Kernote, and this repo's own challenges). NOT "the
+#                       correct cpu for your challenge" -- always mirror a real run.sh.)
+#       --fg            run in the FOREGROUND with -nographic (interactive serial)
+#       --extra STR     extra raw args appended to the qemu command
+#       --log FILE      console log path (default ./qemu.log)
+#       --dry-run       print the assembled qemu command and exit (no boot)
+#
+# NOTE on challenge-provided run.sh: many kernel CTF challenges ship their own
+# run.sh with the exact -append/-cpu they expect. If one is present in the cwd
+# this wrapper WARNS and shows its qemu line so you can mirror the real flags
+# rather than guessing (HANDOFF item 2: "don't reinvent flags already given").
+set -euo pipefail
+
+KERNEL=""; INITRD=""; APPEND=""; DEBUG=0; HALT=0
+MEM="256M"; PORT="1234"; SMP="1"; CPU="kvm64,+smep,+smap"
+FG=0; EXTRA=""; LOG="./qemu.log"; DRY=0
+
+die(){ echo "run_qemu.sh: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -k|--kernel) KERNEL="$2"; shift 2;;
+    -i|--initrd) INITRD="$2"; shift 2;;
+    -a|--append) APPEND="$2"; shift 2;;
+    -d|--debug)  DEBUG=1; shift;;
+    -S|--halt)   HALT=1; shift;;
+    -m|--mem)    MEM="$2"; shift 2;;
+    -p|--port)   PORT="$2"; shift 2;;
+    --smp)       SMP="$2"; shift 2;;
+    --cpu)       CPU="$2"; shift 2;;
+    --fg)        FG=1; shift;;
+    --extra)     EXTRA="$2"; shift 2;;
+    --log)       LOG="$2"; shift 2;;
+    --dry-run)   DRY=1; shift;;
+    -h|--help)   sed -n '2,40p' "$0"; exit 0;;
+    *) die "unknown arg: $1";;
+  esac
+done
+
+# --- auto-detect kernel / initramfs in cwd if not given -------------------
+if [ -z "$KERNEL" ]; then
+  KERNEL=$(ls -1 bzImage vmlinuz* vmlinux 2>/dev/null | head -1 || true)
+  [ -n "$KERNEL" ] && echo "[*] auto kernel: $KERNEL" >&2
+fi
+if [ -z "$INITRD" ]; then
+  INITRD=$(ls -1 *.cpio.gz *.cpio.xz *.cpio.zst *.cpio initramfs* rootfs* initrd* 2>/dev/null | head -1 || true)
+  [ -n "$INITRD" ] && echo "[*] auto initrd: $INITRD" >&2
+fi
+[ -n "$KERNEL" ] && [ -f "$KERNEL" ] || die "kernel not found (pass -k)"
+[ -n "$INITRD" ] && [ -f "$INITRD" ] || die "initramfs not found (pass -i)"
+
+# --- surface a challenge-provided boot script (don't reinvent its flags) --
+for rs in run.sh run_qemu.sh start.sh boot.sh launch.sh; do
+  if [ -f "$rs" ] && [ "$(readlink -f "$rs")" != "$(readlink -f "$0")" ]; then
+    echo "[!] challenge boot script present: $rs" >&2
+    echo "[!] this wrapper's --cpu/--append DEFAULTS ARE PLACEHOLDERS, unrelated to this challenge -- mirror the flags below exactly, do not trust the default:" >&2
+    grep -aE 'qemu-system|append|-cpu|-m |-smp' "$rs" 2>/dev/null | sed 's/^/      /' >&2 || true
+    break
+  fi
+done
+
+# --- kernel cmdline -------------------------------------------------------
+if [ -z "$APPEND" ]; then
+  APPEND="console=ttyS0 oops=panic panic=-1 quiet"
+  [ "$DEBUG" -eq 1 ] && APPEND="console=ttyS0 oops=panic panic=-1 nokaslr earlyprintk=serial,ttyS0"
+fi
+
+# --- assemble command -----------------------------------------------------
+CMD=(qemu-system-x86_64
+  -m "$MEM"
+  -kernel "$KERNEL"
+  -initrd "$INITRD"
+  -append "$APPEND"
+  -cpu "$CPU"
+  -smp "$SMP"
+  -no-reboot
+  -gdb "tcp::$PORT")
+[ "$HALT" -eq 1 ] && CMD+=(-S)
+
+if [ "$FG" -eq 1 ]; then
+  CMD+=(-nographic)
+else
+  # background: console -> log file, no monitor/graphics grabbing the terminal
+  CMD+=(-display none -serial "file:$LOG" -monitor none)
+fi
+[ -n "$EXTRA" ] && CMD+=($EXTRA)
+
+if [ "$DRY" -eq 1 ]; then
+  printf '%q ' "${CMD[@]}"; echo
+  exit 0
+fi
+
+echo "[*] gdbstub: tcp::$PORT   (attach: gdb -q -x $CTF_HOME/kernel/.gdbinit-kernel  then  kattach)" >&2
+[ "$HALT" -eq 1 ] && echo "[*] CPU halted at startup (-S) — attach gdb, then 'continue'" >&2
+
+if [ "$FG" -eq 1 ]; then
+  exec "${CMD[@]}"
+else
+  : > "$LOG"
+  setsid "${CMD[@]}" >/dev/null 2>&1 &
+  QPID=$!
+  echo "[*] QEMU pid $QPID   console -> $LOG" >&2
+  echo "$QPID" > .qemu.pid
+  echo "[*] stop with: kill $QPID   (pid also in .qemu.pid)" >&2
+fi

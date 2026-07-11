@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# pkstart <name> [binary_path] : 새/held-out 문제 원샷 온보딩 (solve dir + recon + STATE 정적 시드)
+set -e
+N="${1:?usage: pkstart <name> [binary_path]}"; SRC="${2:-}"
+D="$CTF_HOME/solve/${N}"
+mkdir -p "$D"; cd "$D"
+[ -n "$SRC" ] && [ -f "$SRC" ] && cp "$SRC" .
+B="$(find . -maxdepth 1 -type f -perm -u+x ! -name '*.py' ! -name '*.sh' 2>/dev/null | head -1)"
+[ -z "$B" ] && { echo "[pkstart] 실행 바이너리 없음 — $D 에 바이너리 넣고 다시"; exit 0; }
+echo "[pkstart] name=$N bin=$B  dir=$D"
+R="$($CTF_HOME/bin/recon "$B" 2>/dev/null)"
+echo "$R"
+state init "$N" >/dev/null 2>&1 || true
+echo "$R" | grep -aE 'PROT|SINK|EXEC|WIN|HEAP|libc|TRIAGE' | while IFS= read -r line; do
+  state note "recon: $(echo "$line" | sed 's/^[[:space:]]*//')" >/dev/null 2>&1 || true
+done
+state next "decomp $B <func> -> vuln 도출 -> primitive 실증 -> state offset/ok/no 기록하며 진행" >/dev/null 2>&1 || true
+echo "[pkstart] STATE 시드 완료. 다음: state show; decomp $B"

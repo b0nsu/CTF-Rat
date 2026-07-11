@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+set -e
+REPO="${CTF_TEAM:-$CTF_HOME/team}"
+N="${1:?usage: teamreg <name> [binary]}"; SRC="${2:-}"
+[ -d "$REPO/.git" ] || { echo "[teamreg] 팀 repo 없음: $REPO — TEAM_SETUP.md 따라 clone 먼저"; exit 1; }
+AUTHOR="$(cat "$REPO/.author" 2>/dev/null || echo unknown)"
+D="$REPO/chals/$N"; mkdir -p "$D"
+SHA=""; [ -n "$SRC" ] && [ -f "$SRC" ] && SHA="$(sha256sum "$SRC" | cut -d' ' -f1)"
+printf '{"name":"%s","sha256":"%s","status":"open","registered_by":"%s","registered_at":"%s"}\n' \
+  "$N" "$SHA" "$AUTHOR" "$(date -u +%FT%TZ)" > "$D/meta.json"
+mkdir -p "$CTF_HOME/solve/$N"
+[ -n "$SRC" ] && [ -f "$SRC" ] && cp "$SRC" "$CTF_HOME/solve/$N/"
+( cd "$REPO" && git add -A >/dev/null 2>&1 && git commit -q -m "reg $N by $AUTHOR" >/dev/null 2>&1 \
+  && { git pull -q --rebase >/dev/null 2>&1; git push -q >/dev/null 2>&1; } || true )
+echo "[teamreg] '$N' 등록 (author=$AUTHOR sha=${SHA:0:12}). 로컬: $CTF_HOME/solve/$N — 이제 teamsync --loop & 후 state로 기록"

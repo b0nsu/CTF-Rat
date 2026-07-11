@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# gdbq <binary> "<gdb cmd>" [...]  — pwndbg, context/배너 억제, 물어본 것만
+export PWNDBG_NO_AUTOUPDATE=1
+BIN="$1"; shift
+args=(-q -batch -ex "set context-sections ''")
+for c in "$@"; do args+=(-ex "$c"); done
+gdb "${args[@]}" "$BIN" 2>&1 \
+  | sed -r 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+  | grep -vaE 'pwndbg:|Loaded .* pwndbg|Reading symbols from|no debugging symbols found|Thread debugging using|Using host libthread_db|PWNDBG_NO_AUTOUPDATE|automatic updating'

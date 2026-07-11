@@ -1,0 +1,11 @@
+0x4527a execve("/bin/sh", rsp+0x30, environ)
+constraints:
+  [rsp+0x30] == NULL || {[rsp+0x30], [rsp+0x38], [rsp+0x40], [rsp+0x48], ...} is a valid argv
+
+0xf03a4 execve("/bin/sh", rsp+0x50, environ)
+constraints:
+  [rsp+0x50] == NULL || {[rsp+0x50], [rsp+0x58], [rsp+0x60], [rsp+0x68], ...} is a valid argv
+
+0xf1247 execve("/bin/sh", rsp+0x70, environ)
+constraints:
+  [rsp+0x70] == NULL || {[rsp+0x70], [rsp+0x78], [rsp+0x80], [rsp+0x88], ...} is a valid argv

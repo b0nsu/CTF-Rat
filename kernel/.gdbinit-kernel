@@ -1,0 +1,48 @@
+# kernel/.gdbinit-kernel  — kernel-pwn GDB tuning for the QEMU gdbstub
+# ---------------------------------------------------------------------------
+# Sibling of bin/gdbq's compact-output discipline, applied to *interactive*
+# kernel sessions attached over QEMU's gdbstub (:1234). Source it EXPLICITLY so it
+# never clobbers the userland gdbq/pwndbg config that ~/.gdbinit sets up:
+#
+#     gdb -q -x kernel/.gdbinit-kernel        # pwndbg still auto-loads via ~/.gdbinit
+#     (pwndbg)  kattach                              # -> target remote :1234
+#
+# Rules honored (see kernel/HANDOFF.md item 1 + doctrine/SOLVING.md compact-output rule):
+#   - pagination off        : no "---Type <return>---" stalls in an LLM session
+#   - color/ANSI off         : GDB's own styler + pwndbg syntax highlight, so text is
+#                              clean without needing gdbq's post-hoc sed strip
+#   - context trimmed        : keep regs + the faulting instruction, drop the noise
+#                              panels (stack/backtrace/threads/ghidra/heap_tracker/...)
+
+set pagination off
+set confirm off
+
+# --- color/ANSI off -------------------------------------------------------
+# GDB built-in ANSI styling. Version-robust: pwndbg's per-element color config
+# vars drift across releases, so we kill GDB's styler directly and only toggle
+# pwndbg's syntax highlight (a stable, long-lived pwndbg option) on top.
+set style enabled off
+
+# --- pwndbg tuning (guarded: no hard failure if a var was renamed) --------
+python
+for _cmd in ("set syntax-highlight off",
+             # pwndbg's disassembly panel is named 'disasm' — that IS the "faulting
+             # instruction" HANDOFF item 1 wants kept alongside regs. 'code' (source
+             # lines) is harmless when no source is present. Everything else dropped.
+             "set context-sections regs disasm code"):
+    try:
+        gdb.execute(_cmd)
+    except gdb.error as _e:
+        print("[.gdbinit-kernel] skipped: %s (%s)" % (_cmd, _e))
+end
+
+# --- QEMU gdbstub convenience ---------------------------------------------
+define kattach
+  target remote :1234
+end
+document kattach
+Attach to the QEMU gdbstub on localhost:1234 (started by run_qemu.sh).
+end
+
+# QEMU's gdbstub is flaky with hardware watchpoints; prefer software breakpoints.
+set can-use-hw-watchpoints 0

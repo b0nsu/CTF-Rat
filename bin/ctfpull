@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ctfpull — CTF 문제 수집 어댑터 (RUNNER 아키텍처 L1 INGEST).
+
+CTFd 플랫폼에서 문제 목록/상세를 당겨, 첨부를 스테이징하고 `newchal` 스캐폴드로 넘긴다.
+flag 자동제출은 하지 않는다 (ToS + honest-mode).
+
+설정 우선순위: CLI 플래그 > 환경변수(CTFD_URL/CTFD_TOKEN) > dotenv 파일(--env, 기본 ./.ctfd.env → ~/ctf/.ctfd.env)
+
+사용:
+  ctfpull ctfd --list [--category pwn] [--json]
+  ctfpull ctfd --id <N> [--dest DIR] [--bin NAME] [--no-newchal]
+  ctfpull ctfd --all [--category pwn]
+  ctfpull selftest
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tarfile
+import zipfile
+from datetime import datetime, timezone
+from urllib import error, parse, request
+
+DEFAULT_ENV_PATHS = ["./.ctfd.env", os.path.expanduser("~/ctf/.ctfd.env")]
+CTF_HOME = os.path.expanduser(os.environ.get("CTF_HOME", "~/ctf"))
+
+
+# ─────────────────────────── 유틸 ───────────────────────────
+def die(msg, code=1):
+    print("[ctfpull:err] " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print("[ctfpull] " + msg, file=sys.stderr)
+
+
+def load_dotenv(path):
+    """KEY=VAL / export KEY=VAL / 따옴표 처리. 주석·빈줄 무시. 반환=dict."""
+    out = {}
+    if not path or not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            out[k] = v
+    return out
+
+
+def resolve_config(args):
+    """CLI > env > dotenv 순으로 url/token/cookie 확정."""
+    env = {}
+    env_paths = [args.env] if args.env else DEFAULT_ENV_PATHS
+    for p in env_paths:
+        if p and os.path.isfile(p):
+            env = load_dotenv(p)
+            info("설정 파일 로드: %s (키: %s)" % (p, ",".join(sorted(env.keys())) or "없음"))
+            break
+    url = args.url or os.environ.get("CTFD_URL") or env.get("CTFD_URL")
+    token = args.token or os.environ.get("CTFD_TOKEN") or env.get("CTFD_TOKEN")
+    cookie = args.cookie or os.environ.get("CTFD_COOKIE") or env.get("CTFD_COOKIE")
+    if not url:
+        die("CTFd URL 미지정 (--url / CTFD_URL / .ctfd.env 중 하나 필요)")
+    return url.rstrip("/"), token, cookie
+
+
+def make_opener(insecure):
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return request.build_opener(request.HTTPSHandler(context=ctx))
+
+
+def api_get(base, path, token, cookie, insecure):
+    url = base + path if path.startswith("/") else base + "/" + path
+    req = request.Request(url)
+    req.add_header("Accept", "application/json")
+    if token:
+        req.add_header("Authorization", "Token " + token)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    opener = make_opener(insecure)
+    try:
+        with opener.open(req, timeout=30) as resp:
+            data = resp.read()
+    except error.HTTPError as e:
+        die("HTTP %s @ %s — 인증(토큰/쿠키) 또는 스코프 확인" % (e.code, url))
+    except error.URLError as e:
+        die("연결 실패 @ %s (%s) — --insecure(자체서명) 또는 URL 확인" % (url, e.reason))
+    try:
+        j = json.loads(data)
+    except json.JSONDecodeError:
+        die("JSON 아님 @ %s — CTFd API 경로/로그인 상태 확인 (앞 120B: %r)" % (url, data[:120]))
+    if isinstance(j, dict) and j.get("success") is False:
+        die("CTFd success=false @ %s: %s" % (url, j.get("errors") or j))
+    return j.get("data") if isinstance(j, dict) and "data" in j else j
+
+
+def download(base, file_path, dest_dir, token, cookie, insecure):
+    """CTFd 첨부 다운로드. file_path='/files/<hash>/<name>?token=...'. 반환=로컬경로."""
+    url = base + file_path if file_path.startswith("/") else file_path
+    name = os.path.basename(parse.urlsplit(url).path)
+    local = os.path.join(dest_dir, name)
+    req = request.Request(url)
+    if token:
+        req.add_header("Authorization", "Token " + token)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    opener = make_opener(insecure)
+    with opener.open(req, timeout=120) as resp, open(local, "wb") as f:
+        shutil.copyfileobj(resp, f)
+    return local
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+CONN_HTML = re.compile(r"<[^>]+>")
+
+
+def parse_connection_info(s):
+    """CTFd connection_info → 'host:port' 또는 None. 다양한 표기 흡수."""
+    if not s:
+        return None
+    s = CONN_HTML.sub(" ", str(s))
+    s = s.replace("&#39;", "'").strip()
+    # 'nc host port' / 'nc -v host port' 우선
+    m = re.search(r"\bnc\b[^0-9A-Za-z]*(?:-\S+\s+)*([A-Za-z0-9._-]+)\s+(\d{2,5})", s)
+    if m:
+        return "%s:%s" % (m.group(1), m.group(2))
+    # 'host:port'
+    m = re.search(r"([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9._-]+|\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})", s)
+    if m:
+        return "%s:%s" % (m.group(1), m.group(2))
+    # 'host port' (공백)
+    m = re.search(r"([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9._-]+)\s+(\d{2,5})", s)
+    if m:
+        return "%s:%s" % (m.group(1), m.group(2))
+    return None
+
+
+def is_elf(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def extract_archives(staging):
+    """staging 안의 zip/tar 자동 해제 (동명 하위폴더로)."""
+    for entry in list(os.listdir(staging)):
+        p = os.path.join(staging, entry)
+        try:
+            if zipfile.is_zipfile(p):
+                with zipfile.ZipFile(p) as z:
+                    z.extractall(staging)
+                info("해제(zip): %s" % entry)
+            elif tarfile.is_tarfile(p):
+                with tarfile.open(p) as t:
+                    t.extractall(staging)
+                info("해제(tar): %s" % entry)
+        except (zipfile.BadZipFile, tarfile.TarError, OSError) as e:
+            info("해제 실패(%s): %s" % (entry, e))
+
+
+def detect_binaries(staging, name_hint=None):
+    """staging(재귀)에서 ELF 스캔 → (main_bin, libc, ld, all_elfs)."""
+    elfs = []
+    for root, _, files in os.walk(staging):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if is_elf(p):
+                elfs.append(p)
+    libc = next((p for p in elfs if re.search(r"libc(-|\.|_)", os.path.basename(p))), None)
+    ld = next((p for p in elfs if os.path.basename(p).startswith("ld-")), None)
+    mains = [p for p in elfs if p not in (libc, ld) and not p.endswith(".so")
+             and not re.search(r"\.so(\.\d+)*$", os.path.basename(p))]
+    main = None
+    if mains:
+        if name_hint:
+            main = next((p for p in mains if name_hint.lower() in os.path.basename(p).lower()), None)
+        main = main or mains[0]
+    return main, libc, ld, elfs
+
+
+def slugify(name):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "chal"
+
+
+# ─────────────────────────── 명령 ───────────────────────────
+def cmd_list(base, token, cookie, insecure, category, as_json):
+    data = api_get(base, "/api/v1/challenges", token, cookie, insecure)
+    chals = data if isinstance(data, list) else []
+    if category:
+        chals = [c for c in chals if str(c.get("category", "")).lower() == category.lower()]
+    if as_json:
+        print(json.dumps(chals, ensure_ascii=False, indent=2))
+        return
+    chals.sort(key=lambda c: (str(c.get("category", "")), c.get("value", 0)))
+    print("%-5s %-12s %-6s %-6s %s" % ("ID", "CATEGORY", "PTS", "SOLVES", "NAME"))
+    print("-" * 72)
+    for c in chals:
+        print("%-5s %-12s %-6s %-6s %s" % (
+            c.get("id", "?"), str(c.get("category", ""))[:12],
+            c.get("value", "?"), c.get("solves", "?"), c.get("name", "")))
+    print("-" * 72)
+    print("총 %d개 (fetch: ctfpull ctfd --id <ID>)" % len(chals))
+
+
+def build_run_manifest(base, detail, conn, files_meta):
+    return {
+        "platform": "ctfd",
+        "url": base,
+        "challenge_id": detail.get("id"),
+        "name": detail.get("name"),
+        "category": detail.get("category"),
+        "value": detail.get("value"),
+        "connection_info": conn,
+        "files": files_meta,
+        "flag": None,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def render_newchal_cmd(name, main_bin, libc, conn):
+    argv = ["newchal", name, main_bin]
+    if conn and libc:
+        argv += [libc, conn]
+    elif conn:
+        argv += ["", conn]
+    elif libc:
+        argv += [libc]
+    return argv
+
+
+def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newchal):
+    detail = api_get(base, "/api/v1/challenges/%s" % chal_id, token, cookie, insecure)
+    if not isinstance(detail, dict):
+        die("문제 상세 응답 형식 이상 (id=%s)" % chal_id)
+    name = slugify(detail.get("name", "chal_%s" % chal_id))
+    conn = parse_connection_info(detail.get("connection_info"))
+    staging = os.path.join(dest, name)
+    os.makedirs(staging, exist_ok=True)
+    info("문제: %s (id=%s, cat=%s) → %s" % (detail.get("name"), chal_id, detail.get("category"), staging))
+    if conn:
+        info("연결: %s" % conn)
+
+    files_meta = []
+    for fp in detail.get("files", []) or []:
+        local = download(base, fp, staging, token, cookie, insecure)
+        files_meta.append({"name": os.path.basename(local), "sha256": sha256_of(local)})
+        info("다운로드: %s" % os.path.basename(local))
+    if not files_meta:
+        info("첨부 없음 (remote-only 문제일 수 있음)")
+
+    extract_archives(staging)
+    main_bin, libc, ld, elfs = detect_binaries(staging, bin_hint or name)
+    if bin_hint:
+        cand = [p for p in elfs if os.path.basename(p) == bin_hint]
+        main_bin = cand[0] if cand else main_bin
+
+    manifest = build_run_manifest(base, detail, conn, files_meta)
+    manifest["detected"] = {
+        "main_bin": os.path.relpath(main_bin, staging) if main_bin else None,
+        "libc": os.path.relpath(libc, staging) if libc else None,
+        "ld": os.path.relpath(ld, staging) if ld else None,
+        "all_elfs": [os.path.relpath(p, staging) for p in elfs],
+    }
+    with open(os.path.join(staging, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    info("manifest: %s/run.json" % staging)
+
+    if not main_bin:
+        info("메인 바이너리 자동판별 실패. 후보 ELF: %s" % ([os.path.basename(p) for p in elfs] or "없음"))
+        info("→ --bin <파일명> 으로 지정하거나 수동 newchal")
+        return
+
+    argv = render_newchal_cmd(name, main_bin, libc, conn)
+    if run_newchal and shutil.which("newchal"):
+        info("newchal 실행: %s" % " ".join(argv))
+        subprocess.run(argv, check=False)
+    else:
+        why = "newchal 미탐지(Mac dev?)" if run_newchal else "--no-newchal"
+        print("\n[스테이징 완료] %s — %s. WSL에서 실행:" % (staging, why))
+        print("  " + " ".join(shlex_quote(a) for a in argv))
+
+
+def cmd_fetch_all(base, token, cookie, insecure, dest, bin_hint, run_newchal, category):
+    data = api_get(base, "/api/v1/challenges", token, cookie, insecure)
+    chals = data if isinstance(data, list) else []
+    if category:
+        chals = [c for c in chals if str(c.get("category", "")).lower() == category.lower()]
+    info("일괄 수집 대상 %d개" % len(chals))
+    for c in chals:
+        try:
+            cmd_fetch(base, token, cookie, insecure, c.get("id"), dest, bin_hint, run_newchal)
+        except SystemExit:
+            info("건너뜀 (id=%s)" % c.get("id"))
+
+
+def shlex_quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+# ─────────────────────────── selftest ───────────────────────────
+def selftest():
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        ok = ok and cond
+        print(("  PASS " if cond else "  FAIL ") + label)
+
+    print("[selftest] connection_info 파싱")
+    cases = {
+        "nc chall.example.com 31337": "chall.example.com:31337",
+        "nc -v host.io 1337": "host.io:1337",
+        "host.example.org:9999": "host.example.org:9999",
+        "<a href='#'>nc pwn.ctf.io 5000</a>": "pwn.ctf.io:5000",
+        "10.0.0.5:4444": "10.0.0.5:4444",
+        "connect to pwn.chal.io 20001 please": "pwn.chal.io:20001",
+        "": None,
+        "no connection here": None,
+    }
+    for s, exp in cases.items():
+        got = parse_connection_info(s)
+        check("%-42r → %s" % (s, got), got == exp)
+
+    print("[selftest] newchal 명령 렌더")
+    check("bin+libc+conn", render_newchal_cmd("foo", "/s/foo", "/s/libc.so.6", "h:1") ==
+          ["newchal", "foo", "/s/foo", "/s/libc.so.6", "h:1"])
+    check("bin+conn(무 libc)", render_newchal_cmd("foo", "/s/foo", None, "h:1") ==
+          ["newchal", "foo", "/s/foo", "", "h:1"])
+    check("bin+libc(무 conn)", render_newchal_cmd("foo", "/s/foo", "/s/libc.so.6", None) ==
+          ["newchal", "foo", "/s/foo", "/s/libc.so.6"])
+    check("bin만", render_newchal_cmd("foo", "/s/foo", None, None) == ["newchal", "foo", "/s/foo"])
+
+    print("[selftest] manifest 스키마")
+    m = build_run_manifest("https://x", {"id": 1, "name": "n", "category": "pwn", "value": 100},
+                           "h:1", [{"name": "a", "sha256": "z"}])
+    check("필수 키", all(k in m for k in
+          ("platform", "url", "challenge_id", "name", "category", "connection_info", "files", "flag", "fetched_at")))
+    check("flag=None", m["flag"] is None)
+    check("platform=ctfd", m["platform"] == "ctfd")
+
+    print("[selftest] slugify")
+    check("공백/특수 → _", slugify("My Chal! (v2)") == "My_Chal_v2")
+
+    print("\n[selftest] " + ("ALL GREEN ✅" if ok else "FAILED ❌"))
+    sys.exit(0 if ok else 1)
+
+
+# ─────────────────────────── main ───────────────────────────
+def main():
+    ap = argparse.ArgumentParser(prog="ctfpull", description="CTF 문제 수집 어댑터 (L1 INGEST). flag 자동제출 안 함.")
+    sub = ap.add_subparsers(dest="platform")
+
+    sp = sub.add_parser("ctfd", help="CTFd 플랫폼")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--list", action="store_true", help="문제 목록")
+    g.add_argument("--id", help="단일 문제 fetch")
+    g.add_argument("--all", action="store_true", help="일괄 fetch")
+    sp.add_argument("--category", help="카테고리 필터 (예: pwn, rev)")
+    sp.add_argument("--json", action="store_true", help="목록을 JSON으로")
+    sp.add_argument("--dest", default=os.path.join(CTF_HOME, "solve_incoming"), help="스테이징 루트")
+    sp.add_argument("--bin", dest="bin_hint", help="메인 바이너리 파일명 강제 지정")
+    sp.add_argument("--no-newchal", action="store_true", help="newchal 호출 없이 스테이징만")
+    sp.add_argument("--url", help="CTFd base URL")
+    sp.add_argument("--token", help="CTFd API 토큰")
+    sp.add_argument("--cookie", help="세션 쿠키 (예: 'session=...')")
+    sp.add_argument("--env", help="dotenv 경로 (기본 ./.ctfd.env → ~/ctf/.ctfd.env)")
+    sp.add_argument("--insecure", action="store_true", help="TLS 검증 생략 (자체서명 랩)")
+
+    sub.add_parser("selftest", help="네트워크 없이 내부 로직 검증")
+
+    args = ap.parse_args()
+    if args.platform == "selftest":
+        selftest()
+    if args.platform != "ctfd":
+        ap.print_help()
+        sys.exit(2)
+
+    base, token, cookie = resolve_config(args)
+    if args.list:
+        cmd_list(base, token, cookie, args.insecure, args.category, args.json)
+    elif args.all:
+        cmd_fetch_all(base, token, cookie, args.insecure, args.dest,
+                      args.bin_hint, not args.no_newchal, args.category)
+    else:
+        cmd_fetch(base, token, cookie, args.insecure, args.id, args.dest,
+                  args.bin_hint, not args.no_newchal)
+
+
+if __name__ == "__main__":
+    main()

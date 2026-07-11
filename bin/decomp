@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# decomp <binary> [func] — Ghidra headless 1회 전체 디컴파일 캐시 후 함수별 조회 (context 폭발 방지)
+set -euo pipefail
+GHIDRA="${GHIDRA_HOME:-/opt/ghidra_11.2.1_PUBLIC}"
+SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
+BIN="$(readlink -f "$1")"; FUNC="${2:-}"
+CACHE="${BIN}.decomp"
+if [ ! -f "$CACHE/_index.txt" ]; then
+  echo "[*] Ghidra headless 디컴파일 (최초 1회, ~30-90s)..." >&2
+  mkdir -p "$CACHE"; proj="$(mktemp -d)"
+  "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
+     -scriptPath "$SCRIPTDIR" -postScript decomp_export.py "$CACHE" \
+     -deleteProject >/dev/null 2>&1 || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
+  rm -rf "$proj"
+fi
+if [ -z "$FUNC" ]; then
+  echo "# 함수 목록 (size 내림차순).  개별: decomp <bin> <func>"
+  sort -t$'\t' -k3 -nr "$CACHE/_index.txt" 2>/dev/null | head -60
+else
+  f="$CACHE/${FUNC}.c"
+  [ -f "$f" ] || f="$(ls "$CACHE"/*"$FUNC"*.c 2>/dev/null | head -1)"
+  if [ -f "$f" ]; then cat "$f"; else echo "[!] '$FUNC' 없음. 목록: decomp $BIN"; fi
+fi

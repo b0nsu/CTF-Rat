@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import sys, os, json, glob, subprocess
+REPO=os.environ.get("CTF_TEAM", os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "team"))
+def main():
+    if len(sys.argv)<2: print("usage: teamstate <name>"); return
+    n=sys.argv[1]
+    try: subprocess.run(["git","-C",REPO,"pull","-q","--rebase"],timeout=30,
+                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    except: pass
+    d=os.path.join(REPO,"chals",n)
+    files=sorted(glob.glob(os.path.join(d,"*.jsonl")))
+    if not files: print("팀 STATE 없음: %s (등록/동기화 됐나?)"%d); return
+    print("== TEAM STATE: %s (작성자 %d명) =="%(n,len(files)))
+    all_off={}; all_no=[]; per={}
+    for f in files:
+        a=os.path.basename(f)[:-6]; per[a]={"offset":[],"ok":[],"no":[],"alert":[],"next":[]}
+        for ln in open(f):
+            ln=ln.strip()
+            if not ln: continue
+            try: e=json.loads(ln)
+            except: continue
+            t=e.get("t")
+            if t=="offset": per[a]["offset"].append((e["k"],e.get("v"))); all_off[e["k"]]=e.get("v")
+            elif t in("ok","alert","next"): per[a][t].append(e.get("text",""))
+            elif t=="no": per[a]["no"].append(e["text"]); all_no.append(e["text"])
+    if all_off:
+        print("\n[통합 검증 오프셋 — 재측정 불필요]")
+        for k,v in all_off.items(): print("  %s = %s"%(k,v))
+    if all_no:
+        print("\n[통합 배제 — 재시도 금지]")
+        for x in dict.fromkeys(all_no): print("  X %s"%x[:90])
+    for a,dd in per.items():
+        if not any(dd[k] for k in ("alert","ok","next")): continue
+        print("\n[%s]"%a)
+        for x in dd["alert"]: print("  ! %s"%x[:90])
+        for x in dd["ok"]:    print("  + %s"%x[:90])
+        for x in dd["next"]:  print("  > %s"%x[:90])
+main()

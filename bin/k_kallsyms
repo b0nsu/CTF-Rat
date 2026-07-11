@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""kallsyms_diff — KASLR base + symbol-offset resolver for kernel-pwn Phase 1.
+
+Kernel-side sibling of the userland ``glibc-aio`` offset lookup: instead of *recalling*
+kernel symbol addresses (which drift across builds and are re-slid every boot by KASLR),
+you feed it the *static* symbol table shipped with the challenge and ONE live-measured
+anchor, and it prints the resolved runtime addresses. Honest-mode rule (HANDOFF B.3): the
+anchor MUST be live-measured from the running target (/proc/kallsyms, a leak, or GDB) —
+never guessed.
+
+Static symbol table (positional arg) — any of, format auto-detected:
+    * System.map                 ("<hexaddr> <type> <name>")
+    * ``nm vmlinux`` output      (same 3-column layout; undefined "U" lines skipped)
+    * a captured /proc/kallsyms   ("<hexaddr> <type> <name> [module]")
+
+Anchor (pick ONE; without one, prints static offsets relative to _text only):
+    --base 0xADDR            live runtime address of the kernel base (_text)
+    --anchor NAME=0xADDR     live runtime address of any symbol -> derive the slide
+
+Symbol selection:
+    --sym NAME [NAME ...]    resolve these (repeatable); default = kernel-pwn shortlist
+    --all                    resolve the WHOLE table to a file, print only the path
+                             (big-output-goes-to-a-file rule; grep it, don't inline it)
+    -o FILE                  output path for --all (default ~/ctf/kernel/dumps/kallsyms-resolved.txt)
+
+Examples:
+    kallsyms_diff.py System.map --base 0xffffffffab000000
+    kallsyms_diff.py System.map --anchor commit_creds=0xffffffffab089d40 --sym modprobe_path
+    kallsyms_diff.py kallsyms.txt --anchor commit_creds=0x... --all -o dumps/live.txt
+"""
+import argparse
+import os
+import re
+import sys
+
+# Common kernel-pwn targets: privesc primitives, mitigation-relevant writes, base anchors.
+DEFAULT_SHORTLIST = [
+    "_text", "_stext", "startup_64",
+    "commit_creds", "prepare_kernel_cred", "init_cred",
+    "modprobe_path", "core_pattern", "poweroff_cmd",
+    "native_write_cr4", "__sys_setresuid",
+    "swapgs_restore_regs_and_return_to_usermode",
+    "anon_pipe_buf_ops", "n_tty_ops",
+]
+
+HEX_RE = re.compile(r"^[0-9a-fA-F]{8,16}$")
+
+
+def parse_symtab(path):
+    """Return {name: static_addr}. Accepts System.map / nm / kallsyms layouts."""
+    syms = {}
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 3:
+                continue  # nm "U foo" undefined lines, blanks, etc.
+            addr, _type, name = parts[0], parts[1], parts[2]
+            if not HEX_RE.match(addr) or len(_type) != 1:
+                continue
+            # First definition wins; kallsyms can list a symbol name more than once
+            # (e.g. per-CPU / weak aliases) — keep the first, deterministic.
+            syms.setdefault(name, int(addr, 16))
+    return syms
+
+
+def find_text_base(syms):
+    """Static kernel base: prefer _text, fall back to _stext / startup_64."""
+    for anchor in ("_text", "_stext", "startup_64"):
+        if anchor in syms:
+            return anchor, syms[anchor]
+    return None, None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="kallsyms_diff", add_help=True,
+                                 description="KASLR base + symbol-offset resolver")
+    ap.add_argument("symtab", help="System.map / nm output / captured kallsyms")
+    ap.add_argument("--base", help="live runtime address of _text (hex)")
+    ap.add_argument("--anchor", help="NAME=0xADDR — live address of any known symbol")
+    ap.add_argument("--sym", nargs="+", default=None, help="symbols to resolve")
+    ap.add_argument("--all", action="store_true", help="dump full resolved table to a file")
+    ap.add_argument("-o", "--out", default=None, help="output file for --all")
+    args = ap.parse_args(argv)
+
+    if not os.path.exists(args.symtab):
+        ap.error("symtab not found: %s" % args.symtab)
+
+    syms = parse_symtab(args.symtab)
+    if not syms:
+        ap.error("no symbols parsed from %s (unexpected format?)" % args.symtab)
+
+    text_name, text_static = find_text_base(syms)
+
+    # ---- derive the KASLR slide from whichever anchor was given ----
+    slide = None
+    if args.base is not None and args.anchor is not None:
+        ap.error("give only one of --base / --anchor")
+    if args.base is not None:
+        if text_static is None:
+            ap.error("--base needs _text/_stext/startup_64 in the symtab to diff against")
+        slide = int(args.base, 16) - text_static
+    elif args.anchor is not None:
+        if "=" not in args.anchor:
+            ap.error("--anchor must be NAME=0xADDR")
+        aname, aaddr = args.anchor.split("=", 1)
+        if aname not in syms:
+            ap.error("anchor symbol %r not in symtab" % aname)
+        slide = int(aaddr, 16) - syms[aname]
+
+    def live(addr):
+        return None if slide is None else addr + slide
+
+    # ---- report the slide / base up front ----
+    out = []
+    if slide is not None:
+        out.append("slide       = 0x%x" % (slide & 0xffffffffffffffff))
+        if text_static is not None:
+            out.append("base(%s) = 0x%x  (static 0x%x)"
+                       % (text_name, live(text_static), text_static))
+        # sanity: KASLR slide is a multiple of the 2MiB alignment on x86-64
+        if slide % 0x200000 != 0:
+            out.append("WARN: slide 0x%x is not 2MiB-aligned — anchor or symtab likely mismatched"
+                       % (slide & 0xffffffffffffffff))
+    else:
+        out.append("(no anchor given — showing static offsets relative to %s only)"
+                    % (text_name or "?"))
+
+    # ---- resolve requested symbols ----
+    wanted = args.sym if args.sym else DEFAULT_SHORTLIST
+    rows = []
+    for name in wanted:
+        if name not in syms:
+            rows.append((name, None, None, None))
+            continue
+        s = syms[name]
+        off = (s - text_static) if text_static is not None else None
+        rows.append((name, s, off, live(s)))
+
+    def fmt_row(name, static, off, liveaddr):
+        parts = ["%-42s" % name]
+        parts.append("static=0x%x" % static if static is not None else "static=<MISSING>")
+        if off is not None and static is not None:
+            parts.append("off(%s)=0x%x" % (text_name, off))
+        if liveaddr is not None:
+            parts.append("live=0x%x" % liveaddr)
+        return "  ".join(parts)
+
+    # ---- --all: full table to a file; otherwise print the shortlist inline ----
+    if args.all:
+        out_path = args.out or os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "kernel/dumps/kallsyms-resolved.txt")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as fh:
+            fh.write("\n".join(out) + "\n\n")
+            for name in sorted(syms, key=lambda n: syms[n]):
+                s = syms[name]
+                off = (s - text_static) if text_static is not None else 0
+                la = live(s)
+                fh.write("0x%016x  off=0x%-9x  %s%s\n"
+                         % (s, off, name, ("  live=0x%x" % la) if la is not None else ""))
+        print("\n".join(out))
+        print("[+] full resolved table (%d symbols) -> %s" % (len(syms), out_path))
+        print("    grep it, e.g.:  grep -w commit_creds %s" % out_path)
+        return 0
+
+    for row in rows:
+        out.append(fmt_row(*row))
+    print("\n".join(out))
+    missing = [r[0] for r in rows if r[1] is None]
+    if missing:
+        print("# not found in symtab: %s" % ", ".join(missing), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

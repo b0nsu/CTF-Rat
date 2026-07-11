@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+# flag 포맷 검증 + placeholder 배제. 당일: pkflag --set '<정규식>' -> ~/ctf/FLAG_FORMAT 저장.
+#   pkflag <candidate> -> REAL / FAKE / NO_MATCH (REAL이면 exit 0)
+import sys, os, re
+FF=os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "FLAG_FORMAT")
+FAKE=re.compile(r'fake|test|example|dummy|sample|placeholder|redacted|your.?flag|change.?me|x{4,}', re.I)
+def main():
+    a=sys.argv[1:]
+    if a and a[0]=="--set":
+        open(FF,"w").write(a[1] if len(a)>1 else ""); print("[pkflag] 포맷 설정:", a[1] if len(a)>1 else "(빈값)"); return
+    if a and a[0]=="--show":
+        print(open(FF).read().strip() if os.path.exists(FF) else "(미설정)"); return
+    if not a:
+        print("usage: pkflag <flag> | pkflag --set '<regex>' | pkflag --show"); return
+    cand=a[0]
+    fmt=open(FF).read().strip() if os.path.exists(FF) else ""
+    fake=bool(FAKE.search(cand))
+    m=bool(re.search(fmt,cand)) if fmt else bool(re.search(r'^[A-Za-z0-9_]{1,}\{.+\}$',cand))
+    verdict="REAL" if (m and not fake) else ("FAKE(placeholder)" if fake else "NO_MATCH(포맷 불일치)")
+    print("candidate: %s"%cand)
+    print("format   : %s"%(fmt or "(미설정 — heuristic FMT{...})"))
+    print("=> %s"%verdict)
+    sys.exit(0 if verdict=="REAL" else 1)
+main()

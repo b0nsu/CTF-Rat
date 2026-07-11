@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# recon <binary> [libc.so.6] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
+import sys, os, re, subprocess
+from pwn import ELF, context
+context.log_level = 'error'
+def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: recon <binary> [libc.so.6]"); return 1
+    path = sys.argv[1]; libc_path = sys.argv[2] if len(sys.argv) > 2 else None
+    try: e = ELF(path, checksec=False)
+    except Exception as ex:
+        print("[!] ELF 파싱 실패:", ex); print(sh("file '%s'" % path)); return 1
+    ftype = sh("file '%s'" % path).strip()
+    syms = set(e.symbols.keys()); plt = set(e.plt.keys()); universe = plt | syms
+    def any_of(names): return sorted(n for n in names if n in universe)
+    dangerous = any_of({'gets','read','scanf','__isoc99_scanf','__isoc99_sscanf','strcpy','strcat','sprintf','memcpy','fgets','fread'})
+    fmtfns   = any_of({'printf','fprintf','snprintf','vprintf','vsnprintf','syslog','dprintf'})
+    heapfns  = any_of({'malloc','free','calloc','realloc'})
+    winsyms  = sorted(s for s in syms if re.search(r'win|backdoor|shell|getshell|magic|secret|give_?flag|print_?flag', s, re.I))
+    has_system = 'system' in universe
+    has_execve = bool(universe & {'execve','execl','execlp','execvp','posix_spawn','execveat'})
+    has_syscall = 'syscall' in universe
+    seccomp = bool(universe & {'prctl','seccomp','seccomp_init','seccomp_load','seccomp_rule_add'})
+    strs = sh("strings -n 4 '%s'" % path)
+    binsh = '/bin/sh' in strs
+    catflag = bool(re.search(r'cat[ /].*flag|/flag|flag\.txt|flag\{|/home/.*flag', strs))
+    # fmt: 정상 printf 문자열 오탐 심함 → 신호 약함으로만 취급 (FAST 근거로 안 씀)
+    fmtspec = bool(re.search(r'%[0-9$]*[sxpn]', strs))
+    vmish = bool(re.search(r'\b(opcode|bytecode|vm_|dispatch|interpreter)\b', strs, re.I))
+    stripped = ('not stripped' not in ftype)
+    nfunc = len(getattr(e, 'functions', {}) or {})   # 실제 함수 수 (심볼 전체 아님)
+
+    # libc 버전 — GLIBC_2.2.5 심볼버전 오탐 회피: 'release version'/'GLIBC X.Y-' 우선
+    lp = libc_path
+    if not lp:
+        cand = sh("ls %s/libc*.so* 2>/dev/null" % (os.path.dirname(os.path.abspath(path)) or '.')).split()
+        lp = cand[0] if cand else None
+    libc_ver = None
+    if lp and os.path.exists(lp):
+        s = sh("strings '%s'" % lp)
+        m = (re.search(r'release version (\d+\.\d+)', s) or re.search(r'GLIBC (\d+\.\d+)-', s)
+             or re.search(r'glibc[ -](\d+\.\d+)', s, re.I))
+        if m: libc_ver = m.group(1)
+
+    print("="*60)
+    print("BIN   :", path)
+    print("FILE  :", ftype[:120])
+    print("PROT  : PIE=%s Canary=%s NX=%s RELRO=%s | stripped=%s funcs=%d" % (
+        e.pie, e.canary, e.nx, e.relro, stripped, nfunc))
+    print("libc  :", libc_ver or (lp or "미제공"))
+    if winsyms: print("WIN?  :", ", ".join(winsyms[:8]))
+    print("SINK  :", ", ".join(dangerous) or "-", "| fmt계열:", ", ".join(fmtfns) or "-")
+    print("EXEC  : system=%s execve=%s syscall=%s /bin/sh=%s seccomp=%s" % (
+        has_system, has_execve, has_syscall, binsh, seccomp))
+    if heapfns: print("HEAP  :", ", ".join(heapfns))
+    if catflag: print("FLAG  : flag 문자열/경로 감지")
+    if vmish:   print("VM?   : interpreter/opcode 문자열 감지")
+    if stripped: print("[!] stripped — 심볼기반 신호(win/함수명) 신뢰 불가, triage 확신도 하향")
+
+    # ---------- 보수적 triage: 확실할 때만 🟢 ----------
+    tier="🟠 HARD"; techs=[]; why=[]; conf="낮음"
+    fast = (not e.canary) and dangerous
+    if winsyms and fast and not e.pie and not stripped:
+        tier="🟢 FAST"; conf="높음"; techs=["ret2win"]; why=["win 심볼 + overflow sink + no PIE/canary"]
+    elif fast and has_system and binsh:
+        tier="🟢 FAST"; conf="높음"; techs=["ret2 system('/bin/sh')"]; why=["overflow + system+/bin/sh"]
+    elif fast and libc_ver:
+        tier="🟡 STANDARD"; conf="중간"; techs=["ret2libc + one_gadget","leak→libc"]; why=["overflow + libc(%s)"%libc_ver]
+    elif fast:
+        tier="🟡 STANDARD"; conf="중간"; techs=["ROP (leak 필요)"]; why=["overflow, canary/libc 확인 필요"]
+    if heapfns:
+        if libc_ver and tuple(map(int, libc_ver.split('.'))) < (2,32):
+            tier="🟡 STANDARD"; conf="중간"; techs=["tcache poisoning / fastbin dup","__free_hook/__malloc_hook overwrite"]
+            why=["heap + glibc %s (<2.32: hooks 존재, safe-linking 없음)"%libc_ver]
+        else:
+            tier="🟠 HARD"; conf="낮음"; techs=["FSOP / House of *","tcache + safe-linking 우회"]
+            why=["heap + glibc %s (>=2.32: safe-linking; >=2.34: hooks 제거)"%(libc_ver or '미상')]
+    if fmtfns and not dangerous and not heapfns:
+        techs.append("format-string 후보 (decomp로 printf(user) 확인 — 정적 확신 불가)"); why.append("printf 계열 존재")
+    if seccomp:
+        techs.append("seccomp → ORW shellcode/ROP"); why.append("seccomp 필터 (seccomp-tools dump)")
+    if vmish and nfunc>25:
+        tier="🟠 HARD"; conf="낮음"; techs=["custom VM: RE 선행"]; why=["인터프리터 구조 추정"]
+
+    rec = {"🟢 FAST":"SOLVE (확신 — 먼저)", "🟡 STANDARD":"SOLVE (작업 필요)",
+           "🟠 HARD":"후순위 (확신 낮음)"}[tier]
+    if stripped and tier=="🟢 FAST": tier="🟡 STANDARD"; rec="SOLVE (stripped라 확신 하향)"
+    print("-"*60)
+    print("TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
+    print("  추정 기법:", "; ".join(dict.fromkeys(techs)) or "미상 — decomp 로 vuln 확인")
+    print("  근거    :", "; ".join(why) or "정적 신호 부족")
+    print("  다음    : decomp %s <func> → vuln 확정 → state.md" % path)
+    print("="*60)
+    return 0
+sys.exit(main())

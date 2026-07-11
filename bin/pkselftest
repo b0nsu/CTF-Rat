@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# 도구 회귀 self-test (kernel testkit 패턴 이식). 도구 수정 후 한 방 검증.
+VENV=python3
+P=0; F=0
+ok(){ echo "  [PASS] $1"; P=$((P+1)); }
+no(){ echo "  [FAIL] $1"; F=$((F+1)); }
+T=$(mktemp -d); cd "$T"
+# T1 state roundtrip
+state init st >/dev/null 2>&1; state offset system 0x50d70 t >/dev/null 2>&1; state ok "prim" >/dev/null 2>&1
+state show 2>/dev/null | grep -q "system = 0x50d70" && ok "state offset/show" || no "state offset/show"
+# T2 pwnstage reads STATE offset as int
+$VENV -c "import pwnstage;assert pwnstage.offsets().get('system')==0x50d70" 2>/dev/null && ok "pwnstage.offsets int" || no "pwnstage.offsets int"
+# T3 pkflag real vs fake
+pkflag --set 'DH\{[0-9a-f]{4,}\}' >/dev/null 2>&1
+pkflag 'DH{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no
+pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
+[ "$R1" = ok ] && [ "$R2" = ok ] && ok "pkflag real/fake" || no "pkflag real/fake"
+# T4 pwnkit snapscript + pwnclean --kv filter
+$VENV -c "import pwnkit;print(pwnkit.snapscript([('a','0x1')]).strip())" 2>/dev/null | grep -q 'SNAP a=' && ok "pwnkit.snapscript" || no "pwnkit.snapscript"
+printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/dev/null | grep -q 'SNAP r=0x401234' && ok "pwnclean --kv filter" || no "pwnclean --kv filter"
+# T5 pwnkit.run_batch (headless gdb 플러밍) — 심볼불요, 상수 SNAP
+B=$CTF_HOME/solve/heapnote_G/main
+if [ -f "$B" ]; then cp "$B" ./m; $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"; else echo "  [skip] run_batch (테스트 바이너리 없음)"; fi
+# T6 pkshare SHARE 생성
+pkshare --handoff >/dev/null 2>&1 && [ -f SHARE.md ] && ok "pkshare SHARE.md" || no "pkshare SHARE.md"
+cd /; rm -rf "$T"
+echo "=== pkselftest: PASS=$P FAIL=$F ==="
+[ $F -eq 0 ] && echo "ALL GREEN" || echo "REGRESSION 있음"

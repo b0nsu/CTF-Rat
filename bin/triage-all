@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+# triage-all <bin|dir> ...  — 여러 바이너리 recon → tier 정렬표 (풀 수 있는 것 빠르게 거르기)
+CTF="$CTF_HOME"
+bins=()
+for a in "$@"; do
+  if [ -d "$a" ]; then
+    while IFS= read -r f; do bins+=("$f"); done < <(find "$a" -maxdepth 3 -type f -exec sh -c 'file "$1"|grep -q ELF' _ {} \; -print 2>/dev/null)
+  elif [ -f "$a" ]; then bins+=("$a"); fi
+done
+[ ${#bins[@]} -eq 0 ] && { echo "usage: triage-all <bin|dir> ..."; exit 1; }
+printf '%-28s %-14s %-8s %s\n' "BINARY" "TIER" "확신" "기법"
+printf '%s\n' "--------------------------------------------------------------------------------"
+tmp=$(mktemp)
+for b in "${bins[@]}"; do
+  out="$("$CTF/bin/recon" "$b" 2>/dev/null)"
+  t="$(echo "$out" | grep -m1 'TRIAGE:' | sed 's/TRIAGE: //')"
+  tech="$(echo "$out" | grep -m1 '추정 기법:' | sed 's/.*추정 기법: //' | cut -c1-40)"
+  tier="$(echo "$t" | awk '{print $1" "$2}')"; conf="$(echo "$t" | grep -oE '확신도: [^ ]+' | cut -d' ' -f2)"
+  # 정렬 키: 🟢0 🟡1 🟠2
+  k=2; case "$tier" in *FAST*) k=0;; *STANDARD*) k=1;; esac
+  printf '%d\t%-28s %-14s %-8s %s\n' "$k" "$(basename "$b")" "$tier" "$conf" "$tech" >> "$tmp"
+done
+sort -n "$tmp" | cut -f2-
+rm -f "$tmp"
+echo "→ 🟢/🟡 부터 풀고 🟠 는 후순위. 개별: cd solve && newchal <name> <bin>"

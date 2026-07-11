@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+# analyze <binary> — decomp 캐시 기반 취약 표적 localizer
+# gnnPwn 차용: 함수 그래프 + kind 피처 + 1-hop 전파(Finding K: self kind ⊕ 1-hop 이웃 kind 합)
+import sys, os, re, glob
+IN=r'\b(fgets|gets|read|scanf|__isoc99_scanf|__isoc99_sscanf|getchar|recv|fread)\b'
+SINK=r'\b(memcpy|strcpy|strcat|sprintf|memmove|alloca)\b'
+ALLOC=r'\b(malloc|calloc|realloc|free)\b'
+FMT=r'\b(printf|fprintf|snprintf|syslog|vprintf)\b'
+# PLT thunk/런타임 스텁 — 랭킹에서 제외(엣지/피처 계산엔 code 기반으로 여전히 반영됨)
+THUNK={'getchar','putchar','fgets','gets','read','write','printf','puts','memset','strlen',
+ 'setvbuf','malloc','free','calloc','scanf','__isoc99_scanf','__isoc99_sscanf','system','exit',
+ '_start','_init','_fini','__libc_csu_init','__libc_csu_fini','register_tm_clones',
+ 'deregister_tm_clones','frame_dummy','__do_global_dtors_aux','__stack_chk_fail','atoi','strcpy'}
+def feats(c):
+    return dict(inp=len(re.findall(IN,c)), sink=len(re.findall(SINK,c)),
+        alloc=len(re.findall(ALLOC,c)), fmt=len(re.findall(FMT,c)),
+        idxw=len(re.findall(r'\w+\s*\[[^\]]+\]\s*=[^=]',c)),
+        ptrw=len(re.findall(r'\*\s*\w+\s*=[^=]',c)),
+        loop=len(re.findall(r'\b(while|for)\b',c)),
+        cmp=len(re.findall(r'[<>]=?',c)),
+        gp=len(re.findall(r'\b(getchar|putchar)\b',c)))
+def sinky(f): return f['sink']*3+f['idxw']*2+f['ptrw']*2+f['alloc']*2+f['fmt']+f['gp']
+def inpy(f):  return f['inp']*3+f['gp']*2
+def main():
+    b=sys.argv[1]; cache=os.path.abspath(b)+'.decomp'
+    fs=glob.glob(cache+'/*.c')
+    if not fs: print("decomp 캐시 없음 → 먼저: decomp %s"%b); return 1
+    F={}
+    for fp in fs:
+        n=os.path.basename(fp)[:-2]; c=open(fp,errors='replace').read()
+        F[n]={'c':c,'f':feats(c)}
+    names=set(F)
+    for n,d in F.items():
+        d['calls']={m for m in names if m!=n and re.search(r'\b%s\b'%re.escape(m),d['c'])}
+    rank=[]
+    for n,d in F.items():
+        if n in THUNK or n.startswith('_'): continue   # 스텁 제외
+        f=d['f']; own=sinky(f)+inpy(f)
+        nb=0.5*sum(sinky(F[m]['f'])+inpy(F[m]['f']) for m in d['calls'])  # 1-hop 이웃
+        sc=own+nb
+        if (f['idxw']+f['ptrw']+f['gp'])>0 and f['loop']>0 and f['cmp']<3: sc+=5
+        rank.append((sc,n,f,d['calls']))
+    rank.sort(reverse=True)
+    print("="*60); print("VULN 표적 랭킹 (gnnPwn graph+1-hop 전파)"); print("="*60)
+    for sc,n,f,calls in rank[:8]:
+        t=[]
+        if f['inp'] or f['gp']: t.append('INPUT')
+        if f['sink']: t.append('SINK:mem')
+        if f['idxw']: t.append('idx-write')
+        if f['ptrw']: t.append('ptr-write')
+        if f['alloc']: t.append('HEAP')
+        if f['fmt']: t.append('fmt')
+        if f['loop'] and (f['idxw']+f['ptrw']+f['gp']) and f['cmp']<3: t.append('경계희박')
+        inr=sorted(c for c in calls if c in {'fgets','gets','read','scanf','__isoc99_scanf','getchar','recv'})
+        print("  %5.1f  %-22s %-40s %s"%(sc,n,' '.join(t), ('←'+','.join(inr) if inr else '')))
+    print("→ 상위부터 decomp 정독. INPUT+SINK/write+경계희박 = 표적 유력")
+main()

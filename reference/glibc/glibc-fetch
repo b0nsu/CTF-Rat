@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# glibc-fetch <version> [arch] — Ubuntu glibc(libc6 + libc6-dbg)를 로컬로 내려받아 추출.
+#   축적(repo 커밋) 대신, pwn 문제 만났을 때 필요한 버전만. 받은 파일은 libs/ (gitignore).
+#
+# 예:  glibc-fetch 2.35-0ubuntu3 amd64
+#      glibc-fetch --list                 # 카탈로그(list) 출력
+# 출처/대안:  SOURCES.md
+set -euo pipefail
+HERE="$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+if [ "${1:-}" = "--list" ] || [ -z "${1:-}" ]; then
+  echo "# glibc 카탈로그 (reference/glibc/list). 사용: glibc-fetch <version> [arch=amd64]"
+  echo "# 예: glibc-fetch 2.35-0ubuntu3 amd64   |  최신: 2.41(25.10)/2.40(24.10)/2.39(24.04)"
+  [ "${1:-}" = "--list" ] && cat "$HERE/list"
+  exit 0
+fi
+
+VER="$1"; ARCH="${2:-amd64}"
+OUT="$HERE/libs/${VER}_${ARCH}"
+mkdir -p "$OUT/x"
+POOLS=(
+  "http://archive.ubuntu.com/ubuntu/pool/main/g/glibc"
+  "http://old-releases.ubuntu.com/ubuntu/pool/main/g/glibc"
+  "http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc"   # non-amd64
+)
+
+fetch() {  # $1=pkg
+  local f="${1}_${VER}_${ARCH}.deb" base
+  for base in "${POOLS[@]}"; do
+    echo "[glibc-fetch] try $base/$f" >&2
+    if curl -fsSL "$base/$f" -o "$OUT/$f"; then echo "[glibc-fetch] ✓ $f" >&2; return 0; fi
+  done
+  echo "[glibc-fetch] ✗ $1 못 찾음 (버전/arch 확인 or SOURCES.md 수동)" >&2; return 1
+}
+extract() {  # $1=deb
+  [ -f "$1" ] || return 0
+  if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$1" "$OUT/x"
+  else ( cd "$OUT" && ar x "$1" && tar xf data.tar.* -C "$OUT/x" ); fi
+}
+
+fetch libc6      && extract "$OUT/libc6_${VER}_${ARCH}.deb"      || true
+fetch libc6-dbg  && extract "$OUT/libc6-dbg_${VER}_${ARCH}.deb"  || true
+
+# 자주 쓰는 산출물을 최상위로 (libc.so.6 / ld / dbg)
+find "$OUT/x" \( -name 'libc.so.6' -o -name 'ld-linux*.so.*' -o -name 'libc-*.so' \) \
+     -exec cp -n {} "$OUT/" \; 2>/dev/null || true
+echo "[glibc-fetch] → $OUT"
+ls -1 "$OUT" 2>/dev/null | grep -v '^x$' || true
+echo "[glibc-fetch] 전체 트리는 $OUT/x/ (심볼: usr/lib/debug). one_gadget \"\$OUT/libc.so.6\" 로 가젯."

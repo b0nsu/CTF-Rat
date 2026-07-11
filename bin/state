@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# 챌린지별 STATE.jsonl (append-only, flock 병렬안전, 사망 내성). LLM이 읽기 좋은 digest.
+import sys, os, json, fcntl, time
+F = "STATE.jsonl"
+def app(ev):
+    ev["ts"] = int(time.time())
+    with open(F, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        fcntl.flock(fh, fcntl.LOCK_UN)
+def show():
+    if not os.path.exists(F):
+        print("== STATE: (empty) — `state init <chal>` first =="); return
+    chal = os.path.basename(os.path.abspath(os.getcwd()))
+    offs = {}; ok = []; no = []; nxt = []; notes = []; alerts = []
+    for ln in open(F):
+        ln = ln.strip()
+        if not ln: continue
+        try: e = json.loads(ln)
+        except: continue
+        t = e.get("t")
+        if   t == "init":   chal = e.get("chal", chal)
+        elif t == "offset": offs[e["k"]] = (e.get("v"), e.get("src", ""))
+        elif t == "ok":     ok.append(e["text"])
+        elif t == "no":     no.append((e["text"], e.get("reason", "")))
+        elif t == "next":   nxt.append(e["text"])
+        elif t == "note":   notes.append(e["text"])
+        elif t == "alert":  alerts.append(e["text"])
+    o = ["== STATE: %s ==" % chal]
+    if alerts:
+        o.append("!! ALERTS (invalidating — RE-PLAN before acting):")
+        for x in alerts: o.append("  [!] " + x)
+    if offs:
+        o.append("OFFSETS (verified, live-measured):")
+        for k,(v,s) in offs.items(): o.append("  %s = %s%s" % (k, v, "  [%s]"%s if s else ""))
+    if ok:
+        o.append("WORKING (verified primitives/steps):")
+        for x in ok: o.append("  [+] " + x)
+    if no:
+        o.append("RULED OUT (do NOT retry):")
+        for x,r in no: o.append("  [-] %s%s" % (x, "  <= %s"%r if r else ""))
+    if nxt:
+        o.append("NEXT:")
+        for x in nxt: o.append("  [>] " + x)
+    if notes:
+        o.append("NOTES:")
+        for x in notes: o.append("  [.] " + x)
+    if not (offs or ok or no or nxt or notes or alerts): o.append("(no facts yet)")
+    print("\n".join(o))
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("show", "s"): show(); return
+    c = a[0]; rest = a[1:]
+    if c == "init":
+        app({"t":"init","chal": rest[0] if rest else os.path.basename(os.path.abspath(os.getcwd()))})
+        print("[state] init"); show()
+    elif c == "offset":
+        if len(rest) < 2: print("usage: state offset <k> <v> [src]"); return
+        app({"t":"offset","k":rest[0],"v":rest[1],"src":" ".join(rest[2:])})
+        print("[state] offset %s=%s" % (rest[0], rest[1]))
+    elif c == "get":
+        if not rest: return
+        val=""
+        if os.path.exists(F):
+            for ln in open(F):
+                try: e=json.loads(ln)
+                except: continue
+                if e.get("t")=="offset" and e.get("k")==rest[0]: val=e.get("v","")
+        print(val)
+    elif c in ("ok","next","note","alert"):
+        app({"t":c,"text":" ".join(rest)}); print("[state] %s" % c)
+    elif c in ("no","ruleout"):
+        txt = " ".join(rest); reason = ""
+        if " -- " in txt: txt, reason = txt.split(" -- ", 1)
+        app({"t":"no","text":txt.strip(),"reason":reason.strip()}); print("[state] ruled out")
+    else:
+        print("cmds: init | offset <k> <v> [src] | ok <t> | no <t> -- <reason> | next <t> | note <t> | alert <t> | show")
+main()

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+REPO="${CTF_TEAM:-$CTF_HOME/team}"
+[ -d "$REPO/.git" ] || { echo "[teamsync] 팀 repo 없음: $REPO"; exit 1; }
+AUTHOR="$(cat "$REPO/.author" 2>/dev/null || echo unknown)"
+sync_one(){ local n="$1"; local ls="$CTF_HOME/solve/$n/STATE.jsonl"
+  [ -f "$ls" ] && { mkdir -p "$REPO/chals/$n"; cp "$ls" "$REPO/chals/$n/$AUTHOR.jsonl"; }; }
+push_pull(){ cd "$REPO" || return
+  git add -A >/dev/null 2>&1
+  git diff --cached --quiet 2>/dev/null || git commit -q -m "sync $AUTHOR" >/dev/null 2>&1
+  git pull -q --rebase >/dev/null 2>&1
+  git push -q >/dev/null 2>&1 || true; }
+once(){ if [ -n "$1" ] && [ "$1" != "--loop" ]; then sync_one "$1"
+  else for d in "$HOME"/ctf/solve/*/STATE.jsonl; do [ -f "$d" ] && sync_one "$(basename "$(dirname "$d")")"; done; fi
+  push_pull; }
+if [ "$1" = "--loop" ] || [ "$2" = "--loop" ]; then
+  echo "[teamsync] loop 시작(20s, author=$AUTHOR). 중단=Ctrl-C"
+  while true; do once "${1#--loop}"; sleep 20; done
+else once "$1"; echo "[teamsync] 1회 동기화 완료(author=$AUTHOR)"; fi
