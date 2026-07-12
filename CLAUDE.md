@@ -39,8 +39,9 @@ triage   recon              pwn 정적 프로파일 + 보수적 triage
          analyze            그래프+1-hop 전파 vuln localizer (prior only)
 RE       decomp             Ghidra headless 디컴파일 캐시(함수별 조회)
          gdbq               GDB batch (노이즈 제거)
-symbolic solve/_template/rev/symsolve.py   angr 하니스(+concrete-verify)
+symbolic solve/_template/rev/symsolve.py   angr 하니스(+concrete-verify, PE면 wine)
          solve/_template/rev/vmlift.py     custom-VM 리프터 스캐폴드
+         solve/_template/rev/qiling_trace.py  Windows PE 동적 에뮬(Qiling, Wine 불필요)
 pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 조립
 버스     state              STATE.jsonl (확정/배제/다음 기록 — 재도출 방지)
 검증     pkflag(포맷) pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate

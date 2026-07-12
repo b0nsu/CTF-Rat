@@ -29,6 +29,7 @@ revq 와 같은 angr 로드 베이스(PIE=0x400000)를 쓰므로 **revq 가 찍�
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -212,6 +213,13 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
             argv1 = val
     # 상대경로면 execvp 가 PATH 검색해 실패 → 절대경로로 고정.
     run_args = [os.path.abspath(binpath)] + ([argv1.decode("latin-1")] if argv1 is not None else [])
+    # PE 는 Linux 직접 실행 불가 → wine 있으면 그걸로, 없으면 스킵.
+    ftype = subprocess.run(["file", run_args[0]], capture_output=True, text=True).stdout
+    if "PE32" in ftype or "MS Windows" in ftype:
+        if shutil.which("wine"):
+            run_args = ["wine"] + run_args
+        else:
+            return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)"
     try:
         p = subprocess.run(run_args, input=stdin_val, capture_output=True, timeout=10)
     except Exception as e:

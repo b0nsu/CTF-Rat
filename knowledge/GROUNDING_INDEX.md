@@ -50,6 +50,15 @@
 | 플랫폼(모바일/임베디드/HW) | `ctf-reverse/platforms.md` | `platforms-hardware.md` |
 | 실전 팁 | `ctf-reverse/field-notes.md` | — |
 
+### Windows(PE/DLL/.NET) rev — 도구+지식
+> 기본 플랫폼은 Linux. Windows rev 는 Linux 호스트에서 대응(정적=Ghidra/angr, 동적=Qiling/Frida). SETUP.md §8.
+| 상황 | 도구 | 지식 |
+|---|---|---|
+| PE/DLL 정적 | `decomp`(Ghidra) + `revq`(angr; PE 감지 배너) | `ctf-reverse/platforms.md`, `languages.md`, `anti-analysis.md` |
+| PE 동적 (Wine 불필요) | `solve/_template/rev/qiling_trace.py`(Qiling 에뮬) + Frida | `ctf-reverse/tools-dynamic.md`, `tools-emulation.md` |
+| .exe 실행/재현 | `wine`(symsolve concrete-verify 가 PE면 자동) | — |
+| .NET / Unity(IL2CPP) | `ilspycmd`/ILSpy · il2cppdumper · monodis | `ctf-reverse/languages.md`, `platforms.md` |
+
 ## writeup 작성 (SOLVE 후 — 참고용)
 - `knowledge/ctf-writeup/SKILL.md` — 표준 제출형식(메타 + Summary + 1~3 step + **하나의 완결 스크립트** + Flag) + 제출 전 체크리스트.
 - 원칙: 재현 가능한 완결 스크립트 하나, 터미널 덤프 복붙 금지, 1~3단계 간결 (우리 honest-mode 와 일치).

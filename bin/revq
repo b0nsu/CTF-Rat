@@ -247,6 +247,7 @@ def extract_angr(binpath):
         "strings": strings,
         "imports": imports,
         "evasion": _file_evasion(binpath, imports, strings, sec_names),
+        "platform": _detect_platform(sh(["file", binpath])),
     }
 
 
@@ -337,11 +338,24 @@ def _is_stripped(binpath):
     return "not stripped" not in sh(["file", binpath])
 
 
+def _detect_platform(ftype):
+    """`file` 출력 → 플랫폼. PE/DLL(Windows) vs ELF(Linux) 라우팅용."""
+    if "PE32" in ftype or "MS Windows" in ftype or "for MS Windows" in ftype:
+        return "pe"
+    if "ELF" in ftype:
+        return "elf"
+    if "Mach-O" in ftype:
+        return "macho"
+    return "?"
+
+
 # ─────────────────────────── 엔진 B: binutils (빠름, xref 없음) ───────────────────────────
 def extract_binutils(binpath):
     """readelf/nm/strings 로 빠른 map. stripped 면 함수 목록 빈약 + xref 없음."""
     ftype = sh(["file", binpath])
     if "ELF" not in ftype:
+        if _detect_platform(ftype) == "pe":
+            die("PE/Windows 바이너리 — `--fast`(binutils)는 ELF 전용. angr 엔진 사용: `revq %s`(--fast 빼기)" % binpath)
         die("ELF 아님(binutils 엔진은 ELF 전용): %s" % ftype.strip()[:80])
     arch = "amd64" if "x86-64" in ftype else ("i386" if "80386" in ftype else "?")
     pie = "pie executable" in ftype or "shared object" in ftype
@@ -382,6 +396,7 @@ def extract_binutils(binpath):
         "stripped": stripped, "functions": functions, "strings": strings,
         "imports": imports,
         "evasion": _file_evasion(binpath, imports, strings, sec_names),
+        "platform": _detect_platform(sh(["file", binpath])),
     }
 
 
@@ -446,6 +461,10 @@ def render_summary(rev):
     L.append("IMPORT: " + (", ".join(hot) if hot else "(판별/입력/crypto 관련 없음)"))
     if rev["engine"] == "binutils":
         L.append("[!] binutils 엔진 — xref/interesting 부정확. 정밀분석은 angr(기본, --fast 빼기).")
+    if rev.get("platform") == "pe":
+        L.append("PLATFORM: PE/Windows — 정적=decomp(Ghidra)+revq(angr) | 동적=Qiling/Frida(Wine 불필요)")
+        L.append("  ※ recon(pwn/ELF triage) 대상 아님 · .NET/Unity=ilspycmd/il2cppdumper")
+        L.append("  라우팅: knowledge/GROUNDING_INDEX.md(PE/.NET 행) · 동적 스캐폴드 solve/_template/rev/qiling_trace.py")
 
     # evasion (정적 신뢰 하향 신호)
     ev = rev.get("evasion", [])
@@ -747,6 +766,12 @@ def selftest():
     chk(classify_evasion(["memcmp"], ["hello world"], 5.0, [".text", ".data"]) == [],
         "evasion: 정상 바이너리 무신호")
     chk(_entropy(b"\x00\x00\x00\x00") == 0.0 and _entropy(bytes(range(256))) > 7.9, "_entropy 계산")
+
+    # platform 감지 (PE/ELF 라우팅)
+    chk(_detect_platform("a.exe: PE32+ executable (console) x86-64, for MS Windows") == "pe", "platform: PE 감지")
+    chk(_detect_platform("chall: ELF 64-bit LSB pie executable, x86-64") == "elf", "platform: ELF 감지")
+    chk("PE/Windows" in render_summary({**_fixture(), "platform": "pe"}), "render_summary: PE 배너")
+    chk("PLATFORM" not in render_summary({**_fixture(), "platform": "elf"}), "render_summary: ELF 은 배너 없음")
 
     print("-" * 40)
     if fails:

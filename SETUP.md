@@ -69,3 +69,15 @@ angr 미설치 환경이면 revq 는 `selftest`·`--fast`(binutils) 만, symsolv
 - **rev**: `revq <bin>` → `revq <bin> --func <후보>` → `decomp <bin> <fn>` → `symsolve … --find-str …`
 - **pwn**: `recon <bin>` → `decomp` → `pwnkit`/`pwnstage` → `state` 로 진행 기록
 - **doctrine**: `doctrine/SOLVING.md`(ROE+6-phase), `doctrine/SOLVABILITY.md`, `knowledge/GROUNDING_INDEX.md`
+
+## 8. Windows rev (PE/DLL/.NET) — 옵션 (Windows 문제 만나면만)
+정적 분석은 **Ghidra(`decomp`) + angr(`revq`)** 로 Linux 에서 그대로 된다(revq 가 PE 감지 시 라우팅 배너 출력).
+동적/실행은 아래 (Linux 호스트에서, Wine 불필요):
+```bash
+pip install qiling frida-tools        # Qiling PE 에뮬(Wine 불필요) + Frida 계측
+sudo apt install -y wine64            # .exe 직접 실행/재현 (symsolve concrete-verify 가 PE면 자동 wine)
+# .NET / Unity
+dotnet tool install -g ilspycmd       # ILSpy CLI (.NET 디컴파일)  |  IL2CPP=il2cppdumper, Mono=monodis
+```
+- **동적 정석 = `solve/_template/rev/qiling_trace.py`**(Qiling 에뮬, Wine 불필요). Windows **rootfs**(DLL) 필요 — 파일 상단 참고.
+- 라우팅은 `knowledge/GROUNDING_INDEX.md`(PE/.NET 행), rev 지식은 `knowledge/ctf-reverse/`.
