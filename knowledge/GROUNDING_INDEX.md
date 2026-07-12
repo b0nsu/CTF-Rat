@@ -5,7 +5,7 @@
 > **이 바이너리에서 fresh 도출 + 로컬 실증**했을 때만. 답/writeup 검색 금지.
 
 ## 사용 규율 (context 규율 = CLAUDE.md 승계)
-1. **통째 로드 금지.** `knowledge/ctf-skills/*.md`는 총 ~9000줄. triage로 class 확정된 **1개 파일만**.
+1. **통째 로드 금지.** pwn=`knowledge/ctf-skills/*.md`(~9000줄), rev=`knowledge/ctf-reverse/*.md`(~9400줄). triage로 확정된 **1개 파일만**.
 2. **큰 읽기는 subagent(Task)에 위임** → 결론(관련 기법명·전제·완화조건·코드 스니펫)만 회수. 메인 컨텍스트에 원문 붙이지 말 것.
 3. 각 파일 첫머리에 **Table of Contents** 있음 → 먼저 ToC만 grep(`grep -m30 '^##' <file>`)해 섹션 특정 후, 그 섹션만 발췌.
 4. **오프셋/gadget/상수는 여기서 recall 금지** — 전부 바이너리·gdb 실측 후 `state offset`. 문서 값은 개념 예시일 뿐.
@@ -14,9 +14,11 @@
 ## 소스 3축
 | 소스 | 경로 | 강점 |
 |---|---|---|
-| how2heap | `~/gnnPwn/data/rag_corpus/how2heap/` | glibc 버전별 heap 정밀(safe-linking/hook/tcache 게이팅) |
-| ctf-skills | `knowledge/ctf-skills/` (vendored, MIT) | 유형 폭: musl·custom allocator·FSOP 최신·sandbox·ROP advanced |
-| kernel env | `kernel/` + kernel*.md | 커널 (환경이 상위, md는 개념 참조) |
+| ctf-skills (=ctf-pwn) | `knowledge/ctf-skills/` (vendored, MIT) | **pwn** 유형 폭: musl·custom allocator·FSOP 최신·sandbox·ROP advanced |
+| ctf-reverse | `knowledge/ctf-reverse/` (vendored, MIT) | **rev**: anti-analysis·언어별(Go/Rust/.NET…)·RE 패턴·VM·툴(Ghidra/angr/frida/qemu) |
+| ctf-writeup | `knowledge/ctf-writeup/SKILL.md` (vendored, MIT) | writeup 작성 표준(제출형식·체크리스트) — 참고용 |
+| how2heap | 외부: github.com/shellphish/how2heap (선택 clone) | glibc 버전별 heap 정밀(safe-linking/hook/tcache 게이팅) |
+| kernel env | `kernel/` + `ctf-skills/kernel*.md` | 커널 (환경이 상위, md는 개념 참조) |
 
 ## triage class → 파일 라우팅
 | vuln class (triage) | 1차 grounding | 보조 |
@@ -35,6 +37,23 @@
 | 잡다한 실전 팁 / 디버깅 관용구 | `ctf-skills/field-notes.md` | — |
 | 위에 안 잡히는 다단계 체인 | `ctf-skills/advanced.md`, `advanced-exploits{,-2..-5}.md` | ToC 먼저 훑고 해당 절만 |
 
+## rev challenge → 파일 라우팅 (`knowledge/ctf-reverse/`)
+> rev 본체는 바이너리 RE(우리 도구 `revq`→`decomp`→`symsolve`/`vmlift`). 아래는 개념 grounding.
+| rev 상황 | 1차 grounding | 보조 |
+|---|---|---|
+| 시작점 / 전반 라우팅 | `ctf-reverse/SKILL.md`(ToC) | `patterns.md` |
+| crackme / keygen / serial 검증 로직 | `ctf-reverse/patterns-ctf.md` | `patterns-ctf-2.md`, `patterns-ctf-3.md` |
+| anti-debug / packing / 난독화 (revq **EVASION** 뜨면) | `ctf-reverse/anti-analysis-ctf.md` | `anti-analysis.md` |
+| 언어별(Go/Rust/C++/.NET/Nim…) | `ctf-reverse/languages.md` | `languages-compiled.md`, `languages-platforms.md` |
+| custom VM / bytecode (→ `vmlift`) | `ctf-reverse/patterns-runtime.md` | `ctf-skills/sandbox-escape.md`(VM 절) |
+| 툴 선택(Ghidra/IDA/angr/frida/qemu) | `ctf-reverse/tools.md` | `tools-dynamic.md`, `tools-emulation.md`, `tools-advanced{,-2}.md` |
+| 플랫폼(모바일/임베디드/HW) | `ctf-reverse/platforms.md` | `platforms-hardware.md` |
+| 실전 팁 | `ctf-reverse/field-notes.md` | — |
+
+## writeup 작성 (SOLVE 후 — 참고용)
+- `knowledge/ctf-writeup/SKILL.md` — 표준 제출형식(메타 + Summary + 1~3 step + **하나의 완결 스크립트** + Flag) + 제출 전 체크리스트.
+- 원칙: 재현 가능한 완결 스크립트 하나, 터미널 덤프 복붙 금지, 1~3단계 간결 (우리 honest-mode 와 일치).
+
 ## 채택 안 하는 부분 (우리 상위 규율이 이김)
 - SKILL.md의 **tool-setup / 설치 절 / 자체 gdb quickstart** → 무시. 우리 도구가 상위:
   - GDB = 시스템 gdb 12.1 + **pwndbg**(`~/.gdbinit`에서 자동 source, 확인됨).
@@ -43,7 +62,11 @@
 - SKILL의 driver식 pivot 문구("switch to /ctf-web" 등)도 참고만. 판정은 SOLVABILITY.md.
 - Windows exploit 언급 → 우리 미션(x86-64 linux) 밖, 무시.
 
-## 커버리지 요약 (2026-07-09 기준)
-userland 주류 유형 개념 공백 거의 없음. ctf-skills가 how2heap 대비 채우는 핵심:
-**musl/커스텀 allocator · sandbox escape · custom VM · FSOP 최신형 · advanced ROP.**
-남는 얇은 곳: type confusion 심화(=바이너리 RE 본체라 카탈로그 무관).
+## 커버리지 요약
+- **pwn** (`ctf-skills/`): musl/커스텀 allocator · sandbox escape · custom VM · FSOP 최신형 · advanced ROP.
+- **rev** (`ctf-reverse/`): anti-analysis · 언어별 리버싱 · RE 패턴 · VM · 툴/에뮬레이션.
+- 얇은 곳: type confusion 심화(=바이너리 RE 본체라 카탈로그 무관).
+
+## vendored 출처 / 미vendoring
+- 출처: **github.com/ljagiello/ctf-skills (MIT)**. 매핑: pwn=`ctf-skills/`(업스트림 ctf-pwn) · rev=`ctf-reverse/` · writeup=`ctf-writeup/`.
+- 업스트림엔 `ctf-web`·`ctf-crypto`·`ctf-forensics`·`ctf-osint`·`ctf-malware`·`ctf-misc`·`ctf-ai-ml` 도 있으나 **pwn/rev 스코프상 미vendoring** (필요 시 동일 방식으로 추가).

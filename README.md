@@ -15,7 +15,7 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 CLAUDE.md / AGENTS.md      에이전트 진입점 (심볼릭)
 SETUP.md                   환경무관 초기 세팅
 doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
-knowledge/                 GROUNDING_INDEX + ctf-skills/(유형별 기법 19)
+knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) · ctf-reverse/(rev) · ctf-writeup/
 reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
 bin/                       도구 전체 (+ghidra_scripts/)
 solve/_template/rev/       symsolve · vmlift

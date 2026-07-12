@@ -27,6 +27,8 @@
 5. **Exploit 체이닝** — 한 컨텍스트에 조립.
 6. **Adversarial verify** — SOLVE 선언 전 skeptic 으로 **반증 시도**(leak 위양성·libc mismatch·local↔remote 차).
    rev 는 `symsolve --find-str …`(복원 입력을 **실 바이너리 재실행**으로 concrete-verify)로 executable oracle 검증.
+7. **Writeup**(선택, SOLVE 후) — `knowledge/ctf-writeup/SKILL.md` 표준형식(메타 + Summary + 1~3 step + 완결 스크립트 + Flag).
+   rev grounding 은 `knowledge/ctf-reverse/`, pwn 은 `knowledge/ctf-skills/` — 라우팅은 `knowledge/GROUNDING_INDEX.md`.
 
 ## 도구 (bin/) — 전부 `CTF_HOME`(레포루트) 자동 해석
 ```
@@ -51,7 +53,7 @@ rev 시너지: `revq` 주소 = angr 로드베이스(PIE 0x400000) → `symsolve 
 CLAUDE.md / AGENTS.md      이 진입점 (AGENTS.md→CLAUDE.md 심볼릭, Codex 호환)
 SETUP.md                   환경무관 초기 세팅
 doctrine/                  SOLVING(ROE+6-phase) · SOLVABILITY · calibration · FINALS
-knowledge/                 GROUNDING_INDEX + ctf-skills/(19 md, 유형별 기법)
+knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) + ctf-reverse/(rev) + ctf-writeup/
 reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
 bin/                       도구 전체 (+ghidra_scripts/)
 solve/_template/rev/       symsolve · vmlift (챌린지 dir 로 복사해 사용)
