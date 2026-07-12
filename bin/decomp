@@ -20,7 +20,7 @@ if [ ! -f "$CACHE/_index.txt" ]; then
   mkdir -p "$CACHE"; proj="$(mktemp -d)"
   [ -x "$GHIDRA/support/analyzeHeadless" ] || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
   "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
-     -scriptPath "$SCRIPTDIR" -postScript decomp_export.py "$CACHE" \
+     -scriptPath "$SCRIPTDIR" -postScript DecompExport.java "$CACHE" \
      -deleteProject >/dev/null 2>&1 || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
   rm -rf "$proj"
 fi
