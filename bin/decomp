@@ -2,13 +2,23 @@
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 # decomp <binary> [func] — Ghidra headless 1회 전체 디컴파일 캐시 후 함수별 조회 (context 폭발 방지)
 set -euo pipefail
-GHIDRA="${GHIDRA_HOME:-/opt/ghidra_11.2.1_PUBLIC}"
+if [ $# -lt 1 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  echo "Usage: decomp <binary> [func]"
+  exit 1
+fi
+GHIDRA="${GHIDRA_HOME:-}"
+if [ -z "$GHIDRA" ]; then
+  for cand in /opt/ghidra_*_PUBLIC "$HOME"/ctf-tools/ghidra_*_PUBLIC; do
+    if [ -x "$cand/support/analyzeHeadless" ]; then GHIDRA="$cand"; break; fi
+  done
+fi
 SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
 BIN="$(readlink -f "$1")"; FUNC="${2:-}"
 CACHE="${BIN}.decomp"
 if [ ! -f "$CACHE/_index.txt" ]; then
   echo "[*] Ghidra headless 디컴파일 (최초 1회, ~30-90s)..." >&2
   mkdir -p "$CACHE"; proj="$(mktemp -d)"
+  [ -x "$GHIDRA/support/analyzeHeadless" ] || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
   "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
      -scriptPath "$SCRIPTDIR" -postScript decomp_export.py "$CACHE" \
      -deleteProject >/dev/null 2>&1 || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }

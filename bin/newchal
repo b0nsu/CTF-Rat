@@ -2,6 +2,10 @@
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 # newchal <name> <binary> [libc.so.6] [host:port] — solve 디렉토리 스캐폴딩
 set -euo pipefail
+if [ $# -lt 2 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  echo "Usage: newchal <name> <binary> [libc.so.6] [host:port]"
+  exit 1
+fi
 CTF="$CTF_HOME"; NAME="$1"; BIN="$2"; LIBC="${3:-}"; REMOTE="${4:-}"
 D="$CTF/solve/$NAME"; mkdir -p "$D"; cd "$D"
 cp "$BIN" ./ 2>/dev/null || true

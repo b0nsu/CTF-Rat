@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
+export PATH="$CTF_HOME/bin:$PATH"
+export PYTHONPATH="$CTF_HOME/bin${PYTHONPATH:+:$PYTHONPATH}"
 # 도구 회귀 self-test (kernel testkit 패턴 이식). 도구 수정 후 한 방 검증.
 VENV=python3
 P=0; F=0
