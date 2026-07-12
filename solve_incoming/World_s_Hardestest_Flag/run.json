@@ -1,0 +1,23 @@
+{
+  "platform": "ctfd",
+  "url": "https://broncoctf.ctfd.io",
+  "challenge_id": 23,
+  "name": "World's Hardestest Flag",
+  "category": "Pwn",
+  "value": 416,
+  "connection_info": null,
+  "files": [
+    {
+      "name": "mrdeh-hardestest.rbxl",
+      "sha256": "6d7ef124104e80a24c4cf9ab93680d0ab47b2dad5ad9729cf997bce81ad933ce"
+    }
+  ],
+  "flag": null,
+  "fetched_at": "2026-07-12T08:52:19.139123+00:00",
+  "detected": {
+    "main_bin": null,
+    "libc": null,
+    "ld": null,
+    "all_elfs": []
+  }
+}
