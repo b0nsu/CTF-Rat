@@ -16,6 +16,7 @@ WSL2 / 컨테이너) 어디든 한 번 세팅하면, Claude·Codex 가 이 레�
 ```bash
 git clone https://github.com/b0nsu/CTF-Rat && cd CTF-Rat
 export PATH="$PWD/bin:$PATH"          # k_* 커널 래퍼 포함 전 도구
+export PYTHONPATH="$PWD/bin${PYTHONPATH:+:$PYTHONPATH}"  # exploit.py의 pwnkit/pwnstage import
 # (선택) export CTF_HOME="$PWD"       # 안 해도 도구가 레포루트 자동 해석
 ```
 

@@ -8,11 +8,26 @@ BIN="$(readlink -f "$1")"; FUNC="${2:-}"
 CACHE="${BIN}.decomp"
 if [ ! -f "$CACHE/_index.txt" ]; then
   echo "[*] Ghidra headless 디컴파일 (최초 1회, ~30-90s)..." >&2
-  mkdir -p "$CACHE"; proj="$(mktemp -d)"
+  [ -x "$GHIDRA/support/analyzeHeadless" ] || {
+    echo "[!] Ghidra 없음: GHIDRA_HOME=$GHIDRA" >&2
+    exit 1
+  }
+  rm -rf "$CACHE"; mkdir -p "$CACHE"; proj="$(mktemp -d)"
   "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
-     -scriptPath "$SCRIPTDIR" -postScript decomp_export.py "$CACHE" \
-     -deleteProject >/dev/null 2>&1 || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
+     -scriptPath "$SCRIPTDIR" -postScript DecompExport.java "$CACHE" \
+     -deleteProject >"$CACHE/.ghidra.log" 2>&1 || {
+       cat "$CACHE/.ghidra.log" >&2
+       rm -rf "$CACHE" "$proj"
+       echo "[!] Ghidra 디컴파일 실패" >&2
+       exit 1
+     }
   rm -rf "$proj"
+  [ -f "$CACHE/_index.txt" ] || {
+    cat "$CACHE/.ghidra.log" >&2
+    rm -rf "$CACHE"
+    echo "[!] Ghidra export 실패" >&2
+    exit 1
+  }
 fi
 if [ -z "$FUNC" ]; then
   echo "# 함수 목록 (size 내림차순).  개별: decomp <bin> <func>"
