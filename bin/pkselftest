@@ -4,6 +4,7 @@ export PATH="$CTF_HOME/bin:$PATH"
 export PYTHONPATH="$CTF_HOME/bin${PYTHONPATH:+:$PYTHONPATH}"
 # 도구 회귀 self-test (kernel testkit 패턴 이식). 도구 수정 후 한 방 검증.
 VENV=python3
+export PYTHONPATH="$CTF_HOME/bin${PYTHONPATH:+:$PYTHONPATH}"
 P=0; F=0
 ok(){ echo "  [PASS] $1"; P=$((P+1)); }
 no(){ echo "  [FAIL] $1"; F=$((F+1)); }
@@ -28,4 +29,9 @@ if [ -f "$B" ]; then cp "$B" ./m; $VENV -c "import pwnkit;s,_=pwnkit.run_batch('
 pkshare --handoff >/dev/null 2>&1 && [ -f SHARE.md ] && ok "pkshare SHARE.md" || no "pkshare SHARE.md"
 cd /; rm -rf "$T"
 echo "=== pkselftest: PASS=$P FAIL=$F ==="
-[ $F -eq 0 ] && echo "ALL GREEN" || echo "REGRESSION 있음"
+if [ "$F" -eq 0 ]; then
+  echo "ALL GREEN"
+else
+  echo "REGRESSION 있음"
+  exit 1
+fi
