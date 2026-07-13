@@ -1,0 +1,2 @@
+{"t": "ok", "text": "House Of Mirage local exploit verified: expire session -> stale session pointer reused as sink -> batch leak PIE/heap -> re-free/reuse as sink1 -> stale import builds fake vtable to FUN_00103970 archive replay.", "ts": 1783841970}
+{"t": "ok", "text": "House Of Mirage remote solved: stale expired session reused as sink, leaked vtable/PIE and heap object, built fake vtable to archive replay, obtained real flag.", "ts": 1783844153}

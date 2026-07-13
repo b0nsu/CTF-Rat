@@ -1,0 +1,15 @@
+{"t": "init", "chal": "Red_Tide_Terminal", "ts": 1783865084}
+{"t": "alert", "text": "Remote binary differs from downloadable PIE+canary build: remote is non-PIE and exploitable frame behaves no-canary; local exploit offsets are not valid for remote.", "ts": 1783865084}
+{"t": "offset", "k": "rip_offset", "v": "104", "src": "remote full-read overflow oracle + write(1,banner) ROP verify", "ts": 1783865084}
+{"t": "offset", "k": "saved_rbp_offset", "v": "96", "src": "remote route_packet frame", "ts": 1783865084}
+{"t": "offset", "k": "pop_rdi", "v": "0x4013ec", "src": "remote arbitrary-read gadget farm", "ts": 1783865084}
+{"t": "offset", "k": "pop_rsi", "v": "0x4013f5", "src": "remote arbitrary-read gadget farm", "ts": 1783865084}
+{"t": "offset", "k": "pop_rdx", "v": "0x4013fe", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "pop_rax", "v": "0x401407", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "syscall_ret", "v": "0x401410", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "offset", "k": "leave_ret", "v": "0x4013e6", "src": "remote arbitrary-read gadget farm", "ts": 1783865085}
+{"t": "ok", "text": "Remote control-flow verified with write(1, 0x40205c, 0x28), printing the Red Tide banner.", "ts": 1783865085}
+{"t": "ok", "text": "Remote exploit verified: stage1 reads ORW chain into .bss and pivots with leave_ret; stage2 openat/read/write reads flag.txt.", "ts": 1783865085}
+{"t": "no", "text": "Downloaded PIE+canary exploit.py path for remote", "reason": "remote challenge service runs a different non-PIE/CET-shifted build; use exploit_remote.py offsets instead.", "ts": 1783865085}
+{"t": "note", "text": "Flag recovered, not auto-submitted: grodno{324d2c61-ea1c-40db-bf53-f361c5e3ad21}", "ts": 1783865085}
+{"t": "note", "text": "Reproducer: exploit_remote.py; remote entry used during solve: 10.112.0.12:47209.", "ts": 1783865085}

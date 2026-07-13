@@ -1,0 +1,2 @@
+{"t": "ok", "text": "Clockwork Vault local exploit verified: idx -2 leaks service_cookie, idx -1 retunes cycle slot to encoded print_flag, dummy flag printed.", "ts": 1783841403}
+{"t": "ok", "text": "Clockwork Vault remote solved: leaked service_cookie and remote callbacks, set cycle slot to open_vault at 0x4013e4, obtained real flag.", "ts": 1783843153}
