@@ -1,0 +1,20 @@
+{
+  "platform": "ctfd",
+  "url": "https://broncoctf.ctfd.io",
+  "challenge_id": 2,
+  "name": "Become a Discordian",
+  "category": "Welcome",
+  "value": 10,
+  "description": "Join the Discord for event updates and to ask for help! \r\n\r\nAnd, find a free flag over there.\r\n\r\nhttps://discord.gg/Pw7kXjgvc7\r\n",
+  "hints": [],
+  "connection_info": null,
+  "files": [],
+  "flag": null,
+  "fetched_at": "2026-07-12T12:55:17.680118+00:00",
+  "detected": {
+    "main_bin": null,
+    "libc": null,
+    "ld": null,
+    "all_elfs": []
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "platform": "ctfd",
+  "url": "https://broncoctf.ctfd.io",
+  "challenge_id": 10,
+  "name": "Grandma's Secret",
+  "category": "Crypto",
+  "value": 10,
+  "description": "Grandma wants to protect her wifi password. Can you find out what it is before grandpa does?",
+  "hints": [],
+  "connection_info": null,
+  "files": [
+    {
+      "name": "Letter.jpeg",
+      "sha256": "64a6a1ab0b6b886c987d4aa20a0a60326f729c9086679203b7457b8c2883dfed"
+    }
+  ],
+  "flag": null,
+  "fetched_at": "2026-07-12T12:57:55.739189+00:00",
+  "detected": {
+    "main_bin": null,
+    "libc": null,
+    "ld": null,
+    "all_elfs": []
+  }
+}
