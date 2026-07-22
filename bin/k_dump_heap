@@ -34,8 +34,8 @@ import argparse
 import datetime
 import os
 import re
-import subprocess
 import sys
+from ratlib.runner import EXIT_DEPENDENCY, EXIT_TIMEOUT, RunnerPolicyError, run
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 GDBINIT_KERNEL = os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "kernel/.gdbinit-kernel")
@@ -90,15 +90,16 @@ def main(argv=None):
 
     # --- run it, bounded ---
     try:
-        proc = subprocess.run(gdb_argv, capture_output=True, text=True,
-                              timeout=args.timeout)
-        raw = proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired as e:
-        raw = (e.stdout or "") + (e.stderr or "")
-        raw += "\n[dump_heap] TIMEOUT after %ds — is QEMU's gdbstub up on %s:%s?\n" % (
-            args.timeout, args.host, args.port)
-    except FileNotFoundError:
-        ap.error("gdb not found on PATH")
+        proc = run(gdb_argv, timeout_seconds=args.timeout, network="ctfguard-target",
+                   guard_target=[args.host, str(args.port)], tool_version="gdb")
+        raw = (proc.stdout.preview + proc.stderr.preview).decode("utf-8", errors="replace")
+        if proc.exit_code == EXIT_TIMEOUT:
+            raw += "\n[dump_heap] TIMEOUT after %ds — is QEMU's gdbstub up on %s:%s?\n" % (
+                args.timeout, args.host, args.port)
+        elif proc.exit_code == EXIT_DEPENDENCY:
+            ap.error("gdb not found on PATH")
+    except RunnerPolicyError as exc:
+        ap.error(str(exc))
 
     clean = ANSI.sub("", raw)
 

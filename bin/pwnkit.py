@@ -24,13 +24,17 @@ def snapscript(pairs):
 
 def run_batch(binary, script, stdin=b"", timeout=60, pwndbg=False):
     "headless scripted gdb via gdb -batch (SSH-safe). gdb.debug(gdbscript=) needs a terminal so SNAP is lost; use this. returns (snaps, raw)."
-    import subprocess, tempfile, os as _o, re as _r
+    import tempfile, os as _o, re as _r
+    from ratlib.runner import run
     with tempfile.NamedTemporaryFile("w", suffix=".gdb", delete=False) as f:
         f.write(((CLEAN_GS if pwndbg else _GS_CORE)) + script); sp = f.name  # pwndbg=True면 .gdbinit 로드(tcachebins/heap 사용가능)
     try:
-        pr = subprocess.run((["gdb","-q","-batch","-x",sp,binary] if pwndbg else ["gdb","-q","-nx","-batch","-x",sp,binary]),
-                            input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        raw = (pr.stdout or b"").decode("latin1")
+        argv = (["gdb","-q","-batch","-x",sp,binary] if pwndbg else
+                ["gdb","-q","-nx","-batch","-x",sp,binary])
+        pr = run(argv, timeout_seconds=timeout, input_bytes=stdin, tool_version="gdb")
+        raw = (pr.stdout.preview + pr.stderr.preview).decode("latin1")
+        if pr.timed_out:
+            raw += "\n[pwnkit] TIMEOUT\n"
     finally:
         try: _o.unlink(sp)
         except: pass

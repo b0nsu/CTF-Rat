@@ -18,15 +18,19 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import ssl
-import subprocess
 import sys
-import tarfile
-import zipfile
+import uuid
 from datetime import datetime, timezone
 from urllib import error, parse, request
+
+from ratlib.safe_archive import ArchiveError, DEFAULT_POLICY, is_supported_archive, load_policy, safe_extract_archive
+from ratlib.run_manifest import atomic_write as atomic_write_run_manifest
+from ratlib.run_manifest import validate as validate_shared_run_manifest
+from ratlib.runner import run as run_bounded
 
 DEFAULT_ENV_PATHS = ["./.ctfd.env", os.path.expanduser("~/ctf/.ctfd.env")]
 CTF_HOME = os.path.expanduser(os.environ.get("CTF_HOME", "~/ctf"))
@@ -170,21 +174,29 @@ def is_elf(path):
         return False
 
 
-def extract_archives(staging):
-    """staging 안의 zip/tar 자동 해제 (동명 하위폴더로)."""
-    for entry in list(os.listdir(staging)):
-        p = os.path.join(staging, entry)
-        try:
-            if zipfile.is_zipfile(p):
-                with zipfile.ZipFile(p) as z:
-                    z.extractall(staging)
-                info("해제(zip): %s" % entry)
-            elif tarfile.is_tarfile(p):
-                with tarfile.open(p) as t:
-                    t.extractall(staging)
-                info("해제(tar): %s" % entry)
-        except (zipfile.BadZipFile, tarfile.TarError, OSError) as e:
-            info("해제 실패(%s): %s" % (entry, e))
+def extract_archives(staging, policy=DEFAULT_POLICY):
+    """Extract archives with path/type/size checks; reject the whole ingest on error."""
+    processed = set()
+    for depth in range(policy.max_depth):
+        candidates = []
+        for root, _, files in os.walk(staging):
+            for entry in files:
+                path = os.path.join(root, entry)
+                real = os.path.realpath(path)
+                if real not in processed and is_supported_archive(path):
+                    candidates.append(path)
+        if not candidates:
+            return
+        for path in sorted(candidates):
+            processed.add(os.path.realpath(path))
+            members = safe_extract_archive(path, staging, policy)
+            info("안전 해제(depth=%d, members=%d): %s" % (depth + 1, members, os.path.relpath(path, staging)))
+    for root, _, files in os.walk(staging):
+        for entry in files:
+            path = os.path.join(root, entry)
+            if os.path.realpath(path) not in processed and is_supported_archive(path):
+                raise ArchiveError("archive nesting exceeds configured depth %d: %s" %
+                                   (policy.max_depth, os.path.relpath(path, staging)))
 
 
 def detect_binaries(staging, name_hint=None):
@@ -205,6 +217,15 @@ def detect_binaries(staging, name_hint=None):
             main = next((p for p in mains if name_hint.lower() in os.path.basename(p).lower()), None)
         main = main or mains[0]
     return main, libc, ld, elfs
+
+
+def detect_dockerfiles(staging):
+    out = []
+    for root, _, files in os.walk(staging):
+        for fn in files:
+            if fn == "Dockerfile":
+                out.append(os.path.join(root, fn))
+    return sorted(out)
 
 
 def slugify(name):
@@ -232,7 +253,53 @@ def cmd_list(base, token, cookie, insecure, category, as_json):
 
 
 def build_run_manifest(base, detail, conn, files_meta):
+    now = datetime.now(timezone.utc).isoformat()
+    inputs = []
+    for item in files_meta:
+        inputs.append({
+            "role": "attachment",
+            "name": item["name"],
+            "sha256": "sha256:" + item["sha256"],
+            "size": int(item.get("size", 0)),
+        })
     return {
+        "schema": "rat.run/v1",
+        "run_id": "run_" + uuid.uuid4().hex,
+        "created_at": now,
+        "updated_at": now,
+        "challenge": {
+            "id": detail.get("id"),
+            "name": detail.get("name") or "",
+            "category": detail.get("category"),
+        },
+        "status": "created",
+        "inputs": inputs,
+        "target_policy": {
+            "guard_challenge": slugify(detail.get("name") or "chal_%s" % detail.get("id")),
+            "allowlist": [conn] if conn else [],
+            "network_mode": "ctfguard-target" if conn else "none",
+        },
+        "environment": {
+            "os": sys.platform,
+            "arch": platform.machine() or "unknown",
+            "runtime": "python-%d.%d" % sys.version_info[:2],
+        },
+        "toolchain": {
+            "ctf_rat_revision": os.environ.get("CTF_RAT_REVISION", "worktree"),
+            "ctfpull_version": "p0-v1",
+            "schema_bundle": "v1",
+        },
+        "policy": {
+            "archive": {
+                "max_members": DEFAULT_POLICY.max_members,
+                "max_member_bytes": DEFAULT_POLICY.max_member_bytes,
+                "max_total_bytes": DEFAULT_POLICY.max_total_bytes,
+                "max_compression_ratio": DEFAULT_POLICY.max_compression_ratio,
+                "max_depth": 2,
+            },
+            "subprocess": {"wall_timeout_seconds": 60, "output_hard_cap_bytes": 64 * 1024 * 1024},
+        },
+        "state": {"stream_id": None, "latest_event_cursor": None, "latest_checkpoint_id": None},
         "platform": "ctfd",
         "url": base,
         "challenge_id": detail.get("id"),
@@ -242,11 +309,19 @@ def build_run_manifest(base, detail, conn, files_meta):
         "connection_info": conn,
         "files": files_meta,
         "flag": None,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": now,
     }
 
 
-def render_newchal_cmd(name, main_bin, libc, conn):
+def validate_run_manifest(manifest):
+    return validate_shared_run_manifest(manifest)
+
+
+def write_run_manifest(path, payload):
+    atomic_write_run_manifest(path, payload)
+
+
+def render_newchal_cmd(name, main_bin, libc, conn, run_manifest=None):
     argv = ["newchal", name, main_bin]
     if conn and libc:
         argv += [libc, conn]
@@ -254,10 +329,13 @@ def render_newchal_cmd(name, main_bin, libc, conn):
         argv += ["", conn]
     elif libc:
         argv += [libc]
+    if run_manifest:
+        argv += ["--run", run_manifest]
     return argv
 
 
-def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newchal):
+def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newchal,
+              archive_policy=DEFAULT_POLICY, extract=True):
     detail = api_get(base, "/api/v1/challenges/%s" % chal_id, token, cookie, insecure)
     if not isinstance(detail, dict):
         die("문제 상세 응답 형식 이상 (id=%s)" % chal_id)
@@ -272,26 +350,43 @@ def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newcha
     files_meta = []
     for fp in detail.get("files", []) or []:
         local = download(base, fp, staging, token, cookie, insecure)
-        files_meta.append({"name": os.path.basename(local), "sha256": sha256_of(local)})
+        files_meta.append({"name": os.path.basename(local), "sha256": sha256_of(local), "size": os.path.getsize(local)})
         info("다운로드: %s" % os.path.basename(local))
     if not files_meta:
         info("첨부 없음 (remote-only 문제일 수 있음)")
 
-    extract_archives(staging)
+    if extract:
+        try:
+            extract_archives(staging, archive_policy)
+        except ArchiveError as exc:
+            die("unsafe archive rejected: %s" % exc, code=4)
     main_bin, libc, ld, elfs = detect_binaries(staging, bin_hint or name)
+    dockerfiles = detect_dockerfiles(staging)
     if bin_hint:
         cand = [p for p in elfs if os.path.basename(p) == bin_hint]
         main_bin = cand[0] if cand else main_bin
 
     manifest = build_run_manifest(base, detail, conn, files_meta)
+    manifest["policy"]["archive"] = {
+        key: getattr(archive_policy, key) for key in archive_policy.__dataclass_fields__
+    }
     manifest["detected"] = {
         "main_bin": os.path.relpath(main_bin, staging) if main_bin else None,
         "libc": os.path.relpath(libc, staging) if libc else None,
         "ld": os.path.relpath(ld, staging) if ld else None,
+        "dockerfiles": [os.path.relpath(p, staging) for p in dockerfiles],
         "all_elfs": [os.path.relpath(p, staging) for p in elfs],
     }
-    with open(os.path.join(staging, "run.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    known = {(item["role"], item["sha256"]) for item in manifest["inputs"]}
+    for role, path in (("binary", main_bin), ("libc", libc), ("loader", ld)):
+        if not path:
+            continue
+        digest = "sha256:" + sha256_of(path)
+        if (role, digest) not in known:
+            manifest["inputs"].append({"role": role, "name": os.path.relpath(path, staging),
+                                       "sha256": digest, "size": os.path.getsize(path)})
+    staging_manifest = os.path.join(staging, "run.json")
+    write_run_manifest(staging_manifest, manifest)
     info("manifest: %s/run.json" % staging)
 
     if not main_bin:
@@ -299,17 +394,29 @@ def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newcha
         info("→ --bin <파일명> 으로 지정하거나 수동 newchal")
         return
 
-    argv = render_newchal_cmd(name, main_bin, libc, conn)
+    argv = render_newchal_cmd(name, main_bin, libc, conn, staging_manifest)
     if run_newchal and shutil.which("newchal"):
         info("newchal 실행: %s" % " ".join(argv))
-        subprocess.run(argv, check=False)
+        scaffold_env = {key: os.environ[key] for key in
+                        ("CTF_HOME", "HOME", "GHIDRA_HOME", "XDG_CACHE_HOME") if key in os.environ}
+        completed = run_bounded(argv, timeout_seconds=180, tool_version="newchal-p0-v1",
+                                env=scaffold_env)
+        if completed.stdout.preview:
+            sys.stdout.buffer.write(completed.stdout.preview)
+        if completed.stderr.preview:
+            sys.stderr.buffer.write(completed.stderr.preview)
+        if completed.exit_code != 0:
+            die("newchal failed (exit=%d%s)" %
+                (completed.exit_code, ", output truncated" if
+                 completed.stdout.truncated or completed.stderr.truncated else ""), completed.exit_code)
     else:
         why = "newchal 미탐지(Mac dev?)" if run_newchal else "--no-newchal"
         print("\n[스테이징 완료] %s — %s. WSL에서 실행:" % (staging, why))
         print("  " + " ".join(shlex_quote(a) for a in argv))
 
 
-def cmd_fetch_all(base, token, cookie, insecure, dest, bin_hint, run_newchal, category):
+def cmd_fetch_all(base, token, cookie, insecure, dest, bin_hint, run_newchal, category,
+                  archive_policy=DEFAULT_POLICY, extract=True):
     data = api_get(base, "/api/v1/challenges", token, cookie, insecure)
     chals = data if isinstance(data, list) else []
     if category:
@@ -317,7 +424,8 @@ def cmd_fetch_all(base, token, cookie, insecure, dest, bin_hint, run_newchal, ca
     info("일괄 수집 대상 %d개" % len(chals))
     for c in chals:
         try:
-            cmd_fetch(base, token, cookie, insecure, c.get("id"), dest, bin_hint, run_newchal)
+            cmd_fetch(base, token, cookie, insecure, c.get("id"), dest, bin_hint, run_newchal,
+                      archive_policy, extract)
         except SystemExit:
             info("건너뜀 (id=%s)" % c.get("id"))
 
@@ -362,11 +470,12 @@ def selftest():
 
     print("[selftest] manifest 스키마")
     m = build_run_manifest("https://x", {"id": 1, "name": "n", "category": "pwn", "value": 100},
-                           "h:1", [{"name": "a", "sha256": "z"}])
+                           "h:1", [{"name": "a", "sha256": "0" * 64, "size": 1}])
     check("필수 키", all(k in m for k in
           ("platform", "url", "challenge_id", "name", "category", "connection_info", "files", "flag", "fetched_at")))
     check("flag=None", m["flag"] is None)
     check("platform=ctfd", m["platform"] == "ctfd")
+    check("rat.run/v1", m["schema"] == "rat.run/v1" and validate_run_manifest(m) is m)
 
     print("[selftest] slugify")
     check("공백/특수 → _", slugify("My Chal! (v2)") == "My_Chal_v2")
@@ -390,6 +499,8 @@ def main():
     sp.add_argument("--dest", default=os.path.join(CTF_HOME, "solve_incoming"), help="스테이징 루트")
     sp.add_argument("--bin", dest="bin_hint", help="메인 바이너리 파일명 강제 지정")
     sp.add_argument("--no-newchal", action="store_true", help="newchal 호출 없이 스테이징만")
+    sp.add_argument("--no-extract", action="store_true", help="첨부 archive를 해제하지 않음")
+    sp.add_argument("--archive-policy", help="기본 한도보다 엄격한 JSON archive policy")
     sp.add_argument("--url", help="CTFd base URL")
     sp.add_argument("--token", help="CTFd API 토큰")
     sp.add_argument("--cookie", help="세션 쿠키 (예: 'session=...')")
@@ -406,14 +517,18 @@ def main():
         sys.exit(2)
 
     base, token, cookie = resolve_config(args)
+    try:
+        archive_policy = load_policy(args.archive_policy) if args.archive_policy else DEFAULT_POLICY
+    except ArchiveError as exc:
+        die(str(exc), code=2)
     if args.list:
         cmd_list(base, token, cookie, args.insecure, args.category, args.json)
     elif args.all:
         cmd_fetch_all(base, token, cookie, args.insecure, args.dest,
-                      args.bin_hint, not args.no_newchal, args.category)
+                      args.bin_hint, not args.no_newchal, args.category, archive_policy, not args.no_extract)
     else:
         cmd_fetch(base, token, cookie, args.insecure, args.id, args.dest,
-                  args.bin_hint, not args.no_newchal)
+                  args.bin_hint, not args.no_newchal, archive_policy, not args.no_extract)
 
 
 if __name__ == "__main__":

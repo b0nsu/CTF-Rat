@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rat.run/v1",
+  "title": "ctf-rat run manifest v1",
+  "type": "object",
+  "required": ["schema", "run_id", "created_at", "updated_at", "challenge", "status", "inputs", "target_policy", "environment", "toolchain", "policy"],
+  "properties": {
+    "schema": {"const": "rat.run/v1"},
+    "run_id": {"type": "string", "minLength": 8},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "challenge": {
+      "type": "object",
+      "required": ["id", "name", "category"],
+      "properties": {"id": {}, "name": {"type": "string"}, "category": {"type": ["string", "null"]}},
+      "additionalProperties": true
+    },
+    "status": {"enum": ["created", "active", "blocked", "verified", "complete"]},
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "name", "sha256", "size"],
+        "properties": {
+          "role": {"type": "string"}, "name": {"type": "string"},
+          "sha256": {"pattern": "^sha256:[0-9a-f]{64}$"}, "size": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": true
+      }
+    },
+    "target_policy": {"type": "object", "required": ["guard_challenge", "allowlist", "network_mode"]},
+    "environment": {"type": "object", "required": ["os", "arch", "runtime"]},
+    "toolchain": {"type": "object", "required": ["ctf_rat_revision", "schema_bundle"]},
+    "policy": {"type": "object", "required": ["archive", "subprocess"]},
+    "manifest_owner": {
+      "type": "object",
+      "required": ["kind", "path"],
+      "properties": {"kind": {"const": "solve"}, "path": {"type": "string"}},
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}
