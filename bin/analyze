@@ -41,7 +41,7 @@ def main():
         if (f['idxw']+f['ptrw']+f['gp'])>0 and f['loop']>0 and f['cmp']<3: sc+=5
         rank.append((sc,n,f,d['calls']))
     rank.sort(reverse=True)
-    print("="*60); print("VULN 표적 랭킹 (gnnPwn graph+1-hop 전파)"); print("="*60)
+    print("="*60); print("SIGNAL 표적 랭킹 (gnnPwn graph+1-hop prior; 취약점 확정 아님)"); print("="*60)
     for sc,n,f,calls in rank[:8]:
         t=[]
         if f['inp'] or f['gp']: t.append('INPUT')

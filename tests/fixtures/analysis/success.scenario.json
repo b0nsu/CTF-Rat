@@ -1,0 +1,1 @@
+{"schema":"rat.scenario/v1","name":"success","stdin":"OK\n","expect":{"exit_code":0,"stdout_regex":"SUCCESS"},"markers":["SUCCESS"]}
