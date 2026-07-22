@@ -1,0 +1,87 @@
+# Primitive Gate — SELF 확인 전 체이닝 금지
+
+목적: “될 것 같은 가설”을 “검증된 primitive”처럼 쓰는 실수를 막는다. exploit.py에 ROP/shellcode/remote 체인을 붙이기 전에, 최소 payload로 control primitive가 실제 바이너리에서 증명되어야 한다.
+
+## 상태 타입
+
+- `state hypothesis <text>`: 아직 검증 전인 풀이 가설. 체이닝 근거로 사용 금지.
+- `state primitive <name> pass <evidence>`: 최소 payload로 검증된 primitive. 체이닝 가능.
+- `state primitive <name> fail|blocked <evidence>`: primitive 실패/보류. 같은 경로로 체이닝 금지.
+- `state no <text> -- <reason>`: 재시도 금지 dead-end.
+
+## Primitive PASS 조건
+
+primitive PASS는 “가능성”이 아니라 “제어성”까지 증명해야 한다.
+
+필수 증거:
+
+1. 최소 payload로 재현된다.
+2. gdb 전용이 아니라 일반 실행 core 또는 remote-equivalent 실행에서 확인했다.
+3. EIP/RIP, ESP/RSP/RBP, 주요 register를 기록했다.
+4. control target이 예상 주소와 일치한다.
+5. target memory가 단순 readable이 아니라 attacker-controlled임을 marker로 증명했다.
+6. `strcpy`, `strlen`, `gets`, `read`, newline 등 terminator/length 부작용을 확인했다.
+7. ASLR, argv/env 길이, libc/kernel/vDSO 차이 같은 layout 의존성을 기록했다.
+
+Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
+
+8. 같은 malloc/free 순서에서 tcache bin의 `count`, head, next 반환 순서를 확인했다.
+9. safe-linking 대상이면 `encoded_fd == target ^ (chunk_addr >> 12)` 를 실측 주소로 계산했다.
+10. 실패 원인을 libc mismatch 로 올리기 전에 Docker/loopback 또는 leak/build-id/hash 증거를 확보했다.
+
+예:
+
+```sh
+state hypothesis "saved EBP low-byte overwrite may pivot main epilogue into attacker-controlled stack data"
+
+# 최소 payload 실행 후 core/gdb에서:
+#   ESP=0xfffc00bf
+#   [ESP]=0x41424344 ("DCBA" marker from our payload/env/argv)
+#   next ret target=0x80000000
+state primitive stack_pivot pass "core: ESP=0xfffc00bf, [ESP]=0x41424344 attacker marker, next ret=0x80000000"
+```
+
+## 금지 규칙
+
+아래 중 하나라도 해당하면 exploit chaining 금지:
+
+- `state hypothesis`만 있고 `state primitive ... pass`가 없다.
+- pivot 주소가 readable일 뿐 attacker-controlled marker가 없다.
+- gdb에서는 되지만 일반 실행 core에서 깨진다.
+- terminator/NUL/newline이 다음 byte 또는 chain을 훼손하는지 확인하지 않았다.
+- remote layout에 의존하는데 remote-equivalent evidence가 없다.
+- tcache poisoning/dup 경로에서 bin count/head/fd를 확인하지 않고 libc/remote 차이로 추정했다.
+- Dockerfile이 제공됐는데 이미지 안의 libc/loader 해시 또는 loopback 서비스 검증 없이 원격 libc mismatch를 주장했다.
+- 원격에서 ASLR/libc base/stack canary/heap layout/timing/부분 overwrite 성공 조건을
+  반복 연결로 맞추는 확률 brute-force가 필요하다. 이런 경로는 의도 풀이로 간주하지 말고
+  `state no ... -- probabilistic remote brute, unintended` 로 배제한다.
+- 로컬 `/proc/<pid>/maps`, gdb, core, 고정 ASLR, 로컬 libc base를 써서만 성립하는 체인을
+  remote primitive로 승격했다. remote-equivalent leak/control evidence가 없으면
+  `state primitive <name> blocked "not remote-equivalent: ..."` 로 남긴다.
+
+## Anti-Bruteforce Rule
+
+- Remote exploit은 챌린지가 명시적으로 brute-force를 요구하지 않는 한 deterministic 해야 한다.
+- 원격 반복 시도로 ASLR, canary, heap layout, timing race, partial overwrite 확률을 맞추지 않는다.
+- 로컬 brute-force는 측정/가설 검증 도구로만 허용하며 solve strategy 로 쓰지 않는다.
+- looped remote exploit을 실행하기 전에는 `state primitive <name> pass remote-equivalent:<evidence>` 가
+  있어야 한다. 없으면 분석으로 돌아간다.
+- "못 풀겠어서 brute-force"는 실패 경로다. 해당 경로는 즉시 `state no` 로 기록하고 재시도하지 않는다.
+
+## SELF 체크리스트
+
+ROP/shellcode 작성 전에 확인:
+
+```text
+[ ] 이건 hypothesis인가, primitive PASS인가?
+[ ] 최소 payload로 EIP/ESP/RSP 이동을 확인했나?
+[ ] 일반 실행 core 또는 remote-equivalent 실행인가?
+[ ] target memory에 attacker marker가 있나?
+[ ] terminator/NUL/strlen/strcpy 부작용을 확인했나?
+[ ] ASLR/env/argv/layout 의존성을 기록했나?
+[ ] remote 반복 시도로 확률 조건을 맞추는 경로는 아닌가?
+[ ] remote-equivalent primitive 없이 로컬 maps/gdb/core 기반 체인을 원격에 쓰고 있지 않은가?
+[ ] heap이면 tcache count/head/fd와 safe-linking encoding을 같은 sequence에서 확인했나?
+[ ] libc mismatch 가설이면 Docker image hash/loopback, leak, build-id 중 하나로 증명했나?
+[ ] 실패 경로는 state no 또는 primitive fail로 기록했나?
+```

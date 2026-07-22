@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"rat.task-output/v1","type":"object","required":["schema","task_id","status","outputs","evidence_ids"],"properties":{"schema":{"const":"rat.task-output/v1"},"task_id":{"type":"string"},"status":{"const":"completed"},"outputs":{"type":"object"},"evidence_ids":{"type":"array"}},"additionalProperties":false}

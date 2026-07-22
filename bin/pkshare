@@ -18,6 +18,8 @@ def main():
     ok=[e["text"] for e in events if e.get("t")=="ok"]
     offs=[(e["k"],e.get("v"),e.get("src","")) for e in events if e.get("t")=="offset"]
     no=[(e["text"],e.get("reason","")) for e in events if e.get("t")=="no"]
+    hyps=[e["text"] for e in events if e.get("t")=="hypothesis"]
+    prims=[e for e in events if e.get("t")=="primitive"]
     nxt=[e["text"] for e in events if e.get("t")=="next"]
     solved=("--solved" in sys.argv) or any(("SOLVED" in x.upper() or "flag" in x.lower() or "shell" in x.lower()) for x in ok)
     if "--handoff" in sys.argv: solved=False
@@ -26,7 +28,7 @@ def main():
         try: flag=open("flag").read().strip()
         except: pass
     scripts=sorted(glob.glob("solve*.py")+glob.glob("exploit*.py"))
-    tag={"note":"🔎 정찰/맥락","ok":"✓ 됨","no":"✗ 배제","alert":"⚠ 전환점","offset":"📏 측정","next":"→ 다음"}
+    tag={"note":"🔎 정찰/맥락","ok":"✓ 됨","no":"✗ 배제","alert":"⚠ 전환점","offset":"📏 측정","next":"→ 다음","hypothesis":"? 가설","primitive":"🧪 primitive"}
     L=["# %s — %s"%(chal,"SOLVED ✅" if solved else "IN PROGRESS / STUCK ⏸"),""]
     L.append("> 팀 공유용 %s. **풀이과정(어떻게 도달했나) 포함.**"%("writeup" if solved else "handoff"))
     L.append("\n## 풀이과정 (진행 순서 — 시도·배제·핵심착상)")
@@ -37,7 +39,21 @@ def main():
         n+=1
         if t=="offset": L.append("%d. **[%s]** `%s = %s`%s"%(n,tag[t],e["k"],e.get("v"),"  (%s)"%e.get("src") if e.get("src") else ""))
         elif t=="no": L.append("%d. **[%s]** %s%s"%(n,tag[t],e["text"]," — %s"%e.get("reason") if e.get("reason") else ""))
+        elif t=="primitive": L.append("%d. **[%s]** `%s` = **%s**%s"%(n,tag[t],e.get("name","primitive"),e.get("status","unknown").upper()," — %s"%e.get("evidence") if e.get("evidence") else ""))
         elif t in tag: L.append("%d. **[%s]** %s"%(n,tag[t],e.get("text","")))
+    L.append("\n## Gate Status")
+    prim_pass=[e for e in prims if e.get("status")=="pass"]
+    if prim_pass:
+        L.append("- Primitive: PASS")
+        for e in prim_pass: L.append("  - `%s`: %s"%(e.get("name","primitive"),e.get("evidence","(no evidence text)")))
+    elif hyps:
+        L.append("- Primitive: BLOCKED — hypothesis exists but no `primitive ... pass` evidence is recorded.")
+        L.append("- Exploit chaining / remote attempt: BLOCKED until a primitive PASS is recorded.")
+    else:
+        L.append("- Primitive: NOT STARTED")
+    if hyps:
+        L.append("- Active hypotheses:")
+        for x in hyps: L.append("  - %s"%x)
     if n==0: L.append("(STATE 기록 없음 — 진행하며 state ok/no/alert/offset 로 과정 남길 것)")
     if offs:
         L.append("\n## 검증된 오프셋/상수 (live 측정)"); L.append("| key | value | src |"); L.append("|---|---|---|")
