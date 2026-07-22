@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from ratlib.orchestration import GateError, cancel_task, finish_task, invalidate, repair_task, start_task
+p=argparse.ArgumentParser(); p.add_argument("--root",default=os.getcwd()); sub=p.add_subparsers(dest="cmd",required=True)
+q=sub.add_parser("start"); q.add_argument("--contract",required=True); q.add_argument("--checkpoint",default=""); q.add_argument("--input",action="append",default=[]); q.add_argument("--depends",action="append",default=[]); q.add_argument("--primitive"); q.add_argument("--input-digest"); q.add_argument("--environment-digest"); q.add_argument("--child-pid",type=int)
+q=sub.add_parser("finish"); q.add_argument("task_id"); q.add_argument("--status",required=True); q.add_argument("--output"); q.add_argument("--budget")
+q=sub.add_parser("repair"); q.add_argument("task_id"); q.add_argument("--output",required=True); q.add_argument("--budget")
+q=sub.add_parser("cancel"); q.add_argument("task_id"); q.add_argument("--reason",required=True)
+q=sub.add_parser("invalidate"); q.add_argument("--evidence",action="append",required=True); q.add_argument("--reason",required=True)
+a=p.parse_args()
+try:
+ if a.cmd=="start": out=start_task(a.root,json.load(open(a.contract)),checkpoint_id=a.checkpoint,inputs=a.input,dependencies=a.depends,primitive_id=a.primitive,input_digest=a.input_digest,environment_digest=a.environment_digest,child_pid=a.child_pid)
+ elif a.cmd=="finish": out=finish_task(a.root,a.task_id,a.status,json.load(open(a.output)) if a.output else None,json.load(open(a.budget)) if a.budget else None)
+ elif a.cmd=="repair": out=repair_task(a.root,a.task_id,json.load(open(a.output)),json.load(open(a.budget)) if a.budget else None)
+ elif a.cmd=="cancel": out=cancel_task(a.root,a.task_id,a.reason)
+ else: out=invalidate(a.root,a.evidence,a.reason)
+ print(json.dumps(out))
+except (GateError,OSError,ValueError,json.JSONDecodeError) as e: print("[rat-task:policy] "+str(e),file=sys.stderr); raise SystemExit(5)

@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from ratlib.orchestration import GateError, converge, plan_fanout
+p=argparse.ArgumentParser(); p.add_argument("--root",default=os.getcwd()); sub=p.add_subparsers(dest="cmd",required=True)
+q=sub.add_parser("plan"); q.add_argument("--branches",required=True); q.add_argument("--trigger",required=True); q.add_argument("--budget",required=True)
+q=sub.add_parser("converge"); q.add_argument("--retained",required=True); q.add_argument("--refuted",required=True); q.add_argument("--unknowns",required=True); q.add_argument("--rationale",required=True); a=p.parse_args()
+try:
+ if a.cmd=="plan": out=plan_fanout(a.root,json.load(open(a.branches)),json.load(open(a.trigger)),json.load(open(a.budget)))
+ else: out=converge(a.root,json.load(open(a.retained)),json.load(open(a.refuted)),json.load(open(a.unknowns)),json.load(open(a.rationale)))
+ print(json.dumps(out))
+except (GateError,OSError,ValueError,json.JSONDecodeError) as e: print("[rat-fanout:policy] "+str(e),file=sys.stderr); raise SystemExit(5)
