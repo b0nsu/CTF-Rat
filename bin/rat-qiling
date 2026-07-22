@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Bounded optional Qiling runner with honest partial/timeout results."""
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+
+from ratlib.runner import EXIT_DEPENDENCY, EXIT_INPUT, EXIT_TIMEOUT, run
+
+SCHEMA = "rat.qiling-result/v1"
+
+
+DRIVER = r'''
+import json, os, sys
+from qiling import Qiling
+try:
+    from qiling.const import QL_VERBOSE
+    verbose = QL_VERBOSE.OFF
+except Exception:
+    verbose = 0
+
+binary, rootfs, checkpoint, budget = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+state = {'instructions': 0, 'last_pc': None, 'hook_type': 'instruction'}
+budget_exhausted = False
+def save():
+    tmp = checkpoint + '.tmp'
+    with open(tmp, 'w') as f: json.dump(state, f); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, checkpoint)
+def hook(ql, address, size):
+    global budget_exhausted
+    state['instructions'] += 1; state['last_pc'] = address
+    if state['instructions'] % 1000 == 0: save()
+    if state['instructions'] >= budget:
+        budget_exhausted = True; save(); ql.emu_stop()
+try:
+    ql = Qiling([binary], rootfs, verbose=verbose)
+    ql.hook_code(hook)
+    ql.run()
+    save()
+    if budget_exhausted:
+        print(json.dumps({'status':'timeout', 'reason':'instruction_budget', **state})); raise SystemExit(124)
+    print(json.dumps({'status':'ok', **state})); raise SystemExit(0)
+except Exception as exc:
+    save(); print(json.dumps({'status':'partial', 'reason':type(exc).__name__, 'message':str(exc), **state})); raise SystemExit(70)
+'''
+
+
+def result(status, code, **extra):
+    payload = {"schema": SCHEMA, "status": status, "exit_code": code}
+    payload.update(extra)
+    return payload
+
+
+def execute(binary, rootfs, timeout, instruction_budget):
+    if not os.path.isfile(binary):
+        return result("error", EXIT_INPUT, diagnostic="binary missing")
+    if not os.path.isdir(rootfs):
+        return result("error", EXIT_INPUT, diagnostic="rootfs missing")
+    if importlib.util.find_spec("qiling") is None:
+        return result("dependency_missing", EXIT_DEPENDENCY,
+                      diagnostic="Qiling is not installed; install the optional qiling dependency")
+    with tempfile.TemporaryDirectory(prefix="rat-qiling-") as temp:
+        checkpoint = os.path.join(temp, "checkpoint.json")
+        proc = run([sys.executable, "-c", DRIVER, os.path.abspath(binary), os.path.abspath(rootfs), checkpoint,
+                    str(instruction_budget)], timeout_seconds=timeout, env={"PYTHONPATH": os.pathsep.join(sys.path)},
+                   network="inherit", tool_version="rat-qiling-p0-v1")
+        state = {"instructions": 0, "last_pc": None, "hook_type": "instruction"}
+        try:
+            with open(checkpoint, encoding="utf-8") as source:
+                state.update(json.load(source))
+        except (OSError, ValueError):
+            pass
+        child = None
+        try:
+            child = json.loads(proc.stdout.preview.decode(errors="replace").splitlines()[-1])
+        except (ValueError, IndexError):
+            pass
+        if proc.timed_out:
+            return result("timeout", EXIT_TIMEOUT, reason="wall_timeout", duration_ms=proc.duration_ms, **state)
+        if child:
+            state.update({key: child[key] for key in ("instructions", "last_pc", "hook_type") if key in child})
+        status = child.get("status", "partial") if child else "partial"
+        return result(status, proc.exit_code, duration_ms=proc.duration_ms,
+                      reason=(child or {}).get("reason"),
+                      diagnostic=(child or {}).get("message", proc.stderr.preview.decode(errors="replace")), **state)
+
+
+def selftest():
+    with tempfile.TemporaryDirectory(prefix="rat-qiling-selftest-") as temp:
+        marker = os.path.join(temp, "started")
+        script = "import pathlib,time; pathlib.Path(%r).write_text('1'); time.sleep(10)" % marker
+        proc = run([sys.executable, "-c", script], timeout_seconds=0.1)
+        assert proc.exit_code == EXIT_TIMEOUT and proc.timed_out and os.path.isfile(marker)
+    print("[rat-qiling] selftest ALL GREEN")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("binary", nargs="?"); p.add_argument("--rootfs")
+    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--instruction-budget", type=int, default=10_000_000)
+    p.add_argument("--selftest", action="store_true")
+    a = p.parse_args(argv)
+    if a.selftest:
+        return selftest()
+    if not a.binary or not a.rootfs or a.timeout <= 0 or a.instruction_budget <= 0:
+        p.error("binary, --rootfs, positive --timeout and --instruction-budget are required")
+    payload = execute(a.binary, a.rootfs, a.timeout, a.instruction_budget)
+    print(json.dumps(payload, sort_keys=True))
+    return payload["exit_code"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

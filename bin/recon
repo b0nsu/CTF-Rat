@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # recon <binary> [libc.so.6] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
-import sys, os, re, subprocess
+import sys, os, re, glob
 from pwn import ELF, context
+from ratlib.runner import run
 context.log_level = 'error'
-def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
+def sh(argv):
+    result = run(argv, timeout_seconds=15, tool_version="system-tool")
+    return result.stdout.preview.decode("utf-8", errors="replace")
 
 def main():
     if len(sys.argv) < 2:
@@ -11,8 +14,8 @@ def main():
     path = sys.argv[1]; libc_path = sys.argv[2] if len(sys.argv) > 2 else None
     try: e = ELF(path, checksec=False)
     except Exception as ex:
-        print("[!] ELF 파싱 실패:", ex); print(sh("file '%s'" % path)); return 1
-    ftype = sh("file '%s'" % path).strip()
+        print("[!] ELF 파싱 실패:", ex); print(sh(["file", "--", path])); return 1
+    ftype = sh(["file", "--", path]).strip()
     syms = set(e.symbols.keys()); plt = set(e.plt.keys()); universe = plt | syms
     def any_of(names): return sorted(n for n in names if n in universe)
     dangerous = any_of({'gets','read','scanf','__isoc99_scanf','__isoc99_sscanf','strcpy','strcat','sprintf','memcpy','fgets','fread'})
@@ -23,7 +26,7 @@ def main():
     has_execve = bool(universe & {'execve','execl','execlp','execvp','posix_spawn','execveat'})
     has_syscall = 'syscall' in universe
     seccomp = bool(universe & {'prctl','seccomp','seccomp_init','seccomp_load','seccomp_rule_add'})
-    strs = sh("strings -n 4 '%s'" % path)
+    strs = sh(["strings", "-n", "4", "--", path])
     binsh = '/bin/sh' in strs
     catflag = bool(re.search(r'cat[ /].*flag|/flag|flag\.txt|flag\{|/home/.*flag', strs))
     # fmt: 정상 printf 문자열 오탐 심함 → 신호 약함으로만 취급 (FAST 근거로 안 씀)
@@ -35,28 +38,29 @@ def main():
     # libc 버전 — GLIBC_2.2.5 심볼버전 오탐 회피: 'release version'/'GLIBC X.Y-' 우선
     lp = libc_path
     if not lp:
-        cand = sh("ls %s/libc*.so* 2>/dev/null" % (os.path.dirname(os.path.abspath(path)) or '.')).split()
+        cand = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(path)) or '.', "libc*.so*")))
         lp = cand[0] if cand else None
     libc_ver = None
     if lp and os.path.exists(lp):
-        s = sh("strings '%s'" % lp)
+        s = sh(["strings", "--", lp])
         m = (re.search(r'release version (\d+\.\d+)', s) or re.search(r'GLIBC (\d+\.\d+)-', s)
              or re.search(r'glibc[ -](\d+\.\d+)', s, re.I))
         if m: libc_ver = m.group(1)
 
     print("="*60)
+    print("[FACT] 직접 ELF/문자열 파싱 관측 (취약점 확정 아님)")
     print("BIN   :", path)
     print("FILE  :", ftype[:120])
     print("PROT  : PIE=%s Canary=%s NX=%s RELRO=%s | stripped=%s funcs=%d" % (
         e.pie, e.canary, e.nx, e.relro, stripped, nfunc))
     print("libc  :", libc_ver or (lp or "미제공"))
-    if winsyms: print("WIN?  :", ", ".join(winsyms[:8]))
-    print("SINK  :", ", ".join(dangerous) or "-", "| fmt계열:", ", ".join(fmtfns) or "-")
+    if winsyms: print("SIGNAL win? :", ", ".join(winsyms[:8]))
+    print("SIGNAL sink :", ", ".join(dangerous) or "-", "| fmt계열:", ", ".join(fmtfns) or "-")
     print("EXEC  : system=%s execve=%s syscall=%s /bin/sh=%s seccomp=%s" % (
         has_system, has_execve, has_syscall, binsh, seccomp))
-    if heapfns: print("HEAP  :", ", ".join(heapfns))
-    if catflag: print("FLAG  : flag 문자열/경로 감지")
-    if vmish:   print("VM?   : interpreter/opcode 문자열 감지")
+    if heapfns: print("SIGNAL heap :", ", ".join(heapfns))
+    if catflag: print("SIGNAL flag : flag 문자열/경로 감지")
+    if vmish:   print("SIGNAL VM?  : interpreter/opcode 문자열 감지")
     if stripped: print("[!] stripped — 심볼기반 신호(win/함수명) 신뢰 불가, triage 확신도 하향")
 
     # ---------- 보수적 triage: 확실할 때만 🟢 ----------
@@ -88,7 +92,7 @@ def main():
            "🟠 HARD":"후순위 (확신 낮음)"}[tier]
     if stripped and tier=="🟢 FAST": tier="🟡 STANDARD"; rec="SOLVE (stripped라 확신 하향)"
     print("-"*60)
-    print("TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
+    print("[ROUTE] TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
     print("  추정 기법:", "; ".join(dict.fromkeys(techs)) or "미상 — decomp 로 vuln 확인")
     print("  근거    :", "; ".join(why) or "정적 신호 부족")
     print("  다음    : decomp %s <func> → vuln 확정 → state.md" % path)

@@ -3,6 +3,17 @@ __pycache__/
 *.pyc
 *.revq.json
 *.decomp/
+.rat-bench/
+.rat/
+**/.rat/
+*.decomp.tmp/
+# P0 runtime/state and ingest staging (local only)
+/ACTIVE.json*
+/.ctfpull-extract-*/
+/downloads/
+/solve_incoming/
+core
+core.*
 # OMC 플러그인 로컬 상태
 .omc/
 # 로컬 시크릿 (CTFd 토큰 등)

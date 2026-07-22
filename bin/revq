@@ -35,11 +35,11 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime, timezone
+from ratlib.runner import run
 
-SCHEMA = 1
+SCHEMA = 2
 
 # ─────────────────────────── 휴리스틱 사전 ───────────────────────────
 # check-루틴을 가리키는 신호. recon 의 SINK 사전과 목적이 다르다(rev = 판별 로직).
@@ -138,7 +138,8 @@ def now_iso():
 def sh(cmd):
     """리스트 인자 실행 → stdout (실패 시 빈 문자열)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True).stdout
+        result = run(cmd, timeout_seconds=30, tool_version="binutils")
+        return result.stdout.preview.decode("utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -154,6 +155,31 @@ def sha256(path):
 
 def cache_path(binpath):
     return binpath + ".revq.json"
+
+
+def annotate_counts(rev):
+    """Expose exact/visible/truncated function counts without conflating aliases."""
+    funcs = rev.get("functions", [])
+    canonical, aliases = set(), {}
+    for func in funcs:
+        # Prefer a concrete address; name is the stable fallback for fast/unknown
+        # entries. This prevents two aliases of one address inflating the count.
+        addr = func.get("addr")
+        key = ("addr", int(addr)) if addr else ("name", func.get("name", "?"))
+        canonical.add(key)
+        aliases.setdefault("%s:%s" % key, []).append(func.get("name", "?"))
+    exact = bool(rev.get("analysis_complete", rev.get("engine") == "angr"))
+    rev["counts"] = {
+        "functions_total": len(canonical),
+        "functions_records": len(funcs),
+        "functions_filtered": int(rev.get("functions_filtered", 0)),
+        "functions_visible": len(canonical),
+        "functions_truncated": 0,
+        "functions_exact": exact,
+        "scope": "discovered non-PLT functions" if rev.get("engine") == "angr" else "defined text symbols only",
+        "aliases": {key: names for key, names in aliases.items() if len(names) > 1},
+    }
+    return rev
 
 
 def parse_int(s):
@@ -213,7 +239,8 @@ def extract_angr(binpath):
         imports = sorted(obj.plt.keys())
 
     functions = []
-    for f in funcs_mgr.values():
+    all_functions = list(funcs_mgr.values())
+    for f in all_functions:
         if f.is_simprocedure or f.is_plt:
             continue
         calls = _func_call_targets(f, funcs_mgr)
@@ -226,11 +253,27 @@ def extract_angr(binpath):
                 ncallers = len(set(callgraph.predecessors(f.addr)))
             except Exception:
                 ncallers = 0
+        try:
+            blocks = list(f.blocks)
+        except Exception:
+            blocks = []
+        instruction_count = 0
+        for block in blocks:
+            count = getattr(block, "instructions", None)
+            if isinstance(count, int):
+                instruction_count += count
+                continue
+            try:
+                instruction_count += len(block.capstone.insns)
+            except Exception:
+                pass
         functions.append({
             "name": f.name,
             "addr": f.addr,
             "size": int(f.size or 0),
-            "ninstr": sum(1 for _ in f.blocks) if hasattr(f, "blocks") else 0,
+            "nblocks": len(blocks),
+            "ninstr": instruction_count,
+            "count_quality": "cfg",
             "calls": calls,
             "strings": fstrs,
             "ncallers": ncallers,
@@ -246,6 +289,8 @@ def extract_angr(binpath):
         "functions": functions,
         "strings": strings,
         "imports": imports,
+        "analysis_complete": True,
+        "functions_filtered": sum(1 for f in all_functions if f.is_simprocedure or f.is_plt),
         "evasion": _file_evasion(binpath, imports, strings, sec_names),
     }
 
@@ -355,7 +400,8 @@ def extract_binutils(binpath):
         if len(parts) == 3 and parts[1] in ("t", "T"):
             addr = parse_int("0x" + parts[0]) if re.fullmatch(r"[0-9a-fA-F]+", parts[0]) else None
             functions.append({"name": parts[2], "addr": addr or 0, "size": 0,
-                              "ninstr": 0, "calls": [], "strings": [], "ncallers": 0})
+                              "nblocks": 0, "ninstr": 0, "count_quality": "unavailable",
+                              "calls": [], "strings": [], "ncallers": 0})
 
     # 문자열 (파일 오프셋; fast 티어는 정밀 vaddr/xref 미제공).
     strings = []
@@ -381,6 +427,8 @@ def extract_binutils(binpath):
         "schema": SCHEMA, "engine": "binutils", "arch": arch, "pie": pie,
         "stripped": stripped, "functions": functions, "strings": strings,
         "imports": imports,
+        "analysis_complete": False,
+        "functions_filtered": 0,
         "evasion": _file_evasion(binpath, imports, strings, sec_names),
     }
 
@@ -436,9 +484,10 @@ def render_summary(rev):
     L = []
     L.append("=" * 64)
     L.append("BIN   : %s" % rev.get("bin", "?"))
+    counts = annotate_counts(rev).get("counts", {})
     L.append("PROF  : engine=%s arch=%s pie=%s stripped=%s | funcs=%d strings=%d imports=%d"
              % (rev["engine"], rev["arch"], rev["pie"], rev["stripped"],
-                len(rev["functions"]), len(rev["strings"]), len(rev["imports"])))
+                counts.get("functions_total", len(rev["functions"])), len(rev["strings"]), len(rev["imports"])))
     imp = set(rev["imports"])
     hot = sorted((imp & CMP_FUNCS) | (imp & INPUT_FUNCS)
                  | {i for i in imp if CRYPTO_HINTS.search(i)}
@@ -497,14 +546,22 @@ def _sorted_funcs(funcs, key):
 
 
 def render_funcs(rev, sort="size", limit=40):
-    L = ["# 함수 %d개 (sort=%s)  개별: revq <bin> --func <name>" % (len(rev["functions"]), sort)]
-    L.append("%-28s %-12s %6s %5s %4s  %s" % ("NAME", "ADDR", "SIZE", "xref", "call", "STR"))
-    for f in _sorted_funcs(rev["functions"], sort)[:limit]:
+    counts = annotate_counts(rev).get("counts", {})
+    rows = _sorted_funcs(rev["functions"], sort)
+    visible = min(len(rows), limit)
+    counts["functions_visible"] = visible
+    counts["functions_truncated"] = max(len(rows) - visible, 0)
+    L = ["# 함수 total=%d visible=%d filtered=%d truncated=%d exact=%s (sort=%s)  개별: revq <bin> --func <name>"
+         % (counts.get("functions_total", len(rows)), visible, counts.get("functions_filtered", 0),
+            counts["functions_truncated"], str(counts.get("functions_exact", False)).lower(), sort)]
+    L.append("%-24s %-12s %6s %5s %5s %5s %4s  %s" %
+             ("NAME", "ADDR", "SIZE", "block", "instr", "xref", "call", "STR"))
+    for f in rows[:limit]:
         addr = ("%#x" % f["addr"]) if f.get("addr") else "-"
         s = ",".join(_q(x) for x in f.get("strings", [])[:2])
-        L.append("%-28s %-12s %6d %5d %4d  %s"
-                 % (f["name"][:28], addr, f.get("size", 0), f.get("ncallers", 0),
-                    len(f.get("calls", [])), s[:40]))
+        L.append("%-24s %-12s %6d %5d %5d %5d %4d  %s"
+                 % (f["name"][:24], addr, f.get("size", 0), f.get("nblocks", 0),
+                    f.get("ninstr", 0), f.get("ncallers", 0), len(f.get("calls", [])), s[:40]))
     return "\n".join(L)
 
 
@@ -544,8 +601,9 @@ def render_func(rev, target):
     f = _find_func(rev, target)
     if not f:
         return "[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % target
-    L = ["== FUNC %s @%#x (size %d, %d instr) ==" % (f["name"], f.get("addr", 0),
-                                                     f.get("size", 0), f.get("ninstr", 0))]
+    L = ["== FUNC %s @%#x (size %d, %d blocks, %d instr; %s) ==" %
+         (f["name"], f.get("addr", 0), f.get("size", 0), f.get("nblocks", 0),
+          f.get("ninstr", 0), f.get("count_quality", "unknown"))]
     L.append("callers: %d" % f.get("ncallers", 0))
     L.append("calls  : " + (", ".join(f.get("calls", [])) or "-"))
     L.append("strings: " + ("; ".join(_q(s) for s in f.get("strings", [])) or "-"))
@@ -594,13 +652,14 @@ def load_or_extract(binpath, want_engine, refresh):
             if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
-                return rev
+                return annotate_counts(rev)
         except Exception:
             pass
     rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
     rev["bin"] = binpath
     rev["sha256"] = cur_sha
     rev["generated_at"] = now_iso()
+    annotate_counts(rev)
     try:
         with open(cp, "w") as f:
             json.dump(rev, f)
@@ -689,14 +748,17 @@ def _fixture():
              "xrefs": [{"func": "main", "addr": 0x1260}]},
         ],
         "functions": [
-            {"name": "main", "addr": 0x1230, "size": 120, "ninstr": 30,
+            {"name": "main", "addr": 0x1230, "size": 120, "nblocks": 5, "ninstr": 30,
+             "count_quality": "cfg",
              "calls": ["__isoc99_scanf", "check", "printf"],
              "strings": ["Enter license: ", "%31s"], "ncallers": 1},
-            {"name": "check", "addr": 0x1180, "size": 90, "ninstr": 24,
+            {"name": "check", "addr": 0x1180, "size": 90, "nblocks": 4, "ninstr": 24,
+             "count_quality": "cfg",
              "calls": ["memcmp", "strlen"],
              "strings": ["Correct! The flag is here", "Wrong password, try again"],
              "ncallers": 1},
-            {"name": "helper_noise", "addr": 0x1300, "size": 40, "ninstr": 12,
+            {"name": "helper_noise", "addr": 0x1300, "size": 40, "nblocks": 2, "ninstr": 12,
+             "count_quality": "cfg",
              "calls": ["malloc"], "strings": [], "ncallers": 3},
         ],
     }
@@ -711,6 +773,17 @@ def selftest():
     print("== revq selftest (순수 로직) ==")
 
     rev = _fixture()
+    annotate_counts(rev)
+    chk(rev["counts"]["functions_total"] == 3, "function total count is canonical")
+    alias_rev = dict(rev)
+    alias_rev["functions"] = list(rev["functions"]) + [dict(rev["functions"][0], name="main_alias")]
+    annotate_counts(alias_rev)
+    chk(alias_rev["counts"]["functions_total"] == 3 and alias_rev["counts"]["aliases"],
+        "function aliases preserved without inflating total")
+    chk("truncated=2" in render_funcs(rev, limit=1), "visible/truncated count")
+    chk(all("nblocks" in f and "ninstr" in f and f["ninstr"] >= f["nblocks"]
+            for f in rev["functions"]), "schema v2 separates instruction and block counts")
+    chk("5 blocks, 30 instr" in render_func(rev, "main"), "function card labels block/instruction counts")
     inter = compute_interesting(rev)
     top = inter[0] if inter else {}
     chk(top.get("func") == "check", "interesting top = check (memcmp+Correct 참조)")
