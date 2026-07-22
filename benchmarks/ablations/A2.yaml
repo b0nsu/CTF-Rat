@@ -1,0 +1,15 @@
+{
+  "schema": "rat.benchmark-ablation/v1",
+  "ablation_id": "A2",
+  "components": [
+    "legacy-bin",
+    "state-v2",
+    "artifact-store",
+    "slice",
+    "dyn",
+    "verify"
+  ],
+  "cold_attempts": 3,
+  "warm_attempts": 1,
+  "oracle": "external-read-only"
+}
