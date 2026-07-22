@@ -1,0 +1,44 @@
+import json, os, pathlib, shutil, subprocess, sys, tempfile, unittest
+
+ROOT=pathlib.Path(__file__).resolve().parents[1]
+BIN=ROOT/"bin"; FIX=ROOT/"tests"/"fixtures"/"analysis"
+sys.path.insert(0,str(BIN))
+from ratlib.schema import validate
+
+@unittest.skipUnless(shutil.which("gcc"), "gcc required for executable P2 fixture")
+class P2Analysis(unittest.TestCase):
+ def setUp(self):
+  self.d=tempfile.TemporaryDirectory(); self.work=pathlib.Path(self.d.name); self.exe=self.work/"toy"
+  subprocess.run(["gcc","-O0","-fno-pie","-no-pie",str(FIX/"toy.c"),"-o",str(self.exe)],check=True)
+  self.sc=self.work/"scenario.json"; self.sc.write_bytes((FIX/"success.scenario.json").read_bytes()); self.store=self.work/"store"
+ def tearDown(self): self.d.cleanup()
+ def tool(self,name,*args,ok=True):
+  p=subprocess.run([str(BIN/name),str(self.exe),"--store",str(self.store),"--format","json",*args],text=True,capture_output=True)
+  if ok: self.assertEqual(p.returncode,0,p.stderr)
+  doc=json.loads(p.stdout); validate(doc, "rat.tool-result/v1"); return p, doc
+ def test_core_profile_slice_dyn_verify(self):
+  _,x=self.tool("rat-profile"); self.assertEqual(x["schema"],"rat.tool-result/v1"); self.assertGreater(x["summary"]["fact_count"],0); profile=x["artifacts"][0]["digest"]
+  _,x=self.tool("rat-slice","--profile",profile,"--from","main","--to","fgets"); self.assertIn(x["status"],("ok","partial"))
+  _,x=self.tool("rat-dyn","--profile",profile,"--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0); trace=x["artifacts"][0]["digest"]
+  _,x=self.tool("rat-verify","--profile",profile,"--trace",trace,"--scenario",str(self.sc),"--runs","3"); self.assertEqual(x["summary"]["verdict"],"pass")
+  changed=self.work/"changed-env.json"; changed.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"OPEN\\n","env":{"RAT_VERIFY_TEST":"changed"},"expect":{"exit_code":0}}))
+  p,x=self.tool("rat-verify","--profile",profile,"--trace",trace,"--scenario",str(changed),ok=False)
+  self.assertEqual(p.returncode,124); self.assertEqual(x["summary"]["verdict"],"inconclusive"); self.assertFalse(x["summary"]["environment_match"])
+ def test_extensions_and_verified_only_rop_gate(self):
+  _,x=self.tool("rat-fuzz","--budget","0.05"); self.assertGreater(x["summary"]["execs"],0)
+  trace=self.work/"heap.json"; trace.write_text(json.dumps({"allocator":"glibc","events":[{"chunk":4096,"target":8192,"encoded_fd":8193}]}))
+  _,x=self.tool("rat-heap","--trace",str(trace)); self.assertEqual(x["summary"]["invariant_violations"],[])
+  p,x=self.tool("rat-rop","--goal","call","--primitive","not-a-pass",ok=False); self.assertEqual(p.returncode,5); self.assertEqual(x["status"],"error")
+  _,x=self.tool("rat-runtime","--backend","native","--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0)
+  _,x=self.tool("rat-runtime","--backend","qemu","--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0)
+  _,x=self.tool("rat-runtime","--backend","qiling","--scenario",str(self.sc)); self.assertEqual(x["status"],"partial")
+  bc=self.work/"vm.bin"; bc.write_bytes(bytes([2,1,0x10,3,5,0x51,255]))
+  _,x=self.tool("rat-vm","--bytecode",str(bc),"--solve"); self.assertEqual(x["summary"]["unknown_opcode"],[])
+ def test_pipeline_rejects_missing_or_mismatched_evidence_and_timeout(self):
+  p=subprocess.run([str(BIN/"rat-dyn"),str(self.exe),"--store",str(self.store),"--format","json","--scenario",str(self.sc)],text=True,capture_output=True)
+  self.assertEqual(p.returncode,2) # parser enforces the profile gate
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  slow=self.work/"slow.json"; slow.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"SLEEP\n"}))
+  p,dyn=self.tool("rat-dyn","--profile",pd,"--scenario",str(slow),"--timeout","0.05",ok=False); self.assertEqual(p.returncode,124)
+  self.assertEqual(dyn["status"],"timeout")
+if __name__=="__main__": unittest.main()

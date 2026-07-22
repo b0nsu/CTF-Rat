@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+import os,sys; sys.path.insert(0,os.path.dirname(os.path.realpath(__file__)))
+from ratlib.analysis import main
+raise SystemExit(main("rat-profile"))
