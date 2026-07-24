@@ -224,26 +224,33 @@ def migrate_v1(challenge_dir=None,dry_run=False):
  if not os.path.exists(old): raise ValueError("STATE.jsonl not found")
  with open(old,"rb") as source: raw=source.read()
  digest="sha256:"+hashlib.sha256(raw).hexdigest()
- if any(e["type"]=="migration.completed" and e["payload"].get("v1_digest")==digest for e in s.read()): return {"idempotent":True,"digest":digest,"mapped":0}
+ events=s.read()
+ if any(e["type"]=="migration.completed" and e["payload"].get("v1_digest")==digest for e in events): return {"idempotent":True,"digest":digest,"mapped":0}
+ # A process can die after writing only part of the v1 mapping.  Each source
+ # line therefore has a deterministic identity; retrying imports only records
+ # the missing lines instead of duplicating history before migration.completed.
+ imported={e["payload"].get("legacy_source_id") for e in events if e.get("actor")=="migration"}
  mapped=[]; bad=[]
  for n,line in enumerate(raw.splitlines(),1):
   try: e=json.loads(line); t=e.get("t"); text=e.get("text","")
   except Exception: bad.append(n); continue
-  prefix="legacy_%s_%d" % (digest[7:19],n)
-  if t=="init": mapped.append(("run.initialized",{"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="offset": mapped.append(("observation.recorded",{"observation_id":prefix,"quality":{"level":"derived"},"validity":{"state":"active"},"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="ok": mapped.append(("finding.revised",{"finding_id":prefix,"state":"supported","evidence_observation_ids":[],"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="hypothesis": mapped.append(("hypothesis.recorded",{"hypothesis_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="primitive": mapped.append(("primitive.revised",{"primitive_id":prefix,"status":"candidate","self_evidence":[],"legacy_status":e.get("status"),"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="no": mapped.append(("route.ruled_out",{"fingerprint":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="alert": mapped.append(("alert.recorded",{"alert_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="next": mapped.append(("next.recorded",{"probe":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="note": mapped.append(("note.recorded",{"note_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
+  prefix="legacy_%s_%d" % (digest[7:19],n); source_id="%s:%d" % (digest,n)
+  provenance={"legacy":e,"legacy_line":n,"legacy_source_id":source_id,"text":text}
+  if t=="init": mapped.append(("run.initialized",provenance))
+  elif t=="offset": mapped.append(("observation.recorded",provenance|{"observation_id":prefix,"quality":{"level":"derived"},"validity":{"state":"active"}}))
+  elif t=="ok": mapped.append(("finding.revised",provenance|{"finding_id":prefix,"state":"supported","evidence_observation_ids":[]}))
+  elif t=="hypothesis": mapped.append(("hypothesis.recorded",provenance|{"hypothesis_id":prefix}))
+  elif t=="primitive": mapped.append(("primitive.revised",provenance|{"primitive_id":prefix,"status":"candidate","self_evidence":[],"legacy_status":e.get("status")}))
+  elif t=="no": mapped.append(("route.ruled_out",provenance|{"fingerprint":prefix}))
+  elif t=="alert": mapped.append(("alert.recorded",provenance|{"alert_id":prefix}))
+  elif t=="next": mapped.append(("next.recorded",provenance|{"probe":prefix}))
+  elif t=="note": mapped.append(("note.recorded",provenance|{"note_id":prefix}))
   else: bad.append(n)
  if not dry_run:
+  mapped=[(typ,p) for typ,p in mapped if p["legacy_source_id"] not in imported]
   for typ,p in mapped: s.append(typ,p,actor="migration")
   if bad:
    malformed=put_bytes(raw,kind="legacy-state-v1",media_type="application/x-ndjson",logical_name="STATE.jsonl",root=s.root)
    s.append("migration.diagnostic",{"v1_digest":digest,"raw_artifact":malformed["digest"],"malformed_lines":bad},actor="migration")
   s.append("migration.completed",{"v1_digest":digest,"last_byte_offset":len(raw),"malformed_lines":bad},actor="migration")
- return {"idempotent":False,"digest":digest,"mapped":len(mapped),"malformed_lines":bad}
+ return {"idempotent":False,"digest":digest,"mapped":len(mapped),"malformed_lines":bad,"resumed":bool(imported)}

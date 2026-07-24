@@ -61,6 +61,26 @@ class P1Contracts(unittest.TestCase):
    view=Stream(d).view()
    self.assertEqual(next(iter(view["findings"].values()))["state"],"supported")
    self.assertEqual(next(iter(view["primitives"].values()))["status"],"candidate")
+ def test_v1_migration_resumes_after_interrupted_import_without_duplicates(self):
+  with tempfile.TemporaryDirectory() as d:
+   legacy=os.path.join(d,"STATE.jsonl")
+   with open(legacy,"w",encoding="utf-8") as f: f.write('{"t":"hypothesis","text":"first"}\n{"t":"hypothesis","text":"second"}\n')
+   raw=pathlib.Path(legacy).read_bytes(); digest="sha256:"+__import__("hashlib").sha256(raw).hexdigest()
+   s=Stream(d)
+   s.append("hypothesis.recorded",{"hypothesis_id":"legacy_%s_1" % digest[7:19],"legacy_source_id":"%s:1" % digest,"legacy_line":1,"legacy":{"t":"hypothesis","text":"first"},"text":"first"},actor="migration")
+   result=migrate_v1(d)
+   self.assertTrue(result["resumed"]); self.assertEqual(result["mapped"],1)
+   self.assertEqual(sorted(x["text"] for x in Stream(d).view()["hypotheses"].values()),["first","second"])
+   self.assertTrue(migrate_v1(d)["idempotent"])
+ def test_state_show_prefers_v2_after_migration(self):
+  with tempfile.TemporaryDirectory() as d:
+   pathlib.Path(d,"STATE.jsonl").write_text('{"t":"hypothesis","text":"legacy hypothesis"}\n')
+   self.assertEqual(migrate_v1(d)["mapped"],1)
+   tool=os.path.join(os.path.dirname(__file__),"..","bin","state")
+   shown=subprocess.run([tool,"--dir",d,"show"],text=True,capture_output=True,check=True)
+   self.assertIn("STATE v2",shown.stdout); self.assertIn("legacy hypothesis",shown.stdout)
+   legacy=subprocess.run([tool,"--dir",d,"show","--legacy"],text=True,capture_output=True,check=True)
+   self.assertNotIn("STATE v2",legacy.stdout)
  def test_adapter_does_not_cache_timeout_or_drop_spooled_stdout(self):
   with tempfile.TemporaryDirectory() as d:
    slow=[sys.executable,"-c","import time; time.sleep(.2)"]

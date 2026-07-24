@@ -89,14 +89,18 @@ def profile(a):
     r=root(a,a.binary); started=iso(); facts=[]; signals=[]; routes=[]
     fileout=command(["file","--",a.binary],a.timeout).stdout.preview.decode(errors="replace").strip()
     readelf=command(["readelf","-hW","-lW","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
-    facts.extend([{"kind":"format","value":fileout,"quality":"direct"},{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
+    is_elf=fileout.startswith("ELF ")
+    facts.append({"kind":"format","value":fileout,"quality":"direct"})
+    if is_elf:
+        facts.extend([{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
     imports=re.findall(r"\b(?:UND\s+)?([_A-Za-z][\w@.]*)$",readelf,re.M)
     strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
     for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
         if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
     if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
     arts=[artifact({"binary_digest":fdigest(a.binary),"environment":profile_environment(a),"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
-    return emit(envelope("rat-profile",a.binary,a,{"format":fileout,"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":"elf-header+program-header+dynamic-symbols","skipped_analyzers":[]},arts,started=started),a)
+    coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
+    return emit(envelope("rat-profile",a.binary,a,{"format":fileout,"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started),a)
 def slice_(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)

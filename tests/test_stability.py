@@ -305,6 +305,15 @@ class DecompCacheTests(unittest.TestCase):
             write_decomp_meta(cache, binary, ghidra, scripts, "partial", "timeout")
             self.assertEqual(validate_decomp_cache(cache, binary, ghidra, scripts), (False, "partial"))
 
+    def test_failed_function_export_cannot_be_marked_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            binary, scripts, ghidra, cache = self.fixture(temp)
+            with open(os.path.join(cache, ".rat-decomp-status.json"), "w") as f:
+                json.dump({"discovered": 2, "exported": 1, "failed": ["00401000"]}, f)
+            write_decomp_meta(cache, binary, ghidra, scripts, "complete")
+            with open(os.path.join(cache, ".rat-cache.json")) as f: meta=json.load(f)
+            self.assertEqual(meta["status"], "partial"); self.assertEqual(meta["failed_functions"], ["00401000"])
+
     def test_decomp_missing_dependency_has_common_exit(self):
         with tempfile.TemporaryDirectory() as temp:
             binary = os.path.join(temp, "binary")

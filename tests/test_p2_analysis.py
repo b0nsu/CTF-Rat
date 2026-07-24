@@ -26,6 +26,12 @@ class P2Analysis(unittest.TestCase):
   changed=self.work/"changed-env.json"; changed.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"OPEN\\n","env":{"RAT_VERIFY_TEST":"changed"},"expect":{"exit_code":0}}))
   p,x=self.tool("rat-verify","--profile",profile,"--trace",trace,"--scenario",str(changed),"--claim","claim","--primitive","primitive","--exploit-task","task",ok=False)
   self.assertEqual(p.returncode,124); self.assertEqual(x["summary"]["verdict"],"inconclusive"); self.assertFalse(x["summary"]["environment_match"])
+ def test_profile_does_not_claim_elf_protections_for_non_elf(self):
+  non_elf=self.work/"sample.pe"; non_elf.write_bytes(b"MZ"+b"\0"*126)
+  p=subprocess.run([str(BIN/"rat-profile"),str(non_elf),"--store",str(self.store),"--format","json"],text=True,capture_output=True,check=True)
+  result=json.loads(p.stdout); profile=json.loads(__import__("ratlib.artifact",fromlist=["get"]).get(result["artifacts"][0]["digest"],root=str(self.store)))
+  self.assertEqual([fact["kind"] for fact in profile["facts"]],["format"])
+  self.assertIn("ELF protection facts skipped",result["summary"]["coverage"])
  def test_verify_rejects_empty_expect_without_oracle(self):
   _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
   empty=self.work/"empty.json"; empty.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"OK\n"}))

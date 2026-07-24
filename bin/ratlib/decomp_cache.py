@@ -77,11 +77,20 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
     if os.path.isfile(index):
         with open(index, encoding="utf-8", errors="replace") as f:
             total = sum(1 for line in f if line.strip())
+    exported = total; discovered = total; failed = []
+    try:
+        with open(os.path.join(cache, ".rat-decomp-status.json"), encoding="utf-8") as f: export_status=json.load(f)
+        discovered=int(export_status.get("discovered", total)); exported=int(export_status.get("exported", total)); failed=list(export_status.get("failed", []))
+    except (OSError, ValueError, TypeError):
+        pass
+    if failed or exported != discovered:
+        status="partial"
+        diagnostics=diagnostics or "function export incomplete"
     payload = {
         "schema": SCHEMA, "key": cache_key(prov), "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(), "provenance": prov,
-        "functions_total": total, "functions_exported": total,
-        "failed_functions": [], "diagnostics": [diagnostics] if diagnostics else [],
+        "functions_total": discovered, "functions_exported": exported,
+        "failed_functions": failed, "diagnostics": [diagnostics] if diagnostics else [],
     }
     os.makedirs(cache, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".rat-cache-", suffix=".tmp", dir=cache)
