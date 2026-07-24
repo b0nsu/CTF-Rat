@@ -31,7 +31,7 @@ class BrokerTests(unittest.TestCase):
    root=os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
    binary=put_bytes(b"not an executable",kind="challenge-binary",media_type="application/octet-stream",logical_name="chall",root=d)
    c=contract(allowed_inputs=[binary["digest"]])
-   with patch("ratlib.broker.run",self.runner):
+   with patch("ratlib.broker.run",self.runner), patch("ratlib.broker.shutil.which",return_value="/usr/bin/bwrap"):
     result=run_authorized(c,[os.path.join(root,"bin","rat-profile"),"--binary","/tmp/attacker"],inputs=[binary["digest"]],bindings={2:binary["digest"]},artifact_root=d,ctf_home=root,challenge_dir=root)
    self.assertTrue(result["authorized"]); self.assertIn("--unshare-net",self.argv); self.assertIn("--ro-bind",self.argv); self.assertIn(os.path.join(d,"materialized",binary["digest"][7:]),self.argv)
    with self.assertRaises(GateError): run_authorized(c,[os.path.join(root,"bin","rat-profile"),"--binary","/tmp/attacker"],inputs=[binary["digest"]],artifact_root=d,ctf_home=root,challenge_dir=root)
