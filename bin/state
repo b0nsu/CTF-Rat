@@ -1,19 +1,78 @@
 #!/usr/bin/env python3
 # 챌린지별 STATE.jsonl (append-only, flock 병렬안전, 사망 내성). LLM이 읽기 좋은 digest.
 import sys, os, json, fcntl, time
-F = "STATE.jsonl"
-def app(ev):
+from ratlib.runner import run
+from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive
+from ratlib.schema import validate, ValidationError
+STATE = "STATE.jsonl"
+CTF_HOME = os.environ.get("CTF_HOME", os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")))
+def active_chal():
+    try:
+        with open(os.path.join(CTF_HOME, "ACTIVE.json"), "r") as f:
+            return json.load(f).get("chal")
+    except Exception:
+        return None
+def solve_name_from_cwd():
+    root = os.path.join(os.path.abspath(CTF_HOME), "solve")
+    cwd = os.path.abspath(os.getcwd())
+    try:
+        rel = os.path.relpath(cwd, root)
+    except ValueError:
+        return None
+    if rel == "." or rel.startswith(".."):
+        return None
+    return rel.split(os.sep, 1)[0]
+def state_file(target=None):
+    if target:
+        p = os.path.abspath(target)
+        if os.path.isdir(p) or not p.endswith(".jsonl"):
+            return os.path.join(p, STATE)
+        return p
+    env = os.environ.get("STATE_PATH")
+    if env:
+        return os.path.abspath(env)
+    cwd = os.path.abspath(os.getcwd())
+    if solve_name_from_cwd():
+        return os.path.join(cwd, STATE)
+    if cwd == os.path.abspath(CTF_HOME):
+        chal = active_chal()
+        if chal:
+            d = os.path.join(CTF_HOME, "solve", chal)
+            if os.path.isdir(d):
+                return os.path.join(d, STATE)
+    return os.path.join(cwd, STATE)
+def path_arg(arg):
+    if not arg:
+        return False
+    return (
+        arg.endswith(".jsonl")
+        or arg.startswith(".")
+        or arg.startswith("/")
+        or os.sep in arg
+        or os.path.isdir(arg)
+    )
+def guard_check(chal):
+    guard = os.path.join(CTF_HOME, "bin", "ctfguard")
+    if os.path.exists(guard):
+        checked = run([guard, "check-newchal", chal], timeout_seconds=5,
+                      tool_version="ctfguard-p0-v1")
+        if checked.exit_code != 0:
+            raise SystemExit(checked.exit_code)
+def app(ev, fpath=None):
     ev["ts"] = int(time.time())
-    with open(F, "a") as fh:
+    fpath = fpath or state_file()
+    os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+    with open(fpath, "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
         fcntl.flock(fh, fcntl.LOCK_UN)
-def show():
-    if not os.path.exists(F):
+def show(fpath=None):
+    fpath = fpath or state_file()
+    if not os.path.exists(fpath):
         print("== STATE: (empty) — `state init <chal>` first =="); return
-    chal = os.path.basename(os.path.abspath(os.getcwd()))
-    offs = {}; ok = []; no = []; nxt = []; notes = []; alerts = []
-    for ln in open(F):
+    chal = os.path.basename(os.path.dirname(os.path.abspath(fpath)))
+    offs = {}; ok = []; no = []; nxt = []; notes = []; alerts = []; hyps = []; prims = []
+    for ln in open(fpath):
         ln = ln.strip()
         if not ln: continue
         try: e = json.loads(ln)
@@ -26,6 +85,8 @@ def show():
         elif t == "next":   nxt.append(e["text"])
         elif t == "note":   notes.append(e["text"])
         elif t == "alert":  alerts.append(e["text"])
+        elif t == "hypothesis": hyps.append(e["text"])
+        elif t == "primitive":  prims.append(e)
     o = ["== STATE: %s ==" % chal]
     if alerts:
         o.append("!! ALERTS (invalidating — RE-PLAN before acting):")
@@ -36,6 +97,18 @@ def show():
     if ok:
         o.append("WORKING (verified primitives/steps):")
         for x in ok: o.append("  [+] " + x)
+    if hyps:
+        o.append("HYPOTHESES (not evidence; cannot be used for chaining until primitive PASS):")
+        for x in hyps: o.append("  [?] " + x)
+    if prims:
+        o.append("PRIMITIVE GATE:")
+        for e in prims:
+            status = e.get("status", "unknown").upper()
+            name = e.get("name", "primitive")
+            ev = e.get("evidence", "")
+            o.append("  [%s] %s%s" % (status, name, " — " + ev if ev else ""))
+    elif hyps:
+        o.append("PRIMITIVE GATE: BLOCKED — hypothesis exists but no primitive PASS recorded")
     if no:
         o.append("RULED OUT (do NOT retry):")
         for x,r in no: o.append("  [-] %s%s" % (x, "  <= %s"%r if r else ""))
@@ -45,34 +118,131 @@ def show():
     if notes:
         o.append("NOTES:")
         for x in notes: o.append("  [.] " + x)
-    if not (offs or ok or no or nxt or notes or alerts): o.append("(no facts yet)")
+    if not (offs or ok or no or nxt or notes or alerts or hyps or prims): o.append("(no facts yet)")
     print("\n".join(o))
 def main():
     a = sys.argv[1:]
-    if not a or a[0] in ("show", "s"): show(); return
+    fpath = None
+    if len(a) >= 2 and a[0] in ("--dir", "--state"):
+        fpath = state_file(a[1]); a = a[2:]
+    if not a:
+        show(fpath); return
+    # P1 typed-state commands.  Legacy commands below deliberately retain their
+    # old JSONL format until an explicit migration is requested.
+    if a[0] == "migrate":
+        if a[1:] not in (["--to-v2"], ["--to-v2", "--dry-run"]):
+            print("usage: state migrate --to-v2 [--dry-run]", file=sys.stderr); raise SystemExit(2)
+        try: print(json.dumps(migrate_v1(os.path.dirname(fpath or state_file()), "--dry-run" in a)))
+        except ValueError as e: print("[state:err] %s" % e, file=sys.stderr); raise SystemExit(2)
+        return
+    if a[0] == "event" and len(a) == 3 and a[1] == "append":
+        try:
+            doc=json.load(open(a[2],encoding="utf-8")); stream=Stream(os.path.dirname(fpath or state_file()))
+            if doc.get("schema") == "rat.observation/v1": validate(doc); ev=stream.append("observation.recorded",doc)
+            elif doc.get("schema") == "rat.finding/v1": validate(doc); ev=revise_finding(stream,doc)
+            elif doc.get("schema") == "rat.primitive/v1": validate(doc); ev=revise_primitive(stream,doc)
+            else: raise ValueError("only observation/finding/primitive documents can be appended")
+            print(json.dumps({"cursor":{"stream_id":ev["stream_id"],"seq":ev["seq"]},"event_id":ev["event_id"]}))
+        except (OSError,ValueError,ValidationError,json.JSONDecodeError) as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
+        return
+    if a[0] in ("finding", "primitive") and len(a) == 3:
+        expected = "rat.finding/v1" if a[0] == "finding" else "rat.primitive/v1"
+        allowed = ({"propose":"proposed", "support":"supported", "confirm":"confirmed", "refute":"refuted", "invalidate":"invalidated"}
+                   if a[0] == "finding" else {"candidate":"candidate", "pass":"pass", "fail":"fail", "block":"blocked"})
+        try:
+            if a[1] not in allowed: raise ValueError("unsupported %s action" % a[0])
+            doc=json.load(open(a[2],encoding="utf-8")); validate(doc, expected)
+            if doc.get("state" if a[0] == "finding" else "status") != allowed[a[1]]: raise ValueError("document state does not match action")
+            stream=Stream(os.path.dirname(fpath or state_file()))
+            ev=revise_finding(stream,doc) if a[0] == "finding" else revise_primitive(stream,doc)
+            print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]}))
+        except (OSError,ValueError,ValidationError,json.JSONDecodeError) as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
+        return
+    if a[0] == "invalidate-evidence" and len(a) >= 2:
+        ev=Stream(os.path.dirname(fpath or state_file())).append("evidence.invalidated", {"observation_ids":a[1:], "reason":"manual invalidation"})
+        print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]})); return
+    if a[0] in ("unknown", "route", "probe") and len(a) >= 2:
+        stream=Stream(os.path.dirname(fpath or state_file())); text=" ".join(a[1:])
+        typ={"unknown":"unknown.recorded", "route":"route.ruled_out", "probe":"next.recorded"}[a[0]]
+        field={"unknown":"unknown_id", "route":"fingerprint", "probe":"probe"}[a[0]]
+        ev=stream.append(typ,{field:a[1],"text":text})
+        print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]})); return
+    if a[0] == "primitive" and len(a) == 5 and a[1] == "consume":
+        try:
+            ev=consume_primitive(Stream(os.path.dirname(fpath or state_file())),a[2],input_digest=a[3],environment_digest=a[4])
+            print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]}))
+        except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
+        return
+    if a[0] == "delta":
+        import argparse
+        p=argparse.ArgumentParser(prog="state delta"); p.add_argument("--after"); p.add_argument("--until"); p.add_argument("--max-bytes",type=int,default=32768); ns=p.parse_args(a[1:])
+        def cur(v): return json.loads(v) if v else None
+        try:
+            ev=Stream(os.path.dirname(fpath or state_file())).delta(cur(ns.after),cur(ns.until)); raw=json.dumps(ev,ensure_ascii=False).encode()
+            if len(raw)>ns.max_bytes: raw=json.dumps({"events":ev[-10:],"truncated":True},ensure_ascii=False).encode()
+            print(raw.decode())
+        except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
+        return
+    if a[0] == "compact":
+        view=Stream(os.path.dirname(fpath or state_file())).view()
+        print(json.dumps({"observations":view["observations"],"findings":view["findings"],"primitives":view["primitives"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
+    if a[0] == "checkpoint" and len(a)>1:
+        if a[1] == "create":
+            import argparse
+            p=argparse.ArgumentParser(); p.add_argument("--phase",required=True); p.add_argument("--task",required=True); p.add_argument("--role",default="local"); p.add_argument("--reason",required=True); ns=p.parse_args(a[2:])
+            print(json.dumps(Stream(os.path.dirname(fpath or state_file())).checkpoint(phase=ns.phase,task_id=ns.task,role=ns.role,reason=ns.reason)))
+            return
+        if a[1] in ("show","materialize") and len(a)==3:
+            path=os.path.join(os.path.dirname(fpath or state_file()),".rat","checkpoints",a[2]+".json")
+            try: print(open(path,encoding="utf-8").read(),end="")
+            except OSError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
+            return
+    if a[0] in ("show", "s"):
+        if len(a) > 1 and path_arg(a[1]):
+            fpath = state_file(a[1])
+        show(fpath); return
     c = a[0]; rest = a[1:]
     if c == "init":
-        app({"t":"init","chal": rest[0] if rest else os.path.basename(os.path.abspath(os.getcwd()))})
-        print("[state] init"); show()
+        chal = rest[0] if rest else os.path.basename(os.path.abspath(os.getcwd()))
+        guard_check(chal)
+        app({"t":"init","chal": chal}, fpath)
+        print("[state] init"); show(fpath)
     elif c == "offset":
         if len(rest) < 2: print("usage: state offset <k> <v> [src]"); return
-        app({"t":"offset","k":rest[0],"v":rest[1],"src":" ".join(rest[2:])})
+        app({"t":"offset","k":rest[0],"v":rest[1],"src":" ".join(rest[2:])}, fpath)
         print("[state] offset %s=%s" % (rest[0], rest[1]))
     elif c == "get":
         if not rest: return
+        if len(rest) > 1 and path_arg(rest[-1]):
+            fpath = state_file(rest[-1]); rest = rest[:-1]
         val=""
-        if os.path.exists(F):
-            for ln in open(F):
+        sf = fpath or state_file()
+        if os.path.exists(sf):
+            for ln in open(sf):
                 try: e=json.loads(ln)
                 except: continue
                 if e.get("t")=="offset" and e.get("k")==rest[0]: val=e.get("v","")
         print(val)
     elif c in ("ok","next","note","alert"):
-        app({"t":c,"text":" ".join(rest)}); print("[state] %s" % c)
+        app({"t":c,"text":" ".join(rest)}, fpath); print("[state] %s" % c)
+    elif c in ("hypothesis", "hyp"):
+        if not rest or not " ".join(rest).strip():
+            print("usage: state hypothesis <text>", file=sys.stderr); raise SystemExit(2)
+        app({"t":"hypothesis","text":" ".join(rest)}, fpath); print("[state] hypothesis")
+    elif c in ("primitive", "prim"):
+        if len(rest) < 2:
+            print("usage: state primitive <name> <pass|fail|blocked> [evidence...]", file=sys.stderr); raise SystemExit(2)
+        status = rest[1].lower(); evidence = " ".join(rest[2:]).strip()
+        if status not in ("pass", "fail", "blocked"):
+            print("[state:err] primitive status must be pass, fail, or blocked", file=sys.stderr); raise SystemExit(2)
+        if status == "pass" and not evidence:
+            print("[state:err] primitive PASS requires concrete evidence", file=sys.stderr); raise SystemExit(2)
+        app({"t":"primitive","name":rest[0],"status":status,"evidence":evidence}, fpath)
+        print("[state] primitive %s=%s" % (rest[0], status))
     elif c in ("no","ruleout"):
         txt = " ".join(rest); reason = ""
         if " -- " in txt: txt, reason = txt.split(" -- ", 1)
-        app({"t":"no","text":txt.strip(),"reason":reason.strip()}); print("[state] ruled out")
+        app({"t":"no","text":txt.strip(),"reason":reason.strip()}, fpath); print("[state] ruled out")
     else:
-        print("cmds: init | offset <k> <v> [src] | ok <t> | no <t> -- <reason> | next <t> | note <t> | alert <t> | show")
+        print("cmds: init | offset <k> <v> [src] | ok <t> | hypothesis <t> | primitive <name> <pass|fail|blocked> [evidence] | no <t> -- <reason> | next <t> | note <t> | alert <t> | show")
 main()

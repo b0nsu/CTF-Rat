@@ -1,0 +1,22 @@
+name: p0-p4-regression
+
+on:
+  pull_request:
+  push:
+    branches: [main, ssttff]
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: python3 tests/e2e_artifact_handoff.py
+      - run: python3 tests/e2e_analysis.py --category core
+      - run: python3 tests/e2e_orchestration.py --scenario converge
+      - run: python3 tests/e2e_orchestration.py --scenario invalidate-cancel
+      - run: bin/pkselftest --format json
+      - run: bin/rat-bench validate-corpus --version v1

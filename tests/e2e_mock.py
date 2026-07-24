@@ -123,9 +123,21 @@ def main():
             check("main_bin=chal", m.get("detected", {}).get("main_bin") == "chal", str(m.get("detected")))
             check("libc 판별", m.get("detected", {}).get("libc") == "libc.so.6", str(m.get("detected")))
             check("ld 판별", m.get("detected", {}).get("ld") == "ld-linux-x86-64.so.2", str(m.get("detected")))
+            check("Dockerfile 판별", m.get("detected", {}).get("dockerfiles") == ["Dockerfile"], str(m.get("detected")))
             check("flag=None", m.get("flag") is None)
             check("file sha256 기록", m["files"] and "sha256" in m["files"][0])
+            check("rat.run/v1 manifest", m.get("schema") == "rat.run/v1", str(m.get("schema")))
+            check("manifest input provenance", all(x.get("sha256", "").startswith("sha256:") and isinstance(x.get("size"), int)
+                                                   for x in m.get("inputs", [])), str(m.get("inputs")))
         check("newchal 명령 출력", "newchal warmup_pwn" in r.stdout and "pwn.demo.io:31337" in r.stdout, r.stdout)
+
+    print("[e2e] --no-extract")
+    with tempfile.TemporaryDirectory() as tmp:
+        r = run_ctfpull(port, "--id", "1", "--no-newchal", "--no-extract", "--dest", tmp)
+        stage = os.path.join(tmp, "warmup_pwn")
+        check("no-extract exit 0", r.returncode == 0, r.stderr)
+        check("archive 유지", os.path.isfile(os.path.join(stage, "handout.zip")))
+        check("archive 내용 미해제", not os.path.exists(os.path.join(stage, "chal")))
 
     print("[e2e] 인증 실패 경로 (토큰 누락)")
     base = "http://127.0.0.1:%d" % port

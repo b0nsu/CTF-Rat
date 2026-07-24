@@ -1,0 +1,19 @@
+name: benchmark-smoke
+
+on:
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  contracts-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest tests.test_benchmark_manifest tests.test_kpi_collector tests.test_ablation_matrix tests.test_regression_gate tests.test_benchmark_smoke
+      - run: bin/rat-bench validate-corpus --version v1
+      - run: bin/rat-bench nightly --lock benchmarks/baselines/baseline.lock.json --dry-run

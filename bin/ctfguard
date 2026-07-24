@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+
+def ctf_home():
+    return os.environ.get(
+        "CTF_HOME",
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")),
+    )
+
+
+def active_path():
+    return os.path.join(ctf_home(), "ACTIVE.json")
+
+
+def load():
+    try:
+        with open(active_path(), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save(obj):
+    tmp = active_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, active_path())
+
+
+def die(msg, code=2):
+    print("ctfguard: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def policy_die(msg):
+    die(msg, code=5)
+
+
+def solve_name_from_cwd():
+    root = os.path.join(os.path.abspath(ctf_home()), "solve")
+    cwd = os.path.abspath(os.getcwd())
+    try:
+        rel = os.path.relpath(cwd, root)
+    except ValueError:
+        return None
+    if rel == "." or rel.startswith(".."):
+        return None
+    return rel.split(os.sep, 1)[0]
+
+
+def canonical_target(*parts):
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return "%s:%s" % (parts[0], parts[1])
+    if len(parts) == 3:
+        return "%s@%s:%s" % (parts[0], parts[1], parts[2])
+    die("bad target format")
+
+
+def target_matches(allowed, requested):
+    if requested in allowed:
+        return True
+    if "@" in requested:
+        hostport = requested.split("@", 1)[1]
+        return hostport in allowed
+    return False
+
+
+def require_active():
+    a = load()
+    if not a:
+        policy_die("no active challenge lock. Run: ctfguard begin <chal> [target...]")
+    return a
+
+
+def check_chal(chal):
+    a = require_active()
+    if a.get("chal") != chal:
+        policy_die("active challenge is %r, refusing to touch %r" % (a.get("chal"), chal))
+    return a
+
+
+def cmd_begin(args):
+    if not args:
+        die("usage: ctfguard begin <chal> [target...]")
+    chal, targets = args[0], args[1:]
+    a = load()
+    if a and a.get("chal") != chal:
+        policy_die(
+            "active challenge is %r. Finish it before starting %r"
+            % (a.get("chal"), chal)
+        )
+    obj = a or {"chal": chal, "targets": [], "started_at": int(time.time())}
+    obj["chal"] = chal
+    obj.setdefault("targets", [])
+    for t in targets:
+        if t not in obj["targets"]:
+            obj["targets"].append(t)
+    save(obj)
+    print("[ctfguard] active=%s targets=%s" % (chal, ",".join(obj["targets"]) or "-"))
+
+
+def cmd_target(args):
+    if not args:
+        die("usage: ctfguard target <target...>")
+    a = require_active()
+    t = canonical_target(*args)
+    a.setdefault("targets", [])
+    if t not in a["targets"]:
+        a["targets"].append(t)
+    save(a)
+    print("[ctfguard] target added: %s" % t)
+
+
+def cmd_check(args):
+    a = require_active()
+    chal = args[0] if args else solve_name_from_cwd()
+    if chal:
+        check_chal(chal)
+    print("[ctfguard] ok active=%s targets=%s" % (a.get("chal"), ",".join(a.get("targets", [])) or "-"))
+
+
+def cmd_check_newchal(args):
+    if not args:
+        die("usage: ctfguard check-newchal <chal>")
+    check_chal(args[0])
+    print("[ctfguard] ok newchal=%s" % args[0])
+
+
+def cmd_check_target(args):
+    if not args:
+        die("usage: ctfguard check-target <target...>")
+    a = require_active()
+    requested = canonical_target(*args)
+    allowed = a.get("targets", [])
+    if not allowed:
+        policy_die("active challenge %r has no allowed targets" % a.get("chal"))
+    if not target_matches(allowed, requested):
+        policy_die(
+            "target %r not in active allowlist for %r: %s"
+            % (requested, a.get("chal"), ", ".join(allowed))
+        )
+    print("[ctfguard] ok target=%s" % requested)
+
+
+def cmd_nc(args):
+    if len(args) < 2:
+        die("usage: ctfguard nc <host> <port> [nc args...]")
+    cmd_check_target(args[:2])
+    os.execvp("nc", ["nc"] + args)
+
+
+def cmd_ssh(args):
+    if len(args) < 3:
+        die("usage: ctfguard ssh <user> <host> <port> [ssh args...]")
+    cmd_check_target(args[:3])
+    user, host, port = args[:3]
+    rest = args[3:]
+    os.execvp("ssh", ["ssh", "-p", port, "%s@%s" % (user, host)] + rest)
+
+
+def cmd_finish(args):
+    status = args[0] if args else "blocked"
+    if status not in ("blocked", "complete"):
+        die("usage: ctfguard finish [blocked|complete]")
+    a = require_active()
+    old = active_path()
+    done = old + ".%s.%d" % (status, int(time.time()))
+    os.replace(old, done)
+    print("[ctfguard] %s: %s (archived %s)" % (status, a.get("chal"), os.path.basename(done)))
+
+
+def cmd_status(args):
+    a = load()
+    if not a:
+        print("[ctfguard] inactive")
+        return
+    print(json.dumps(a, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def main():
+    if len(sys.argv) < 2:
+        die("cmds: begin target check check-newchal check-target nc ssh finish status")
+    cmd, args = sys.argv[1], sys.argv[2:]
+    table = {
+        "begin": cmd_begin,
+        "target": cmd_target,
+        "check": cmd_check,
+        "check-newchal": cmd_check_newchal,
+        "check-target": cmd_check_target,
+        "nc": cmd_nc,
+        "ssh": cmd_ssh,
+        "finish": cmd_finish,
+        "status": cmd_status,
+    }
+    if cmd not in table:
+        die("unknown command %r" % cmd)
+    table[cmd](args)
+
+
+if __name__ == "__main__":
+    main()

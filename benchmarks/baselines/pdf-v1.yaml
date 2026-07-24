@@ -1,0 +1,61 @@
+{
+  "schema": "rat.benchmark-thresholds/v1",
+  "baseline_id": "pdf-v1",
+  "source": {
+    "sha256": "sha256:41244dff6a95bfb6269249b180497dfe745f21bb3b6c4bcadb2b7d250e0f9b95",
+    "document": "CTF-Rat_bin_architecture_upgrade_report_ko_corrected.pdf",
+    "pages": "printed pp.30-31"
+  },
+  "targets": {
+    "verified_solve_at_1": {
+      "relative_min": 0.15,
+      "baseline": "A0",
+      "source": "printed p.30 §17.2"
+    },
+    "median_tts_easy_medium": {
+      "relative_max": -0.25,
+      "source": "printed p.30 §17.2"
+    },
+    "first_primitive_time": {
+      "relative_max": -0.3,
+      "source": "printed p.30 §17.2"
+    },
+    "tokens_per_verified_solve": {
+      "relative_max": -0.25,
+      "source": "printed p.30 §17.2"
+    },
+    "strong_model_token_share": {
+      "max": 0.45,
+      "source": "printed p.30 §17.2"
+    },
+    "duplicate_call_rate": {
+      "max": 0.05,
+      "source": "printed p.30 §17.2"
+    },
+    "cache_hit_rate": {
+      "min": 0.6,
+      "source": "printed p.30 §17.2"
+    },
+    "evidence_coverage": {
+      "min": 0.95,
+      "source": "printed p.30 §17.2"
+    },
+    "false_solve_rate": {
+      "max": 0,
+      "source": "printed p.30 §17.2"
+    },
+    "top3_recall": {
+      "min": 0.85,
+      "source": "printed p.30 §17.2"
+    },
+    "exploit_reliability": {
+      "local_min": 0.95,
+      "remote_min": 0.85,
+      "source": "printed p.31 §17.2"
+    },
+    "context_compression_ratio": {
+      "min": 10,
+      "source": "printed p.31 §17.2"
+    }
+  }
+}
