@@ -9,7 +9,7 @@ import contextlib, fcntl, functools, json, os, signal, threading, time, uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from .artifact import put_bytes
+from .artifact import get, put_bytes
 from .state_v2 import Stream
 
 PHASES = tuple("solve-P%d" % n for n in range(6))
@@ -80,6 +80,20 @@ def _active_attempt(root, phase=None):
         elif event["type"]=="phase.exited" and active==event["payload"]["phase"]:
             active=None; attempt=None
     return attempt if phase is None or active==phase else None
+def _last_attempt(root, phase):
+    """Return the latest epoch entered for a phase, even after it exited."""
+    latest=None
+    for event in Stream(root).read():
+        if event["type"] in ("phase.entered", "phase.rollback", "phase.rolled_back") and event["payload"].get("phase")==phase:
+            latest=event["payload"].get("attempt_id")
+    return latest
+def _lineage(root):
+    """The active evidence epoch; rollback always starts a new lineage."""
+    lineage=None
+    for event in Stream(root).read():
+        if event["type"] in ("phase.entered", "phase.rollback", "phase.rolled_back"):
+            lineage=event["payload"].get("lineage_id",lineage)
+    return lineage
 def _tasks(root):
     d=_task_dir(root); out=[]
     for name in os.listdir(d):
@@ -92,7 +106,7 @@ def _task(root, task_id):
     try: return _read(path),path
     except (OSError, ValueError) as exc: raise GateError("task not found") from exc
 def _checkpoint(root, reason, phase, task_id="orchestrator", role="orchestrator"):
-    return Stream(root).checkpoint(phase=phase, task_id=task_id, role=role, reason=reason)
+    return Stream(root).checkpoint(phase=phase, task_id=task_id, role=role, reason=reason, lineage_id=_lineage(root))
 def _pass_primitives(root):
     return [p for p in Stream(root).view()["primitives"].values() if p.get("status")=="pass"]
 def _primitive(root, primitive_id, input_digest, environment_digest):
@@ -101,7 +115,10 @@ def _primitive(root, primitive_id, input_digest, environment_digest):
     if p.get("input_digest")!=input_digest or p.get("environment_digest")!=environment_digest:
         raise GateError("primitive environment/input mismatch")
     return p
-def _verify_records(root): return [e["payload"] for e in Stream(root).read() if e["type"]=="verification.recorded"]
+def _verify_records(root, lineage_id=None):
+    stale={e["payload"].get("verification_id") for e in Stream(root).read() if e["type"]=="verification.staled"}
+    records=[e["payload"] for e in Stream(root).read() if e["type"]=="verification.recorded" and e["payload"].get("verification_id") not in stale]
+    return records if lineage_id is None else [r for r in records if r.get("lineage_id")==lineage_id]
 def _require_active_evidence(root, evidence_ids):
     if not isinstance(evidence_ids,list) or not evidence_ids or not all(isinstance(i,str) and i for i in evidence_ids): raise GateError("evidence IDs are required")
     observations=Stream(root).view()["observations"]
@@ -137,19 +154,31 @@ def enter(root, phase):
     expected=0 if last is None else PHASES.index(last)+1
     if active is not None or expected>=len(PHASES) or PHASES.index(phase)!=expected: raise GateError("previous phase must exit before the next phase enters")
     if phase=="solve-P4" and not _pass_primitives(root): raise GateError("solve-P4 requires an active primitive PASS")
+    lineage=_lineage(root) or _id("lineage")
     if phase=="solve-P5":
-        completed=[t for t in _tasks(root) if t["phase"]=="solve-P4" and t["role"]=="exploit-builder" and t["status"]=="completed"]
-        if not completed or not any(v.get("verdict")=="pass" and v.get("exploit_task_id") in {t["task_id"] for t in completed} for v in _verify_records(root)):
+        p4_attempt=_last_attempt(root,"solve-P4")
+        completed=[t for t in _tasks(root) if t["phase"]=="solve-P4" and t.get("lineage_id")==lineage and t.get("phase_attempt_id")==p4_attempt and t["role"]=="exploit-builder" and t["status"]=="completed"]
+        if not completed or not any(v.get("verdict")=="pass" and v.get("exploit_task_id") in {t["task_id"] for t in completed} and v.get("exploit_phase_attempt_id")==p4_attempt for v in _verify_records(root,lineage)):
             raise GateError("solve-P5 requires a concrete verification tied to a completed exploit task")
-    Stream(root).append("phase.entered",{"phase":phase,"from":last,"run_id":_run_id(root),"attempt_id":_id("attempt")})
+    Stream(root).append("phase.entered",{"phase":phase,"from":last,"run_id":_run_id(root),"attempt_id":_id("attempt"),"lineage_id":lineage})
     return _checkpoint(root,"phase-enter",phase)
 
 @_serialized
 def rollback(root, phase, reason, invalidates):
     root=_root(root); current=_state(root)
     if phase not in PHASES or current is None or PHASES.index(phase)>=PHASES.index(current) or not invalidates: raise GateError("rollback needs an earlier phase and invalidated evidence")
+    old_lineage=_lineage(root)
     invalidate(root,list(invalidates),reason)
-    Stream(root).append("phase.rollback",{"phase":phase,"from":current,"reason":reason,"invalidates":list(invalidates),"attempt_id":_id("attempt")})
+    for task in _tasks(root):
+        if task.get("lineage_id")==old_lineage and task.get("status") not in {"cancelled","stale"}:
+            if task.get("status")=="running":
+                task["cancellation"]=_terminate_task(task)
+            task.update({"status":"stale","stale_reason":"rollback:%s" % reason,"staled_at":_now()})
+            _write(os.path.join(_task_dir(root),task["task_id"]+".json"),task)
+            Stream(root).append("task.staled",task,task_id=task["task_id"])
+    for verification in _verify_records(root,old_lineage):
+        Stream(root).append("verification.staled",{"verification_id":verification["verification_id"],"reason":"rollback:%s" % reason,"lineage_id":old_lineage})
+    Stream(root).append("phase.rollback",{"phase":phase,"from":current,"reason":reason,"invalidates":list(invalidates),"attempt_id":_id("attempt"),"lineage_id":_id("lineage"),"supersedes_lineage_id":old_lineage})
     return _checkpoint(root,"invalidation",phase)
 
 @_serialized
@@ -161,7 +190,7 @@ def finish_phase(root, phase, terminal=False):
         attempt=_active_attempt(root,phase); reports=_skeptic_reports(root,attempt)
         skeptics=[t for t in _tasks(root) if t["phase"]==phase and t.get("phase_attempt_id")==attempt and t["role"]=="skeptic" and t["status"]=="completed"]
         if len(reports)!=1 or len(skeptics)!=1 or reports[0].get("task_id")!=skeptics[0]["task_id"] or reports[0].get("verdict")!="accept": raise GateError("verified solve requires one completed skeptic task with accept")
-        if not any(v.get("verdict")=="pass" and v.get("exploit_task_id")==reports[0].get("exploit_task_id") for v in _verify_records(root)): raise GateError("verified solve requires linked concrete verification")
+        if not any(v.get("verdict")=="pass" and v.get("exploit_task_id")==reports[0].get("exploit_task_id") for v in _verify_records(root,_lineage(root))): raise GateError("verified solve requires linked concrete verification")
     Stream(root).append("phase.exited",{"phase":phase,"terminal":terminal})
     return _checkpoint(root,"phase-exit",phase)
 
@@ -170,7 +199,7 @@ def start_task(root, contract, *, checkpoint_id, inputs, dependencies=(), primit
     root=_root(root); validate_contract(contract); phase=_state(root)
     if phase!=contract["phase"]: raise GateError("contract phase is not active")
     if dependencies: _require_active_evidence(root,list(dependencies))
-    role=contract["role"]; attempt=_active_attempt(root,phase)
+    role=contract["role"]; attempt=_active_attempt(root,phase); lineage=_lineage(root)
     active=[t for t in _tasks(root) if t["status"]=="running"]; same=[t for t in active if t["phase"]==phase and t.get("phase_attempt_id")==attempt]
     if phase in {"solve-P0","solve-P3","solve-P4"} and same: raise GateError("fan-out forbidden in this phase")
     if phase=="solve-P1":
@@ -179,7 +208,7 @@ def start_task(root, contract, *, checkpoint_id, inputs, dependencies=(), primit
         if role in {"static-scout","dynamic-scout"} and tuple(inputs) in locators: raise GateError("duplicate P1 scout input is forbidden")
     if phase=="solve-P2":
         if role!="hypothesis": raise GateError("solve-P2 work must use hypothesis role")
-        plans=[e["payload"] for e in Stream(root).read() if e["type"]=="fanout.planned"]
+        plans=[e["payload"] for e in Stream(root).read() if e["type"]=="fanout.planned" and e["payload"].get("phase_attempt_id")==attempt]
         if same and not plans: raise GateError("parallel P2 work requires a validated fan-out plan")
         if len(same)>=3: raise GateError("solve-P2 fan-out cap is 3")
         if plans and len(same)>=len(plans[-1]["branches"]): raise GateError("task count exceeds planned branches")
@@ -189,7 +218,8 @@ def start_task(root, contract, *, checkpoint_id, inputs, dependencies=(), primit
         if not all(isinstance(x,str) and x for x in (primitive_id,input_digest,environment_digest)): raise GateError("exploit builder requires primitive and environment provenance")
         _primitive(root,primitive_id,input_digest,environment_digest)
     if role=="skeptic":
-        if not any(v.get("verdict")=="pass" for v in _verify_records(root)): raise GateError("skeptic requires prior concrete verification")
+        p4_attempt=_last_attempt(root,"solve-P4")
+        if not any(v.get("verdict")=="pass" and v.get("exploit_phase_attempt_id")==p4_attempt for v in _verify_records(root,lineage)): raise GateError("skeptic requires prior concrete verification")
     if not checkpoint_id: raise GateError("task requires a fixed input checkpoint")
     cp=os.path.join(root,".rat","checkpoints",checkpoint_id+".json")
     if not os.path.isfile(cp): raise GateError("checkpoint not found")
@@ -198,7 +228,7 @@ def start_task(root, contract, *, checkpoint_id, inputs, dependencies=(), primit
         try:
             if os.getpgid(child_pid)!=child_pid: raise GateError("child PID must be its own process-group leader")
         except ProcessLookupError as exc: raise GateError("child process does not exist") from exc
-    task={"schema":"rat.task-event/v1","task_id":_id("task"),"run_id":_run_id(root),"phase":phase,"phase_attempt_id":attempt,"role":role,"contract":contract,"checkpoint_id":checkpoint_id,"inputs":list(inputs),"dependencies":list(dependencies),"primitive_id":primitive_id,"input_digest":input_digest,"environment_digest":environment_digest,"child_pid":child_pid,"status":"running","started_at":_now(),"budget_used":{}}
+    task={"schema":"rat.task-event/v1","task_id":_id("task"),"run_id":_run_id(root),"phase":phase,"phase_attempt_id":attempt,"lineage_id":lineage,"role":role,"contract":contract,"checkpoint_id":checkpoint_id,"inputs":list(inputs),"dependencies":list(dependencies),"primitive_id":primitive_id,"input_digest":input_digest,"environment_digest":environment_digest,"child_pid":child_pid,"status":"running","started_at":_now(),"budget_used":{}}
     _write(os.path.join(_task_dir(root),task["task_id"]+".json"),task); Stream(root).append("task.started",task,task_id=task["task_id"]); _checkpoint(root,"task-start",phase,task["task_id"],role)
     return task
 
@@ -255,17 +285,17 @@ def plan_fanout(root, branches, trigger, budget):
         fingerprints.append((branch["objective"],tuple(sorted(branch["evidence_ids"]))))
     if len(set(fingerprints))!=len(fingerprints): raise GateError("duplicate branch input is forbidden")
     if not isinstance(budget,dict) or any(not isinstance(budget.get(k),int) or budget[k]<=0 for k in ("remaining","per_branch","converge")) or budget["remaining"]<budget["per_branch"]*len(branches)+budget["converge"]: raise GateError("insufficient fan-out budget")
-    record={"fanout_id":_id("fanout"),"phase":"solve-P2","trigger":trigger,"branches":branches,"budget":budget}; Stream(root).append("fanout.planned",record); _checkpoint(root,"fan-out","solve-P2"); return record
+    record={"fanout_id":_id("fanout"),"phase":"solve-P2","phase_attempt_id":_active_attempt(root,"solve-P2"),"lineage_id":_lineage(root),"trigger":trigger,"branches":branches,"budget":budget}; Stream(root).append("fanout.planned",record); _checkpoint(root,"fan-out","solve-P2"); return record
 @_serialized
 def converge(root, retained, refuted, unknowns, rationale):
     root=_root(root)
     if _state(root)!="solve-P2": raise GateError("converge is only allowed in solve-P2")
     if any(t["phase"]=="solve-P2" and t["status"] in {"running","repair-needed"} for t in _tasks(root)): raise GateError("fan-out must reach terminal tasks before converge")
-    plans=[e["payload"] for e in Stream(root).read() if e["type"]=="fanout.planned"]
+    attempt=_active_attempt(root,"solve-P2"); plans=[e["payload"] for e in Stream(root).read() if e["type"]=="fanout.planned" and e["payload"].get("phase_attempt_id")==attempt]
     valid={b["hypothesis_id"] for b in plans[-1]["branches"]} if plans else set()
     retained,refuted,unknowns=map(set,(retained,refuted,unknowns))
     if not (retained|refuted|unknowns)<=valid or retained&unknowns or not (retained|refuted) or not isinstance(rationale,list) or not rationale: raise GateError("converge must classify planned branches with rationale")
-    report={"schema":"rat.converge-report/v1","converge_id":_id("converge"),"run_id":_run_id(root),"retained":sorted(retained),"refuted":sorted(refuted),"unknowns":sorted(unknowns),"rationale":rationale}; Stream(root).append("fanout.converged",report); _checkpoint(root,"converge","solve-P2"); return report
+    report={"schema":"rat.converge-report/v1","converge_id":_id("converge"),"run_id":_run_id(root),"phase_attempt_id":attempt,"lineage_id":_lineage(root),"retained":sorted(retained),"refuted":sorted(refuted),"unknowns":sorted(unknowns),"rationale":rationale}; Stream(root).append("fanout.converged",report); _checkpoint(root,"converge","solve-P2"); return report
 
 def _terminate_task(task):
     pid=task.get("child_pid")
@@ -302,19 +332,56 @@ def report_skeptic(root, report):
     task,_=_task(root,report["task_id"])
     if task["phase"]!="solve-P5" or task.get("phase_attempt_id")!=attempt or task["role"]!="skeptic" or task["status"]!="completed": raise GateError("skeptic report requires completed skeptic task")
     exploit,_=_task(root,report["exploit_task_id"])
-    if exploit["phase"]!="solve-P4" or exploit["role"]!="exploit-builder" or exploit["status"]!="completed": raise GateError("skeptic report requires completed exploit task")
-    Stream(root).append("skeptic.reported",report|{"phase_attempt_id":attempt},actor="skeptic",task_id=task["task_id"]); _checkpoint(root,"task-end","solve-P5",task["task_id"],"skeptic"); return report
+    if exploit["phase"]!="solve-P4" or exploit["role"]!="exploit-builder" or exploit["status"]!="completed" or exploit.get("lineage_id")!=_lineage(root): raise GateError("skeptic report requires completed exploit task in current lineage")
+    Stream(root).append("skeptic.reported",report|{"phase_attempt_id":attempt,"lineage_id":_lineage(root)},actor="skeptic",task_id=task["task_id"]); _checkpoint(root,"task-end","solve-P5",task["task_id"],"skeptic"); return report
+def _verification_report(root, report_digest):
+    """Load the sole authority for a verification promotion.
+
+    Verification reports are content-addressed artifacts emitted by rat-verify.
+    The orchestration layer intentionally never accepts a caller-supplied
+    verdict: doing so would recreate the exact promotion bypass rat-verify is
+    meant to prevent.
+    """
+    if not isinstance(report_digest,str) or not report_digest.startswith("sha256:"):
+        raise GateError("verification requires an immutable report artifact digest")
+    try:
+        report=json.loads(get(report_digest,root=os.path.join(root,".rat")))
+    except Exception as exc:
+        raise GateError("verification report artifact is missing or invalid") from exc
+    provenance=report.get("provenance")
+    required={"schema","verdict","repetitions","environment_match","scope","provenance","results","producer"}
+    if set(report)!=required or report["schema"]!="rat.verification-report/v1":
+        raise GateError("verification report schema is invalid")
+    if report["verdict"] not in {"pass","fail","inconclusive"} or not isinstance(report["repetitions"],int) or report["repetitions"]<1:
+        raise GateError("verification report verdict or repetitions are invalid")
+    if not isinstance(report["environment_match"],bool) or not isinstance(report["results"],list) or len(report["results"])!=report["repetitions"]:
+        raise GateError("verification report result set is invalid")
+    if not isinstance(provenance,dict) or set(provenance)!={"claim_id","primitive_id","exploit_task_id","trace_digest","environment_digest"}:
+        raise GateError("verification report provenance is invalid")
+    producer=report["producer"]
+    if not isinstance(producer,dict) or set(producer)!={"tool","build_digest"} or producer["tool"]!="rat-verify" or not isinstance(producer["build_digest"],str) or not producer["build_digest"].startswith("sha256:"):
+        raise GateError("verification report producer provenance is invalid")
+    if not all(isinstance(provenance[k],str) and provenance[k] for k in provenance) or not provenance["trace_digest"].startswith("sha256:") or not provenance["environment_digest"].startswith("sha256:"):
+        raise GateError("verification report digest provenance is invalid")
+    return report
+
 @_serialized
-def record_verification(root, verdict, evidence_ids, environment_match=True, *, exploit_task_id=None, primitive_id=None):
-    root=_root(root)
-    if verdict not in {"pass","fail","inconclusive"}: raise GateError("invalid verification verdict")
+def record_verification(root, report_digest, evidence_ids):
+    """Record a verifier-produced result and promote only an authenticated PASS."""
+    root=_root(root); report=_verification_report(root,report_digest); provenance=report["provenance"]
+    verdict=report["verdict"]; task=None
     if verdict=="pass":
-        if not evidence_ids or not environment_match or not exploit_task_id or not primitive_id: raise GateError("verification pass needs evidence, matching environment, exploit and primitive")
+        if not report["environment_match"]: raise GateError("verification PASS requires a matching environment")
         _require_active_evidence(root,list(evidence_ids))
-        task,_=_task(root,exploit_task_id)
-        if task["phase"]!="solve-P4" or task["role"]!="exploit-builder" or task["status"]!="completed" or task.get("primitive_id")!=primitive_id: raise GateError("verification must be linked to completed exploit and its primitive")
-        _primitive(root,primitive_id,task.get("input_digest"),task.get("environment_digest"))
-    record={"verification_id":_id("verify"),"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":environment_match,"exploit_task_id":exploit_task_id,"primitive_id":primitive_id}; Stream(root).append("verification.recorded",record); return record
+        task,_=_task(root,provenance["exploit_task_id"])
+        if task["phase"]!="solve-P4" or task["role"]!="exploit-builder" or task["status"]!="completed" or task.get("primitive_id")!=provenance["primitive_id"]:
+            raise GateError("verification must be linked to completed exploit and its primitive")
+        if task.get("environment_digest")!=provenance["environment_digest"]:
+            raise GateError("verification report environment does not match exploit task")
+        _primitive(root,provenance["primitive_id"],task.get("input_digest"),task.get("environment_digest"))
+    record={"verification_id":_id("verify"),"report_digest":report_digest,"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":report["environment_match"],"exploit_task_id":provenance["exploit_task_id"],"primitive_id":provenance["primitive_id"],"trace_digest":provenance["trace_digest"],"producer_build_digest":report["producer"]["build_digest"],"exploit_phase_attempt_id":task.get("phase_attempt_id") if task else None,"lineage_id":task.get("lineage_id") if task else _lineage(root)}
+    Stream(root).append("verification.recorded",record)
+    return record
 def context_bundle(root, checkpoint_id, phase, budget):
     root=_root(root)
     if phase not in PHASES or not isinstance(budget,int) or budget<=0 or budget>DEFAULT_BUDGET["inline_bytes"]: raise GateError("invalid context request")

@@ -1,13 +1,19 @@
-import os, sys, tempfile, unittest
+import multiprocessing, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
-from ratlib.orchestration import DEFAULT_BUDGET, GateError, enter, finish_phase, finish_task, plan_fanout, start_task, invalidate
+from ratlib.orchestration import DEFAULT_BUDGET, GateError, converge, enter, finish_phase, finish_task, plan_fanout, rollback, start_task, invalidate
 from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
 def contract(role, phase, required=()):
  return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"x","allowed_inputs":[],"required_outputs":list(required),"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
+def _start_parallel(root, checkpoint_id, index, queue):
+ try:
+  task=start_task(root,contract("hypothesis","solve-P2"),checkpoint_id=checkpoint_id,inputs=["branch-%d" % index])
+  queue.put(("ok",task["task_id"]))
+ except GateError as exc:
+  queue.put(("blocked",str(exc)))
 def output(task, outputs=None): return {"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":outputs or {},"evidence_ids":["e0"]}
 def observation(stream, oid):
- rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root)
+ rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root,provenance={"evidence_policy":{"level":"direct","promotion_allowed":True}})
  return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
 def to_p2(d):
  for p in ("solve-P0","solve-P1"):
@@ -41,3 +47,21 @@ class RoleContractTests(unittest.TestCase):
    cp=to_p2(d); task=start_task(d,contract("hypothesis","solve-P2"),checkpoint_id=cp["checkpoint_id"],inputs=["one"],dependencies=["e0"])
    bad={"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":{},"evidence_ids":["missing"]}
    with self.assertRaises(GateError): finish_task(d,task["task_id"],"completed",bad)
+ def test_rollback_does_not_reuse_prior_fanout_attempt(self):
+  with tempfile.TemporaryDirectory() as d:
+   to_p2(d)
+   branches=[{"hypothesis_id":"h1","objective":"one","falsification":"not-one","evidence_ids":["e1"]},{"hypothesis_id":"h2","objective":"two","falsification":"not-two","evidence_ids":["e2"]}]
+   plan_fanout(d,branches,{"uncertainty_set":["h1","h2"],"evidence_ids":["e0"]},{"remaining":100,"per_branch":20,"converge":20})
+   finish_phase(d,"solve-P2"); enter(d,"solve-P3"); rollback(d,"solve-P2","restart",["e0"])
+   with self.assertRaises(GateError): converge(d,["h1"],["h2"],[],[{"evidence_ids":["e1"]}])
+ def test_multiprocess_task_cap_is_atomic(self):
+  with tempfile.TemporaryDirectory() as d:
+   cp=to_p2(d)
+   branches=[{"hypothesis_id":"h%d" % n,"objective":"branch-%d" % n,"falsification":"not-%d" % n,"evidence_ids":["e0"]} for n in range(3)]
+   plan_fanout(d,branches,{"uncertainty_set":["h0","h1","h2"],"evidence_ids":["e0"]},{"remaining":100,"per_branch":20,"converge":20})
+   queue=multiprocessing.Queue(); workers=[multiprocessing.Process(target=_start_parallel,args=(d,cp["checkpoint_id"],n,queue)) for n in range(5)]
+   for worker in workers: worker.start()
+   for worker in workers: worker.join(5); self.assertFalse(worker.is_alive())
+   results=[queue.get(timeout=1) for _ in workers]
+   self.assertEqual(sum(kind=="ok" for kind,_ in results),3)
+   self.assertEqual(sum(kind=="blocked" for kind,_ in results),2)

@@ -1,4 +1,4 @@
-import json, os, sys, tempfile, unittest
+import json, os, pathlib, subprocess, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.artifact import put_bytes, get, verify
 from ratlib.schema import validate, ValidationError
@@ -8,7 +8,7 @@ from ratlib.contracts import execute
 
 D="sha256:"+"a"*64
 def observation(stream, oid, level="direct"):
- rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root)
+ rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root,provenance={"evidence_policy":{"level":level,"promotion_allowed":level=="direct"}})
  return {"observation_id":oid,"quality":{"level":level},"validity":{"state":"active"},"evidence":[rec["digest"]]}
 class P1Contracts(unittest.TestCase):
  def test_artifact_is_content_addressed(self):
@@ -41,6 +41,18 @@ class P1Contracts(unittest.TestCase):
    s=Stream(d)
    s.append("observation.recorded",observation(s,"heuristic","heuristic"))
    with self.assertRaises(ValueError): revise_finding(s,{"finding_id":"f","state":"confirmed","evidence_observation_ids":["heuristic"]})
+ def test_stream_append_cannot_bypass_finding_or_primitive_lifecycle(self):
+  with tempfile.TemporaryDirectory() as d:
+   s=Stream(d); s.append("observation.recorded",observation(s,"o"))
+   with self.assertRaises(ValueError): s.append("finding.revised",{"finding_id":"f","state":"confirmed","evidence_observation_ids":["o"]})
+   with self.assertRaises(ValueError): s.append("primitive.revised",{"primitive_id":"p","status":"pass","self_evidence":["o","o","o"]})
+ def test_evidence_quality_is_derived_from_artifact_policy(self):
+  with tempfile.TemporaryDirectory() as d:
+   s=Stream(d)
+   artifact=put_bytes(b"p2",kind="rat-profile",media_type="application/json",logical_name="result.json",root=s.root,provenance={"evidence_policy":{"level":"heuristic","promotion_allowed":False}})
+   s.append("observation.recorded",{"observation_id":"p2","quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[artifact["digest"]]})
+   self.assertEqual(s.view()["observations"]["p2"]["quality"]["level"],"heuristic")
+   with self.assertRaises(ValueError): revise_finding(s,{"finding_id":"f","state":"confirmed","evidence_observation_ids":["p2"]})
  def test_v1_migration_materializes_legacy_events_without_promoting_pass(self):
   with tempfile.TemporaryDirectory() as d:
    with open(os.path.join(d,"STATE.jsonl"),"w",encoding="utf-8") as f:
@@ -90,4 +102,14 @@ class P1Contracts(unittest.TestCase):
    revise_primitive(s,doc); revise_primitive(s,{**doc,"status":"pass","self_evidence":["o1","o2","o3"]})
    consume_primitive(s,"p",input_digest=D,environment_digest=D)
    self.assertEqual(s.view()["primitives"]["p"]["status"],"consumed")
+ def test_artifact_gc_is_dry_run_by_default_and_keeps_run_manifest_root(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=os.path.join(d,".rat"); kept=put_bytes(b"kept",kind="x",media_type="text/plain",logical_name="kept",root=root); orphan=put_bytes(b"orphan",kind="x",media_type="text/plain",logical_name="orphan",root=root)
+   pathlib.Path(d,"run.json").write_text(json.dumps({"input":kept["digest"]}))
+   tool=os.path.join(os.path.dirname(__file__),"..","bin","rat-artifact")
+   first=subprocess.run([tool,"--root",root,"gc"],text=True,capture_output=True,check=True)
+   self.assertTrue(json.loads(first.stdout)["dry_run"]); self.assertEqual(get(orphan["digest"],root=root),b"orphan")
+   second=subprocess.run([tool,"--root",root,"gc","--apply"],text=True,capture_output=True,check=True)
+   self.assertFalse(json.loads(second.stdout)["dry_run"]); self.assertEqual(get(kept["digest"],root=root),b"kept")
+   with self.assertRaises(FileNotFoundError): get(orphan["digest"],root=root)
 if __name__ == "__main__": unittest.main()

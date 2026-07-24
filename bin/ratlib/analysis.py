@@ -168,11 +168,29 @@ def dyn(a):
     status="timeout" if p.timed_out else ("ok" if p.exit_code==0 else "partial")
     arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc),"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
     return emit(envelope("rat-dyn",a.binary,a,{"exit":p.exit_code,"signal":p.signal,"trace_span":len(events),"hit_counts":{"breakpoint":int(any(e["event"]=="breakpoint" and e.get("hit") for e in events))},"register_observations":len(registers),"memory_observations":0,"last_event":events[-1]["event"],"dropped_events":0,"scenario_step":sc.get("name","run")},arts,status=status,diagnostics=(["wall timeout; last stable event retained"] if p.timed_out else []),code=p.exit_code if not p.timed_out else EXIT_TIMEOUT,started=started),a)
-def _verify_conditions(expected, process):
+def _verify_conditions(expected, process, scenario_doc):
     if "exit_code" in expected and process.exit_code != expected["exit_code"]: return False
     if "stdout_regex" in expected and not re.search(expected["stdout_regex"], process.stdout.preview.decode(errors="replace")): return False
     if "stderr_regex" in expected and not re.search(expected["stderr_regex"], process.stderr.preview.decode(errors="replace")): return False
+    if "file_digests" in expected:
+        files=expected["file_digests"]
+        base=Path(scenario_doc.get("cwd") or os.getcwd()).resolve()
+        if not isinstance(files,dict) or not files: return False
+        for name,digest in files.items():
+            if not isinstance(name,str) or not isinstance(digest,str): return False
+            candidate=(base / name).resolve()
+            if (candidate != base and base not in candidate.parents) or not candidate.is_file() or fdigest(candidate)!=digest: return False
     return not process.timed_out
+
+def _strict_expect(scenario_doc):
+    """Validate the executable oracle shared by verify and VM lifting."""
+    expected=scenario_doc.get("expect",{})
+    allowed={"exit_code","stdout_regex","stderr_regex","file_digests"}
+    if not isinstance(expected,dict) or not expected:
+        raise ValueError("executable oracle requires a non-empty expect condition")
+    if set(expected)-allowed:
+        raise ValueError("unsupported verification condition")
+    return expected
 
 def _oracle_argv(spec):
     """Accept an executable or a JSON argv array; never invoke a shell."""
@@ -193,23 +211,24 @@ def verify(a):
     sc=scenario(a.scenario); reps=max(1,a.runs); results=[]; expected=sc.get("expect",{})
     try:
         oracle_argv=_oracle_argv(a.oracle)
-        allowed={"exit_code","stdout_regex","stderr_regex"}
         if not expected and not oracle_argv: raise ValueError("verification requires scenario expect or --oracle")
-        if expected and (not isinstance(expected,dict) or set(expected)-allowed): raise ValueError("unsupported verification condition")
+        if expected: _strict_expect(sc)
+        if not all(isinstance(getattr(a,key),str) and getattr(a,key) for key in ("claim","primitive","exploit_task")): raise ValueError("verification PASS provenance requires --claim, --primitive, and --exploit-task")
     except (ValueError,json.JSONDecodeError) as exc:
         return emit(envelope("rat-verify",a.binary,a,{},status="error",code=EXIT_POLICY,diagnostics=[str(exc)],started=started),a)
     environment_match=trace.get("environment_digest")==execution_environment(profile,sc)
     for _ in range(reps):
-        p=execute_binary(a.binary,sc,a.timeout); ok=_verify_conditions(expected,p) if expected else True; oracle_result=None
+        p=execute_binary(a.binary,sc,a.timeout); ok=_verify_conditions(expected,p,sc) if expected else True; oracle_result=None
         if oracle_argv:
             payload={"schema":"rat.verification-oracle-input/v1","binary_digest":fdigest(a.binary),"environment_digest":execution_environment(profile,sc),"exit_code":p.exit_code,"timed_out":p.timed_out,"stdout":p.stdout.preview.decode(errors="replace"),"stderr":p.stderr.preview.decode(errors="replace")}
             oracle=command(oracle_argv,a.timeout,stdin=json.dumps(payload,sort_keys=True).encode())
             oracle_result={"argv":oracle.argv,"exit":oracle.exit_code,"timed_out":oracle.timed_out,"stdout":oracle.stdout.preview.decode(errors="replace"),"stderr":oracle.stderr.preview.decode(errors="replace")}
+            oracle_result["artifact"]=artifact(oracle_result,"verification-oracle","oracle.json",r)["digest"]
             ok=ok and not oracle.timed_out and oracle.exit_code==0
         results.append({"exit":p.exit_code,"timed_out":p.timed_out,"conditions_met":ok,"oracle":oracle_result})
     verdict="pass" if environment_match and all(x["conditions_met"] for x in results) else ("inconclusive" if not environment_match or any(x["timed_out"] for x in results) else "fail")
     status="ok" if verdict=="pass" else ("timeout" if verdict=="inconclusive" else "partial")
-    report={"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","provenance":{"claim_id":a.claim,"primitive_id":a.primitive,"exploit_task_id":a.exploit_task,"trace_digest":a.trace,"environment_digest":execution_environment(profile,sc)},"results":results}
+    report={"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","provenance":{"claim_id":a.claim,"primitive_id":a.primitive,"exploit_task_id":a.exploit_task,"trace_digest":a.trace,"environment_digest":execution_environment(profile,sc)},"results":results,"producer":{"tool":"rat-verify","build_digest":POLICY}}
     arts=[artifact(report,"verification-report","verification.json",r)]
     diagnostics=[]
     if not environment_match: diagnostics.append("trace environment does not match this verification scenario")
@@ -227,7 +246,9 @@ def fuzz(a):
             # testcase reproduces three times under the same local scenario.
             reproduced=0
             for _ in range(3):
-                q=command([a.binary],a.timeout,stdin=data)
+                remaining=deadline-time.monotonic()
+                if remaining<=0: break
+                q=command([a.binary],min(a.timeout,max(.01,remaining)),stdin=data)
                 reproduced += int(q.exit_code == p.exit_code and not q.timed_out)
             if reproduced == 3: crashes.setdefault(sig,data)
         elif p.exit_code and not p.timed_out:
@@ -292,7 +313,7 @@ def vm(a):
         try:
             oracle=scenario(a.oracle); oracle["stdin"]=candidate.decode("latin1")
             p=execute_binary(a.binary,oracle,a.timeout); expected=oracle.get("expect",{})
-            verified=not p.timed_out and ("exit_code" not in expected or p.exit_code==expected["exit_code"])
+            verified=_verify_conditions(_strict_expect(oracle),p,oracle)
         except (OSError,ValueError): verified=False
     ops=sorted(set(ops)); candidates=[{"input_hex":candidate.hex(),"verified":verified}] if candidate and verified else []
     arts=[artifact({"opcodes":ops,"unknown":unknown,"dispatch":a.dispatch,"derived_candidate_hex":candidate.hex() if candidate else None,"candidate_verified":verified},"opcode-table","opcodes.json",r)]

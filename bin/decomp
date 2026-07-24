@@ -2,33 +2,188 @@
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 # decomp <binary> [func] — Ghidra headless 1회 전체 디컴파일 캐시 후 함수별 조회 (context 폭발 방지)
 set -euo pipefail
-if [ $# -lt 1 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  echo "Usage: decomp <binary> [func]"
-  exit 1
-fi
-GHIDRA="${GHIDRA_HOME:-}"
-if [ -z "$GHIDRA" ]; then
-  for cand in /opt/ghidra_*_PUBLIC "$HOME"/ctf-tools/ghidra_*_PUBLIC; do
-    if [ -x "$cand/support/analyzeHeadless" ]; then GHIDRA="$cand"; break; fi
-  done
-fi
+GHIDRA="${GHIDRA_HOME:-/opt/ghidra_11.2.1_PUBLIC}"
 SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
-BIN="$(readlink -f "$1")"; FUNC="${2:-}"
+REFRESH=0; TIMEOUT_SEC=120; FORMAT=text; positional=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --refresh) REFRESH=1 ;;
+    --timeout) shift; TIMEOUT_SEC="${1:-}" ;;
+    --format) shift; FORMAT="${1:-}" ;;
+    -h|--help) echo "usage: decomp [--refresh] [--timeout SEC] [--format text|json] BIN [FUNC]"; exit 0 ;;
+    *) positional+=("$1") ;;
+  esac
+  shift
+done
+[ "${#positional[@]}" -ge 1 ] || { echo "usage: decomp [--refresh] [--timeout SEC] [--format text|json] BIN [FUNC]" >&2; exit 2; }
+[[ "$TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo "[!] invalid timeout: $TIMEOUT_SEC" >&2; exit 2; }
+[ "$FORMAT" = text ] || [ "$FORMAT" = json ] || { echo "[!] invalid format: $FORMAT" >&2; exit 2; }
+BIN="$(readlink -f "${positional[0]}")"; FUNC="${positional[1]:-}"
+[ -f "$BIN" ] || { echo "[!] input 없음: ${positional[0]}" >&2; exit 4; }
 CACHE="${BIN}.decomp"
+META_TOOL="$CTF_HOME/bin/ratlib/decomp_cache.py"
+emit_file(){
+  if [ "$FORMAT" = json ]; then
+    python3 - "$1" <<'PY'
+import json,sys
+print(json.dumps({'schema':'rat.decomp-result/v1','status':'ok','source':'decompile','content':open(sys.argv[1],errors='replace').read()}))
+PY
+  else
+    cat "$1"
+  fi
+}
+
+if [ "$REFRESH" -eq 1 ] && [ -d "$CACHE" ]; then
+  mv "$CACHE" "$CACHE.stale.$(date +%s)"
+fi
+if [ -f "$CACHE/_index.txt" ]; then
+  set +e
+  cache_state="$(python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" 2>/dev/null)"
+  cache_rc=$?
+  set -e
+  if [ "$cache_rc" -eq 10 ]; then
+    echo "[!] legacy decomp cache: provenance 없음, read-only partial로 사용" >&2
+    echo "RAT_STATUS=partial RAT_EXIT=0" >&2
+  elif [ "$cache_rc" -ne 0 ]; then
+    echo "[!] decomp cache $cache_state: 재분석 필요" >&2
+    mv "$CACHE" "$CACHE.$cache_state.$(date +%s)"
+  fi
+fi
 if [ ! -f "$CACHE/_index.txt" ]; then
   echo "[*] Ghidra headless 디컴파일 (최초 1회, ~30-90s)..." >&2
+  [ -x "$GHIDRA/support/analyzeHeadless" ] || {
+    echo "[!] Ghidra 없음: GHIDRA_HOME=$GHIDRA" >&2
+    echo "RAT_STATUS=dependency_missing RAT_EXIT=3" >&2
+    exit 3
+  }
   mkdir -p "$CACHE"; proj="$(mktemp -d)"
-  [ -x "$GHIDRA/support/analyzeHeadless" ] || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
-  "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
+  python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" partial --diagnostic "analysis started"
+  set +e
+  timeout --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
      -scriptPath "$SCRIPTDIR" -postScript DecompExport.java "$CACHE" \
-     -deleteProject >/dev/null 2>&1 || { echo "[!] Ghidra 실패 — GHIDRA_HOME 확인"; exit 1; }
+     -deleteProject >"$CACHE/.ghidra.log" 2>&1
+  analysis_rc=$?
+  set -e
+  if [ "$analysis_rc" -ne 0 ]; then
+       cat "$CACHE/.ghidra.log" >&2
+       python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" partial --diagnostic "ghidra exit=$analysis_rc"
+       rm -rf "$proj"
+       if [ "$analysis_rc" -eq 124 ]; then echo "RAT_STATUS=timeout RAT_EXIT=124" >&2; exit 124; fi
+       echo "[!] Ghidra 디컴파일 실패" >&2
+       echo "RAT_STATUS=error RAT_EXIT=70" >&2
+       exit 70
+  fi
   rm -rf "$proj"
+  [ -f "$CACHE/_index.txt" ] || {
+    cat "$CACHE/.ghidra.log" >&2
+    python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" partial --diagnostic "export index missing"
+    echo "[!] Ghidra export 실패" >&2
+    echo "RAT_STATUS=partial RAT_EXIT=70" >&2
+    exit 70
+  }
+  python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" complete
 fi
 if [ -z "$FUNC" ]; then
-  echo "# 함수 목록 (size 내림차순).  개별: decomp <bin> <func>"
-  sort -t$'\t' -k3 -nr "$CACHE/_index.txt" 2>/dev/null | head -60
+  if [ "$FORMAT" = json ]; then
+    python3 - "$CACHE/_index.txt" <<'PY'
+import json,sys
+rows=[]
+for line in open(sys.argv[1], errors='replace'):
+    p=line.rstrip('\n').split('\t')
+    if len(p)>=3: rows.append({'address':p[0], 'name':p[1], 'size':int(p[2])})
+rows.sort(key=lambda x:-x['size'])
+print(json.dumps({'schema':'rat.decomp-list/v1','status':'ok','total':len(rows),'visible':min(len(rows),60),'truncated':max(len(rows)-60,0),'functions':rows[:60]}))
+PY
+  else
+    echo "# 함수 목록 (size 내림차순).  개별: decomp <bin> <func>"
+    sort -t$'\t' -k3 -nr "$CACHE/_index.txt" 2>/dev/null | head -60
+  fi
 else
-  f="$CACHE/${FUNC}.c"
-  [ -f "$f" ] || f="$(ls "$CACHE"/*"$FUNC"*.c 2>/dev/null | head -1)"
-  if [ -f "$f" ]; then cat "$f"; else echo "[!] '$FUNC' 없음. 목록: decomp $BIN"; fi
+  candidates=()
+  [ -f "$CACHE/${FUNC}.c" ] && candidates+=("$CACHE/${FUNC}.c")
+
+  # revq uses angr's PIE load base (usually sub_40xxxx), while Ghidra's
+  # default ELF image base is often FUN_0010xxxx.  Accept either spelling.
+  if [[ "$FUNC" =~ ^(sub_|FUN_)?(0x)?0*([0-9a-fA-F]+)$ ]]; then
+    addr_hex="${BASH_REMATCH[3]}"
+    addr=$((16#$addr_hex))
+    for a in "$addr" "$(( addr >= 0x400000 ? addr - 0x300000 : addr ))"; do
+      printf -v gh "FUN_%08x.c" "$a"
+      [ -f "$CACHE/$gh" ] && candidates+=("$CACHE/$gh")
+      printf -v sub "sub_%x.c" "$a"
+      [ -f "$CACHE/$sub" ] && candidates+=("$CACHE/$sub")
+    done
+  fi
+
+  shopt -s nullglob
+  matches=("$CACHE"/*"$FUNC"*.c)
+  shopt -u nullglob
+  candidates+=("${matches[@]}")
+
+  if [ "${#candidates[@]}" -gt 0 ] && [ -f "${candidates[0]}" ]; then
+    emit_file "${candidates[0]}"
+  elif [[ "$FUNC" =~ ^(sub_|FUN_)?(0x)?0*([0-9a-fA-F]+)$ ]]; then
+    addr_hex="${BASH_REMATCH[3]}"
+    addr=$((16#$addr_hex))
+    # If the caller used angr's PIE base spelling (sub_40xxxx), map it back
+    # to the ELF/Ghidra VMA.  This keeps hidden/undiscovered obfuscated entry
+    # points inspectable even when Ghidra did not create a function there.
+    if [ "$addr" -ge 4194304 ]; then
+      addr=$((addr - 0x300000))
+    fi
+    printf -v gh "FUN_%08x.c" "$addr"
+    if [ -x "$GHIDRA/support/analyzeHeadless" ]; then
+      echo "[*] '$FUNC' 함수 캐시 없음; Ghidra one-shot create/decompile 시도 $(printf '0x%x' "$addr")" >&2
+      proj="$(mktemp -d)"
+      one_log="$CACHE/.ghidra-one-$(printf '%x' "$addr").log"
+      if timeout --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
+          -scriptPath "$SCRIPTDIR" -postScript DecompOne.java "$CACHE" "$(printf '%x' "$addr")" \
+          -deleteProject >"$one_log" 2>&1; then
+        rm -rf "$proj"
+        if [ -f "$CACHE/$gh" ]; then
+          if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$CACHE/$gh"; then
+            echo "[!] Ghidra one-shot 결과 품질 낮음; 캐시 제거 후 disassembly fallback 사용" >&2
+            rm -f "$CACHE/$gh"
+          else
+            emit_file "$CACHE/$gh"
+            exit 0
+          fi
+        fi
+        # A containing function may have been decompiled under a different name.
+        if grep -q "^$(printf '%08x' "$addr")	" "$CACHE/_index.txt" 2>/dev/null; then
+          one_name="$(awk -F '\t' -v a="$(printf '%08x' "$addr")" '$1==a {print $2}' "$CACHE/_index.txt" | tail -1)"
+          if [ -n "$one_name" ] && [ -f "$CACHE/$one_name.c" ]; then
+            if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$CACHE/$one_name.c"; then
+              echo "[!] Ghidra one-shot 결과 품질 낮음; 캐시 제거 후 disassembly fallback 사용" >&2
+              rm -f "$CACHE/$one_name.c"
+            else
+              emit_file "$CACHE/$one_name.c"
+              exit 0
+            fi
+          fi
+        fi
+      else
+        rm -rf "$proj"
+      fi
+      echo "[!] Ghidra one-shot 실패; disassembly fallback 사용 (log: $one_log)" >&2
+    fi
+    start=$((addr > 96 ? addr - 96 : 0))
+    stop=$((addr + 192))
+    echo "[!] '$FUNC' 함수 캐시 없음; disassembly fallback around $(printf '0x%x' "$addr")" >&2
+    echo "RAT_STATUS=fallback RAT_EXIT=0" >&2
+    if [ "$FORMAT" = json ]; then
+      fallback="$(objdump -d --start-address="$start" --stop-address="$stop" "$BIN")"
+      python3 - "$FUNC" "$fallback" <<'PY'
+import json,sys
+print(json.dumps({'schema':'rat.decomp-result/v1','status':'fallback','requested':sys.argv[1],'content':sys.argv[2]}))
+PY
+    else
+      objdump -d --start-address="$start" --stop-address="$stop" "$BIN"
+    fi
+  else
+    echo "[!] '$FUNC' 없음. 목록: decomp $BIN" >&2
+    echo "[*] 비슷한 함수:" >&2
+    grep -i -- "$FUNC" "$CACHE/_index.txt" 2>/dev/null | head -20 >&2 || true
+    exit 1
+  fi
 fi

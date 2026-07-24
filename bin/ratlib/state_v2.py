@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib, json, os, fcntl, uuid
 from datetime import datetime, timezone
 from typing import Any
-from .artifact import get, put_bytes
+from .artifact import get, metadata, put_bytes
 
 EVENT_SCHEMA="rat.state-event/v2"; TRANSITIONS={
  "proposed":{"supported","refuted"}, "supported":{"confirmed","verified","refuted","stale"},
@@ -60,12 +60,38 @@ class Stream:
     for digest in evidence:
      try: get(digest,root=self.root)
      except Exception as exc: raise ValueError("observation evidence artifact is missing or corrupt") from exc
+    if not legacy:
+     policies=[]
+     for digest in evidence:
+      try: policy=metadata(digest,root=self.root).get("provenance",{}).get("evidence_policy",{})
+      except Exception as exc: raise ValueError("observation evidence metadata is missing or corrupt") from exc
+      policies.append(policy)
+     # Quality is a property of immutable producer provenance, never a caller
+     # assertion.  In particular P2's promotion_allowed=false outputs can
+     # never become direct evidence by relabelling an observation.
+     if policies and all(isinstance(p,dict) and p.get("level")=="direct" and p.get("promotion_allowed") is True for p in policies):
+      payload["quality"]={"level":"direct"}
+     elif policies and all(isinstance(p,dict) and p.get("level") in {"direct","derived"} for p in policies):
+      payload["quality"]={"level":"derived"}
+     else:
+      payload["quality"]={"level":"heuristic"}
   elif typ=="finding.revised":
    if not isinstance(payload.get("finding_id"),str) or payload.get("state") not in TRANSITIONS: raise ValueError("finding revision requires id and state")
    if not isinstance(payload.get("evidence_observation_ids",[]),list): raise ValueError("finding evidence must be a list")
+   if not legacy:
+    view=self.view(); old=view["findings"].get(payload["finding_id"]); new=payload["state"]
+    if not old and new!="proposed": raise ValueError("initial finding revision must be proposed")
+    if new!="proposed" and not payload.get("evidence_observation_ids"): raise ValueError("finding requires evidence")
+    if old and new not in TRANSITIONS.get(old["state"],set()): raise ValueError("illegal finding transition")
+    if new=="confirmed" and not any(view["observations"].get(x,{}).get("quality",{}).get("level")=="direct" and view["observations"].get(x,{}).get("validity",{}).get("state")=="active" for x in payload["evidence_observation_ids"]): raise ValueError("confirmed finding needs active direct evidence")
   elif typ=="primitive.revised":
    if not isinstance(payload.get("primitive_id"),str) or payload.get("status") not in {"candidate","pass","fail","blocked","stale"}: raise ValueError("primitive revision requires id and status")
    if not isinstance(payload.get("self_evidence",[]),list): raise ValueError("primitive SELF evidence must be a list")
+   if not legacy:
+    view=self.view(); old=view["primitives"].get(payload["primitive_id"]); new=payload["status"]
+    if not old and new!="candidate": raise ValueError("initial primitive revision must be candidate")
+    if old and (old.get("status"),new) not in {("candidate","pass"),("candidate","fail"),("candidate","blocked"),("pass","stale"),("blocked","candidate"),("stale","candidate")}: raise ValueError("illegal primitive transition")
+    if new=="pass" and (len(payload["self_evidence"])<3 or not all(view["observations"].get(x,{}).get("quality",{}).get("level")=="direct" and view["observations"].get(x,{}).get("validity",{}).get("state")=="active" for x in payload["self_evidence"])): raise ValueError("PASS needs three active direct SELF observations")
   elif typ=="primitive.consumed":
    if not all(isinstance(payload.get(k),str) and payload[k] for k in ("primitive_id","input_digest","environment_digest")): raise ValueError("primitive consumption requires provenance")
   elif typ=="evidence.invalidated":
@@ -145,7 +171,7 @@ class Stream:
   for p in primitives.values():
    if set(p.get("self_evidence",[])) & invalid: p["status"]="stale"
   return {"observations":observations,"findings":findings,"primitives":primitives,"hypotheses":hypotheses,"ruled_out":ruled_out,"unknowns":unknowns,"next_probes":next_probes}
- def checkpoint(self, *, phase, task_id, role, reason, max_bytes=32768):
+ def checkpoint(self, *, phase, task_id, role, reason, max_bytes=32768, lineage_id=None):
   events=self.read(); cur=cursor(events[-1]) if events else {"stream_id":"", "seq":0}; view=self.view()
   active={k:sorted(v) for k,v in view.items() if isinstance(v,dict)}
   small={"cursor":cur, "active":active,
@@ -159,7 +185,7 @@ class Stream:
   previous=[e["payload"].get("checkpoint_id") for e in events if e["type"]=="checkpoint.created"]
   try: run_id=json.load(open(os.path.join(os.path.dirname(self.root),"run.json"),encoding="utf-8"))["run_id"]
   except (OSError,ValueError,KeyError): run_id="local"
-  cp={"schema":"rat.checkpoint/v1","checkpoint_id":_id("checkpoint"),"run_id":run_id,"created_at":now(),"reason":reason,"phase":phase,"task_id":task_id,"role":role,"event_cursor":cur,"active":active,"invalidation_cursor":cur,"context_artifact":context["digest"],"budgets":{},"status":"handoff","verified_findings":[i for i,x in view["findings"].items() if x.get("state") in ("confirmed","verified")],"supported_hypotheses":list(view["hypotheses"]),"ruled_out":list(view["ruled_out"]),"unresolved_unknowns":list(view["unknowns"]),"next_probes":view["next_probes"],"supersedes":previous[-1] if previous else None}
+  cp={"schema":"rat.checkpoint/v1","checkpoint_id":_id("checkpoint"),"run_id":run_id,"created_at":now(),"reason":reason,"phase":phase,"task_id":task_id,"role":role,"lineage_id":lineage_id,"event_cursor":cur,"active":active,"invalidation_cursor":cur,"context_artifact":context["digest"],"budgets":{},"status":"handoff","verified_findings":[i for i,x in view["findings"].items() if x.get("state") in ("confirmed","verified")],"supported_hypotheses":list(view["hypotheses"]),"ruled_out":list(view["ruled_out"]),"unresolved_unknowns":list(view["unknowns"]),"next_probes":view["next_probes"],"supersedes":previous[-1] if previous else None}
   d=os.path.join(self.root,"checkpoints"); os.makedirs(d,exist_ok=True)
   with open(os.path.join(d,cp["checkpoint_id"]+".json"),"w",encoding="utf-8") as f: json.dump(cp,f,sort_keys=True); f.write("\n")
   self.append("checkpoint.created",cp,task_id=task_id); return cp

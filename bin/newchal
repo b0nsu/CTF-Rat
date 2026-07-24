@@ -1,23 +1,102 @@
 #!/usr/bin/env bash
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
-# newchal <name> <binary> [libc.so.6] [host:port] — solve 디렉토리 스캐폴딩
+RATLIB_BIN="$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)"
+# newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]
 set -euo pipefail
-if [ $# -lt 2 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  echo "Usage: newchal <name> <binary> [libc.so.6] [host:port]"
-  exit 1
+if [ "$#" -lt 2 ]; then
+  echo "usage: newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]" >&2
+  exit 2
 fi
-CTF="$CTF_HOME"; NAME="$1"; BIN="$2"; LIBC="${3:-}"; REMOTE="${4:-}"
-D="$CTF/solve/$NAME"; mkdir -p "$D"; cd "$D"
-cp "$BIN" ./ 2>/dev/null || true
-BN="$(basename "$BIN")"
-[ -n "$LIBC" ] && cp "$LIBC" ./libc.so.6 2>/dev/null || true
+CTF="$(readlink -f -- "$CTF_HOME")"; NAME="$1"; BIN="$2"; shift 2
+RUN_SOURCE=""; POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --run)
+      [ "$#" -ge 2 ] || { echo "[newchal:err] --run requires a path" >&2; exit 2; }
+      RUN_SOURCE="$2"; shift 2 ;;
+    --) shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+    -*) echo "[newchal:err] unknown option: $1" >&2; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+[ "${#POSITIONAL[@]}" -le 2 ] || { echo "[newchal:err] too many positional arguments" >&2; exit 2; }
+LIBC="${POSITIONAL[0]:-}"; REMOTE="${POSITIONAL[1]:-}"
+if [ "$NAME" = "." ] || [ "$NAME" = ".." ] || [ "${#NAME}" -gt 128 ] ||
+   [[ ! "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[newchal:err] NAME must be a safe ASCII slug (1-128 chars)" >&2
+  exit 2
+fi
+[ -f "$BIN" ] || { echo "[newchal:err] binary not found: $BIN" >&2; exit 4; }
+if [ -n "$LIBC" ] && [ ! -f "$LIBC" ]; then
+  echo "[newchal:err] libc not found: $LIBC" >&2; exit 4
+fi
+if [ -n "$RUN_SOURCE" ] && [ ! -f "$RUN_SOURCE" ]; then
+  echo "[newchal:err] run manifest not found: $RUN_SOURCE" >&2; exit 4
+fi
+RUN_ABS=""
+if [ -n "$RUN_SOURCE" ]; then
+  RUN_ABS="$(readlink -f -- "$RUN_SOURCE")"
+  PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" <<'PY'
+import sys
+from ratlib.run_manifest import read
+try:
+    read(sys.argv[1])
+except (OSError, ValueError) as exc:
+    print("[newchal:err] invalid incoming run manifest: %s" % exc, file=sys.stderr)
+    raise SystemExit(2)
+PY
+fi
+SOLVE_ROOT="$CTF/solve"; mkdir -p -- "$SOLVE_ROOT"
+SOLVE_ROOT="$(readlink -f -- "$SOLVE_ROOT")"; D="$SOLVE_ROOT/$NAME"
+if [ -L "$D" ]; then
+  echo "[newchal:err] solve destination must not be a symlink: $D" >&2
+  exit 5
+fi
+if [ -n "$RUN_ABS" ] && [ -f "$D/run.json" ]; then
+  PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" <<'PY'
+import sys
+from ratlib.run_manifest import read
+try:
+    incoming, existing = read(sys.argv[1]), read(sys.argv[2])
+except (OSError, ValueError) as exc:
+    print("[newchal:err] existing run manifest: %s" % exc, file=sys.stderr)
+    raise SystemExit(2)
+if incoming["run_id"] != existing["run_id"]:
+    print("[newchal:err] refusing a different run_id for an existing solve directory", file=sys.stderr)
+    raise SystemExit(5)
+PY
+fi
+BIN_ABS="$(readlink -f -- "$BIN" 2>/dev/null || printf '%s' "$BIN")"
+LIBC_ABS=""
+if [ -n "$LIBC" ]; then LIBC_ABS="$(readlink -f -- "$LIBC" 2>/dev/null || printf '%s' "$LIBC")"; fi
+"$CTF/bin/ctfguard" check-newchal "$NAME" >/dev/null
+mkdir -p -- "$D"; D="$(readlink -f -- "$D")"
+case "$D/" in "$SOLVE_ROOT"/*/) ;; *) echo "[newchal:err] destination escaped solve root" >&2; exit 5;; esac
+cd "$D"
+cp -- "$BIN_ABS" ./
+BN="$(basename "$BIN_ABS")"
+if [ -n "$LIBC_ABS" ]; then cp -- "$LIBC_ABS" ./libc.so.6; fi
+SRC_DIR="$(cd -- "$(dirname -- "$BIN_ABS")" && pwd)"
+DOCKER_SRC=""
+for cand in "$SRC_DIR/Dockerfile" "$SRC_DIR/../Dockerfile"; do
+  if [ -f "$cand" ]; then DOCKER_SRC="$cand"; break; fi
+done
+if [ -n "$DOCKER_SRC" ] && [ ! -f ./Dockerfile ]; then
+  cp "$DOCKER_SRC" ./Dockerfile 2>/dev/null || true
+fi
 # pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
 if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
   echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
+  set +e
   timeout 60 pwninit --bin "$BN" --libc ./libc.so.6 --no-template 2>&1 \
-     | grep -vE 'unstripping|launchpad|failed unstripping' || echo "[!] pwninit timeout/실패 → glibc-aio 로 수동 patchelf 필요"
+     | grep -vE 'unstripping|launchpad|failed unstripping'
+  pwninit_rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$pwninit_rc" -ne 0 ]; then
+    echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → glibc-aio 로 수동 patchelf 필요"
+  fi
 fi
-HOST="${REMOTE%%:*}"; PORT="${REMOTE##*:}"
+HOST="${REMOTE%%:*}"; PORT="${REMOTE##*:}"; [ -n "$PORT" ] || PORT=0
 python3 - "$D" "$BN" "$HOST" "$PORT" <<'PY'
 import sys,os
 D,BN,HOST,PORT=sys.argv[1:5]
@@ -45,5 +124,17 @@ io.interactive()
 ''' % (exe, ('libc = ELF("./libc.so.6", checksec=False)\\n' if haslibc else ''), HOST, PORT))
 PY
 sed "s/{{NAME}}/$NAME/; s#{{BIN}}#$BN#; s#{{REMOTE}}#${REMOTE:-'-'}#" "$CTF/solve/_template/state.md" > state.md 2>/dev/null || cp "$CTF/solve/_template/state.md" state.md
-echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC:+./libc.so.6} | tee -a state.md
+PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" <<'PY'
+import sys
+from ratlib.run_manifest import materialize_for_solve
+source, destination, name, binary, libc, remote, owner = sys.argv[1:]
+try:
+    materialize_for_solve(source or None, destination, name=name, binary=binary,
+                          libc=libc or None, remote=remote or None, owner_path=owner)
+except (OSError, ValueError) as exc:
+    print("[newchal:err] run manifest: %s" % exc, file=sys.stderr)
+    raise SystemExit(2)
+PY
+echo "=== libcgate ==="; "$CTF/bin/libcgate" "." | tee -a state.md || true
+echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC_ABS:+./libc.so.6} | tee -a state.md
 echo; echo "[+] $D 생성. 다음: cd $D; decomp ./$BN <func>"
