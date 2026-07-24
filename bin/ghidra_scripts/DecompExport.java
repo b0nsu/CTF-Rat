@@ -30,20 +30,29 @@ public class DecompExport extends GhidraScript {
         FunctionManager fm = currentProgram.getFunctionManager();
         ConsoleTaskMonitor mon = new ConsoleTaskMonitor();
         List<String> idx = new ArrayList<>();
+        List<String> failed = new ArrayList<>();
+        int discovered = 0;
 
         for (Function f : fm.getFunctions(true)) {
+            discovered++;
             try {
                 DecompileResults r = dec.decompileFunction(f, 60, mon);
                 if (r != null && r.decompileCompleted() && r.getDecompiledFunction() != null) {
                     String name = f.getName();
                     String safe = name.replaceAll("[^A-Za-z0-9_.-]", "_");
-                    try (FileWriter fh = new FileWriter(new File(outdir, safe + ".c"))) {
+                    // Entry address is part of the filename: two normalized names
+                    // must never overwrite one another in the cache.
+                    String output = f.getEntryPoint().toString().replaceAll("[^A-Za-z0-9_.-]", "_") + "_" + safe;
+                    try (FileWriter fh = new FileWriter(new File(outdir, output + ".c"))) {
                         fh.write(r.getDecompiledFunction().getC());
                     }
-                    idx.add(f.getEntryPoint().toString() + "\t" + name + "\t" + f.getBody().getNumAddresses());
+                    idx.add(f.getEntryPoint().toString() + "\t" + name + "\t" + f.getBody().getNumAddresses() + "\t" + output);
+                } else {
+                    failed.add(f.getEntryPoint().toString());
                 }
             } catch (Exception ignored) {
                 // Continue exporting other functions even if one decompile fails.
+                failed.add(f.getEntryPoint().toString());
             }
         }
 
@@ -55,6 +64,11 @@ public class DecompExport extends GhidraScript {
                 fh.write(idx.get(i));
             }
         } finally {
+            try (FileWriter fh = new FileWriter(new File(outdir, ".rat-decomp-status.json"))) {
+                fh.write("{\"discovered\":" + discovered + ",\"exported\":" + idx.size() + ",\"failed\":[");
+                for (int i = 0; i < failed.size(); i++) { if (i > 0) fh.write(","); fh.write("\"" + failed.get(i).replace("\"", "\\\"") + "\""); }
+                fh.write("]}\n");
+            }
             dec.dispose();
         }
     }

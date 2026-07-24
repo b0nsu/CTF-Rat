@@ -82,6 +82,15 @@ if [ ! -f "$CACHE/_index.txt" ]; then
     exit 70
   }
   python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" complete
+  set +e
+  python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null
+  cache_post_rc=$?
+  set -e
+  if [ "$cache_post_rc" -eq 12 ]; then
+    echo "[!] 일부 함수 decompile 실패; partial cache로 보존" >&2
+    echo "RAT_STATUS=partial RAT_EXIT=70" >&2
+    exit 70
+  fi
 fi
 if [ -z "$FUNC" ]; then
   if [ "$FORMAT" = json ]; then

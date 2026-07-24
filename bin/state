@@ -66,8 +66,33 @@ def app(ev, fpath=None):
         fcntl.flock(fh, fcntl.LOCK_EX)
         fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
         fcntl.flock(fh, fcntl.LOCK_UN)
-def show(fpath=None):
+def show_v2(fpath):
+    """Render the materialized v2 view while keeping the legacy text shape."""
+    view = Stream(os.path.dirname(os.path.abspath(fpath))).view()
+    chal = os.path.basename(os.path.dirname(os.path.abspath(fpath)))
+    o = ["== STATE v2: %s ==" % chal]
+    offsets=[]
+    for observation in view["observations"].values():
+        legacy=observation.get("legacy", {})
+        if legacy.get("t") == "offset": offsets.append((legacy.get("k"),legacy.get("v"),legacy.get("src", "")))
+    if offsets:
+        o.append("OFFSETS (legacy-derived; re-measure before promotion):")
+        for key,value,source in offsets: o.append("  %s = %s%s" % (key,value,"  [%s]" % source if source else ""))
+    if view["findings"]:
+        o.append("FINDINGS:")
+        for finding in view["findings"].values(): o.append("  [%s] %s" % (finding.get("state","unknown").upper(),finding.get("text",finding.get("finding_id"))))
+    if view["hypotheses"]:
+        o.append("HYPOTHESES:")
+        for hypothesis in view["hypotheses"].values(): o.append("  [?] " + hypothesis.get("text",hypothesis.get("hypothesis_id")))
+    if view["primitives"]:
+        o.append("PRIMITIVE GATE:")
+        for primitive in view["primitives"].values(): o.append("  [%s] %s" % (primitive.get("status","unknown").upper(),primitive.get("primitive_id")))
+    if not (offsets or view["findings"] or view["hypotheses"] or view["primitives"]): o.append("(no v2 facts yet)")
+    print("\n".join(o))
+def show(fpath=None, legacy=False):
     fpath = fpath or state_file()
+    if not legacy and os.path.exists(Stream(os.path.dirname(os.path.abspath(fpath))).path):
+        show_v2(fpath); return
     if not os.path.exists(fpath):
         print("== STATE: (empty) — `state init <chal>` first =="); return
     chal = os.path.basename(os.path.dirname(os.path.abspath(fpath)))
@@ -198,9 +223,12 @@ def main():
             except OSError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
             return
     if a[0] in ("show", "s"):
-        if len(a) > 1 and path_arg(a[1]):
-            fpath = state_file(a[1])
-        show(fpath); return
+        legacy="--legacy" in a[1:]
+        paths=[arg for arg in a[1:] if arg != "--legacy"]
+        if len(paths) > 1 or (paths and not path_arg(paths[0])):
+            print("usage: state show [--legacy] [path]", file=sys.stderr); raise SystemExit(2)
+        if paths: fpath = state_file(paths[0])
+        show(fpath, legacy=legacy); return
     c = a[0]; rest = a[1:]
     if c == "init":
         chal = rest[0] if rest else os.path.basename(os.path.abspath(os.getcwd()))
@@ -217,6 +245,12 @@ def main():
             fpath = state_file(rest[-1]); rest = rest[:-1]
         val=""
         sf = fpath or state_file()
+        stream = Stream(os.path.dirname(os.path.abspath(sf)))
+        if os.path.exists(stream.path):
+            for observation in stream.view()["observations"].values():
+                legacy=observation.get("legacy", {})
+                if legacy.get("t")=="offset" and legacy.get("k")==rest[0]: val=legacy.get("v","")
+            print(val); return
         if os.path.exists(sf):
             for ln in open(sf):
                 try: e=json.loads(ln)

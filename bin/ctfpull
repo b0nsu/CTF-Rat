@@ -334,6 +334,27 @@ def render_newchal_cmd(name, main_bin, libc, conn, run_manifest=None):
     return argv
 
 
+def activate_for_newchal(name, conn):
+    """Make the ingest→scaffold hand-off an explicit guard transaction.
+
+    ``newchal`` correctly rejects an absent/different active challenge.  The
+    old convenience path called it without first acquiring that lock, so a
+    normal ``ctfpull --id`` could stage successfully and then fail late.
+    """
+    guard = os.path.join(CTF_HOME, "bin", "ctfguard")
+    if not os.path.isfile(guard):
+        guard = shutil.which("ctfguard")
+    if not guard:
+        die("ctfguard missing; use --no-newchal to stage only", code=3)
+    argv=[guard, "begin", name]
+    if conn: argv.append(conn)
+    completed=run_bounded(argv, timeout_seconds=10, tool_version="ctfguard-ingest-v1")
+    if completed.stdout.preview: sys.stderr.buffer.write(completed.stdout.preview)
+    if completed.stderr.preview: sys.stderr.buffer.write(completed.stderr.preview)
+    if completed.exit_code != 0:
+        die("ctfguard could not activate %s (exit=%d); use --no-newchal to stage only" % (name, completed.exit_code), completed.exit_code)
+
+
 def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newchal,
               archive_policy=DEFAULT_POLICY, extract=True):
     detail = api_get(base, "/api/v1/challenges/%s" % chal_id, token, cookie, insecure)
@@ -396,6 +417,7 @@ def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newcha
 
     argv = render_newchal_cmd(name, main_bin, libc, conn, staging_manifest)
     if run_newchal and shutil.which("newchal"):
+        activate_for_newchal(name, conn)
         info("newchal 실행: %s" % " ".join(argv))
         scaffold_env = {key: os.environ[key] for key in
                         ("CTF_HOME", "HOME", "GHIDRA_HOME", "XDG_CACHE_HOME") if key in os.environ}
