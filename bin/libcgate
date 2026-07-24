@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+libcgate - audit libc/loader provenance before blaming a remote mismatch.
+
+Usage:
+  libcgate [challenge-dir]
+  libcgate --selftest
+
+This is intentionally offline. It does not build Docker images; it reports
+whether the current challenge directory has enough runtime evidence and prints
+the heap/tcache checks that must precede a "remote libc differs" conclusion.
+"""
+import argparse
+import hashlib
+import os
+import re
+import sys
+import tempfile
+
+
+LIBC_RE = re.compile(r"^(?:libc(?:[-_].*)?\.so(?:\.\d+)*|libc[-_].*\.so(?:\.\d+)*)$")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_bytes(path, limit=4 * 1024 * 1024):
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit)
+    except OSError:
+        return b""
+
+
+def printable_chunks(data):
+    # Good enough for glibc version strings without shelling out to strings(1).
+    out = []
+    cur = bytearray()
+    for b in data:
+        if 32 <= b < 127:
+            cur.append(b)
+        else:
+            if len(cur) >= 4:
+                out.append(bytes(cur).decode("ascii", "ignore"))
+            cur.clear()
+    if len(cur) >= 4:
+        out.append(bytes(cur).decode("ascii", "ignore"))
+    return "\n".join(out)
+
+
+def libc_version(path):
+    s = printable_chunks(read_bytes(path))
+    m = (
+        re.search(r"release version ([0-9]+\.[0-9]+)", s)
+        or re.search(r"GNU C Library .*? release version ([0-9]+\.[0-9]+)", s)
+        or re.search(r"glibc[ -]([0-9]+\.[0-9]+)", s, re.I)
+        or re.search(r"GLIBC ([0-9]+\.[0-9]+)-", s)
+    )
+    return m.group(1) if m else None
+
+
+def find_files(root):
+    dockerfiles = []
+    libcs = []
+    loaders = []
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        rel_depth = os.path.relpath(cur, root).count(os.sep)
+        if rel_depth > 2:
+            dirs[:] = []
+        for fn in files:
+            p = os.path.join(cur, fn)
+            base = os.path.basename(fn)
+            if base == "Dockerfile":
+                dockerfiles.append(p)
+            elif LIBC_RE.match(base):
+                libcs.append(p)
+            elif base.startswith("ld-") or base.startswith("ld-linux"):
+                loaders.append(p)
+    return sorted(dockerfiles), sorted(libcs), sorted(loaders)
+
+
+def from_line(path):
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            if line.strip().upper().startswith("FROM "):
+                return line.strip()
+    except OSError:
+        pass
+    return None
+
+
+def describe(path):
+    real = os.path.realpath(path)
+    symlink = os.path.islink(path)
+    bits = [os.path.relpath(path)]
+    if symlink:
+        bits.append("symlink->%s" % os.readlink(path))
+    try:
+        bits.append("sha256=%s" % sha256(real)[:16])
+    except OSError:
+        bits.append("sha256=?")
+    ver = libc_version(real)
+    if ver:
+        bits.append("glibc=%s" % ver)
+    return " ".join(bits)
+
+
+def same_file(a, b):
+    try:
+        return sha256(os.path.realpath(a)) == sha256(os.path.realpath(b))
+    except OSError:
+        return False
+
+
+def audit(root):
+    root = os.path.abspath(root)
+    old = os.getcwd()
+    os.chdir(root)
+    try:
+        dockerfiles, libcs, loaders = find_files(".")
+        lines = ["== libcgate: %s ==" % root]
+        warnings = []
+        notes = []
+
+        if dockerfiles:
+            lines.append("Dockerfile:")
+            for p in dockerfiles:
+                src = from_line(p)
+                lines.append("  - %s%s" % (os.path.relpath(p), "  [%s]" % src if src else ""))
+            notes.append("Dockerfile present: built image is authoritative for libc, loader, env, cwd, user, and wrapper.")
+        else:
+            lines.append("Dockerfile: none found")
+            notes.append("No Dockerfile found: use supplied libc/ld when present; glibc-fetch is only a fallback.")
+
+        lines.append("libc candidates:")
+        if libcs:
+            for p in libcs:
+                lines.append("  - " + describe(p))
+        else:
+            lines.append("  - none")
+            if dockerfiles:
+                warnings.append("Dockerfile exists but no extracted libc candidate was found in this directory.")
+
+        lines.append("loader candidates:")
+        if loaders:
+            for p in loaders:
+                lines.append("  - " + describe(p))
+                if os.path.islink(p):
+                    link = os.readlink(p)
+                    real = os.path.realpath(p)
+                    if link.startswith(("/lib/", "/usr/lib/")) or real.startswith(("/lib/", "/usr/lib/")):
+                        warnings.append("%s points at host loader %s; extract the loader from the Docker image for proof." % (os.path.relpath(p), link))
+        else:
+            lines.append("  - none")
+            if dockerfiles:
+                warnings.append("Dockerfile exists but no extracted ld-linux candidate was found in this directory.")
+
+        by_base = {os.path.basename(p): p for p in libcs}
+        if "libc.so.6" in by_base and "libc_docker.so.6" in by_base:
+            if same_file(by_base["libc.so.6"], by_base["libc_docker.so.6"]):
+                notes.append("libc.so.6 matches libc_docker.so.6 by sha256.")
+            else:
+                warnings.append("libc.so.6 differs from libc_docker.so.6; pick one authoritative runtime libc and record why.")
+
+        lines.append("verdict:")
+        for w in warnings:
+            lines.append("  WARN: " + w)
+        for n in notes:
+            lines.append("  NOTE: " + n)
+        lines.append("  GATE: Before claiming remote libc mismatch, verify Docker-loopback behavior or leak/hash/build-id evidence.")
+        lines.append("  GATE: For heap/tcache failures, first prove tcache count/head/fd and safe-linking encoding on the exact malloc/free sequence.")
+        return "\n".join(lines), 1 if warnings else 0
+    finally:
+        os.chdir(old)
+
+
+def selftest():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "Dockerfile"), "w") as f:
+            f.write("FROM ubuntu:22.04\n")
+        with open(os.path.join(d, "libc.so.6"), "wb") as f:
+            f.write(b"GNU C Library stable release version 2.35\x00")
+        os.symlink("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", os.path.join(d, "ld-linux-x86-64.so.2"))
+        out, rc = audit(d)
+        assert "Dockerfile present" in out
+        assert "glibc=2.35" in out
+        assert "host loader" in out
+        assert rc == 1
+    print("[libcgate] selftest ALL GREEN")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", nargs="?", default=".")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+        return 0
+    out, rc = audit(args.path)
+    print(out)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
