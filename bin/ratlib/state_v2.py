@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib, json, os, fcntl, uuid
 from datetime import datetime, timezone
 from typing import Any
-from .artifact import put_bytes
+from .artifact import get, put_bytes
 
 EVENT_SCHEMA="rat.state-event/v2"; TRANSITIONS={
  "proposed":{"supported","refuted"}, "supported":{"confirmed","verified","refuted","stale"},
@@ -39,10 +39,49 @@ class Stream:
  def _valid(self,e):
   req={"schema","stream_id","seq","event_id","at","actor","task_id","type","payload","caused_by"}
   if set(e)!=req or e["schema"]!=EVENT_SCHEMA or not isinstance(e["seq"],int): raise ValueError("invalid state event")
+ def _validate_payload(self, typ, payload, events, actor):
+  """Keep the direct API on the same typed path as the ``state`` CLI.
+
+  Old v1 migrations are intentionally admitted as derived legacy records; all
+  newly-produced observations must carry content-addressed evidence.
+  """
+  if not isinstance(typ,str) or not isinstance(payload,dict): raise ValueError("state event type and payload must be objects")
+  legacy=actor=="migration"
+  if typ=="observation.recorded":
+   if not isinstance(payload.get("observation_id"),str) or not payload["observation_id"]: raise ValueError("observation requires observation_id")
+   quality,validity=payload.get("quality"),payload.get("validity")
+   if not isinstance(quality,dict) or quality.get("level") not in {"direct","derived","heuristic"}: raise ValueError("observation requires valid quality")
+   if not isinstance(validity,dict) or validity.get("state")!="active": raise ValueError("observation must start active")
+   if any(e["type"]==typ and e["payload"].get("observation_id")==payload["observation_id"] for e in events): raise ValueError("observation_id is immutable and cannot be reused")
+   evidence=payload.get("evidence")
+   if not legacy and (not isinstance(evidence,list) or not evidence): raise ValueError("observation requires evidence artifact digests")
+   if evidence is not None:
+    if not isinstance(evidence,list) or not all(isinstance(d,str) for d in evidence): raise ValueError("observation evidence must be a digest list")
+    for digest in evidence:
+     try: get(digest,root=self.root)
+     except Exception as exc: raise ValueError("observation evidence artifact is missing or corrupt") from exc
+  elif typ=="finding.revised":
+   if not isinstance(payload.get("finding_id"),str) or payload.get("state") not in TRANSITIONS: raise ValueError("finding revision requires id and state")
+   if not isinstance(payload.get("evidence_observation_ids",[]),list): raise ValueError("finding evidence must be a list")
+  elif typ=="primitive.revised":
+   if not isinstance(payload.get("primitive_id"),str) or payload.get("status") not in {"candidate","pass","fail","blocked","stale"}: raise ValueError("primitive revision requires id and status")
+   if not isinstance(payload.get("self_evidence",[]),list): raise ValueError("primitive SELF evidence must be a list")
+  elif typ=="primitive.consumed":
+   if not all(isinstance(payload.get(k),str) and payload[k] for k in ("primitive_id","input_digest","environment_digest")): raise ValueError("primitive consumption requires provenance")
+  elif typ=="evidence.invalidated":
+   if not isinstance(payload.get("observation_ids"),list) or not payload["observation_ids"] or not isinstance(payload.get("reason"),str) or not payload["reason"].strip(): raise ValueError("evidence invalidation requires IDs and reason")
+  elif typ=="hypothesis.recorded":
+   if not isinstance(payload.get("hypothesis_id"),str) or not payload["hypothesis_id"]: raise ValueError("hypothesis requires hypothesis_id")
+  elif typ=="unknown.recorded":
+   if not isinstance(payload.get("unknown_id"),str) or not payload["unknown_id"]: raise ValueError("unknown requires unknown_id")
+  elif typ=="route.ruled_out":
+   if not isinstance(payload.get("fingerprint"),str) or not payload["fingerprint"]: raise ValueError("route requires fingerprint")
+  elif typ=="next.recorded":
+   if not isinstance(payload.get("probe"),str) or not payload["probe"]: raise ValueError("next probe requires probe")
  def append(self, typ, payload, *, actor="local", task_id="local", caused_by=None):
   os.makedirs(os.path.dirname(self.path),mode=0o700,exist_ok=True)
   with open(self.path,"a+",encoding="utf-8") as f:
-   fcntl.flock(f,fcntl.LOCK_EX); f.seek(0); events=[]; sid=None
+   fcntl.flock(f,fcntl.LOCK_EX); f.seek(0); events=[]; sid=None; last_valid_offset=0
    lines=list(f)
    for n,line in enumerate(lines,1):
     try:
@@ -51,10 +90,16 @@ class Stream:
      if e["stream_id"] != sid or e["seq"] != len(events)+1:
       raise ValueError("non-monotonic state stream")
      events.append(e)
+     last_valid_offset += len(line.encode("utf-8"))
     except (ValueError,json.JSONDecodeError) as exc:
-     if n == len(lines) and not line.endswith("\n"): break
+     # Recover an interrupted final append while holding the stream lock.
+     # Otherwise a later JSON record would be appended to these bytes and
+     # permanently corrupt the state stream.
+     if n == len(lines) and not line.endswith("\n"):
+      f.seek(last_valid_offset); f.truncate(); f.flush(); os.fsync(f.fileno()); break
      fcntl.flock(f,fcntl.LOCK_UN)
      raise ValueError("invalid state event at line %d: %s" % (n, exc)) from exc
+   self._validate_payload(typ,payload,events,actor)
    e={"schema":EVENT_SCHEMA,"stream_id":sid or _id("stream"),"seq":len(events)+1,"event_id":_id("evt"),"at":now(),"actor":actor,"task_id":task_id,"type":typ,"payload":payload,"caused_by":caused_by or []}
    f.seek(0,2); f.write(json.dumps(e,sort_keys=True,separators=(",",":"))+"\n"); f.flush(); os.fsync(f.fileno()); fcntl.flock(f,fcntl.LOCK_UN)
   self._update_manifest(e, payload.get("checkpoint_id") if typ=="checkpoint.created" else None)
@@ -83,6 +128,9 @@ class Stream:
    if t=="observation.recorded": observations[p["observation_id"]]=p
    elif t=="finding.revised": findings[p["finding_id"]]=p
    elif t=="primitive.revised": primitives[p["primitive_id"]]=p
+   elif t=="primitive.consumed" and p["primitive_id"] in primitives:
+    primitive=primitives[p["primitive_id"]]
+    if primitive.get("input_digest")==p["input_digest"] and primitive.get("environment_digest")==p["environment_digest"]: primitive["status"]="consumed"
    elif t=="hypothesis.recorded": hypotheses[p.get("hypothesis_id",e["event_id"])]=p
    elif t=="route.ruled_out": ruled_out[p.get("fingerprint",e["event_id"])]=p
    elif t=="unknown.recorded": unknowns[p.get("unknown_id",e["event_id"])]=p

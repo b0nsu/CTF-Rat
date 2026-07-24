@@ -2,17 +2,21 @@ import os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
 from ratlib.orchestration import (DEFAULT_BUDGET, GateError, _state, enter, finish_phase,
     finish_task, record_verification, report_skeptic, rollback, start_task)
+from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream, revise_primitive
 D="sha256:"+"a"*64
 def contract(role, phase):
  return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"test","allowed_inputs":[],"required_outputs":[],"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
 def output(task): return {"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":{},"evidence_ids":["obs"]}
+def observation(stream, oid):
+ rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root)
+ return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
 def advance(root, phase):
  cp=enter(root,phase); finish_phase(root,phase); return cp
 class PhaseValidatorTests(unittest.TestCase):
  def passed_primitive(self, root):
   s=Stream(root)
-  for oid in ("o1","o2","o3"): s.append("observation.recorded",{"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"}})
+  for oid in ("o1","o2","o3","obs"): s.append("observation.recorded",observation(s,oid))
   revise_primitive(s,{"primitive_id":"p","status":"candidate","self_evidence":[],"input_digest":D,"environment_digest":D})
   revise_primitive(s,{"primitive_id":"p","status":"pass","self_evidence":["o1","o2","o3"],"input_digest":D,"environment_digest":D})
  def to_p3(self, root):

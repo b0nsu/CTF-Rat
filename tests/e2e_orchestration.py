@@ -5,18 +5,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
 from ratlib.orchestration import (DEFAULT_BUDGET, GateError, converge, enter,
  finish_phase, finish_task, invalidate, plan_fanout, record_verification,
  report_skeptic, start_task)
+from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream, revise_primitive
 D="sha256:"+"a"*64
 def contract(role, phase): return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"probe","allowed_inputs":[],"required_outputs":[],"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
 def output(t): return {"schema":"rat.task-output/v1","task_id":t["task_id"],"status":"completed","outputs":{},"evidence_ids":["obs"]}
+def observation(stream, oid):
+ rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root)
+ return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
 def advance(d,p): enter(d,p); finish_phase(d,p)
 def p2(d):
- advance(d,"solve-P0"); advance(d,"solve-P1"); return enter(d,"solve-P2")
+ advance(d,"solve-P0"); advance(d,"solve-P1")
+ s=Stream(d)
+ for oid in ("o1","o2","obs"): s.append("observation.recorded",observation(s,oid))
+ return enter(d,"solve-P2")
 def primitive(d):
  s=Stream(d)
- for oid in ("o1","o2","o3"): s.append("observation.recorded",{"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"}})
+ for oid in ("p1","p2","p3"): s.append("observation.recorded",observation(s,oid))
  revise_primitive(s,{"primitive_id":"p","status":"candidate","self_evidence":[],"input_digest":D,"environment_digest":D})
- revise_primitive(s,{"primitive_id":"p","status":"pass","self_evidence":["o1","o2","o3"],"input_digest":D,"environment_digest":D})
+ revise_primitive(s,{"primitive_id":"p","status":"pass","self_evidence":["p1","p2","p3"],"input_digest":D,"environment_digest":D})
 def verified_pipeline(d, verdict):
  p2(d); finish_phase(d,"solve-P2"); enter(d,"solve-P3"); primitive(d); finish_phase(d,"solve-P3"); cp4=enter(d,"solve-P4")
  b=start_task(d,contract("exploit-builder","solve-P4"),checkpoint_id=cp4["checkpoint_id"],inputs=[],primitive_id="p",input_digest=D,environment_digest=D); finish_task(d,b["task_id"],"completed",output(b)); record_verification(d,"pass",["obs"],True,exploit_task_id=b["task_id"],primitive_id="p"); finish_phase(d,"solve-P4"); cp5=enter(d,"solve-P5")

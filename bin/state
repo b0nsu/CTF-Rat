@@ -185,7 +185,7 @@ def main():
         return
     if a[0] == "compact":
         view=Stream(os.path.dirname(fpath or state_file())).view()
-        print(json.dumps({"findings":view["findings"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
+        print(json.dumps({"observations":view["observations"],"findings":view["findings"],"primitives":view["primitives"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
     if a[0] == "checkpoint" and len(a)>1:
         if a[1] == "create":
             import argparse
