@@ -12,6 +12,17 @@ from .artifact import put_bytes, put_file, digest_bytes, get
 from .runner import run, EXIT_DEPENDENCY, EXIT_INPUT, EXIT_POLICY, EXIT_TIMEOUT
 
 VERSION="p2-mvp/1"; POLICY="sha256:"+hashlib.sha256(b"p2-local-executable-only").hexdigest()
+P2_LIMITATIONS={
+ "rat-profile":["format signals are not vulnerability proof"],
+ "rat-slice":["call-path reachability only; no value-flow proof"],
+ "rat-dyn":["local execution trace; remote equivalence is unproven"],
+ "rat-fuzz":["builtin corpus has no coverage guidance"],
+ "rat-heap":["timeline requires complete allocator events"],
+ "rat-rop":["gadget candidates are not exploit success"],
+ "rat-runtime":["runtime backend coverage is incomplete"],
+ "rat-vm":["toy VM semantics only unless executable oracle passes"],
+ "rat-verify":["local verification does not establish remote equivalence"],
+}
 def iso(): return datetime.now(timezone.utc).isoformat()
 # Artifacts belong to the active challenge/CWD unless the caller explicitly
 # selects a store.  Never attempt to create ``<system-binary-dir>/.rat``.
@@ -52,6 +63,11 @@ def require_profile(a, r):
 def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=(), code=0, started=None):
     started=started or iso(); finished=iso(); bdig=fdigest(binary) if binary and os.path.isfile(binary) else "sha256:"+"0"*64
     doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":bdig},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":bdig,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
+    if name in P2_LIMITATIONS:
+        # Analysis output is deliberately non-promotable.  Only STATE's
+        # evidence/primitive lifecycle may promote independently verified
+        # observations.
+        doc["extensions"]={"analysis_policy":{"maturity":"experimental","promotion_allowed":False,"evidence_quality":"heuristic","limitations":P2_LIMITATIONS[name]}}
     return doc
 def emit(doc,a):
     print(json.dumps(doc,sort_keys=True) if a.format=="json" else "%s: %s"%(doc["tool"]["name"],json.dumps(doc["summary"],ensure_ascii=False)))
@@ -88,7 +104,7 @@ def slice_(a):
     try:
         import angr
     except ImportError:
-        return emit(envelope("rat-slice",a.binary,a,{},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path","coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
     try:
         project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
         funcs=list(cfg.kb.functions.values())
@@ -124,9 +140,9 @@ def slice_(a):
         payload={"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"nodes":nodes,"edges":edges,"unresolved_indirect_edges":unresolved,"frontier":[]}
         arts=[artifact(payload,"static-slice","slice.json",r)]
         status="ok" if paths else "partial"
-        return emit(envelope("rat-slice",a.binary,a,{"nodes":len(nodes),"edges":len(edges),"sources_reached":bool(src),"sinks_reached":bool(sink and paths),"coverage":"angr CFGFast callgraph + VEX IR blocks","unresolved_indirect_edges":unresolved,"path_count":len(paths)},arts,status=status,diagnostics=(["no CFG call path; no data-flow claim made"] if not paths else []),started=started),a)
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path","nodes":len(nodes),"edges":len(edges),"sources_reached":bool(src),"sinks_reached":bool(sink and paths),"coverage":"angr CFGFast callgraph + VEX IR blocks","unresolved_indirect_edges":unresolved,"path_count":len(paths)},arts,status=status,diagnostics=(["no CFG call path; no data-flow claim made"] if not paths else ["call-path reachability is not a data-flow proof"]),started=started),a)
     except Exception as exc:
-        return emit(envelope("rat-slice",a.binary,a,{},status="partial",diagnostics=["angr analysis incomplete: %s"%type(exc).__name__],started=started),a)
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path","coverage":"incomplete"},status="partial",diagnostics=["angr analysis incomplete: %s"%type(exc).__name__],started=started),a)
 def dyn(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
@@ -138,7 +154,10 @@ def dyn(a):
     # or reported as dependency-missing/partial; we never invent registers.
     if a.break_loc:
         if shutil.which("gdb"):
-            gp=command(["gdb","-q","-nx","-batch","-ex","break "+a.break_loc,"-ex","run","-ex","info registers",a.binary],a.timeout,stdin=sc.get("stdin","").encode())
+            # The debugger observation must exercise the same invocation as
+            # the ordinary trace; otherwise a breakpoint hit is not evidence
+            # about the scenario that produced the trace artifact.
+            gp=command(["gdb","-q","-nx","-batch","-ex","break "+a.break_loc,"-ex","run","-ex","info registers","--args",a.binary,*[str(x) for x in sc.get("argv",[])]],a.timeout,stdin=sc.get("stdin","").encode(),cwd=sc.get("cwd"),env={str(k):str(v) for k,v in sc.get("env",{}).items()})
             gtext=(gp.stdout.preview+gp.stderr.preview).decode(errors="replace")
             for key,val in re.findall(r"\b([a-z]{2,3})\s+0x([0-9a-f]+)",gtext): registers[key]="0x"+val
             events.append({"event":"breakpoint","location":a.break_loc,"hit":bool(registers),"registers":registers})
@@ -149,6 +168,22 @@ def dyn(a):
     status="timeout" if p.timed_out else ("ok" if p.exit_code==0 else "partial")
     arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc),"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
     return emit(envelope("rat-dyn",a.binary,a,{"exit":p.exit_code,"signal":p.signal,"trace_span":len(events),"hit_counts":{"breakpoint":int(any(e["event"]=="breakpoint" and e.get("hit") for e in events))},"register_observations":len(registers),"memory_observations":0,"last_event":events[-1]["event"],"dropped_events":0,"scenario_step":sc.get("name","run")},arts,status=status,diagnostics=(["wall timeout; last stable event retained"] if p.timed_out else []),code=p.exit_code if not p.timed_out else EXIT_TIMEOUT,started=started),a)
+def _verify_conditions(expected, process):
+    if "exit_code" in expected and process.exit_code != expected["exit_code"]: return False
+    if "stdout_regex" in expected and not re.search(expected["stdout_regex"], process.stdout.preview.decode(errors="replace")): return False
+    if "stderr_regex" in expected and not re.search(expected["stderr_regex"], process.stderr.preview.decode(errors="replace")): return False
+    return not process.timed_out
+
+def _oracle_argv(spec):
+    """Accept an executable or a JSON argv array; never invoke a shell."""
+    if not spec: return None
+    if spec.lstrip().startswith("["):
+        argv=json.loads(spec)
+        if not isinstance(argv,list) or not argv or not all(isinstance(x,str) and x for x in argv):
+            raise ValueError("oracle JSON must be a non-empty argv array")
+        return argv
+    return [spec]
+
 def verify(a):
     r=root(a,a.binary); started=iso()
     try:
@@ -156,14 +191,26 @@ def verify(a):
         if trace.get("binary_digest") != fdigest(a.binary): raise ValueError("trace binary digest does not match current binary")
     except ValueError as exc: return emit(envelope("rat-verify",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=[str(exc)],started=started),a)
     sc=scenario(a.scenario); reps=max(1,a.runs); results=[]; expected=sc.get("expect",{})
+    try:
+        oracle_argv=_oracle_argv(a.oracle)
+        allowed={"exit_code","stdout_regex","stderr_regex"}
+        if not expected and not oracle_argv: raise ValueError("verification requires scenario expect or --oracle")
+        if expected and (not isinstance(expected,dict) or set(expected)-allowed): raise ValueError("unsupported verification condition")
+    except (ValueError,json.JSONDecodeError) as exc:
+        return emit(envelope("rat-verify",a.binary,a,{},status="error",code=EXIT_POLICY,diagnostics=[str(exc)],started=started),a)
     environment_match=trace.get("environment_digest")==execution_environment(profile,sc)
     for _ in range(reps):
-        p=execute_binary(a.binary,sc,a.timeout); text=(p.stdout.preview+p.stderr.preview).decode(errors="replace")
-        ok=not p.timed_out and ("exit_code" not in expected or p.exit_code==expected["exit_code"]) and ("stdout_regex" not in expected or bool(re.search(expected["stdout_regex"],text)))
-        results.append({"exit":p.exit_code,"timed_out":p.timed_out,"conditions_met":ok})
+        p=execute_binary(a.binary,sc,a.timeout); ok=_verify_conditions(expected,p) if expected else True; oracle_result=None
+        if oracle_argv:
+            payload={"schema":"rat.verification-oracle-input/v1","binary_digest":fdigest(a.binary),"environment_digest":execution_environment(profile,sc),"exit_code":p.exit_code,"timed_out":p.timed_out,"stdout":p.stdout.preview.decode(errors="replace"),"stderr":p.stderr.preview.decode(errors="replace")}
+            oracle=command(oracle_argv,a.timeout,stdin=json.dumps(payload,sort_keys=True).encode())
+            oracle_result={"argv":oracle.argv,"exit":oracle.exit_code,"timed_out":oracle.timed_out,"stdout":oracle.stdout.preview.decode(errors="replace"),"stderr":oracle.stderr.preview.decode(errors="replace")}
+            ok=ok and not oracle.timed_out and oracle.exit_code==0
+        results.append({"exit":p.exit_code,"timed_out":p.timed_out,"conditions_met":ok,"oracle":oracle_result})
     verdict="pass" if environment_match and all(x["conditions_met"] for x in results) else ("inconclusive" if not environment_match or any(x["timed_out"] for x in results) else "fail")
     status="ok" if verdict=="pass" else ("timeout" if verdict=="inconclusive" else "partial")
-    arts=[artifact({"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","results":results},"verification-report","verification.json",r)]
+    report={"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","provenance":{"claim_id":a.claim,"primitive_id":a.primitive,"exploit_task_id":a.exploit_task,"trace_digest":a.trace,"environment_digest":execution_environment(profile,sc)},"results":results}
+    arts=[artifact(report,"verification-report","verification.json",r)]
     diagnostics=[]
     if not environment_match: diagnostics.append("trace environment does not match this verification scenario")
     if verdict!="pass": diagnostics.append("only pass may support confirmed finding or primitive PASS")
@@ -171,11 +218,11 @@ def verify(a):
 def fuzz(a):
     r=root(a,a.binary); started=iso(); corpus=[]
     if a.corpus and os.path.isdir(a.corpus): corpus=[Path(a.corpus,x).read_bytes() for x in os.listdir(a.corpus) if os.path.isfile(Path(a.corpus,x))]
-    corpus=corpus or [b"",b"A",b"A"*16,b"A"*128]; deadline=time.monotonic()+a.budget; crashes={}; runs=0
+    corpus=corpus or [b"",b"A",b"A"*16,b"A"*128]; deadline=time.monotonic()+a.budget; crashes={}; non_crash_exits={}; runs=0
     while time.monotonic()<deadline:
         data=corpus[runs%len(corpus)]; p=command([a.binary],min(a.timeout,max(.01,deadline-time.monotonic())),stdin=data); runs+=1
-        if p.exit_code and not p.timed_out:
-            sig="exit:%s"%p.exit_code
+        if p.signal and not p.timed_out:
+            sig="signal:%s"%p.signal
             # A unique failure remains a proposed signal unless the exact
             # testcase reproduces three times under the same local scenario.
             reproduced=0
@@ -183,8 +230,10 @@ def fuzz(a):
                 q=command([a.binary],a.timeout,stdin=data)
                 reproduced += int(q.exit_code == p.exit_code and not q.timed_out)
             if reproduced == 3: crashes.setdefault(sig,data)
-    arts=[artifact({"execs":runs,"crashes":list(crashes)},"fuzz-corpus","fuzz.json",r)]+[artifact(v,"crash-input","crash-%s.bin"%i,r,"application/octet-stream") for i,v in enumerate(crashes.values())]
-    return emit(envelope("rat-fuzz",a.binary,a,{"execs":runs,"coverage":"unavailable without optional engine","unique_crash":len(crashes),"unique_hang":0,"corpus_delta":0},arts,status="partial",diagnostics=["budget exhaustion is a normal partial result; crashes are proposed until 3x reproduction"],started=started),a)
+        elif p.exit_code and not p.timed_out:
+            non_crash_exits.setdefault("exit:%s"%p.exit_code,0); non_crash_exits["exit:%s"%p.exit_code]+=1
+    arts=[artifact({"execs":runs,"crashes":list(crashes),"non_crash_exits":non_crash_exits},"fuzz-corpus","fuzz.json",r)]+[artifact(v,"crash-input","crash-%s.bin"%i,r,"application/octet-stream") for i,v in enumerate(crashes.values())]
+    return emit(envelope("rat-fuzz",a.binary,a,{"execs":runs,"coverage":"unavailable without optional engine","unique_crash":len(crashes),"unique_hang":0,"non_crash_exit":non_crash_exits,"corpus_delta":0},arts,status="partial",diagnostics=["budget exhaustion is a normal partial result; only reproduced signal exits are crash candidates"],started=started),a)
 def heap(a):
     r=root(a,a.binary); started=iso(); trace=json.load(open(a.trace,encoding="utf-8")) if a.trace else scenario(a.scenario); events=trace.get("events",[]); violations=[]
     for e in events:
@@ -195,17 +244,20 @@ def rop(a):
     r=root(a,a.binary); started=iso(); p=command(["objdump","-d","--",a.binary],a.timeout); gadgets=[x.strip() for x in p.stdout.preview.decode(errors="replace").splitlines() if re.search(r"\b(ret|pop\s+%rdi)",x)]
     # A name is not proof.  Exploit-oriented ROP consumes only an active P1
     # primitive PASS from the local state stream.
-    active = not a.primitive
-    if a.primitive:
+    active = bool(a.index_only)
+    if not a.index_only and a.primitive and a.input_digest and a.environment_digest:
         try:
             from .state_v2 import Stream
             prim = Stream(os.path.dirname(r)).view()["primitives"].get(a.primitive, {})
-            active = prim.get("status") == "pass" and prim.get("input_digest") == fdigest(a.binary)
+            active = (a.input_digest == fdigest(a.binary) and prim.get("status") == "pass"
+                      and prim.get("input_digest") == a.input_digest
+                      and prim.get("environment_digest") == a.environment_digest)
         except Exception:
             active = False
     blocked=not active; status="error" if blocked else "ok"; code=EXIT_POLICY if blocked else 0
     arts=[artifact({"gadgets":gadgets[:500],"goal":a.goal,"candidate_is_not_exploit_success":True},"gadget-index","gadgets.json",r)]
-    return emit(envelope("rat-rop",a.binary,a,{"gadget_count":len(gadgets),"goal":a.goal,"candidate_count":0 if blocked else len(gadgets),"constraints":{"alignment":"not proven","bad_bytes":"not assessed"}},arts,status=status,diagnostics=(["active verified primitive required for exploit-oriented mode"] if blocked else ["candidates require verify"]),code=code,started=started),a)
+    diagnostic="index-only artifacts cannot be promoted" if a.index_only else ("active verified primitive, input digest, and environment digest required for exploit-oriented mode" if blocked else "candidates require verify")
+    return emit(envelope("rat-rop",a.binary,a,{"gadget_count":len(gadgets),"goal":a.goal,"index_only":a.index_only,"candidate_count":0 if blocked else len(gadgets),"constraints":{"alignment":"not proven","bad_bytes":"not assessed"}},arts,status=status,diagnostics=[diagnostic],code=code,started=started),a)
 def runtime(a):
     r=root(a,a.binary); started=iso(); sc=scenario(a.scenario)
     backend=a.backend
@@ -255,10 +307,10 @@ def main(which, argv=None):
     if which=="rat-profile": p.add_argument("--libc"); p.add_argument("--loader"); fn=profile
     elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc",required=True); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); fn=slice_
     elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); fn=dyn
-    elif which=="rat-verify": p.add_argument("--profile",required=True); p.add_argument("--trace",required=True); p.add_argument("--scenario",required=True); p.add_argument("--claim"); p.add_argument("--primitive"); p.add_argument("--oracle"); p.add_argument("--runs",type=int,default=3); fn=verify
+    elif which=="rat-verify": p.add_argument("--profile",required=True); p.add_argument("--trace",required=True); p.add_argument("--scenario",required=True); p.add_argument("--claim"); p.add_argument("--primitive"); p.add_argument("--exploit-task"); p.add_argument("--oracle"); p.add_argument("--runs",type=int,default=3); fn=verify
     elif which=="rat-fuzz": p.add_argument("--harness"); p.add_argument("--budget",type=float,default=.2); p.add_argument("--corpus"); p.add_argument("--engine",default="builtin"); fn=fuzz
     elif which=="rat-heap": p.add_argument("--scenario"); p.add_argument("--trace"); p.add_argument("--libc"); fn=heap
-    elif which=="rat-rop": p.add_argument("--goal",required=True); p.add_argument("--constraints"); p.add_argument("--primitive"); fn=rop
+    elif which=="rat-rop": p.add_argument("--goal"); p.add_argument("--constraints"); p.add_argument("--primitive"); p.add_argument("--input-digest"); p.add_argument("--environment-digest"); p.add_argument("--index-only",action="store_true"); fn=rop
     elif which=="rat-runtime": p.add_argument("--backend",choices=("native","qemu","qiling"),default="native"); p.add_argument("--scenario",required=True); p.add_argument("--rootfs"); fn=runtime
     else: p.add_argument("--dispatch"); p.add_argument("--trace"); p.add_argument("--bytecode"); p.add_argument("--solve",action="store_true"); p.add_argument("--oracle"); fn=vm
     a=p.parse_args(argv); return fn(a)

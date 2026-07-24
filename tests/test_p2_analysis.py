@@ -18,17 +18,27 @@ class P2Analysis(unittest.TestCase):
   doc=json.loads(p.stdout); validate(doc, "rat.tool-result/v1"); return p, doc
  def test_core_profile_slice_dyn_verify(self):
   _,x=self.tool("rat-profile"); self.assertEqual(x["schema"],"rat.tool-result/v1"); self.assertGreater(x["summary"]["fact_count"],0); profile=x["artifacts"][0]["digest"]
-  _,x=self.tool("rat-slice","--profile",profile,"--from","main","--to","fgets"); self.assertIn(x["status"],("ok","partial"))
+  self.assertEqual(x["extensions"]["analysis_policy"]["maturity"],"experimental")
+  self.assertFalse(x["extensions"]["analysis_policy"]["promotion_allowed"])
+  _,x=self.tool("rat-slice","--profile",profile,"--from","main","--to","fgets"); self.assertIn(x["status"],("ok","partial")); self.assertEqual(x["summary"]["analysis_kind"],"call-path")
   _,x=self.tool("rat-dyn","--profile",profile,"--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0); trace=x["artifacts"][0]["digest"]
   _,x=self.tool("rat-verify","--profile",profile,"--trace",trace,"--scenario",str(self.sc),"--runs","3"); self.assertEqual(x["summary"]["verdict"],"pass")
   changed=self.work/"changed-env.json"; changed.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"OPEN\\n","env":{"RAT_VERIFY_TEST":"changed"},"expect":{"exit_code":0}}))
   p,x=self.tool("rat-verify","--profile",profile,"--trace",trace,"--scenario",str(changed),ok=False)
   self.assertEqual(p.returncode,124); self.assertEqual(x["summary"]["verdict"],"inconclusive"); self.assertFalse(x["summary"]["environment_match"])
+ def test_verify_rejects_empty_expect_without_oracle(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  empty=self.work/"empty.json"; empty.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"OK\n"}))
+  _,dyn=self.tool("rat-dyn","--profile",pd,"--scenario",str(empty)); trace=dyn["artifacts"][0]["digest"]
+  p,doc=self.tool("rat-verify","--profile",pd,"--trace",trace,"--scenario",str(empty),ok=False)
+  self.assertEqual(p.returncode,5); self.assertEqual(doc["status"],"error")
  def test_extensions_and_verified_only_rop_gate(self):
   _,x=self.tool("rat-fuzz","--budget","0.05"); self.assertGreater(x["summary"]["execs"],0)
   trace=self.work/"heap.json"; trace.write_text(json.dumps({"allocator":"glibc","events":[{"chunk":4096,"target":8192,"encoded_fd":8193}]}))
   _,x=self.tool("rat-heap","--trace",str(trace)); self.assertEqual(x["summary"]["invariant_violations"],[])
   p,x=self.tool("rat-rop","--goal","call","--primitive","not-a-pass",ok=False); self.assertEqual(p.returncode,5); self.assertEqual(x["status"],"error")
+  p,x=self.tool("rat-rop","--goal","call",ok=False); self.assertEqual(p.returncode,5); self.assertEqual(x["status"],"error")
+  _,x=self.tool("rat-rop","--index-only"); self.assertTrue(x["summary"]["index_only"])
   _,x=self.tool("rat-runtime","--backend","native","--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0)
   _,x=self.tool("rat-runtime","--backend","qemu","--scenario",str(self.sc)); self.assertEqual(x["summary"]["exit"],0)
   _,x=self.tool("rat-runtime","--backend","qiling","--scenario",str(self.sc)); self.assertEqual(x["status"],"partial")

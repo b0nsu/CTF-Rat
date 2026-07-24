@@ -1,12 +1,19 @@
 import os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
 from ratlib.orchestration import DEFAULT_BUDGET, GateError, enter, finish_phase, finish_task, plan_fanout, start_task, invalidate
+from ratlib.artifact import put_bytes
+from ratlib.state_v2 import Stream
 def contract(role, phase, required=()):
  return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"x","allowed_inputs":[],"required_outputs":list(required),"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
-def output(task, outputs=None): return {"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":outputs or {},"evidence_ids":["o"]}
+def output(task, outputs=None): return {"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":outputs or {},"evidence_ids":["e0"]}
+def observation(stream, oid):
+ rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root)
+ return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
 def to_p2(d):
  for p in ("solve-P0","solve-P1"):
   enter(d,p); finish_phase(d,p)
+ s=Stream(d)
+ for oid in ("e0","e1","e2"): s.append("observation.recorded",observation(s,oid))
  return enter(d,"solve-P2")
 class RoleContractTests(unittest.TestCase):
  def test_p2_single_branch_and_cap_and_invalidation_cancel(self):
@@ -29,3 +36,8 @@ class RoleContractTests(unittest.TestCase):
    cp=enter(d,"solve-P0"); task=start_task(d,contract("orchestrator","solve-P0",["finding"]),checkpoint_id=cp["checkpoint_id"],inputs=[])
    with self.assertRaises(GateError): finish_task(d,task["task_id"],"completed",{})
    with self.assertRaises(GateError): finish_task(d,task["task_id"],"completed",output(task))
+ def test_output_rejects_unknown_or_invalidated_evidence(self):
+  with tempfile.TemporaryDirectory() as d:
+   cp=to_p2(d); task=start_task(d,contract("hypothesis","solve-P2"),checkpoint_id=cp["checkpoint_id"],inputs=["one"],dependencies=["e0"])
+   bad={"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":{},"evidence_ids":["missing"]}
+   with self.assertRaises(GateError): finish_task(d,task["task_id"],"completed",bad)
