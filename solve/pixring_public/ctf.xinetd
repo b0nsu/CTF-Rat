@@ -1,0 +1,18 @@
+service ctf
+{
+    disable         = no
+    type            = UNLISTED
+    socket_type     = stream
+    protocol        = tcp
+    wait            = no
+    user            = ctf
+    bind            = 0.0.0.0
+    port            = 31340
+    server          = /home/ctf/lib/ld-linux-x86-64.so.2
+    server_args     = --library-path /home/ctf/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu /home/ctf/pixring
+    per_source      = 10
+    rlimit_cpu      = 20
+    banner_fail     = /etc/issue.net
+    log_on_success  += PID HOST EXIT
+    log_on_failure  += HOST
+}

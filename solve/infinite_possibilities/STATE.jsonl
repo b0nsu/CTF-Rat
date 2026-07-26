@@ -1,0 +1,4 @@
+{"t": "ok", "text": "parsed rules grammar: line = filter|correct; filter has Wrong message and correct is 64 any hex", "ts": 1784218284}
+{"t": "ok", "text": "concrete verify: printf candidate | ./main rules prints Correct flag DH{5d74b615f3f60d65457b3bbea310f48848e527ba403c7a72d26ea68f53658818}", "ts": 1784218511}
+{"t": "ok", "text": "Z3 solved Not(filter) over 64 hex nibbles: 5d74b615f3f60d65457b3bbea310f48848e527ba403c7a72d26ea68f53658818", "ts": 1784218511}
+{"t": "primitive", "name": "grammar_solver", "status": "pass", "evidence": "rules parse complete; Z3 model avoids filter; concrete binary accepts candidate and prints Correct", "ts": 1784218511}

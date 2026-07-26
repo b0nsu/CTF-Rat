@@ -1,0 +1,7 @@
+{"t": "init", "chal": "dreamhack_1286", "ts": 1784127498}
+{"t": "hypothesis", "text": "read menu frees list but does not clear head[idx], leaving UAF pointer for repeat read/write allocation interaction", "ts": 1784127498}
+{"t": "primitive", "name": "fake_msg", "status": "pass", "evidence": "local: freed first chunk reused as continuation chunk; stale head[0] read shows controlled size=32 and buf marker C*32 without crash", "ts": 1784127795}
+{"t": "ok", "text": "vuln: read idx lacks bounds; write/read UAF leaves head[idx] dangling; continuation chunk write controls stale msg->size and msg->next at offsets +8/+16", "ts": 1784127795}
+{"t": "primitive", "name": "heap_leak", "status": "pass", "evidence": "local: stale tcache read midx low32=chunk>>12; reconstruct heap as ((0x5<<32)|u32(midx))<<12, matched /proc heap 0x5ef863e56000", "ts": 1784127821}
+{"t": "primitive", "name": "libc_leak", "status": "pass", "evidence": "local: fake large chunk inside heap container freed via fake msg next; tcache-struct controlled allocation builds msg X; read head[3] leaks unsorted libc ptr 0x...3f10 from X+0x100 while process remains alive", "ts": 1784129398}
+{"t": "primitive", "name": "tcache_struct_control", "status": "pass", "evidence": "local: free(heap_base+0x10) via fake msg next, reallocate as continuation, set tcache counts/entries for bin4/bin7; malloc returns chosen heap pointers X and Z with verified head pointers", "ts": 1784129398}

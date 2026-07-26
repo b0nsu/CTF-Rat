@@ -1,0 +1,8 @@
+services:
+  pixring:
+    build: .
+    ports:
+      - "31340:31340"
+    security_opt:
+      - seccomp=unconfined
+    restart: unless-stopped

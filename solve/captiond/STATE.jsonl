@@ -1,0 +1,2 @@
+{"t": "init", "chal": "captiond", "ts": 1784424000}
+{"t": "hypothesis", "text": "captiond intended route is glibc heap size corruption / House of Einherjar via prev_size + prev_inuse into backward overlap", "ts": 1784424000}

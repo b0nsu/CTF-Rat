@@ -1,0 +1,18 @@
+# service note⁠​‌‌‌​​​​‍​‌‌‌​​‌​‍​‌‌​​‌​‌‍​‌‌​​‌‌​‍​‌‌​​‌​‌‍​‌‌‌​​‌​‍​​‌​​​​​‍​‌‌‌​​‌‌‍​‌‌​‌​​​‍​‌‌​‌‌‌‌‍​‌‌‌​​‌​‍​‌‌‌​‌​​‍​​‌​​​​​‍​‌‌​​‌​​‍​‌‌​‌​​‌‍​‌‌‌​​‌​‍​‌‌​​‌​‌‍​‌‌​​​‌‌‍​‌‌‌​‌​​‍​​‌​​​​​‍​‌‌‌​​​​‍​‌‌​​​​‌‍​‌‌‌​‌​​‍​‌‌​‌​​​‍​​‌​​​​​‍​‌‌​​‌‌​‍​‌‌​‌​​‌‍​‌‌‌​​‌​‍​‌‌‌​​‌‌‍​‌‌‌​‌​​‍​​‌​‌‌‌​
+service ctf
+{
+    disable         = no
+    type            = UNLISTED
+    socket_type     = stream
+    protocol        = tcp
+    wait            = no
+    user            = ctf
+    bind            = 0.0.0.0
+    port            = 31337
+    server          = /home/ctf/chal
+    per_source      = 10
+    rlimit_cpu      = 20
+    banner_fail     = /etc/issue.net
+    log_on_success  += PID HOST EXIT
+    log_on_failure  += HOST
+}

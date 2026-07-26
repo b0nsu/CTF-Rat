@@ -1,0 +1,12 @@
+{"t": "init", "chal": "cat_market", "ts": 1784446464}
+{"t": "note", "text": "black-box web target http://host6.sca-ctf.com:32100; Express app; source unavailable", "ts": 1784446464}
+{"t": "note", "text": "homepage shows public item list and existing injected-looking item fields; CSP script-src none", "ts": 1784446464}
+{"t": "ok", "text": "registered normal user; wallet starts at 100 carrot", "ts": 1784446548}
+{"t": "ok", "text": "buying cat-wide-001 price 90 creates deal dl-b36706e9bc4f580b and wallet becomes 10", "ts": 1784446548}
+{"t": "hypothesis", "text": "deal cancel/refund logic may be abusable for balance inflation or unauthorized state transition", "ts": 1784446548}
+{"t": "ok", "text": "buyer can POST /deal/<id>/settle on own paid deal; deal becomes settled; wallet unchanged at 10", "ts": 1784446586}
+{"t": "hypothesis", "text": "settled receipt may expose printable label/flag or allow post-settle cancel refund", "ts": 1784446586}
+{"t": "no", "text": "post-settle cancel refund", "reason": "settled deal cancel changed status to canceled but buyer wallet remained 10; receipt then says not settled", "ts": 1784446620}
+{"t": "no", "text": "canceled deal can be re-settled", "reason": "POST settle after cancel returned 403 not payable", "ts": 1784446620}
+{"t": "ok", "text": "sell endpoint accepts server-side invalid prices: -100, 0, 1000000, 1e3, NaN all created item ids", "ts": 1784446785}
+{"t": "hypothesis", "text": "invalid price such as NaN may crash or poison app state; target began connection-refused immediately after creating invalid price items", "ts": 1784446785}

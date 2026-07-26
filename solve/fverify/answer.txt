@@ -1,0 +1,12 @@
+There are countless functions within <stdio.h> - from fopen all the way through to fread, fwrite, fseek, and ftell.
+But I've always hated how C lets you use just any file without question.
+I wanted only the files I approved of to ever be touched.
+
+So I devised my own creation: the fverify function. With it, I can filter out every unwanted file and keep only the chosen ones.
+HA! HAHAHA!
+
+And within this wicked scheme lies the flag:
+DH{ce60d40e6fd2cc3303465d66559d021a5391a8245b65f517fda3bf61646bfe9a}.
+
+In this terrifying world, isn't it only natural that someone like me would craft a function to verify files?
+After all, one must always be prepared...

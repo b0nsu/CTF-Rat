@@ -1,0 +1,5 @@
+{"t": "init", "chal": "pwnable-tiny_hard", "ts": 1784038283}
+{"t": "note", "text": "pwnable.kr tiny_hard selected after maze timing mismatch; target nc pwnable.kr 10055 / ssh tiny_hard@pwnable.kr -p2222 pw guest; no auto-submit", "ts": 1784038283}
+{"t": "hypothesis", "text": "argv[0][0:4] controls call target: entry pop eax(argc); pop edx(argv0 ptr); mov edx,[edx]; sub esp,0x1000; call edx", "ts": 1784038283}
+{"t": "primitive", "name": "eip_control", "status": "pass", "evidence": "gdb follow-exec local: argv0 first dword 0x41414141 yields EIP=0x41414141, ESP=0xffffce24, EDX=0x41414141; argv0 string at 0xffffdf1f", "ts": 1784038283}
+{"t": "no", "text": "argv0 stack shellcode direct jump", "reason": "gdb target argv0+4 0xffffdf23 reaches stack but SIGSEGV due NX stack; need vDSO/syscall/ROP path", "ts": 1784038283}

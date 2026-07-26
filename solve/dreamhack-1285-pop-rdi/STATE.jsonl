@@ -1,0 +1,5 @@
+{"t": "init", "chal": "dreamhack-1285-pop-rdi", "ts": 1784039251}
+{"t": "ok", "text": "recon: amd64 noPIE no-canary NX FullRELRO SHSTK IBT, Ubuntu22.04, imports only scanf/libc_start_main, no useful pop rdi gadget in binary", "ts": 1784039269}
+{"t": "hypothesis", "text": "main scanf(\"%s\", stack[0x100]) gives saved RBP/RIP overwrite at offset 0x100+8; likely intended to find/use hidden pop rdi or pivot via leave;ret because normal gadget set lacks pop rdi", "ts": 1784039309}
+{"t": "ok", "text": "Ubuntu22.04 equivalent libc/ld extracted from libc6_2.35-0ubuntu3.13; prob.u22 patched with interpreter=ld-ubuntu22.so.2 and rpath=$ORIGIN; saved main return offset in libc is 0x29d90; one_gadget candidates include 0xebc81/0xebc85/0xebc88/0xebce2/0xebd38/0xebd3f/0xebd43", "ts": 1784039718}
+{"t": "ok", "text": "Docker installed and verified; image dreamhack-1285-pop-rdi:local built from provided Dockerfile; local service running at 127.0.0.1:18080 via ctfguard; Docker libc/ld extracted as libc.docker.so.6/ld.docker.so.2; libc.so.6 symlink points to Docker extract; prob.docker patched for local gdb", "ts": 1784039967}

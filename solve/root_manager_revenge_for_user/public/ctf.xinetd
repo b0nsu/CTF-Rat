@@ -1,0 +1,14 @@
+service ctf
+{
+    disable = no
+    socket_type = stream
+    protocol = tcp
+    wait = no
+    user = ctf
+    type = UNLISTED
+    port = 31337
+    server = /home/ctf/root_manager_revenge
+    per_source = 10
+    rlimit_cpu = 20
+    rlimit_as = 256M
+}

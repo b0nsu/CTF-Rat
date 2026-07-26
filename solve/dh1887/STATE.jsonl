@@ -1,0 +1,3 @@
+{"t": "ok", "text": "local docker-loopback solve: HOST=127.0.0.1 PORT=18087 ./exploit.py REMOTE prints DH{**flag**}", "ts": 1784125881}
+{"t": "primitive", "name": "tcache_poison_arbitrary_write", "status": "pass", "evidence": "docker-loopback: _IO_list_all overwritten with fake_file via 0x110 tcache count=2; exploit.py prints DH{**flag**}", "ts": 1784125881}
+{"t": "ok", "text": "remote host3.dreamhack.games:23952 exploit.py prints DH{8d35746cd5b310eb65dcfeed2e05188b5db616378073efd91fd2f6204a34bf48:CuFCZBg+regnz6RdPtYbKQ==}", "ts": 1784126097}

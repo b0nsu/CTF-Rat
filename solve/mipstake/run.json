@@ -1,0 +1,58 @@
+{
+  "schema": "rat.run/v1",
+  "run_id": "run_45557f110d85448f8cf0a54b7b7b93f6",
+  "created_at": "2026-07-22T09:14:47.738967+00:00",
+  "updated_at": "2026-07-22T09:14:47.739070+00:00",
+  "challenge": {
+    "id": null,
+    "name": "mipstake",
+    "category": null
+  },
+  "status": "created",
+  "inputs": [
+    {
+      "role": "binary",
+      "name": "mipstake",
+      "sha256": "sha256:01aed34ac641761a17ba2bd5375dbb208fdada8acb20e41e9575b43b48d6ff28",
+      "size": 6264
+    }
+  ],
+  "target_policy": {
+    "guard_challenge": "mipstake",
+    "allowlist": [
+      "pwnable.kr:10047"
+    ],
+    "network_mode": "ctfguard-target"
+  },
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "runtime": "python-3.12"
+  },
+  "toolchain": {
+    "ctf_rat_revision": "worktree",
+    "newchal_version": "p0-v1",
+    "schema_bundle": "v1"
+  },
+  "policy": {
+    "archive": {},
+    "subprocess": {
+      "wall_timeout_seconds": 60,
+      "output_hard_cap_bytes": 67108864
+    }
+  },
+  "state": {
+    "stream_id": null,
+    "latest_event_cursor": null,
+    "latest_checkpoint_id": null
+  },
+  "manifest_owner": {
+    "kind": "solve",
+    "path": "solve/mipstake/run.json"
+  },
+  "scaffold": {
+    "name": "mipstake",
+    "binary": "mipstake",
+    "libc": null
+  }
+}

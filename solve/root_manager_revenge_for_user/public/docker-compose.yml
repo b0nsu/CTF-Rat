@@ -1,0 +1,19 @@
+services:
+  root_manager_revenge:
+    build: .
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SYS_PTRACE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run:rw,nosuid,nodev,noexec,mode=0755
+      - /tmp:rw,nosuid,nodev,exec,mode=1777
+    ports:
+      - "31337:31337"
+    restart: unless-stopped

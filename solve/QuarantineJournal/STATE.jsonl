@@ -1,0 +1,5 @@
+{"t": "ok", "text": "created challenge scaffold; prob is static stripped x86-64, no canary, NX, non-PIE", "ts": 1784427796}
+{"t": "hypothesis", "text": "GVFS overlay starts at file offset 0xcd240; superblock after GVFS contains encrypted filesystem sections and journal replay hides quarantined flag slot", "ts": 1784427983}
+{"t": "ok", "text": "verifier is SHA256(16-byte prefix 'SCA-ESC-MITM-v1\\0' || trimmed input); GDB AAAA digest matches hashlib", "ts": 1784430126}
+{"t": "ok", "text": "journal replay exposes hidden dentry slot_7f3a.qb pointing to inode index 9/id 10, data block 10; final derived key bytes 2ae6aa98d4422c00d062b7013a0a0f34", "ts": 1784430126}
+{"t": "no", "text": "plaintext decoy flags", "reason": "FLAG/SCA variants of n0t_th3_r34l_0ne_keep_digging and decoy_block_keep_looking fail verifier", "ts": 1784430126}

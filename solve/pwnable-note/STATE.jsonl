@@ -1,0 +1,7 @@
+{"t": "init", "chal": "pwnable-note", "ts": 1784036891}
+{"t": "note", "text": "pwnable.kr note selected: Grotesque unsolved/unstaged locally; target ssh note@pwnable.kr -p2222 pw guest; no auto-submit", "ts": 1784036891}
+{"t": "hypothesis", "text": "secret menu 0x31337 fgets(local_410,0x401,stdin) causes 1-byte NUL overflow into saved EBP low byte; recursive select_menu return can pivot ESP into attacker-controlled local_410 frame", "ts": 1784036940}
+{"t": "no", "text": "secret menu single-shot saved EBP pivot", "reason": "gdb: buf=ebp-0x40c, fgets(0x401) NUL lands at ebp-0xc local_10[0], saved_ebp unchanged; normal run exits cleanly", "ts": 1784037130}
+{"t": "ok", "text": "remote-equivalent environment verified: ssh note@pwnable.kr:2222 exposes local copies of loader (7432 B), loader.c (235 B), and note (12027 B); remote is Ubuntu 22.04 i386 glibc 2.35, and the account can execute ./note/./loader.", "ts": 1784383726}
+{"t": "hypothesis", "text": "The secret fgets NUL modifies select_menu local menu integer at EBP-0x10, enabling a recursive-frame or control-flow effect not captured by the ruled-out single-shot saved-EBP pivot; RWE note mapping leaks its address and can hold a final payload.", "ts": 1784383726}
+{"t": "next", "text": "Use a bounded local/remote-equivalent probe to determine which recursive-frame word is changed by the NUL and whether it yields an EBP/return pivot; no ROP or shellcode chaining until control is measured.", "ts": 1784383726}

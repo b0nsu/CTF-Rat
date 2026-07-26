@@ -1,0 +1,15 @@
+service ctf
+{
+    disable         = no
+    type            = UNLISTED
+    socket_type     = stream
+    protocol        = tcp
+    wait            = no
+    user            = ctf
+    port            = 31337
+    server          = /home/ctf/chall
+    bind            = 0.0.0.0
+    per_source      = 8
+    rlimit_cpu      = 30
+    rlimit_as       = 512M
+}

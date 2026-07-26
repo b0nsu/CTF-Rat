@@ -1,0 +1,58 @@
+{
+  "schema": "rat.run/v1",
+  "run_id": "run_d3fe37532bde4df0aebea5500d0d783a",
+  "created_at": "2026-07-25T03:09:01.857307+00:00",
+  "updated_at": "2026-07-25T03:09:01.857436+00:00",
+  "challenge": {
+    "id": null,
+    "name": "pwnable-kr-fd",
+    "category": null
+  },
+  "status": "created",
+  "inputs": [
+    {
+      "role": "binary",
+      "name": "pwnable-kr-fd",
+      "sha256": "sha256:aa9be726b62c30552b84e7ea24fe3f4b20e4825c49b82d51a920a781dfa02aaf",
+      "size": 15060
+    }
+  ],
+  "target_policy": {
+    "guard_challenge": "pwnable-kr-fd",
+    "allowlist": [
+      "fd@pwnable.kr:2222"
+    ],
+    "network_mode": "ctfguard-target"
+  },
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "runtime": "python-3.12"
+  },
+  "toolchain": {
+    "ctf_rat_revision": "worktree",
+    "newchal_version": "p0-v1",
+    "schema_bundle": "v1"
+  },
+  "policy": {
+    "archive": {},
+    "subprocess": {
+      "wall_timeout_seconds": 60,
+      "output_hard_cap_bytes": 67108864
+    }
+  },
+  "state": {
+    "stream_id": null,
+    "latest_event_cursor": null,
+    "latest_checkpoint_id": null
+  },
+  "manifest_owner": {
+    "kind": "solve",
+    "path": "solve/pwnable-kr-fd/run.json"
+  },
+  "scaffold": {
+    "name": "pwnable-kr-fd",
+    "binary": "pwnable-kr-fd",
+    "libc": null
+  }
+}

@@ -1,0 +1,21 @@
+{"t": "ok", "text": "remote account verified; binary retrieved from /home/mipstake/mipstake sha256=01aed34ac641761a17ba2bd5375dbb208fdada8acb20e41e9575b43b48d6ff28", "ts": 1784711687}
+{"t": "hypothesis", "text": "MIPS big-endian network daemon; no PIE/canary/NX and RWX segment; static RE required before exploit chain", "ts": 1784711687}
+{"t": "next", "text": "disassemble server receive path and identify length/control primitive", "ts": 1784711688}
+{"t": "hypothesis", "text": "FUN_400850 permits param3+1 bytes without NUL termination; need confirm call-site buffer size and adjacent control data", "ts": 1784711742}
+{"t": "next", "text": "inspect main call arguments and remote protocol with one benign local request", "ts": 1784711742}
+{"t": "hypothesis", "text": "handler FUN_400944 calls line recv into 16-byte stack buffer with cap 0x2000; stack overflow likely, but requires remote-equivalent control probe", "ts": 1784711785}
+{"t": "next", "text": "allowlist TCP service 10047 and use a cyclic-only crash probe", "ts": 1784711785}
+{"t": "ok", "text": "static fact: FUN_400944 allocates 16-byte local then passes cap 0x2000 to bytewise recv loop; service is pwnable.kr:10047 and spawned child has 60s alarm", "ts": 1784711826}
+{"t": "primitive", "name": "saved_ra_control", "status": "pass", "evidence": "remote-equivalent: payload A*20||be32(0x400944)||LF; handler did not perform normal exit and TCP socket stayed open 2.002s awaiting a second line. Static MIPS frame: buffer=fp+0x18, saved ra=fp+0x2c. LF is terminator after target.", "ts": 1784711902}
+{"t": "offset", "k": "saved_ra", "v": "20", "src": "MIPS handler 0x400944: input fp+0x18, ra fp+0x2c", "ts": 1784711902}
+{"t": "offset", "k": "handler", "v": "0x400944", "src": "remote behavioral control probe target", "ts": 1784711902}
+{"t": "primitive", "name": "fixed_mmap_stage", "status": "pass", "evidence": "remote-equivalent: stage1 saved-fp=0x66665fe8, saved-ra=0x40095c redirected next recv to 0x66666000; stage2 placed RA=0x400944 at map+0x14; socket remained open awaiting third line. LF terminator lands after staged line; final chain must keep shellcode before final LF and avoid 0x0a bytes.", "ts": 1784713071}
+{"t": "next", "text": "generate MIPS big-endian execve shellcode, verify no LF bytes, then use stage1 pivot plus stage2 map-resident shellcode.", "ts": 1784713071}
+{"t": "hypothesis", "text": "mipstake name and no-output shellcode tests indicate MIPS I-cache/NX issue: recv-written mmap/dynamic shellcode does not produce write(4) markers despite fixed-map write primitive passing.", "ts": 1784713797}
+{"t": "no", "text": "direct mmap shellcode output remote write(fd=3..10, marker) shellcode staged at 0x66666018 produced no socket output; likely non-executable mapping or missing cacheflush.", "reason": "", "ts": 1784713797}
+{"t": "no", "text": "direct dynamic shellcode output remote write(fd=3..10, marker) shellcode staged at 0x4001d8 produced no socket output; dynamic page write/reenter remains ambiguous but direct code output not proven.", "reason": "", "ts": 1784713797}
+{"t": "no", "text": "coarse stack sled 0x7fff9800..0x7ffff000 remote stack shellcode write(4,HIT) with 1800-instruction sled yielded no markers for tested high-stack guesses.", "reason": "", "ts": 1784713797}
+{"t": "next", "text": "construct ROP for cacheflush/mprotect; promising gadget is __libc_csu_init caller at 0x400e40 with register pop epilogue 0x400e64, but imported functions lack mprotect/cacheflush/write/dup2.", "ts": 1784713797}
+{"t": "primitive", "name": "socket_fd_a0_shellcode", "status": "pass", "evidence": "remote-equivalent: staged shellcode at 0x66666018 using preserved $a0 as accepted socket fd; write($a0,\"REGFD\") returned marker over TCP, proving code execution and correct fd.", "ts": 1784714025}
+{"t": "primitive", "name": "flag_read", "status": "pass", "evidence": "remote: dup2($a0,1) then open/sendfile(\"/home/mipstake/flag\") returned D0_You_Want_R4re_or_WellDon3? over pwnable.kr:10047; no auto-submit.", "ts": 1784714025}
+{"t": "next", "text": "human submits flag manually to pwnable.kr; keep exploit.py as reproducible solve.", "ts": 1784714025}

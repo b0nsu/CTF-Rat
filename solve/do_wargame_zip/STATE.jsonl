@@ -1,0 +1,15 @@
+{"t": "hypothesis", "text": "main uses scanf(\"%s\") into 0x100-byte stack buffer; saved RIP offset expected 0x108, needs SELF primitive check", "ts": 1784040259}
+{"t": "primitive", "name": "rip_control", "status": "pass", "evidence": "local core: offset=0x108 overwrites saved RIP with marker; scanf %s terminates on newline and appends NUL", "ts": 1784040345}
+{"t": "primitive", "name": "rip_control", "status": "pass", "evidence": "verified local core: offset=0x108, fault_addr=0x4948474645444342 (BCDEFGHI little-endian), scanf %s newline terminates and NUL follows payload", "ts": 1784040353}
+{"t": "offset", "k": "rip_offset", "v": "0x108", "src": "core fault_addr marker", "ts": 1784040732}
+{"t": "offset", "k": "bss_rbp", "v": "0x404800", "src": "writable .bss for one_gadget rbp constraints", "ts": 1784040732}
+{"t": "primitive", "name": "local_shell", "status": "pass", "evidence": "Ubuntu 22.04 libc 2.35 via prob_235: one_gadget 0xebdaf with rbp=0x404800 produced shell and id output", "ts": 1784040732}
+{"t": "primitive", "name": "remote_partial", "status": "fail", "evidence": "800+ remote attempts with 3-byte partial overwrite produced no shell; scanf NUL terminator corrupts high address byte, route invalid without preserving upper bytes", "ts": 1784047125}
+{"t": "no", "text": "remote 3-byte partial one_gadget brute", "reason": "real Docker libc base is page-aligned with broad ASLR, not 0x100000-aligned; scanf appends NUL so partial overwrite corrupts next address byte; 800+ attempts no hit", "ts": 1784047655}
+{"t": "no", "text": "automatic ret2dlresolve via pwntools", "reason": "binary has no pop rdi/csu gadget; pwntools cannot satisfy rdi for system(\"/bin/sh\")", "ts": 1784047655}
+{"t": "hypothesis", "text": "possible remaining route: manual ret2dlresolve if rdi can be made to point to /bin/sh, or stack-reentry trick using existing libc pointers without knowing ASLR", "ts": 1784047655}
+{"t": "no", "text": "remote ASLR/partial-overwrite brute", "reason": "probabilistic remote brute, unintended; violates common anti-bruteforce rule without remote-equivalent leak/control primitive", "ts": 1784048887}
+{"t": "primitive", "name": "bss_write", "status": "pass", "evidence": "local: saved rbp=0x404900 + ret main+0x8 causes second scanf to write attacker bytes at 0x404800; after scanf rbp=0x404900 and bss marker verified", "ts": 1784050129}
+{"t": "no", "text": "fixed-address ret2dlresolve from bss pivot", "reason": "Full RELRO/BIND_NOW leaves GOT[2] lazy resolver slot zero; plt0/0x40103a crashes at RIP=0 before _dl_runtime_resolve", "ts": 1784050129}
+{"t": "no", "text": "libc partial overwrite pop-rdi route", "reason": "scanf %s appends NUL after payload; preserving ASLR byte3 for libc target requires unknown byte, so remote path becomes ASLR brute-force", "ts": 1784050129}
+{"t": "next", "text": "Only remaining apparent path is probabilistic remote ASLR brute, which is prohibited by CTF-Rat ROE; need an additional deterministic leak/control primitive or challenge-side ASLR-off evidence", "ts": 1784050129}
