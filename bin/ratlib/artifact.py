@@ -4,13 +4,16 @@ import argparse, hashlib, json, os, shutil, tempfile
 from datetime import datetime, timezone
 
 def digest_bytes(data: bytes) -> str: return "sha256:" + hashlib.sha256(data).hexdigest()
+def _shared_store(): return os.environ.get("RAT_SHARED_STORE")=="1"
+def _dir_mode(): return 0o770 if _shared_store() else 0o700
+def _file_mode(): return 0o640 if _shared_store() else 0o600
 def _root(path: str | None = None) -> str: return os.path.abspath(path or os.path.join(os.getcwd(), ".rat"))
 def _paths(root: str, digest: str):
     if not digest.startswith("sha256:") or len(digest) != 71: raise ValueError("invalid digest")
     h = digest[7:]; return (os.path.join(root,"objects","sha256",h[:2],h[2:]), os.path.join(root,"metadata","sha256",h[:2],h[2:]+".json"))
 def put_bytes(data: bytes, *, kind: str, media_type: str, logical_name: str, root: str | None = None, provenance: dict | None = None) -> dict:
     root=_root(root); digest=digest_bytes(data); obj, meta=_paths(root,digest)
-    os.makedirs(os.path.dirname(obj),mode=0o700,exist_ok=True); os.makedirs(os.path.dirname(meta),mode=0o700,exist_ok=True)
+    os.makedirs(os.path.dirname(obj),mode=_dir_mode(),exist_ok=True); os.makedirs(os.path.dirname(meta),mode=_dir_mode(),exist_ok=True)
     if os.path.exists(obj):
         with open(obj,"rb") as f: old=f.read()
         if old != data: raise RuntimeError("digest collision/corrupt existing object")
@@ -22,6 +25,7 @@ def put_bytes(data: bytes, *, kind: str, media_type: str, logical_name: str, roo
                 if digest_bytes(check.read()) != digest: raise RuntimeError("write digest mismatch")
             try: os.link(tmp,obj)
             except FileExistsError: pass
+            else: os.chmod(obj,_file_mode())
         finally:
             try: os.unlink(tmp)
             except FileNotFoundError: pass
@@ -31,6 +35,7 @@ def put_bytes(data: bytes, *, kind: str, media_type: str, logical_name: str, roo
         with os.fdopen(fd,"w",encoding="utf-8") as f: json.dump(record,f,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
         try: os.link(tmp,meta)
         except FileExistsError: pass
+        else: os.chmod(meta,_file_mode())
         finally: os.unlink(tmp)
     return record
 def put_file(path: str, **kw):
@@ -40,6 +45,14 @@ def get(digest: str, *, root: str | None = None) -> bytes:
     with open(obj,"rb") as f: data=f.read()
     if digest_bytes(data)!=digest: raise RuntimeError("artifact corruption")
     return data
+def metadata(digest: str, *, root: str | None = None) -> dict:
+    """Return immutable object metadata only after checking its content."""
+    checked_root=_root(root); get(digest,root=checked_root)
+    _,path=_paths(checked_root,digest)
+    with open(path,encoding="utf-8") as source: record=json.load(source)
+    if record.get("schema")!="rat.artifact/v1" or record.get("digest")!=digest:
+        raise RuntimeError("artifact metadata corruption")
+    return record
 def verify(digest: str | None = None, *, root: str | None = None) -> list[str]:
     root=_root(root); failures=[]
     if digest: candidates=[digest]
@@ -58,6 +71,12 @@ def reachable(root: str) -> set[str]:
             try: data=open(os.path.join(base,name),"rb").read().decode("utf-8","ignore")
             except OSError: continue
             found.update(re.findall(r"sha256:[0-9a-f]{64}",data))
+    # ``run.json`` is solve-owned and deliberately sits beside .rat; it is a
+    # root reference even though it is outside the object-store directory.
+    try:
+        data=open(os.path.join(os.path.dirname(os.path.abspath(root)),"run.json"),"rb").read().decode("utf-8","ignore")
+        found.update(re.findall(r"sha256:[0-9a-f]{64}",data))
+    except OSError: pass
     return found
 def gc(*,root: str | None=None,dry_run=True) -> list[str]:
     root=_root(root); keep=reachable(root); removed=[]; base=os.path.join(root,"objects","sha256")
@@ -76,7 +95,7 @@ def main():
     x=sub.add_parser("put"); x.add_argument("file"); x.add_argument("--kind",required=True); x.add_argument("--media-type",required=True); x.add_argument("--logical-name")
     x=sub.add_parser("get"); x.add_argument("digest"); x.add_argument("--output")
     x=sub.add_parser("verify"); x.add_argument("digest",nargs="?")
-    x=sub.add_parser("gc"); x.add_argument("--dry-run",action="store_true")
+    x=sub.add_parser("gc"); x.add_argument("--apply",action="store_true")
     a=p.parse_args()
     if a.cmd=="put": print(json.dumps(put_file(a.file,kind=a.kind,media_type=a.media_type,logical_name=a.logical_name or os.path.basename(a.file),root=a.root)))
     elif a.cmd=="get":
@@ -85,5 +104,5 @@ def main():
         else: os.write(1,data)
     elif a.cmd=="verify":
         bad=verify(a.digest,root=a.root); print(json.dumps({"ok":not bad,"failures":bad})); raise SystemExit(1 if bad else 0)
-    else: print(json.dumps({"dry_run":a.dry_run,"objects":gc(root=a.root,dry_run=a.dry_run)}))
+    else: print(json.dumps({"dry_run":not a.apply,"objects":gc(root=a.root,dry_run=not a.apply)}))
 if __name__ == "__main__": main()

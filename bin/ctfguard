@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from ratlib.runtime import active_path as runtime_active_path
 
 
 def ctf_home():
@@ -13,7 +14,7 @@ def ctf_home():
 
 
 def active_path():
-    return os.path.join(ctf_home(), "ACTIVE.json")
+    return runtime_active_path(ctf_home())
 
 
 def load():
@@ -25,7 +26,9 @@ def load():
 
 
 def save(obj):
-    tmp = active_path() + ".tmp"
+    path = active_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")

@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import argparse, os, sys
+sys.path.insert(0,os.path.dirname(os.path.realpath(__file__)))
+from ratlib.broker_service import serve
+from ratlib.orchestration import GateError
+
+p=argparse.ArgumentParser(prog="rat-brokerd",description="broker-owned Unix-socket execution service")
+p.add_argument("--socket",required=True); p.add_argument("--allow-uid",type=int,required=True)
+p.add_argument("--socket-mode",default="0600",choices=("0600","0660"),help="0660 requires an agent-only shared group")
+p.add_argument("--ctf-home",default=os.environ.get("CTF_HOME",os.path.abspath(os.path.join(os.path.dirname(__file__),".."))))
+p.add_argument("--once",action="store_true")
+a=p.parse_args()
+try: serve(a.socket,allowed_uid=a.allow_uid,ctf_home=a.ctf_home,once=a.once,socket_mode=int(a.socket_mode,8))
+except GateError as exc: print("[rat-brokerd:policy] "+str(exc),file=sys.stderr); raise SystemExit(5)

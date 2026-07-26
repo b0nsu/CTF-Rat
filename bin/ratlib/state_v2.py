@@ -1,19 +1,35 @@
 """Append-only STATE v2 stream, materialization, and lifecycle validation."""
 from __future__ import annotations
-import hashlib, json, os, fcntl, uuid
+import hashlib, json, os, fcntl, tempfile, uuid
 from datetime import datetime, timezone
 from typing import Any
-from .artifact import get, put_bytes
+from .artifact import get, metadata, put_bytes
 
 EVENT_SCHEMA="rat.state-event/v2"; TRANSITIONS={
  "proposed":{"supported","refuted"}, "supported":{"confirmed","verified","refuted","stale"},
  "confirmed":{"verified","refuted","invalidated"}, "verified":{"consumed","refuted","invalidated"},
  "consumed":{"invalidated"}, "refuted":set(), "invalidated":set(), "stale":{"supported","refuted"}}
 def now(): return datetime.now(timezone.utc).isoformat()
+def _shared_dir_mode(): return 0o770 if os.environ.get("RAT_SHARED_STORE")=="1" else 0o700
 def rat_dir(challenge_dir=None): return os.path.join(os.path.abspath(challenge_dir or os.getcwd()),".rat")
 def stream_path(challenge_dir=None): return os.path.join(rat_dir(challenge_dir),"events","STATE.v2.jsonl")
 def _id(prefix): return prefix+"_"+uuid.uuid4().hex
 def cursor(e): return {"stream_id":e["stream_id"],"seq":e["seq"]}
+def _atomic_json(path, doc):
+ """Durably replace a JSON document without exposing a partial checkpoint."""
+ directory=os.path.dirname(path)
+ if not os.path.isdir(directory): os.makedirs(directory,mode=_shared_dir_mode(),exist_ok=True); os.chmod(directory,_shared_dir_mode())
+ fd,tmp=tempfile.mkstemp(prefix=".checkpoint-",dir=directory)
+ try:
+  with os.fdopen(fd,"w",encoding="utf-8") as out:
+   json.dump(doc,out,sort_keys=True,separators=(",",":"),ensure_ascii=False); out.write("\n"); out.flush(); os.fsync(out.fileno())
+  os.replace(tmp,path)
+  directory_fd=os.open(directory,os.O_DIRECTORY)
+  try: os.fsync(directory_fd)
+  finally: os.close(directory_fd)
+ finally:
+  try: os.unlink(tmp)
+  except FileNotFoundError: pass
 class Stream:
  def __init__(self, challenge_dir=None): self.root=rat_dir(challenge_dir); self.path=stream_path(challenge_dir)
  def read(self):
@@ -60,12 +76,38 @@ class Stream:
     for digest in evidence:
      try: get(digest,root=self.root)
      except Exception as exc: raise ValueError("observation evidence artifact is missing or corrupt") from exc
+    if not legacy:
+     policies=[]
+     for digest in evidence:
+      try: policy=metadata(digest,root=self.root).get("provenance",{}).get("evidence_policy",{})
+      except Exception as exc: raise ValueError("observation evidence metadata is missing or corrupt") from exc
+      policies.append(policy)
+     # Quality is a property of immutable producer provenance, never a caller
+     # assertion.  In particular P2's promotion_allowed=false outputs can
+     # never become direct evidence by relabelling an observation.
+     if policies and all(isinstance(p,dict) and p.get("level")=="direct" and p.get("promotion_allowed") is True for p in policies):
+      payload["quality"]={"level":"direct"}
+     elif policies and all(isinstance(p,dict) and p.get("level") in {"direct","derived"} for p in policies):
+      payload["quality"]={"level":"derived"}
+     else:
+      payload["quality"]={"level":"heuristic"}
   elif typ=="finding.revised":
    if not isinstance(payload.get("finding_id"),str) or payload.get("state") not in TRANSITIONS: raise ValueError("finding revision requires id and state")
    if not isinstance(payload.get("evidence_observation_ids",[]),list): raise ValueError("finding evidence must be a list")
+   if not legacy:
+    view=self.view(); old=view["findings"].get(payload["finding_id"]); new=payload["state"]
+    if not old and new!="proposed": raise ValueError("initial finding revision must be proposed")
+    if new!="proposed" and not payload.get("evidence_observation_ids"): raise ValueError("finding requires evidence")
+    if old and new not in TRANSITIONS.get(old["state"],set()): raise ValueError("illegal finding transition")
+    if new=="confirmed" and not any(view["observations"].get(x,{}).get("quality",{}).get("level")=="direct" and view["observations"].get(x,{}).get("validity",{}).get("state")=="active" for x in payload["evidence_observation_ids"]): raise ValueError("confirmed finding needs active direct evidence")
   elif typ=="primitive.revised":
    if not isinstance(payload.get("primitive_id"),str) or payload.get("status") not in {"candidate","pass","fail","blocked","stale"}: raise ValueError("primitive revision requires id and status")
    if not isinstance(payload.get("self_evidence",[]),list): raise ValueError("primitive SELF evidence must be a list")
+   if not legacy:
+    view=self.view(); old=view["primitives"].get(payload["primitive_id"]); new=payload["status"]
+    if not old and new!="candidate": raise ValueError("initial primitive revision must be candidate")
+    if old and (old.get("status"),new) not in {("candidate","pass"),("candidate","fail"),("candidate","blocked"),("pass","stale"),("blocked","candidate"),("stale","candidate")}: raise ValueError("illegal primitive transition")
+    if new=="pass" and (len(payload["self_evidence"])<3 or not all(view["observations"].get(x,{}).get("quality",{}).get("level")=="direct" and view["observations"].get(x,{}).get("validity",{}).get("state")=="active" for x in payload["self_evidence"])): raise ValueError("PASS needs three active direct SELF observations")
   elif typ=="primitive.consumed":
    if not all(isinstance(payload.get(k),str) and payload[k] for k in ("primitive_id","input_digest","environment_digest")): raise ValueError("primitive consumption requires provenance")
   elif typ=="evidence.invalidated":
@@ -79,7 +121,9 @@ class Stream:
   elif typ=="next.recorded":
    if not isinstance(payload.get("probe"),str) or not payload["probe"]: raise ValueError("next probe requires probe")
  def append(self, typ, payload, *, actor="local", task_id="local", caused_by=None):
-  os.makedirs(os.path.dirname(self.path),mode=0o700,exist_ok=True)
+  directory=os.path.dirname(self.path)
+  if not os.path.isdir(directory): os.makedirs(directory,mode=_shared_dir_mode(),exist_ok=True); os.chmod(directory,_shared_dir_mode())
+  created=not os.path.exists(self.path)
   with open(self.path,"a+",encoding="utf-8") as f:
    fcntl.flock(f,fcntl.LOCK_EX); f.seek(0); events=[]; sid=None; last_valid_offset=0
    lines=list(f)
@@ -102,6 +146,10 @@ class Stream:
    self._validate_payload(typ,payload,events,actor)
    e={"schema":EVENT_SCHEMA,"stream_id":sid or _id("stream"),"seq":len(events)+1,"event_id":_id("evt"),"at":now(),"actor":actor,"task_id":task_id,"type":typ,"payload":payload,"caused_by":caused_by or []}
    f.seek(0,2); f.write(json.dumps(e,sort_keys=True,separators=(",",":"))+"\n"); f.flush(); os.fsync(f.fileno()); fcntl.flock(f,fcntl.LOCK_UN)
+  # The broker appends lease/phase evidence while the agent appends planning
+  # events, so the shared event stream needs group write (unlike immutable
+  # artifacts and task snapshots, which remain 0640).
+  if created and os.environ.get("RAT_SHARED_STORE")=="1": os.chmod(self.path,0o660)
   self._update_manifest(e, payload.get("checkpoint_id") if typ=="checkpoint.created" else None)
   return e
  def _update_manifest(self, event, checkpoint_id=None):
@@ -145,7 +193,8 @@ class Stream:
   for p in primitives.values():
    if set(p.get("self_evidence",[])) & invalid: p["status"]="stale"
   return {"observations":observations,"findings":findings,"primitives":primitives,"hypotheses":hypotheses,"ruled_out":ruled_out,"unknowns":unknowns,"next_probes":next_probes}
- def checkpoint(self, *, phase, task_id, role, reason, max_bytes=32768):
+ def checkpoint(self, *, phase, task_id, role, reason, max_bytes=32768, lineage_id=None):
+  if not isinstance(max_bytes,int) or max_bytes<1024: raise ValueError("checkpoint max_bytes must be at least 1024")
   events=self.read(); cur=cursor(events[-1]) if events else {"stream_id":"", "seq":0}; view=self.view()
   active={k:sorted(v) for k,v in view.items() if isinstance(v,dict)}
   small={"cursor":cur, "active":active,
@@ -155,13 +204,27 @@ class Stream:
   if len(raw)>max_bytes:
    overflow=put_bytes(raw,kind="state-delta-overflow",media_type="application/json",logical_name="delta.json",root=self.root)
    small["events"]=small["events"][-10:]; small["overflow_artifact"]=overflow["digest"]; raw=json.dumps(small,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+   # ``active`` can itself be arbitrarily large; once the complete payload is
+   # safely in the overflow object, reduce the inline checkpoint context to a
+   # constant-size locator rather than quietly exceeding the stated budget.
+   if len(raw)>max_bytes:
+    small={"cursor":cur,"overflow_artifact":overflow["digest"],"truncated":True}
+    raw=json.dumps(small,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+  if len(raw)>max_bytes: raise ValueError("checkpoint budget is too small for its cursor")
   context=put_bytes(raw,kind="state-context",media_type="application/json",logical_name="context.json",root=self.root)
   previous=[e["payload"].get("checkpoint_id") for e in events if e["type"]=="checkpoint.created"]
   try: run_id=json.load(open(os.path.join(os.path.dirname(self.root),"run.json"),encoding="utf-8"))["run_id"]
   except (OSError,ValueError,KeyError): run_id="local"
-  cp={"schema":"rat.checkpoint/v1","checkpoint_id":_id("checkpoint"),"run_id":run_id,"created_at":now(),"reason":reason,"phase":phase,"task_id":task_id,"role":role,"event_cursor":cur,"active":active,"invalidation_cursor":cur,"context_artifact":context["digest"],"budgets":{},"status":"handoff","verified_findings":[i for i,x in view["findings"].items() if x.get("state") in ("confirmed","verified")],"supported_hypotheses":list(view["hypotheses"]),"ruled_out":list(view["ruled_out"]),"unresolved_unknowns":list(view["unknowns"]),"next_probes":view["next_probes"],"supersedes":previous[-1] if previous else None}
-  d=os.path.join(self.root,"checkpoints"); os.makedirs(d,exist_ok=True)
-  with open(os.path.join(d,cp["checkpoint_id"]+".json"),"w",encoding="utf-8") as f: json.dump(cp,f,sort_keys=True); f.write("\n")
+  cp={"schema":"rat.checkpoint/v1","checkpoint_id":_id("checkpoint"),"run_id":run_id,"created_at":now(),"reason":reason,"phase":phase,"task_id":task_id,"role":role,"lineage_id":lineage_id,"event_cursor":cur,"active":active,"invalidation_cursor":cur,"context_artifact":context["digest"],"budgets":{},"status":"handoff","verified_findings":[i for i,x in view["findings"].items() if x.get("state") in ("confirmed","verified")],"supported_hypotheses":list(view["hypotheses"]),"ruled_out":list(view["ruled_out"]),"unresolved_unknowns":list(view["unknowns"]),"next_probes":view["next_probes"],"supersedes":previous[-1] if previous else None}
+  # Bound the checkpoint document too, not merely its context artifact.  Full
+  # materialized state remains recoverable from the overflow artifact.
+  cp_raw=json.dumps(cp,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+  if len(cp_raw)>max_bytes:
+   full=put_bytes(cp_raw,kind="checkpoint-overflow",media_type="application/json",logical_name="checkpoint.json",root=self.root)
+   cp={"schema":"rat.checkpoint/v1","checkpoint_id":cp["checkpoint_id"],"run_id":run_id,"created_at":cp["created_at"],"reason":reason,"phase":phase,"task_id":task_id,"role":role,"lineage_id":lineage_id,"event_cursor":cur,"active":{},"invalidation_cursor":cur,"context_artifact":context["digest"],"overflow_artifact":full["digest"],"budgets":{},"status":"handoff","verified_findings":[],"supported_hypotheses":[],"ruled_out":[],"unresolved_unknowns":[],"next_probes":[],"supersedes":previous[-1] if previous else None}
+   if len(json.dumps(cp,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode())>max_bytes: raise ValueError("checkpoint budget is too small for metadata")
+  d=os.path.join(self.root,"checkpoints")
+  _atomic_json(os.path.join(d,cp["checkpoint_id"]+".json"),cp)
   self.append("checkpoint.created",cp,task_id=task_id); return cp
 def revise_finding(stream, doc):
  old=stream.view()["findings"].get(doc["finding_id"]); new=doc["state"]
@@ -198,26 +261,33 @@ def migrate_v1(challenge_dir=None,dry_run=False):
  if not os.path.exists(old): raise ValueError("STATE.jsonl not found")
  with open(old,"rb") as source: raw=source.read()
  digest="sha256:"+hashlib.sha256(raw).hexdigest()
- if any(e["type"]=="migration.completed" and e["payload"].get("v1_digest")==digest for e in s.read()): return {"idempotent":True,"digest":digest,"mapped":0}
+ events=s.read()
+ if any(e["type"]=="migration.completed" and e["payload"].get("v1_digest")==digest for e in events): return {"idempotent":True,"digest":digest,"mapped":0}
+ # A process can die after writing only part of the v1 mapping.  Each source
+ # line therefore has a deterministic identity; retrying imports only records
+ # the missing lines instead of duplicating history before migration.completed.
+ imported={e["payload"].get("legacy_source_id") for e in events if e.get("actor")=="migration"}
  mapped=[]; bad=[]
  for n,line in enumerate(raw.splitlines(),1):
   try: e=json.loads(line); t=e.get("t"); text=e.get("text","")
   except Exception: bad.append(n); continue
-  prefix="legacy_%s_%d" % (digest[7:19],n)
-  if t=="init": mapped.append(("run.initialized",{"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="offset": mapped.append(("observation.recorded",{"observation_id":prefix,"quality":{"level":"derived"},"validity":{"state":"active"},"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="ok": mapped.append(("finding.revised",{"finding_id":prefix,"state":"supported","evidence_observation_ids":[],"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="hypothesis": mapped.append(("hypothesis.recorded",{"hypothesis_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="primitive": mapped.append(("primitive.revised",{"primitive_id":prefix,"status":"candidate","self_evidence":[],"legacy_status":e.get("status"),"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="no": mapped.append(("route.ruled_out",{"fingerprint":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="alert": mapped.append(("alert.recorded",{"alert_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="next": mapped.append(("next.recorded",{"probe":prefix,"legacy":e,"legacy_line":n,"text":text}))
-  elif t=="note": mapped.append(("note.recorded",{"note_id":prefix,"legacy":e,"legacy_line":n,"text":text}))
+  prefix="legacy_%s_%d" % (digest[7:19],n); source_id="%s:%d" % (digest,n)
+  provenance={"legacy":e,"legacy_line":n,"legacy_source_id":source_id,"text":text}
+  if t=="init": mapped.append(("run.initialized",provenance))
+  elif t=="offset": mapped.append(("observation.recorded",provenance|{"observation_id":prefix,"quality":{"level":"derived"},"validity":{"state":"active"}}))
+  elif t=="ok": mapped.append(("finding.revised",provenance|{"finding_id":prefix,"state":"supported","evidence_observation_ids":[]}))
+  elif t=="hypothesis": mapped.append(("hypothesis.recorded",provenance|{"hypothesis_id":prefix}))
+  elif t=="primitive": mapped.append(("primitive.revised",provenance|{"primitive_id":prefix,"status":"candidate","self_evidence":[],"legacy_status":e.get("status")}))
+  elif t=="no": mapped.append(("route.ruled_out",provenance|{"fingerprint":prefix}))
+  elif t=="alert": mapped.append(("alert.recorded",provenance|{"alert_id":prefix}))
+  elif t=="next": mapped.append(("next.recorded",provenance|{"probe":prefix}))
+  elif t=="note": mapped.append(("note.recorded",provenance|{"note_id":prefix}))
   else: bad.append(n)
  if not dry_run:
+  mapped=[(typ,p) for typ,p in mapped if p["legacy_source_id"] not in imported]
   for typ,p in mapped: s.append(typ,p,actor="migration")
   if bad:
    malformed=put_bytes(raw,kind="legacy-state-v1",media_type="application/x-ndjson",logical_name="STATE.jsonl",root=s.root)
    s.append("migration.diagnostic",{"v1_digest":digest,"raw_artifact":malformed["digest"],"malformed_lines":bad},actor="migration")
   s.append("migration.completed",{"v1_digest":digest,"last_byte_offset":len(raw),"malformed_lines":bad},actor="migration")
- return {"idempotent":False,"digest":digest,"mapped":len(mapped),"malformed_lines":bad}
+ return {"idempotent":False,"digest":digest,"mapped":len(mapped),"malformed_lines":bad,"resumed":bool(imported)}

@@ -8,7 +8,7 @@ class EarlyCancelTests(unittest.TestCase):
  def test_invalidation_terminates_registered_process_group(self):
   with tempfile.TemporaryDirectory() as d:
    enter(d,"solve-P0"); finish_phase(d,"solve-P0"); enter(d,"solve-P1"); finish_phase(d,"solve-P1"); cp=enter(d,"solve-P2")
-   stream=Stream(d); evidence=put_bytes(b"e",kind="test-evidence",media_type="text/plain",logical_name="e",root=stream.root)
+   stream=Stream(d); evidence=put_bytes(b"e",kind="test-evidence",media_type="text/plain",logical_name="e",root=stream.root,provenance={"evidence_policy":{"level":"direct","promotion_allowed":True}})
    stream.append("observation.recorded",{"observation_id":"e","quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[evidence["digest"]]})
    child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"],start_new_session=True)
    self.addCleanup(lambda: child.poll() is None and child.kill())
