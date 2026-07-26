@@ -13,11 +13,23 @@
 userland x86-64 linux pwn (heap 비중 큼). 목표: 빠르게 풀 수 있는 것 거르고, context 안 터뜨리며, 실제 바이너리로 검증하며 flag 획득.
 
 ## 고정 루프 (rabbit-hole 방지 — 순서 지킬 것)
+0. `ctfguard begin <name> [user@host:port|host:port]` → active 문제 락 + target allowlist 설정.
+   `ctfguard check` 가 실패하면 어떤 CTF 접속/스캐폴딩도 하지 않는다. 문제 전환은 `ctfguard finish blocked|complete`
+   후 사람에게 보고한 다음에만 가능하다. `nc`/`ssh`는 `ctfguard nc`/`ctfguard ssh` 또는 `ctfguard check-target` 통과 후 실행한다.
 1. `newchal <name> <bin> [libc] [host:port]` → solve 디렉토리 + recon + state.md 자동
 2. **triage 판정** 보고 tier 결정 (🟢 먼저, 🟠/🔴 후순위)
 3. `decomp <bin> <func>` 로 vuln 함수 **하나씩** 확인 → vuln class 확정 → **`knowledge/GROUNDING_INDEX.md` 라우터로 해당 class 지식파일 특정**(통째 로드 금지·subagent로 해당 절만).
-4. primitive 확보 → leak → 최종 exploit
-5. **매 단계 exploit.py 로 실제 바이너리에 실행**해 검증 (추론만 금지)
+4. primitive 후보는 먼저 `state hypothesis ...` 로 기록 → **`doctrine/PRIMITIVE_GATE.md` SELF 확인 통과 후에만** `state primitive <name> pass <evidence>` 로 승격.
+5. primitive PASS 확보 → leak → 최종 exploit. **primitive PASS 없으면 ROP/shellcode/remote chaining 금지.**
+6. **매 단계 exploit.py 로 실제 바이너리에 실행**해 검증 (추론만 금지)
+
+## 원격 brute-force 금지 (공용 규칙)
+- **못 풀겠어서 brute-force 금지.** 원격 exploit은 챌린지가 명시적으로 brute-force를 요구하지 않는 한 deterministic 해야 한다.
+- ASLR/libc base/stack canary/heap layout/timing/partial overwrite 성공 조건을 원격 반복 연결로 맞추는 경로는 의도 풀이가 아니다.
+- 로컬 `/proc/<pid>/maps`, gdb, core, 고정 ASLR, 로컬 libc base로만 성립한 체인은 remote primitive가 아니다.
+- looped remote exploit 실행 전에는 반드시 `state primitive <name> pass remote-equivalent:<evidence>` 가 있어야 한다.
+- 확률 원격 경로를 발견하면 즉시 `state no "<route>" -- "probabilistic remote brute, unintended"` 로 기록하고 분석으로 돌아간다.
+- 로컬 brute-force는 측정/가설 검증까지만 허용하며, solve strategy 또는 원격 공격 루프로 승격하지 않는다.
 
 ## context 규율 (터지지 않게)
 - **decomp/gdbq만 사용**. `objdump -d` 전체, raw `gdb`, ghidra 전체 덤프 금지.
@@ -60,6 +72,18 @@ python/pwntools는 `./venv/bin/python`. exploit.py 는 이미 그 shebang. 새 �
 - one_gadget 오프셋 캐시: `reference/libc-offsets/<version>.txt`.
 - **로그인 CWD가 /mnt/c(윈도우FS)** 라 작업은 반드시 `cd 레포 루트` 에서.
 
+## libc/tcache blame gate
+- `libcgate <chal-dir>` 로 Dockerfile/libc/loader provenance를 먼저 본다. Dockerfile이 있으면
+  Docker 이미지에서 추출한 `libc.so.6`/`ld-linux` 와 loopback 서비스가 우선 증거다.
+- "remote libc가 다르다"는 `state hypothesis`일 뿐이다. Docker loopback도 같은 방식으로 깨지거나,
+  원격 leak/build-id/hash가 Docker libc와 불일치할 때만 `state alert`로 승격한다.
+- heap/tcache 실패는 먼저 allocator 상태를 검증한다. 같은 sequence에서 tcache `count`, head, 반환 순서,
+  safe-linking `encoded_fd = target ^ (chunk >> 12)` 를 pwndbg/SNAP로 확인한다.
+- 단일 freed chunk poison 후 다음 malloc이 forged target으로 안 가는 흔한 원인은 libc mismatch가 아니라
+  tcache count가 0이 된 것이다. 같은 size chunk를 2개 이상 준비해야 하는지 먼저 확인한다.
+- Dockerfile/libc가 맞고 tcache 상태가 틀리면 익스플로잇 순서 문제로 기록한다:
+  `state no "<route>" -- tcache count/head contradicts intended allocation order`.
+
 ## heap/동적 디버깅 (중요 — gdbq 한계 정정)
 - **gdbq 는 -batch + stdin 주입 없음** → 메뉴 기반/heap 챌린지엔 부적합(BP 도달 못 함). 정적·단순 관찰(함수 디스어셈, 심볼)용으로만.
 - heap·인터랙티브 디버깅 **주력 = exploit.py 안에서 `gdb.attach`/`gdb.debug`** (pwntools 가 입력 드라이브 + pwndbg 관찰):
@@ -82,8 +106,8 @@ python/pwntools는 `./venv/bin/python`. exploit.py 는 이미 그 shebang. 새 �
 | P0 Triage | 오케스트레이터 단독 | ❌ | `recon`+triage rubric. 전역 시야 필요 — 여기서 팬아웃=조율비용 낭비 |
 | P1 RE/정찰 | scout Task ×N | ⚠️위임(≠팬아웃) | 큰 읽기(대형 `decomp`/strings/xref)는 **항상** Task로, 결론만 STATE 회수 |
 | P2 Vuln 가설 | hypothesis Task ×2~3 | ✅divergent | **vuln class 불확실할 때만.** 상한 3, 초과분은 팬아웃 말고 순차로 좁힘 |
-| P3 Primitive | 단일 Task/오케스트레이터 | ❌수렴 | leak/AAW는 순차 의존 — 병렬해도 안 빨라짐 |
-| P4 Exploit 체이닝 | 오케스트레이터 단독 | ❌ | primitive 전부를 한 컨텍스트에. `from primitives import *`로 조립(파편화 금지) |
+| P3 Primitive | 단일 Task/오케스트레이터 | ❌수렴 | leak/AAW/control은 순차 의존 — **`PRIMITIVE_GATE.md` SELF 확인 후 `state primitive ... pass` 기록 없으면 다음 phase 금지** |
+| P4 Exploit 체이닝 | 오케스트레이터 단독 | ❌ | primitive 전부를 한 컨텍스트에. `from primitives import *`로 조립(파편화 금지). **hypothesis만으로 체이닝 금지** |
 | P5 Verify | skeptic Task ×1 | ✅반증 | SOLVE 선언 전 refute: leak 위양성(`0x4c4c..`/`0x4747..`/safe-linking 키 `chunk>>12`)·libc mismatch·local↔remote 차 |
 
 - **spawn**: P1=큰 읽기 발생 시 무조건 위임 / P2=class를 1개로 못 좁힐 때만(상한 3) / P5=SOLVE 선언 전 항상 skeptic 1개.
@@ -97,6 +121,9 @@ python/pwntools는 `./venv/bin/python`. exploit.py 는 이미 그 shebang. 새 �
 - 진입 즉시 `state show` (무효화 ALERTS 먼저 확인). checkpoint/종료마다 배운 것 append:
     state offset <k> <v> [src]   # pwndbg/readelf 실측 오프셋만
     state ok   <text>            # 로컬 실증된 primitive/step
+    state hypothesis <text>      # 미검증 가설. 체이닝 근거로 사용 금지.
+    state primitive <name> <pass|fail|blocked> [evidence]
+                                  # PRIMITIVE_GATE SELF 확인 결과. pass만 체이닝 근거로 사용.
     state no   <text> -- <이유>  # 막힌 것 + 이유 (재시도 금지)
     state next <text>            # 다음 한 걸음
     state alert <text>           # 모두의 계획을 바꾸는 무효화 사실 (예: show 단발→그 route 전멸)

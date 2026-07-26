@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Bounded TCP banner probe for broker network-policy integration tests."""
+import argparse
+import json
+import socket
+
+p=argparse.ArgumentParser(prog="rat-net-probe")
+p.add_argument("--host",required=True)
+p.add_argument("--port",required=True,type=int)
+p.add_argument("--timeout",type=float,default=3.0)
+a=p.parse_args()
+if not 1<=a.port<=65535 or not 0.1<=a.timeout<=5.0: p.error("invalid port or timeout")
+try:
+    with socket.create_connection((a.host,a.port),timeout=a.timeout) as conn:
+        conn.settimeout(a.timeout)
+        banner=conn.recv(256)
+except OSError as exc:
+    print(json.dumps({"schema":"rat.tool-result/v1","network_probe":{"host":a.host,"port":a.port,"connected":False,"error":str(exc)}}))
+    raise SystemExit(1)
+print(json.dumps({"schema":"rat.tool-result/v1","network_probe":{"host":a.host,"port":a.port,"connected":True,"banner":banner.decode("ascii","replace")}}))

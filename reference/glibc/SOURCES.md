@@ -15,6 +15,11 @@
 - **libc-database**: `https://github.com/niklasb/libc-database` — `./download <id>` / `./find` (오프셋 역검색).
 - **libc.rip** API: 심볼 오프셋으로 libc 식별 — `https://libc.rip/` (`/api/find`).
 - **pwninit**: 챌린지 dir 에서 `pwninit` → libc/ld 자동 매칭+patchelf (SETUP.md 참고).
+- **Dockerfile 제공 시 우선순위**: [../../DOCKER.md](../../DOCKER.md) 절차로 이미지를 빌드하고,
+  이미지 안의 실제 `libc.so.6`/`ld-linux` 를 추출한다. `glibc-fetch` 는 Docker가 없거나
+  Dockerfile이 없을 때의 fallback이다.
+- **진단 순서**: `libcgate <chal-dir>` 로 provenance를 확인한다. heap/tcache exploit 실패를
+  remote libc mismatch 로 단정하기 전, Docker loopback과 tcache count/head/fd 증거를 먼저 남긴다.
 
 ## 카탈로그 갱신
 `list` 는 스냅샷이다. 최신 반영은 Launchpad 에서 확인:

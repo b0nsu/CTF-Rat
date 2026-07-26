@@ -16,6 +16,27 @@ core
 core.*
 # OMC 플러그인 로컬 상태
 .omc/
+/.tools/
+/STATE.jsonl
+/SHARE.md
+# Large local CTF inputs and generated reverse-engineering outputs.  Keep the
+# reproducible solve scripts and writeups; do not version raw archives, VM
+# images, extracted bundles, or execution logs.
+/solve/**/*.zip
+/solve/**/*.tar
+/solve/**/*.tar.gz
+/solve/**/*.img
+/solve/**/*.log
+/solve/**/*.mdb
+/solve/**/*.bin
+/solve/**/*.out
+/solve/**/flag
+/solve/**/dumps/
+/solve/**/mem_*/
+/solve/**/artifacts/
+/solve/**/extracted/
+/solve/pwnable-ascii/
+/solve/pwnable-elf/
 # 로컬 시크릿 (CTFd 토큰 등)
 .ctfd.env
 *.env

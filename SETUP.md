@@ -54,6 +54,8 @@ reference/glibc/glibc-fetch 2.35-0ubuntu3 amd64    # 필요한 버전만 로컬�
 - 카탈로그: `reference/glibc/list` · 다운로드 출처: `reference/glibc/SOURCES.md`
 - 받은 libs 는 `reference/glibc/libs/` (gitignore — 커밋 안 됨)
 - 최신 계열: 2.41(Ubuntu 25.10) / 2.40(24.10) / 2.39(24.04) / 2.35(22.04)
+- 챌린지가 `Dockerfile` 을 주면 [DOCKER.md](DOCKER.md) 를 우선 사용해 이미지에서 정확한
+  `libc.so.6`/`ld-linux` 를 추출하고 loopback 서비스로 검증한다.
 
 ## 6. 검증 (전부 `ALL GREEN` 이어야 함)
 ```bash
