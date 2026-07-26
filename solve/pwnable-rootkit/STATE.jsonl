@@ -1,0 +1,11 @@
+{"t": "init", "chal": "pwnable-rootkit", "ts": 1784035796}
+{"t": "note", "text": "pwnable.kr rootkit selected: Grotesque unsolved for account ssttff; target ssh rootkit@pwnable.kr -p2222 pw guest", "ts": 1784035796}
+{"t": "ok", "text": "Logged into rootkit QEMU console; /flag exists inode=13 size=46 but open/cat/dd /flag returns EPERM and kernel logs You will not see the flag...", "ts": 1784035796}
+{"t": "hypothesis", "text": "rootkit.ko hooks sys_open/openat/link/symlink/rename and blocks path strings containing flag; raw block device path /dev/ram0 should bypass pathname filter", "ts": 1784035796}
+{"t": "offset", "k": "ext2_block_size", "v": "1024", "src": "stat /flag IO Block and ext2 superblock", "ts": 1784035796}
+{"t": "offset", "k": "flag_inode", "v": "13", "src": "ls -li /flag", "ts": 1784035796}
+{"t": "offset", "k": "inode_table_block", "v": "20", "src": "ext2 group descriptor bg_inode_table", "ts": 1784035796}
+{"t": "offset", "k": "flag_direct_block", "v": "3586", "src": "inode 13 direct block[0] from /dev/ram0", "ts": 1784035796}
+{"t": "primitive", "name": "raw_ext2_read", "status": "pass", "evidence": "remote rootkit QEMU: /flag open blocked, but /dev/ram0 raw read at block 3586 offset 3672064 count 46 yields gzip stream; gzip -dc returns R0otK1tty_Swe3ty_KittY", "ts": 1784035816}
+{"t": "ok", "text": "solve.py fresh remote verification prints R0otK1tty_Swe3ty_KittY", "ts": 1784035816}
+{"t": "next", "text": "Human submit flag to pwnable.kr; auto-submit intentionally skipped per honest-mode", "ts": 1784035816}
