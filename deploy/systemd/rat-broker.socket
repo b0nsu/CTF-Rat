@@ -1,0 +1,13 @@
+[Unit]
+Description=CTF-Rat privileged broker socket
+
+[Socket]
+ListenStream=/run/ratbroker/broker.sock
+SocketUser=ratbroker
+SocketGroup=ratbroker
+SocketMode=0660
+DirectoryMode=0770
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

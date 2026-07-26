@@ -1,0 +1,53 @@
+#!/bin/sh
+# Root-only helper invoked through a narrowly scoped sudoers rule.  It is
+# deliberately not installed or enabled by the repository checkout.
+set -eu
+die() { echo "rat-netns-root: $*" >&2; exit 5; }
+[ "$#" -ge 6 ] || die "usage: --allow-host HOST --allow-port PORT -- CMD..."
+[ "$1" = "--allow-host" ] || die "missing --allow-host"; host=$2; shift 2
+[ "$1" = "--allow-port" ] || die "missing --allow-port"; port=$2; shift 2
+[ "$1" = "--" ] || die "missing command separator"; shift
+case "$port" in ''|*[!0-9]*) die "invalid port";; esac
+[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "invalid port"
+# Resolve exactly once in the root helper.  The child namespace gets no DNS
+# egress; production deployment must inject this pinned mapping into the
+# sandbox's hosts file before enabling hostname targets.
+ips=$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)
+[ -n "$ips" ] || die "target host did not resolve to IPv4"
+command -v ip >/dev/null || die "iproute2 is required"
+command -v iptables >/dev/null || die "iptables is required"
+wan=$(ip route show default | awk 'NR==1 {print $5}')
+[ -n "$wan" ] || die "default route is unavailable"
+previous_forward=$(sysctl -n net.ipv4.ip_forward)
+name="rat$$(date +%s)"
+name=$(printf 'rat%08x' "$$")
+veth_host="${name}h"; veth_ns="${name}n"; subnet="169.254.$(( $$ % 250 + 1 )).0/30"
+host_ip=${subnet%0/30}1; ns_ip=${subnet%0/30}2
+cleanup() {
+  for ip in $ips; do
+    iptables -D FORWARD -i "$veth_host" -o "$wan" -d "$ip" -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$wan" -o "$veth_host" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$veth_host" -j DROP 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s "$subnet" -d "$ip" -p tcp --dport "$port" -j MASQUERADE 2>/dev/null || true
+  done
+  ip link del "$veth_host" 2>/dev/null || true
+  ip netns del "$name" 2>/dev/null || true
+  sysctl -qw net.ipv4.ip_forward="$previous_forward" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+ip netns add "$name"
+ip link add "$veth_host" type veth peer name "$veth_ns"
+ip link set "$veth_ns" netns "$name"
+ip addr add "$host_ip/30" dev "$veth_host"; ip link set "$veth_host" up
+ip netns exec "$name" ip link set lo up
+ip netns exec "$name" ip addr add "$ns_ip/30" dev "$veth_ns"
+ip netns exec "$name" ip link set "$veth_ns" up
+ip netns exec "$name" ip route add default via "$host_ip"
+for ip in $ips; do
+  iptables -A FORWARD -i "$veth_host" -o "$wan" -d "$ip" -p tcp --dport "$port" -j ACCEPT
+  iptables -A FORWARD -i "$wan" -o "$veth_host" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -t nat -A POSTROUTING -s "$subnet" -d "$ip" -p tcp --dport "$port" -j MASQUERADE
+done
+iptables -A FORWARD -i "$veth_host" -j DROP
+sysctl -qw net.ipv4.ip_forward=1
+ip netns exec "$name" runuser -u ratbroker -- "$@"

@@ -8,9 +8,12 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 
 - **세팅**: [SETUP.md](SETUP.md) (venv+angr+pwntools, Ghidra, glibc-fetch — 한 번)
 - **에이전트 진입점/규칙**: [CLAUDE.md](CLAUDE.md) (= `AGENTS.md`, Codex 호환). ROE·6-phase·도구맵.
+  실제 CTF 교전은 먼저 `ctfguard begin <challenge> [target]`으로 대상 allowlist/active lock을 만든다.
 - **풀이 doctrine**: [doctrine/SOLVING.md](doctrine/SOLVING.md)(ROE+6-phase) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md) · [doctrine/FINALS.md](doctrine/FINALS.md)
 - **지식**: [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md) → `knowledge/ctf-skills/`
 - **오케스트레이션 청사진**: [RUNNER_ARCHITECTURE.md](RUNNER_ARCHITECTURE.md)
+- **실행 가능한 benchmark corpus**: [P4 ingestion 상태](docs/architecture-upgrade/P4_CORPUS_INGESTION.md).
+  `benchmarks/corpus/real-v1`은 release-eligible 14개 local pilot이고, 기존 `corpus/v1` 40개 fixture는 smoke test 전용이다.
 
 ## 레이아웃
 ```
@@ -20,6 +23,7 @@ doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
 knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) · ctf-reverse/(rev) · ctf-writeup/
 reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
 bin/                       도구 전체 (+ghidra_scripts/)
+benchmarks/                release gate가 있는 real-v1 pilot + fixture smoke corpus
 solve/_template/rev/       symsolve · vmlift
 kernel/                    커널 pwn 확장
 tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)

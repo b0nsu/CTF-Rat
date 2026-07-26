@@ -1,0 +1,61 @@
+{
+  "schema": "rat.benchmark-challenge/v1",
+  "corpus_id": "ctf-rat-real-v1",
+  "challenge_id": "pilot-vm-01",
+  "version": "1.0.0",
+  "license": "CC0-1.0 self-authored local benchmark",
+  "redistributable": true,
+  "category": "rev-vm-obfuscation",
+  "secondary_tags": [
+    "tiny-vm",
+    "bytecode-transform",
+    "self-authored",
+    "private-oracle"
+  ],
+  "difficulty": "medium",
+  "architectures": [
+    "x86_64"
+  ],
+  "artifacts": {
+    "source_digest": "sha256:c343afec6ec66dc16d46866aa4139ff2b6302a042658b62c5e3cfc3edb99e784",
+    "binary_digest": "sha256:fdd7d9257b98699abc8b065ca930648a4a56189a0a0414b8fbafe44a72b04d6d",
+    "container_digest": "not-applicable-local-toolchain",
+    "source": "src/challenge.c",
+    "binary": "bin/challenge",
+    "oracle": "oracle/check.py",
+    "build_recipe": "cd build && ./build.sh"
+  },
+  "scenario": {
+    "type": "deterministic-local",
+    "network": false,
+    "input_channel": "stdin",
+    "source_visibility": "source-available-track"
+  },
+  "ground_truth": {
+    "required_claims": [
+      "fact",
+      "finding",
+      "primitive-or-solution"
+    ],
+    "locator_tolerance": "symbol-or-source-line",
+    "primary_fact": "bytecode loop transforms four input bytes",
+    "required_primitive": "input reaching VM acceptance"
+  },
+  "oracle": {
+    "type": "local-executable",
+    "network": false,
+    "success_effect": "private evaluator token",
+    "failure_effect": "no private token"
+  },
+  "budgets": {
+    "wall_seconds": 60,
+    "tool_calls": 20,
+    "input_tokens": 16000,
+    "output_tokens": 4000
+  },
+  "seed": 21,
+  "split": "calibration",
+  "skip_conditions": [
+    "x86_64 gcc unavailable"
+  ]
+}

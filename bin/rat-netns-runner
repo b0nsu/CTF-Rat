@@ -1,0 +1,4 @@
+#!/bin/sh
+# Broker-owned adapter.  Install the root helper plus a sudoers rule before
+# setting RAT_BROKER_NETWORK_RUNNER to this file; otherwise it fails closed.
+exec /usr/bin/sudo /usr/local/libexec/rat-netns-root "$@"
