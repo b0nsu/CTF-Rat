@@ -87,11 +87,15 @@ def production_readiness(root):
         scenario=challenge.get("scenario",{})
         if "synthetic fixture" in license_ or "synthetic" in tags:
             defects.append(f"{challenge['challenge_id']}: synthetic fixture is not release-eligible")
+        if challenge.get("redistributable") is not True:
+            defects.append(f"{challenge['challenge_id']}: redistribution status is not approved")
         digest=artifacts.get("source_digest")
         if digest != digest_file(source):
             defects.append(f"{challenge['challenge_id']}: source_digest does not bind source artifact")
         if not isinstance(binary,str) or not (folder/binary).is_file():
             defects.append(f"{challenge['challenge_id']}: executable binary artifact is missing")
+        elif artifacts.get("binary_digest") != digest_file(folder/binary):
+            defects.append(f"{challenge['challenge_id']}: binary_digest does not bind executable artifact")
         if isinstance(scenario.get("smoke_input"),str) and scenario["smoke_input"].startswith("solve:"):
             defects.append(f"{challenge['challenge_id']}: scenario exposes a known solve input")
     return {"release_eligible":not defects,"defects":defects}
