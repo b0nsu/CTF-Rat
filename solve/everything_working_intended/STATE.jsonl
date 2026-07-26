@@ -1,0 +1,2 @@
+{"t": "no", "text": "BOOT/profile field combinations", "reason": "full BOOTX64 calibration replacement plus all eight faultline profile-byte combinations produce calibration session, never challenge decrypt", "ts": 1784443421}
+{"t": "no", "text": "trace checkpoint labels/tokens are direct guest JIT indexes or input words TRACE_JIT_INDEXES decimal/hex token mismatch; TRACE_JIT_FIND_INPUTS found no calibration trace token in guest JIT input stream", "reason": "", "ts": 1784443971}

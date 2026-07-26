@@ -1,0 +1,36 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+# The EFI stage persists the canonical 48-byte handoff as a runtime variable.
+insmod /efivarfs.ko 2>/dev/null || true
+mkdir -p /sys/firmware/efi/efivars
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+
+PROFILE=challenge
+STATE=
+for x in $(cat /proc/cmdline); do
+    case "$x" in
+        faultline.profile=*) PROFILE=${x#*=} ;;
+    esac
+done
+
+VAR=/sys/firmware/efi/efivars/FaultlineState-6d2fef53-1d89-4ab7-9163-7219a4e1045b
+if [ -r "$VAR" ]; then
+    STATE=$(dd if="$VAR" bs=1 skip=12 count=48 2>/dev/null | od -An -tx1 | tr -d ' \n')
+fi
+
+[ ${#STATE} -eq 96 ] || { echo "[chronicle] firmware handoff missing"; exec sh; }
+
+echo "[chronicle] boot profile: $PROFILE"
+insmod /chronicle_module.ko state_hex="$STATE" profile="$([ "$PROFILE" = challenge ] && echo 1 || echo 0)" || exec sh
+echo "[chronicle] kernel handoff ready"
+
+for i in 1 2 3 4 5; do
+    [ -e /dev/ttyS1 ] && break
+    sleep 1
+done
+
+/chronicle_guest
+poweroff -f

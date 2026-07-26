@@ -1,0 +1,16 @@
+# FAULTLINE factory calibration trace
+format = faultline-calibration-v4
+reference-build = b7689ed923e6569c
+profile = calibration
+commitment = sha256-128
+state-size = 48
+checkpoint-labels = opaque
+state-byte-order = lane64-little-endian
+
+checkpoint 0413 T14              00000000142fd8a7 0bd2c057e1faed1f1c1f46b26620d46d
+checkpoint 0755 T3D              000000003d91c46e 24b8d97e40768fc775e9b3efa6bc157e
+checkpoint 1057 T62              0000000062b70f39 c50fbc34608ebc1cad20032a6a8ffd89
+checkpoint 1419 T89              0000000089e35a14 9f733bd1cba3be1cae63602789a4f604
+checkpoint 1751 TB0              00000000b04c728d 1db9a93aaa2fecc36fcef1895b7b00f8
+checkpoint 2057 TD6              00000000d6198be2 17b6e72a8acb305afc74bb54b5b29de2
+checkpoint 2399 TFB              00000000fb72d405 21c97e30ca0d905cb3d17bc5e5c9b911
