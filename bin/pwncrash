@@ -130,7 +130,11 @@ def main(argv=None) -> int:
             except Exception as exc:
                 diagnostics.append("core parse failed: %s" % exc)
         else:
-            diagnostics.append("gdb did not produce a core file")
+            output = raw.strip().replace("\n", " ")
+            diagnostics.append(
+                "gdb did not produce a core file (exit=%d%s)" %
+                (gdb.exit_code, "; " + output[:512] if output else "")
+            )
 
     errors = []
     if not reproduced:
