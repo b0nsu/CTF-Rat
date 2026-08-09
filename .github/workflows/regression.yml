@@ -1,9 +1,9 @@
-name: p0-p4-regression
+name: operational-regression
 
 on:
   pull_request:
   push:
-    branches: [main, ssttff]
+    branches: [main, dev]
 
 jobs:
   regression:
@@ -19,4 +19,3 @@ jobs:
       - run: python3 tests/e2e_orchestration.py --scenario converge
       - run: python3 tests/e2e_orchestration.py --scenario invalidate-cancel
       - run: bin/pkselftest --format json
-      - run: bin/rat-bench validate-corpus --version v1

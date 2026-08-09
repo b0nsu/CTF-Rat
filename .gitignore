@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 *.revq.json
 *.decomp/
-.rat-bench/
 .rat/
 **/.rat/
 *.decomp.tmp/
@@ -19,24 +18,13 @@ core.*
 /.tools/
 /STATE.jsonl
 /SHARE.md
-# Large local CTF inputs and generated reverse-engineering outputs.  Keep the
-# reproducible solve scripts and writeups; do not version raw archives, VM
-# images, extracted bundles, or execution logs.
-/solve/**/*.zip
-/solve/**/*.tar
-/solve/**/*.tar.gz
-/solve/**/*.img
-/solve/**/*.log
-/solve/**/*.mdb
-/solve/**/*.bin
-/solve/**/*.out
-/solve/**/flag
-/solve/**/dumps/
-/solve/**/mem_*/
-/solve/**/artifacts/
-/solve/**/extracted/
-/solve/pwnable-ascii/
-/solve/pwnable-elf/
+# 로컬 문제 풀이 작업물. 공용 템플릿만 main에서 추적한다.
+/solve/*
+!/solve/_template/
+!/solve/_template/**
+# template 재포함 규칙 뒤에도 생성 캐시는 계속 제외한다.
+**/__pycache__/
+**/*.pyc
 # 로컬 시크릿 (CTFd 토큰 등)
 .ctfd.env
 *.env

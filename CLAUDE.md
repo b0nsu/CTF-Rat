@@ -10,7 +10,7 @@
   [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md)(확실히 풀 수 있나 게이트) →
   [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)(**hypothesis→primitive SELF 확인 게이트**) →
   [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)(유형→지식 라우터).
-  결승/팀전은 [doctrine/FINALS.md](doctrine/FINALS.md). 커널은 [kernel/CLAUDE.md](kernel/CLAUDE.md). 오케스트레이션 청사진은 [RUNNER_ARCHITECTURE.md](RUNNER_ARCHITECTURE.md).
+  결승/팀전은 [doctrine/FINALS.md](doctrine/FINALS.md). 커널은 [kernel/CLAUDE.md](kernel/CLAUDE.md).
 - **환경 미준비면**: 먼저 [SETUP.md](SETUP.md)(venv+angr+pwntools, Ghidra, glibc-fetch) → selftest 4종 GREEN 확인.
 
 ## ⛔ 규칙 (위반 금지)
@@ -72,7 +72,6 @@ bin/                       도구 전체 (+ghidra_scripts/)
 solve/_template/rev/       symsolve · vmlift (챌린지 dir 로 복사해 사용)
 kernel/                    커널 pwn 확장(CLAUDE.md·.gdbinit-kernel)
 tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
-RUNNER_ARCHITECTURE.md     다중 에이전트 오케스트레이션 청사진
 ```
 
 ## 테스트 (도구 수정 후 회귀검증 — 전부 ALL GREEN)

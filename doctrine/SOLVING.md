@@ -98,7 +98,7 @@ python/pwntools는 `./venv/bin/python`. exploit.py 는 이미 그 shebang. 새 �
 - 대회 시작 시 여러 챌린지 한 번에 거르기: `triage-all <디렉토리|bin...>` → tier 정렬표. 🟢/🟡 먼저.
 
 ## 다중 에이전트 phase 프로토콜 (언제 팬아웃/수렴 — 한 문제 집중형)
-> 전략: 한 번에 활성 문제 1개. 팬아웃은 문제 "안"에서만(vuln class 좁히기·verify 확신 올리기). 문제-간 자동배분(lease/queue/worker) 안 만듦. 상세·근거=러너 개발 워크스페이스 `ctf-runner/RUNNER_ARCHITECTURE.md`(Mac dev).
+> 전략: 한 번에 활성 문제 1개. 팬아웃은 문제 "안"에서만(vuln class 좁히기·verify 확신 올리기). 문제-간 자동배분(lease/queue/worker)은 운영 workflow에 포함하지 않는다.
 
 문제 하나를 6 phase로 보고, phase마다 팬아웃 on/off를 고정한다:
 | Phase | 주체 | 팬아웃 | 규칙 |

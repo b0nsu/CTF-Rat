@@ -1,7 +1,0 @@
-{
-  "schema": "rat.benchmark-transcript/v1",
-  "baseline_id": "pdf-v1",
-  "source_sha256": "sha256:41244dff6a95bfb6269249b180497dfe745f21bb3b6c4bcadb2b7d250e0f9b95",
-  "reviewers": [],
-  "status": "pending-two-person-review"
-}

@@ -11,9 +11,7 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
   실제 CTF 교전은 먼저 `ctfguard begin <challenge> [target]`으로 대상 allowlist/active lock을 만든다.
 - **풀이 doctrine**: [doctrine/SOLVING.md](doctrine/SOLVING.md)(ROE+6-phase) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md) · [doctrine/FINALS.md](doctrine/FINALS.md)
 - **지식**: [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md) → `knowledge/ctf-skills/`
-- **오케스트레이션 청사진**: [RUNNER_ARCHITECTURE.md](RUNNER_ARCHITECTURE.md)
-- **실행 가능한 benchmark corpus**: [P4 ingestion 상태](docs/architecture-upgrade/P4_CORPUS_INGESTION.md).
-  `benchmarks/corpus/real-v1`은 release-eligible 14개 local pilot이고, 기존 `corpus/v1` 40개 fixture는 smoke test 전용이다.
+- benchmark corpus, ablation, 설계 검토 문서는 `dev` 브랜치에서 관리한다. `main`은 실제 풀이와 검증에 필요한 운영 도구만 제공한다.
 
 ## 레이아웃
 ```
@@ -23,7 +21,6 @@ doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
 knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) · ctf-reverse/(rev) · ctf-writeup/
 reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
 bin/                       도구 전체 (+ghidra_scripts/)
-benchmarks/                release gate가 있는 real-v1 pilot + fixture smoke corpus
 solve/_template/rev/       symsolve · vmlift
 kernel/                    커널 pwn 확장
 tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
@@ -46,7 +43,8 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
   vmlift.py --disasm|--run|--solve [blob]
   ```
   revq 주소 = angr 로드베이스(PIE 0x400000) → `symsolve --find <주소>` 그대로 투입.
-- **pwn**: `pwnkit`/`pwnstage`/`primitives` · **버스**: `state`(확정/배제/다음 기록) · **커널**: `k_*`(kernel/).
+- **pwn**: `pwnkit`/`pwnstage`/`primitives` · `pwncalc`/`pwnleak`/`pwnpayload`/`pwnropcheck`/`pwncrash`/`pwnscope`.
+- **버스**: `state`(확정/배제/다음 기록) · **커널**: `k_*`(kernel/).
 
 ## 테스트 (도구 수정 후 회귀검증)
 ```sh
@@ -58,6 +56,6 @@ bash tests/e2e_rev.sh        # angr 있으면 실 crackme e2e, 없으면 selftes
 ```
 전부 `ALL GREEN ✅`이면 통과.
 
-## 설계 원칙 (RUNNER_ARCHITECTURE.md)
+## 운영 원칙
 한 번에 활성 문제 1개 · 팬아웃은 문제 "안"에서만 · 큰 읽기는 서브에이전트로 위임하고 결론만 회수 ·
 STATE.jsonl 단일 진실원 · 재발명 금지(기존 도구 재사용).
