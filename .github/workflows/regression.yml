@@ -3,7 +3,7 @@ name: operational-regression
 on:
   pull_request:
   push:
-    branches: [main, dev]
+    branches: ['**']
 
 jobs:
   regression:
