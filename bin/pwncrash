@@ -11,8 +11,10 @@ import re
 import tempfile
 import sys
 
+os.environ.setdefault("TERM", "dumb")
+
 from pwn import Corefile, cyclic, cyclic_find, context
-from ratlib.runner import run
+from ratlib.runner import ResourceLimits, run
 
 context.log_level = "error"
 
@@ -97,6 +99,7 @@ def main(argv=None) -> int:
         gdb = run(
             ["gdb", "-q", "-nx", "-batch", "-x", script_path, "--args", binary, *args.arg],
             timeout_seconds=args.timeout,
+            limits=ResourceLimits(core_bytes=512 * 1024 * 1024),
             tool_version="pwncrash/gdb-v1",
         )
         raw = (gdb.stdout.preview + gdb.stderr.preview).decode("utf-8", errors="replace")
