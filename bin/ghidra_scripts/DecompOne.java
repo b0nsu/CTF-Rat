@@ -69,20 +69,19 @@ public class DecompOne extends GhidraScript {
             throw new IllegalArgumentException("bad address: " + args[1]);
         }
 
-        Function function = getFunctionAt(addr);
-        if (function != null) {
-            currentProgram.getFunctionManager().removeFunction(function.getEntryPoint());
-        }
-        clearListing(addr, addr.add(0x80));
-        disassemble(addr);
-        function = createFunction(addr, funName(value));
+        // A requested address can be an interior basic block.  Reusing its
+        // containing function preserves Ghidra's analysis instead of creating
+        // a false entry point in the middle of an instruction stream.
+        Function function = getFunctionContaining(addr);
         if (function == null) {
-            clearListing(addr, addr.add(0x200));
+            clearListing(addr, addr.add(0x80));
             disassemble(addr);
             function = createFunction(addr, funName(value));
         }
         if (function == null) {
-            function = getFunctionContaining(addr);
+            clearListing(addr, addr.add(0x200));
+            disassemble(addr);
+            function = createFunction(addr, funName(value));
         }
         if (function == null) {
             throw new IllegalStateException("cannot create or find function at " + addr);

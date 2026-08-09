@@ -62,6 +62,21 @@ printf '' > ./m2.decomp/_index.txt
 # T9 bounded Qiling transport + optional dependency status
 "$CTF_HOME/bin/rat-qiling" --selftest >/dev/null 2>&1 && ok "rat-qiling bounded selftest" || no "rat-qiling bounded selftest"
 $VENV -c 'import qiling' >/dev/null 2>&1 && ok "qiling optional dependency" || skip "qiling optional dependency 없음"
+# T10 deterministic address math + local/network scope lint
+"$CTF_HOME/bin/pwncalc" base --leak 0x7f0012345000 --offset 0x12345000 2>/dev/null | grep -q 'base=0x7f0000000000' && ok "pwncalc aligned base" || no "pwncalc aligned base"
+printf 'from pwn import *\nio = process("./m")\n' > ./solve_local.py
+"$CTF_HOME/bin/pwnscope" ./solve_local.py >/dev/null 2>&1 && ok "pwnscope local-only" || no "pwnscope local-only"
+# T11 local pwn helpers: leak classification, payload constraint, mapped ROP address
+"$CTF_HOME/bin/pwnleak" --text 'p=0x7ffff7a5f980 marker=0x4141414141414141' 2>/dev/null | grep -Eq 'candidate 0x7ffff7a5f980 +shared-library' && ok "pwnleak classify" || no "pwnleak classify"
+"$CTF_HOME/bin/pwnpayload" --hex 41414141 --max-length 8 2>/dev/null | grep -q 'verdict=pass' && ok "pwnpayload local bytes" || no "pwnpayload local bytes"
+"$CTF_HOME/bin/pwnropcheck" --chain 0x401000 --map /bin/true@0 >/dev/null 2>&1; [ "$?" -eq 2 ] && ok "pwnropcheck rejects unmapped" || no "pwnropcheck rejects unmapped"
+# T12 local cyclic crash/core collection; it remains candidate evidence, never a primitive PASS.
+if command -v cc >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1; then
+  cc -fno-stack-protector -no-pie -O0 -o ./crash_fixture "$CTF_HOME/tests/fixtures/pwn/stack_overflow.c" 2>/dev/null
+  "$CTF_HOME/bin/pwncrash" ./crash_fixture --pattern-length 128 --repetitions 1 --json 2>/dev/null | grep -q '"verdict": "crash-reproduced"' && ok "pwncrash local core" || no "pwncrash local core"
+else
+  skip "pwncrash (cc/gdb dependency 없음)"
+fi
 if [ "${PKSELFTEST_FORCE_FAIL:-0}" = 1 ]; then no "forced failure injection"; fi
 if [ "$FORMAT" = json ]; then
   printf '{"schema":"rat.selftest/v1","pass":%d,"fail":%d,"skip":%d,"strict_optional":%s}\n' "$P" "$F" "$S" "$([ "$STRICT" = 1 ] && echo true || echo false)"

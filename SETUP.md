@@ -71,6 +71,12 @@ angr 미설치 환경이면 revq 는 `selftest`·`--fast`(binutils) 만, symsolv
 - **수집/스캐폴드**: `ctfpull ctfd --id N` → `newchal <name> <bin> [libc] [host:port]`
 - **rev**: `revq <bin>` → `revq <bin> --func <후보>` → `decomp <bin> <fn>` → `symsolve … --find-str …`
 - **pwn**: `recon <bin>` → `decomp` → `pwnkit`/`pwnstage` → `state` 로 진행 기록
+- **주소 계산**: `pwncalc elf-offset --elf ./libc.so.6 --symbol puts` →
+  `pwncalc relocate --elf ./libc.so.6 --leak 0x... --leak-symbol puts --symbol system --string /bin/sh`
+- **범위 검사**: `pwnscope ./solve.py` 로 로컬/원격 transport와 같은 디렉토리의 `run.json` 단일 endpoint 일치 확인
+- **입력·체인 검증**: `pwnleak --text '0x...'` (`ARM32 kernel`이면 `--bits 32 --arch arm`) → `pwncalc ...` → `pwnropcheck --file chain.json --map ./libc.so.6@0x...` →
+  `pwnpayload --file payload.bin --consumer read --bad-byte newline`
+- **로컬 크래시 증거**: `pwncrash ./chall --pattern-length 256` (일반 실행 재현과 GDB core를 기록하지만 primitive PASS는 수동 검토 후 기록)
 - **doctrine**: `doctrine/SOLVING.md`(ROE+6-phase), `doctrine/SOLVABILITY.md`, `knowledge/GROUNDING_INDEX.md`
 
 ## 8. Windows rev (PE/DLL/.NET) — 옵션 (Windows 문제 만나면만)

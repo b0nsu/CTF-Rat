@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Recover raw kernel symbol addresses from a zeroed /proc/kallsyms capture.
+
+Some older kernel CTF targets set ``kptr_restrict=1`` but still expose the full
+symbol-name order through /proc/kallsyms. If the decompressed kernel image keeps
+the kallsyms address table verbatim, one live/static anchor is enough to locate
+that table and reconstruct a System.map-like file.
+
+Example:
+  k_raw_kallsyms --kallsyms kallsyms-zero.txt --image vmlinux.raw \
+      --anchor sys_call_table=0x8000e348 --sym commit_creds prepare_kernel_cred
+"""
+import argparse
+import os
+import re
+import struct
+import sys
+
+
+LINE_RE = re.compile(r"^[0-9a-fA-F]{8,16}\s+(\S)\s+(\S+)(?:\s+\S+)?$")
+
+
+def parse_kallsyms(path):
+    rows = []
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            m = LINE_RE.match(line.strip())
+            if m:
+                rows.append((m.group(1), m.group(2)))
+    return rows
+
+
+def parse_anchor(anchor):
+    if "=" not in anchor:
+        raise ValueError("anchor must be NAME=0xADDR")
+    name, value = anchor.split("=", 1)
+    if not name:
+        raise ValueError("empty anchor name")
+    return name, int(value, 16)
+
+
+def read_u32_table(blob, offset, count):
+    return struct.unpack_from("<%dI" % count, blob, offset)
+
+
+def score_table(values, limit):
+    sample = values[: min(limit, len(values))]
+    in_kernel = [v for v in sample if 0x80000000 <= v <= 0xefffffff]
+    monotonic = sum(1 for a, b in zip(sample, sample[1:]) if a <= b)
+    return len(in_kernel) + monotonic
+
+
+def find_table(blob, count, anchor_index, anchor_value, min_score):
+    max_off = len(blob) - (count * 4)
+    if max_off < 0:
+        raise ValueError("image is too small for %d 32-bit symbols" % count)
+    candidates = []
+    for off in range(0, max_off + 1, 4):
+        if struct.unpack_from("<I", blob, off + anchor_index * 4)[0] != anchor_value:
+            continue
+        values = read_u32_table(blob, off, count)
+        score = score_table(values, 5000)
+        if score >= min_score:
+            candidates.append((score, off, values))
+    candidates.sort(reverse=True)
+    return candidates
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="recover raw 32-bit kallsyms addresses from a kernel image")
+    ap.add_argument("--kallsyms", required=True, help="captured /proc/kallsyms with zeroed addresses")
+    ap.add_argument("--image", required=True, help="decompressed/raw kernel image containing kallsyms_addresses")
+    ap.add_argument("--anchor", required=True, help="known symbol address, NAME=0xADDR")
+    ap.add_argument("--sym", nargs="*", default=[], help="symbols to print; default prints common pwn targets")
+    ap.add_argument("--all", action="store_true", help="write full recovered table")
+    ap.add_argument("-o", "--out", default=None, help="output file for --all")
+    ap.add_argument("--min-score", type=int, default=500, help="minimum candidate sanity score")
+    args = ap.parse_args(argv)
+
+    rows = parse_kallsyms(args.kallsyms)
+    if not rows:
+        ap.error("no kallsyms rows parsed from %s" % args.kallsyms)
+    names = [name for _typ, name in rows]
+    anchor_name, anchor_value = parse_anchor(args.anchor)
+    try:
+        anchor_index = names.index(anchor_name)
+    except ValueError:
+        ap.error("anchor symbol %r not found in kallsyms capture" % anchor_name)
+
+    with open(args.image, "rb") as fh:
+        blob = fh.read()
+    candidates = find_table(blob, len(rows), anchor_index, anchor_value, args.min_score)
+    if not candidates:
+        ap.error("no plausible 32-bit address table found for %s=0x%x" % (anchor_name, anchor_value))
+    score, table_offset, values = candidates[0]
+
+    if len(candidates) > 1:
+        print("WARN: %d candidates found; using best score=%d offset=0x%x" %
+              (len(candidates), score, table_offset), file=sys.stderr)
+
+    print("table_offset = 0x%x" % table_offset)
+    print("anchor       = %s[%d] live=0x%x" % (anchor_name, anchor_index, anchor_value))
+    print("symbols      = %d" % len(rows))
+    print("score        = %d" % score)
+
+    wanted = args.sym or [
+        "_stext", "_text", "sys_call_table", "commit_creds",
+        "prepare_kernel_cred", "init_task", "sys_setuid", "sys_setresuid",
+    ]
+    by_name = {}
+    for i, ((_typ, name), addr) in enumerate(zip(rows, values)):
+        by_name.setdefault(name, (i, _typ, addr))
+    for name in wanted:
+        item = by_name.get(name)
+        if not item:
+            print("%-32s <missing>" % name)
+            continue
+        i, typ, addr = item
+        print("%-32s idx=%-6d type=%s live=0x%08x" % (name, i, typ, addr))
+
+    if args.all:
+        out = args.out or "kallsyms-recovered.txt"
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w") as fh:
+            for (typ, name), addr in zip(rows, values):
+                fh.write("%08x %s %s\n" % (addr, typ, name))
+        print("[+] wrote %s" % out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

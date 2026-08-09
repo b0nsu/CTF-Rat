@@ -2,8 +2,28 @@
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 # decomp <binary> [func] — Ghidra headless 1회 전체 디컴파일 캐시 후 함수별 조회 (context 폭발 방지)
 set -euo pipefail
-GHIDRA="${GHIDRA_HOME:-/opt/ghidra_11.2.1_PUBLIC}"
+GHIDRA="${GHIDRA_HOME:-}"
+if [ -z "$GHIDRA" ]; then
+  for cand in /opt/ghidra_*_PUBLIC "${HOME:-}/ctf-tools"/ghidra_*_PUBLIC; do
+    if [ -x "$cand/support/analyzeHeadless" ]; then GHIDRA="$cand"; break; fi
+  done
+fi
+if [ -z "$GHIDRA" ] && command -v analyzeHeadless >/dev/null 2>&1; then
+  GHIDRA="$(cd -- "$(dirname -- "$(command -v analyzeHeadless)")/.." && pwd)"
+fi
+GHIDRA="${GHIDRA:-/opt/ghidra_11.2.1_PUBLIC}"
 SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
+# Sandboxed runners often mount $HOME read-only.  Ghidra persists its Java
+# discovery and tool state under XDG_CONFIG_HOME before headless analysis.
+# Keep that disposable state inside the kit unless a caller chose a location.
+if [ -z "${XDG_CONFIG_HOME:-}" ]; then
+  if [ -w "$CTF_HOME" ]; then
+    export XDG_CONFIG_HOME="$CTF_HOME/.rat/ghidra-config"
+  else
+    export XDG_CONFIG_HOME="${XDG_CACHE_HOME:-${TMPDIR:-/tmp}}/ctf-rat-ghidra-${UID:-user}"
+  fi
+fi
+mkdir -p "$XDG_CONFIG_HOME"
 REFRESH=0; TIMEOUT_SEC=120; FORMAT=text; positional=()
 while [ "$#" -gt 0 ]; do
   case "$1" in

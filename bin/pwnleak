@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Extract and sanity-check pointer candidates from local program output."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+
+HEX = re.compile(r"(?<![0-9A-Fa-f])(?:0x)?([0-9A-Fa-f]{6,16})(?![0-9A-Fa-f])")
+
+
+def integer(value: str) -> int:
+    return int(value, 0)
+
+
+def canonical(value: int, bits: int, arch: str) -> bool:
+    if bits == 32:
+        return 0 <= value <= 0xFFFFFFFF
+    if arch != "x86":
+        return 0 <= value <= 0xFFFFFFFFFFFFFFFF
+    value &= 0xFFFFFFFFFFFFFFFF
+    upper = value >> 48
+    sign = (value >> 47) & 1
+    return upper == (0xFFFF if sign else 0)
+
+
+def repeated_marker(value: int, bits: int) -> bool:
+    raw = value.to_bytes(bits // 8, "little", signed=False)
+    useful = raw.rstrip(b"\x00")
+    if len(useful) >= 4 and len(set(useful)) == 1:
+        return True
+    return len(useful) >= 4 and all(0x20 <= byte < 0x7F for byte in useful)
+
+
+def classify(value: int, bits: int, arch: str) -> list[str]:
+    if bits == 32 and arch == "arm":
+        if 0x80000000 <= value <= 0xFFFFFFFF:
+            return ["kernel"]
+        if 0x40000000 <= value < 0x80000000:
+            return ["userspace-mapped"]
+        return ["userspace-or-unknown"]
+    if bits == 32:
+        labels = []
+        if 0x08000000 <= value < 0x10000000:
+            labels.append("main-image")
+        if 0xB0000000 <= value < 0xC0000000:
+            labels.append("stack-or-shared")
+        if 0xF0000000 <= value <= 0xFFFFFFFF:
+            labels.append("kernel-or-invalid-userspace")
+        return labels or ["unknown"]
+    if arch != "x86":
+        return ["unknown-%s" % arch]
+    labels = []
+    if 0x400000 <= value < 0x500000:
+        labels.append("main-image")
+    if 0x550000000000 <= value < 0x570000000000:
+        labels.append("pie-or-heap")
+    if 0x700000000000 <= value < 0x7F0000000000:
+        labels.append("mapped-region")
+    if 0x7F0000000000 <= value < 0x7FFFFC000000:
+        labels.append("shared-library")
+    if 0x7FFFFC000000 <= value < 0x800000000000:
+        labels.append("stack-or-vdso")
+    if value >= 0xFFFF800000000000:
+        labels.append("kernel")
+    return labels or ["unknown"]
+
+
+def candidate(value: int, text: str, bits: int, arch: str, chunk: int | None) -> dict:
+    checks = {
+        "canonical": canonical(value, bits, arch),
+        "nonzero": value != 0,
+        "marker_like": repeated_marker(value, bits),
+        "page_aligned": value % 0x1000 == 0,
+        "safe_linking_key_match": chunk is not None and value == chunk >> 12,
+    }
+    confidence = "reject" if not checks["canonical"] or checks["marker_like"] else "candidate"
+    if checks["safe_linking_key_match"]:
+        confidence = "derived-not-pointer"
+    return {
+        "text": text,
+        "value": value,
+        "hex": hex(value),
+        "classification": classify(value, bits, arch),
+        "checks": checks,
+        "disposition": confidence,
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    source = result.add_mutually_exclusive_group()
+    source.add_argument("--text", help="text containing pointer candidates")
+    source.add_argument("--file", help="read text or raw bytes from a file")
+    source.add_argument("--bytes", help="interpret one hex byte sequence as a packed pointer")
+    result.add_argument("--raw", action="store_true", help="treat --file/stdin as packed bytes")
+    result.add_argument("--bits", type=int, choices=(32, 64), default=64)
+    result.add_argument("--arch", choices=("auto", "x86", "arm", "aarch64", "generic"), default="auto",
+                        help="address-layout profile; auto currently assumes x86 for compatibility")
+    result.add_argument("--endian", choices=("little", "big"), default="little")
+    result.add_argument("--width", type=int, choices=(4, 8))
+    result.add_argument("--chunk", type=integer, help="flag a candidate equal to chunk>>12")
+    result.add_argument("--json", action="store_true")
+    return result
+
+
+def read_input(args) -> bytes:
+    if args.bytes is not None:
+        try:
+            return bytes.fromhex(args.bytes.replace("0x", "").replace(" ", ""))
+        except ValueError as exc:
+            raise ValueError("--bytes must contain hexadecimal bytes") from exc
+    if args.text is not None:
+        return args.text.encode()
+    if args.file:
+        return open(args.file, "rb").read()
+    return sys.stdin.buffer.read()
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        data = read_input(args)
+        arch = "x86" if args.arch == "auto" else args.arch
+        width = args.width or args.bits // 8
+        items = []
+        if args.raw or args.bytes is not None:
+            if len(data) < width:
+                raise ValueError("need at least %d packed bytes" % width)
+            for offset in range(0, len(data) - width + 1, width):
+                raw = data[offset:offset + width]
+                value = int.from_bytes(raw, args.endian)
+                item = candidate(value, raw.hex(), args.bits, arch, args.chunk)
+                item["byte_offset"] = offset
+                items.append(item)
+        else:
+            text = data.decode("utf-8", errors="replace")
+            seen = set()
+            for match in HEX.finditer(text):
+                value = int(match.group(1), 16)
+                key = (value, match.start())
+                if key in seen:
+                    continue
+                seen.add(key)
+                item = candidate(value, match.group(0), args.bits, arch, args.chunk)
+                item["text_offset"] = match.start()
+                items.append(item)
+        report = {
+            "schema": "rat.pwnleak/v1",
+            "bits": args.bits,
+            "arch": args.arch,
+            "profile_assumption": "x86" if args.arch == "auto" else None,
+            "endian": args.endian,
+            "candidate_count": len(items),
+            "usable_count": sum(item["disposition"] == "candidate" for item in items),
+            "candidates": items,
+        }
+        if args.json:
+            print(json.dumps(report, sort_keys=True, indent=2))
+        else:
+            print("candidates=%d usable=%d" % (report["candidate_count"], report["usable_count"]))
+            for item in items:
+                print("%s %-19s %-20s %s" % (
+                    item["disposition"], item["hex"], ",".join(item["classification"]),
+                    "marker" if item["checks"]["marker_like"] else "",
+                ))
+        return 0 if items else 1
+    except (OSError, ValueError) as exc:
+        print("pwnleak: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

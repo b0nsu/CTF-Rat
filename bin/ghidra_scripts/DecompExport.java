@@ -36,7 +36,10 @@ public class DecompExport extends GhidraScript {
         for (Function f : fm.getFunctions(true)) {
             discovered++;
             try {
-                DecompileResults r = dec.decompileFunction(f, 60, mon);
+                // Bound each function independently so one malformed or hostile
+                // body cannot prevent the rest of the cache from being useful.
+                // DecompOne remains available for a focused retry.
+                DecompileResults r = dec.decompileFunction(f, 5, mon);
                 if (r != null && r.decompileCompleted() && r.getDecompiledFunction() != null) {
                     String name = f.getName();
                     String safe = name.replaceAll("[^A-Za-z0-9_.-]", "_");

@@ -489,6 +489,20 @@ class NewchalTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertFalse(os.path.exists(os.path.join(temp, "solve", "safe")))
 
+    def test_invalid_remote_fails_before_scaffold_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.make_home(temp)
+            binary = os.path.join(temp, "binary")
+            with open(binary, "wb") as f: f.write(b"fixture")
+            for remote in ("host-without-port", "host:0", "host:65536", "host:not-a-port"):
+                completed = subprocess.run(
+                    [os.path.join(BIN, "newchal"), "safe", binary, "", remote],
+                    env=dict(os.environ, CTF_HOME=temp), stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+                self.assertEqual(completed.returncode, 2, remote)
+                self.assertFalse(os.path.exists(os.path.join(temp, "solve", "safe")), remote)
+
     def test_different_run_identity_does_not_overwrite_existing_solve(self):
         with tempfile.TemporaryDirectory() as temp:
             self.make_home(temp)

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Validate local payload bytes, transport effects, and word layout."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+
+
+NAMED_BYTES = {"nul": 0x00, "null": 0x00, "newline": 0x0A, "lf": 0x0A,
+               "cr": 0x0D, "space": 0x20, "tab": 0x09}
+
+
+def byte_value(value: str) -> int:
+    lowered = value.lower()
+    if lowered in NAMED_BYTES:
+        return NAMED_BYTES[lowered]
+    try:
+        parsed = int(lowered, 16 if not lowered.startswith("0x") else 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("bad byte must be 00..ff, 0xNN, or a named byte") from exc
+    if not 0 <= parsed <= 0xFF:
+        raise argparse.ArgumentTypeError("bad byte is outside 00..ff")
+    return parsed
+
+
+def load_payload(args) -> bytes:
+    if args.hex is not None:
+        try:
+            return bytes.fromhex(args.hex.replace("0x", "").replace(" ", ""))
+        except ValueError as exc:
+            raise ValueError("--hex must contain hexadecimal bytes") from exc
+    if args.file:
+        return open(args.file, "rb").read()
+    return sys.stdin.buffer.read()
+
+
+def first_index(data: bytes, values: set[int]) -> int | None:
+    indexes = [data.find(bytes([value])) for value in values]
+    indexes = [index for index in indexes if index >= 0]
+    return min(indexes) if indexes else None
+
+
+def consumer_effect(data: bytes, consumer: str) -> dict:
+    if consumer in {"strcpy", "strlen"}:
+        stop = first_index(data, {0})
+        return {"stop_bytes": [0], "first_stop": stop, "bytes_consumed": len(data) if stop is None else stop}
+    if consumer == "gets":
+        stop = first_index(data, {0x0A})
+        consumed = len(data) if stop is None else stop
+        return {"stop_bytes": [0x0A], "first_stop": stop, "bytes_consumed": consumed, "appends_nul": True}
+    if consumer == "fgets":
+        stop = first_index(data, {0x0A})
+        consumed = len(data) if stop is None else stop + 1
+        return {"stop_bytes": [0x0A], "first_stop": stop, "bytes_consumed": consumed, "stores_newline": stop is not None, "appends_nul": True}
+    if consumer == "scanf-s":
+        stop = first_index(data, {0, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20})
+        return {"stop_bytes": [0, 9, 10, 11, 12, 13, 32], "first_stop": stop, "bytes_consumed": len(data) if stop is None else stop}
+    return {"stop_bytes": [], "first_stop": None, "bytes_consumed": len(data)}
+
+
+def layout(data: bytes, word_size: int, endian: str) -> list[dict]:
+    result = []
+    for offset in range(0, len(data), word_size):
+        raw = data[offset:offset + word_size]
+        result.append({
+            "offset": offset,
+            "size": len(raw),
+            "hex": raw.hex(),
+            "value": int.from_bytes(raw, endian),
+            "ascii": "".join(chr(byte) if 0x20 <= byte < 0x7F else "." for byte in raw),
+        })
+    return result
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    source = result.add_mutually_exclusive_group()
+    source.add_argument("--hex")
+    source.add_argument("--file")
+    result.add_argument("--bad-byte", action="append", type=byte_value, default=[])
+    result.add_argument("--max-length", type=int)
+    result.add_argument("--transport", choices=("send", "sendline"), default="send")
+    result.add_argument("--consumer", choices=("read", "gets", "fgets", "scanf-s", "strcpy", "strlen"), default="read")
+    result.add_argument("--allow-truncation", action="store_true",
+                        help="permit the consumer to stop before the transmitted payload ends")
+    result.add_argument("--word-size", type=int, choices=(4, 8), default=8)
+    result.add_argument("--endian", choices=("little", "big"), default="little")
+    result.add_argument("--json", action="store_true")
+    return result
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        payload = load_payload(args)
+    except (OSError, ValueError) as exc:
+        print("pwnpayload: %s" % exc, file=sys.stderr)
+        return 2
+    transmitted = payload + (b"\n" if args.transport == "sendline" else b"")
+    bad = sorted(set(args.bad_byte))
+    occurrences = {
+        "0x%02x" % value: [index for index, byte in enumerate(transmitted) if byte == value]
+        for value in bad if value in transmitted
+    }
+    effect = consumer_effect(transmitted, args.consumer)
+    errors = []
+    warnings = []
+    if args.max_length is not None and len(transmitted) > args.max_length:
+        errors.append("transmitted payload exceeds max length")
+    if occurrences:
+        errors.append("payload contains prohibited bytes")
+    if effect["first_stop"] is not None and effect["bytes_consumed"] < len(transmitted):
+        message = "consumer stops before the transmitted payload ends"
+        (warnings if args.allow_truncation else errors).append(message)
+    if args.transport == "sendline" and 0x0A in bad:
+        errors.append("sendline appends a prohibited newline")
+    report = {
+        "schema": "rat.pwnpayload/v1",
+        "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        "input_length": len(payload),
+        "transmitted_length": len(transmitted),
+        "transport": args.transport,
+        "consumer": args.consumer,
+        "bad_byte_occurrences": occurrences,
+        "consumer_effect": effect,
+        "layout": layout(payload, args.word_size, args.endian),
+        "errors": errors,
+        "warnings": warnings,
+        "verdict": "pass" if not errors else "fail",
+    }
+    if args.json:
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        print("verdict=%s input=%d transmitted=%d sha256=%s" % (
+            report["verdict"], len(payload), len(transmitted), report["sha256"],
+        ))
+        for item in errors:
+            print("[error] " + item)
+        for item in warnings:
+            print("[warning] " + item)
+        for word in report["layout"]:
+            print("%04x  %-16s  %#x  %s" % (word["offset"], word["hex"], word["value"], word["ascii"]))
+    return 0 if not errors else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

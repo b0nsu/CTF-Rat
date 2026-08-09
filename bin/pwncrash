@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Reproduce a local crash and collect non-promoted cyclic/core evidence."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import tempfile
+import sys
+
+from pwn import Corefile, cyclic, cyclic_find, context
+from ratlib.runner import run
+
+context.log_level = "error"
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def load_input(args) -> tuple[bytes, str]:
+    if args.input:
+        return open(args.input, "rb").read(), "file"
+    return cyclic(args.pattern_length, n=args.cyclic_width), "cyclic"
+
+
+def cyclic_offset(value: int | None, width: int) -> int | None:
+    if value is None:
+        return None
+    try:
+        result = cyclic_find(value & ((1 << (width * 8)) - 1), n=width)
+    except (ValueError, OverflowError):
+        return None
+    return result if result >= 0 else None
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("binary")
+    result.add_argument("--input", help="use an existing stdin payload instead of cyclic bytes")
+    result.add_argument("--pattern-length", type=int, default=256)
+    result.add_argument("--cyclic-width", type=int, choices=(4, 8), default=4)
+    result.add_argument("--arg", action="append", default=[])
+    result.add_argument("--timeout", type=float, default=10.0)
+    result.add_argument("--repetitions", type=int, default=3)
+    result.add_argument("--json", action="store_true")
+    return result
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    binary = os.path.realpath(args.binary)
+    if args.repetitions < 1 or args.pattern_length < 1:
+        print("pwncrash: repetitions and pattern length must be positive", file=sys.stderr)
+        return 2
+    try:
+        data, input_kind = load_input(args)
+    except OSError as exc:
+        print("pwncrash: %s" % exc, file=sys.stderr)
+        return 2
+    plain = []
+    for _ in range(args.repetitions):
+        result = run([binary, *args.arg], input_bytes=data, timeout_seconds=args.timeout, tool_version="pwncrash/plain-v1")
+        plain.append({
+            "exit_code": result.exit_code,
+            "signal": result.signal,
+            "timed_out": result.timed_out,
+            "stdout_bytes": result.stdout.total_bytes,
+            "stderr_bytes": result.stderr.total_bytes,
+        })
+    signals = [item["signal"] for item in plain]
+    reproduced = bool(signals and signals[0] and all(value == signals[0] for value in signals))
+
+    registers = {}
+    core_doc = None
+    diagnostics = []
+    with tempfile.TemporaryDirectory(prefix="pwncrash-") as directory:
+        input_path = os.path.join(directory, "input.bin")
+        core_path = os.path.join(directory, "core")
+        script_path = os.path.join(directory, "crash.gdb")
+        open(input_path, "wb").write(data)
+        script = (
+            "set pagination off\nset confirm off\nset height 0\n"
+            "handle SIGSEGV stop print nopass\n"
+            "run < %s\n"
+            "info registers\n"
+            "generate-core-file %s\n" % (input_path, core_path)
+        )
+        open(script_path, "w", encoding="ascii").write(script)
+        gdb = run(
+            ["gdb", "-q", "-nx", "-batch", "-x", script_path, "--args", binary, *args.arg],
+            timeout_seconds=args.timeout,
+            tool_version="pwncrash/gdb-v1",
+        )
+        raw = (gdb.stdout.preview + gdb.stderr.preview).decode("utf-8", errors="replace")
+        for name, value in re.findall(r"^([a-z][a-z0-9]+)\s+(0x[0-9a-fA-F]+)\b", raw, re.MULTILINE):
+            registers[name] = int(value, 16)
+        if os.path.isfile(core_path):
+            try:
+                core = Corefile(core_path)
+                pc = int(core.pc)
+                sp = int(core.sp)
+                fault = int(core.fault_addr) if core.fault_addr is not None else None
+                try:
+                    stack = core.read(sp, 64)
+                except Exception:
+                    stack = b""
+                core_doc = {
+                    "sha256": sha256(core_path),
+                    "size": os.path.getsize(core_path),
+                    "architecture": core.arch,
+                    "bits": core.bits,
+                    "pc": pc,
+                    "sp": sp,
+                    "fault_addr": fault,
+                    "pc_cyclic_offset": cyclic_offset(pc, args.cyclic_width),
+                    "fault_cyclic_offset": cyclic_offset(fault, args.cyclic_width),
+                    "stack_hex": stack.hex(),
+                }
+            except Exception as exc:
+                diagnostics.append("core parse failed: %s" % exc)
+        else:
+            diagnostics.append("gdb did not produce a core file")
+
+    errors = []
+    if not reproduced:
+        errors.append("plain execution did not reproduce one stable crash signal")
+    if core_doc is None:
+        errors.append("core evidence is unavailable")
+    report = {
+        "schema": "rat.pwncrash/v1",
+        "scope": "local-only",
+        "promotion": "candidate-evidence-only",
+        "binary": {"path": binary, "sha256": sha256(binary)},
+        "input": {
+            "kind": input_kind,
+            "length": len(data),
+            "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            "cyclic_width": args.cyclic_width,
+        },
+        "plain_runs": plain,
+        "stable_signal": signals[0] if reproduced else None,
+        "registers": registers,
+        "core": core_doc,
+        "errors": errors,
+        "diagnostics": diagnostics,
+        "verdict": "crash-reproduced" if not errors else "inconclusive",
+    }
+    if args.json:
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        print("verdict=%s repetitions=%d signal=%s" % (report["verdict"], args.repetitions, report["stable_signal"]))
+        if core_doc:
+            print("pc=%#x sp=%#x fault=%s pc_offset=%s fault_offset=%s" % (
+                core_doc["pc"], core_doc["sp"],
+                "-" if core_doc["fault_addr"] is None else hex(core_doc["fault_addr"]),
+                core_doc["pc_cyclic_offset"], core_doc["fault_cyclic_offset"],
+            ))
+        for value in errors + diagnostics:
+            print("[warning] " + value)
+    return 0 if not errors else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

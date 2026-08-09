@@ -33,6 +33,15 @@ fi
 if [ -n "$RUN_SOURCE" ] && [ ! -f "$RUN_SOURCE" ]; then
   echo "[newchal:err] run manifest not found: $RUN_SOURCE" >&2; exit 4
 fi
+HOST=""; PORT=0
+if [ -n "$REMOTE" ]; then
+  if [[ ! "$REMOTE" =~ ^([^:@[:space:]]+):([0-9]+)$ ]] ||
+     [ "${BASH_REMATCH[2]:-0}" -lt 1 ] || [ "${BASH_REMATCH[2]:-0}" -gt 65535 ]; then
+    echo "[newchal:err] remote must be HOST:PORT with port 1..65535" >&2
+    exit 2
+  fi
+  HOST="${BASH_REMATCH[1]}"; PORT="${BASH_REMATCH[2]}"
+fi
 RUN_ABS=""
 if [ -n "$RUN_SOURCE" ]; then
   RUN_ABS="$(readlink -f -- "$RUN_SOURCE")"
@@ -96,7 +105,6 @@ if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
     echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → glibc-aio 로 수동 patchelf 필요"
   fi
 fi
-HOST="${REMOTE%%:*}"; PORT="${REMOTE##*:}"; [ -n "$PORT" ] || PORT=0
 python3 - "$D" "$BN" "$HOST" "$PORT" <<'PY'
 import sys,os
 D,BN,HOST,PORT=sys.argv[1:5]

@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Deterministic, network-free address calculator for local CTF analysis."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+try:
+    from elftools.elf.elffile import ELFFile
+except ImportError as exc:  # pragma: no cover - exercised through CLI diagnostics
+    ELFFile = None
+    ELFTOOLS_ERROR = exc
+else:
+    ELFTOOLS_ERROR = None
+
+
+def integer(value: str) -> int:
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an integer such as 4096 or 0x1000") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("addresses and offsets must be non-negative")
+    return parsed
+
+
+def digest(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def artifact(path: str) -> dict:
+    real = os.path.realpath(path)
+    return {"path": real, "sha256": digest(real), "size": os.path.getsize(real)}
+
+
+def address_checks(value: int, bits: int, alignment: int | None = None) -> dict:
+    maximum = (1 << bits) - 1
+    return {
+        "non_negative": value >= 0,
+        "fits_bits": value <= maximum,
+        "alignment": None if not alignment else value % alignment == 0,
+    }
+
+
+def require_valid(checks: dict, label: str) -> None:
+    failed = [name for name, passed in checks.items() if passed is False]
+    if failed:
+        raise ValueError("%s failed checks: %s" % (label, ", ".join(failed)))
+
+
+def load_elf(path: str):
+    if ELFFile is None:
+        raise RuntimeError("pyelftools is required: %s" % ELFTOOLS_ERROR)
+    source = open(path, "rb")
+    try:
+        elf = ELFFile(source)
+        metadata = {
+            "bits": elf.elfclass,
+            "endian": "little" if elf.little_endian else "big",
+            "type": elf.header["e_type"],
+            "machine": elf.header["e_machine"],
+        }
+        loads = [segment for segment in elf.iter_segments() if segment.header.p_type == "PT_LOAD"]
+        image_min = min((int(segment.header.p_vaddr) for segment in loads), default=0)
+        image_max = max(
+            (int(segment.header.p_vaddr) + int(segment.header.p_memsz) for segment in loads),
+            default=0,
+        )
+        return source, elf, metadata | {"image_min": image_min, "image_max": image_max}
+    except Exception:
+        source.close()
+        raise
+
+
+def symbol_offset(elf, name: str) -> int:
+    candidates = []
+    for section_name in (".dynsym", ".symtab"):
+        section = elf.get_section_by_name(section_name)
+        if section is None:
+            continue
+        for symbol in section.get_symbol_by_name(name) or []:
+            value = int(symbol.entry.st_value)
+            defined = symbol.entry.st_shndx != "SHN_UNDEF"
+            candidates.append((defined, value != 0, section_name == ".dynsym", value))
+    if not candidates:
+        raise ValueError("symbol not found: %s" % name)
+    candidates.sort(reverse=True)
+    if not candidates[0][0]:
+        raise ValueError("symbol is undefined in this ELF: %s" % name)
+    return candidates[0][3]
+
+
+def string_offset(path: str, needle: bytes, occurrence: int) -> int:
+    with open(path, "rb") as source:
+        data = source.read()
+    start = 0
+    found = []
+    while True:
+        index = data.find(needle, start)
+        if index < 0:
+            break
+        found.append(index)
+        start = index + 1
+    if not found:
+        raise ValueError("string not found")
+    if occurrence >= len(found):
+        raise ValueError("string occurrence %d unavailable; found %d" % (occurrence, len(found)))
+
+    source, elf, _ = load_elf(path)
+    try:
+        file_offset = found[occurrence]
+        for segment in elf.iter_segments():
+            header = segment.header
+            if header.p_type != "PT_LOAD":
+                continue
+            begin = int(header.p_offset)
+            end = begin + int(header.p_filesz)
+            if begin <= file_offset < end:
+                return int(header.p_vaddr) + file_offset - begin
+    finally:
+        source.close()
+    raise ValueError("string exists outside a loadable segment")
+
+
+def base_result(leak: int, offset: int, bits: int, alignment: int) -> dict:
+    if leak < offset:
+        raise ValueError("leak is smaller than the supplied offset")
+    base = leak - offset
+    checks = address_checks(base, bits, alignment)
+    require_valid(checks, "calculated base")
+    return {
+        "operation": "base",
+        "inputs": {"leak": leak, "offset": offset, "bits": bits, "alignment": alignment},
+        "formula": "base = leak - offset",
+        "result": {"base": base},
+        "checks": checks,
+    }
+
+
+def resolve_result(base: int, offset: int, bits: int) -> dict:
+    address = base + offset
+    checks = address_checks(address, bits)
+    require_valid(checks, "resolved address")
+    return {
+        "operation": "resolve",
+        "inputs": {"base": base, "offset": offset, "bits": bits},
+        "formula": "address = base + offset",
+        "result": {"address": address},
+        "checks": checks,
+    }
+
+
+def elf_result(args) -> dict:
+    path = os.path.realpath(args.elf)
+    source, elf, metadata = load_elf(path)
+    try:
+        offset = symbol_offset(elf, args.symbol) if args.symbol else string_offset(path, args.string.encode(), args.occurrence)
+    finally:
+        source.close()
+    label = args.symbol or args.string
+    relocatable = metadata["type"] == "ET_REL"
+    return {
+        "operation": "elf-offset",
+        "artifact": artifact(path),
+        "elf": metadata,
+        "inputs": {"kind": "symbol" if args.symbol else "string", "name": label},
+        "result": {"offset": offset},
+        "interpretation": "section-relative symbol value; runtime relocation is required" if relocatable else "ELF virtual offset",
+        "checks": {"inside_load_image": None if relocatable else metadata["image_min"] <= offset < metadata["image_max"]},
+    }
+
+
+def relocate_result(args) -> dict:
+    path = os.path.realpath(args.elf)
+    source, elf, metadata = load_elf(path)
+    try:
+        if metadata["type"] == "ET_REL":
+            raise ValueError("relocate requires an ET_DYN or ET_EXEC image; ET_REL symbols need loader/module relocation data")
+        leak_offset = symbol_offset(elf, args.leak_symbol)
+        wanted = {name: symbol_offset(elf, name) for name in args.symbol}
+        for value in args.string:
+            wanted["string:" + value] = string_offset(path, value.encode(), 0)
+    finally:
+        source.close()
+
+    base_doc = base_result(args.leak, leak_offset, metadata["bits"], args.alignment)
+    base = base_doc["result"]["base"]
+    resolved = {name: base + offset for name, offset in wanted.items()}
+    for name, value in resolved.items():
+        require_valid(address_checks(value, metadata["bits"]), "resolved %s" % name)
+    return {
+        "operation": "relocate",
+        "artifact": artifact(path),
+        "elf": metadata,
+        "inputs": {
+            "leak": args.leak,
+            "leak_symbol": args.leak_symbol,
+            "leak_offset": leak_offset,
+            "alignment": args.alignment,
+        },
+        "formula": "base = leak - leak_symbol_offset; address = base + target_offset",
+        "result": {"base": base, "offsets": wanted, "addresses": resolved},
+        "checks": base_doc["checks"] | {
+            "targets_inside_load_image": all(metadata["image_min"] <= x < metadata["image_max"] for x in wanted.values())
+        },
+    }
+
+
+def display(doc: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(doc, sort_keys=True, indent=2))
+        return
+    if doc.get("artifact"):
+        print("artifact=%s" % doc["artifact"]["path"])
+        print("sha256=%s" % doc["artifact"]["sha256"])
+    print("operation=%s" % doc["operation"])
+    if doc.get("formula"):
+        print("formula=%s" % doc["formula"])
+    for key, value in doc["result"].items():
+        if isinstance(value, int):
+            print("%s=%#x" % (key, value))
+        elif isinstance(value, dict):
+            for child, child_value in value.items():
+                print("%s.%s=%#x" % (key, child, child_value))
+    for key, value in doc.get("checks", {}).items():
+        print("check.%s=%s" % (key, str(value).lower()))
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument("--json", action="store_true", help="emit a stable JSON report")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    base = commands.add_parser("base", help="calculate a module base from a leak and offset")
+    base.add_argument("--leak", required=True, type=integer)
+    base.add_argument("--offset", required=True, type=integer)
+    base.add_argument("--bits", type=int, choices=(32, 64), default=64)
+    base.add_argument("--alignment", type=integer, default=0x1000)
+
+    resolve = commands.add_parser("resolve", help="resolve an offset against a module base")
+    resolve.add_argument("--base", required=True, type=integer)
+    resolve.add_argument("--offset", required=True, type=integer)
+    resolve.add_argument("--bits", type=int, choices=(32, 64), default=64)
+
+    offset = commands.add_parser("elf-offset", help="read a symbol or string virtual offset from an ELF")
+    offset.add_argument("--elf", required=True)
+    choice = offset.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--symbol")
+    choice.add_argument("--string")
+    offset.add_argument("--occurrence", type=integer, default=0)
+
+    relocate = commands.add_parser("relocate", help="calculate a base and selected ELF addresses")
+    relocate.add_argument("--elf", required=True)
+    relocate.add_argument("--leak", required=True, type=integer)
+    relocate.add_argument("--leak-symbol", required=True)
+    relocate.add_argument("--symbol", action="append", default=[])
+    relocate.add_argument("--string", action="append", default=[])
+    relocate.add_argument("--alignment", type=integer, default=0x1000)
+    return root
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if args.command == "base":
+            doc = base_result(args.leak, args.offset, args.bits, args.alignment)
+        elif args.command == "resolve":
+            doc = resolve_result(args.base, args.offset, args.bits)
+        elif args.command == "elf-offset":
+            doc = elf_result(args)
+        else:
+            if not args.symbol and not args.string:
+                raise ValueError("relocate requires at least one --symbol or --string")
+            doc = relocate_result(args)
+        display(doc, args.json)
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print("pwncalc: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

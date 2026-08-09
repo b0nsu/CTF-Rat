@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Validate a local ROP-chain layout against mapped ELF segments."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+from elftools.elf.elffile import ELFFile
+
+
+def integer(value) -> int:
+    return int(value, 0) if isinstance(value, str) else int(value)
+
+
+def byte_value(value: str) -> int:
+    parsed = int(value, 0) if value.lower().startswith("0x") else int(value, 16)
+    if not 0 <= parsed <= 0xFF:
+        raise argparse.ArgumentTypeError("bad byte must be 00..ff")
+    return parsed
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def mapping(spec: str) -> dict:
+    try:
+        path, base_text = spec.rsplit("@", 1)
+        base = integer(base_text)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("mapping must be PATH@BASE") from exc
+    path = os.path.realpath(path)
+    with open(path, "rb") as source:
+        elf = ELFFile(source)
+        segments = []
+        for segment in elf.iter_segments():
+            header = segment.header
+            if header.p_type != "PT_LOAD":
+                continue
+            flags = int(header.p_flags)
+            segments.append({
+                "start": base + int(header.p_vaddr),
+                "end": base + int(header.p_vaddr) + int(header.p_memsz),
+                "read": bool(flags & 4),
+                "write": bool(flags & 2),
+                "execute": bool(flags & 1),
+            })
+        return {
+            "path": path,
+            "base": base,
+            "bits": elf.elfclass,
+            "endian": "little" if elf.little_endian else "big",
+            "machine": elf.header["e_machine"],
+            "type": elf.header["e_type"],
+            "sha256": sha256(path),
+            "segments": segments,
+        }
+
+
+def chain(args) -> tuple[list[dict], int]:
+    if args.file:
+        doc = json.load(open(args.file, encoding="utf-8"))
+        if isinstance(doc, dict):
+            values = doc.get("entries")
+            initial = int(doc.get("initial_rsp_mod16", args.initial_rsp_mod16))
+        else:
+            values = doc
+            initial = args.initial_rsp_mod16
+        if not isinstance(values, list):
+            raise ValueError("chain JSON must be a list or contain an entries list")
+    else:
+        values = [value.strip() for value in args.chain.split(",") if value.strip()]
+        initial = args.initial_rsp_mod16
+    entries = []
+    for index, value in enumerate(values):
+        if isinstance(value, dict):
+            kind = value.get("kind", "gadget")
+            address = integer(value.get("value"))
+            name = value.get("name")
+        else:
+            kind, address, name = "gadget", integer(value), None
+        if kind not in {"gadget", "call", "data"}:
+            raise ValueError("entry %d has invalid kind" % index)
+        entries.append({"index": index, "kind": kind, "value": address, "name": name})
+    return entries, initial
+
+
+def locate(address: int, maps: list[dict]) -> tuple[dict | None, dict | None]:
+    for item in maps:
+        for segment in item["segments"]:
+            if segment["start"] <= address < segment["end"]:
+                return item, segment
+    return None, None
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    source = result.add_mutually_exclusive_group(required=True)
+    source.add_argument("--chain", help="comma-separated qwords; every entry is treated as code")
+    source.add_argument("--file", help="JSON list or {entries:[{value,kind,name}]} document")
+    result.add_argument("--map", action="append", type=mapping, default=[], metavar="ELF@BASE")
+    result.add_argument("--bits", type=int, choices=(32, 64), default=64)
+    result.add_argument("--endian", choices=("little", "big"), default="little")
+    result.add_argument("--bad-byte", action="append", type=byte_value, default=[])
+    result.add_argument("--initial-rsp-mod16", type=int, default=0,
+                        help="RSP modulo 16 while it points at the first chain qword")
+    result.add_argument("--json", action="store_true")
+    return result
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        entries, initial = chain(args)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print("pwnropcheck: %s" % exc, file=sys.stderr)
+        return 2
+    word_size = args.bits // 8
+    errors = []
+    warnings = []
+    if not 0 <= initial < 16:
+        errors.append("initial RSP modulo must be in the range 0..15")
+    for item in args.map:
+        if item["bits"] != args.bits:
+            errors.append("mapping bitness does not match --bits: %s" % item["path"])
+        if item["endian"] != args.endian:
+            errors.append("mapping endianness does not match --endian: %s" % item["path"])
+    checked = []
+    for entry in entries:
+        maximum = (1 << args.bits) - 1
+        if not 0 <= entry["value"] <= maximum:
+            errors.append("entry %d address is outside the selected word size" % entry["index"])
+            raw = b""
+        else:
+            raw = entry["value"].to_bytes(word_size, args.endian, signed=False)
+        bad = sorted({byte for byte in args.bad_byte if byte in raw})
+        rsp_mod16 = (initial + word_size * (entry["index"] + 1)) % 16
+        item, segment = locate(entry["value"], args.map)
+        mapped = item is not None
+        executable = bool(segment and segment["execute"])
+        result = entry | {
+            "hex": hex(entry["value"]),
+            "rsp_mod16_at_entry": rsp_mod16,
+            "mapped": mapped,
+            "executable": executable,
+            "mapping": None if item is None else item["path"],
+            "bad_bytes": ["0x%02x" % byte for byte in bad],
+        }
+        if entry["kind"] != "data" and not mapped:
+            errors.append("entry %d code address is outside supplied mappings" % entry["index"])
+        elif entry["kind"] != "data" and not executable:
+            errors.append("entry %d code address is not executable" % entry["index"])
+        if bad:
+            errors.append("entry %d contains prohibited address bytes" % entry["index"])
+        if entry["kind"] == "call" and args.bits == 64 and rsp_mod16 != 8:
+            errors.append("entry %d call violates SysV AMD64 entry alignment" % entry["index"])
+        checked.append(result)
+    if not args.map:
+        warnings.append("no ELF mappings supplied; code-address provenance cannot pass")
+    if not any(entry["kind"] == "call" for entry in entries):
+        warnings.append("no call entries were labelled; ABI alignment was not asserted")
+    elif args.bits != 64:
+        warnings.append("ABI alignment validation is implemented for AMD64 only")
+    report = {
+        "schema": "rat.pwnropcheck/v1",
+        "bits": args.bits,
+        "initial_rsp_mod16": initial,
+        "entries": checked,
+        "mappings": [{key: value for key, value in item.items() if key != "segments"} for item in args.map],
+        "errors": errors,
+        "warnings": warnings,
+        "verdict": "pass" if not errors else "fail",
+    }
+    if args.json:
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        print("verdict=%s entries=%d mappings=%d" % (report["verdict"], len(entries), len(args.map)))
+        for entry in checked:
+            print("%02d %-6s %-18s rsp%%16=%d mapped=%s exec=%s" % (
+                entry["index"], entry["kind"], entry["hex"], entry["rsp_mod16_at_entry"],
+                str(entry["mapped"]).lower(), str(entry["executable"]).lower(),
+            ))
+        for value in errors:
+            print("[error] " + value)
+        for value in warnings:
+            print("[warning] " + value)
+    return 0 if not errors else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

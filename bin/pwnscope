@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Lint a local solve script against its challenge network manifest."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import sys
+
+
+NETWORK_CALLS = {"remote", "ssh", "create_connection", "open_connection", "connect", "connect_ex"}
+PROCESS_CALLS = {"process", "gdb.debug", "gdb.attach"}
+SCAN_TOOLS = {"nmap", "masscan", "zmap", "naabu"}
+TARGET_RE = re.compile(r"(?:(?P<user>[^@:\s]+)@)?(?P<host>[^:\s]+):(?P<port>[1-9][0-9]{0,4})\Z")
+
+
+def call_name(node: ast.Call) -> str:
+    parts = []
+    current = node.func
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def constant(node):
+    return node.value if isinstance(node, ast.Constant) else None
+
+
+def enclosing_loop(parents: dict, node: ast.AST) -> bool:
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, (ast.For, ast.AsyncFor, ast.While)):
+            return True
+        current = parents.get(current)
+    return False
+
+
+def issue(code: str, severity: str, message: str, line: int | None = None) -> dict:
+    result = {"code": code, "severity": severity, "message": message}
+    if line is not None:
+        result["line"] = line
+    return result
+
+
+def inspect_script(path: str) -> dict:
+    source = open(path, encoding="utf-8").read()
+    tree = ast.parse(source, filename=path)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                aliases[imported.asname or imported.name] = imported.name
+    calls = []
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = call_name(node)
+        leaf = aliases.get(name.rsplit(".", 1)[-1], name.rsplit(".", 1)[-1])
+        record = {"name": name, "line": node.lineno, "kind": "other"}
+        if leaf in NETWORK_CALLS:
+            record["kind"] = "network"
+            if enclosing_loop(parents, node):
+                findings.append(issue(
+                    "network-call-in-loop",
+                    "error",
+                    "network connection is created inside a loop",
+                    node.lineno,
+                ))
+            if leaf in {"remote", "create_connection"}:
+                if leaf == "remote" and len(node.args) >= 2:
+                    record["host"] = constant(node.args[0])
+                    record["port"] = constant(node.args[1])
+                elif leaf == "create_connection" and node.args and isinstance(node.args[0], (ast.Tuple, ast.List)):
+                    values = node.args[0].elts
+                    if len(values) >= 2:
+                        record["host"] = constant(values[0])
+                        record["port"] = constant(values[1])
+        elif name in PROCESS_CALLS or leaf == "process":
+            record["kind"] = "local-process"
+        elif leaf in {"run", "Popen", "call", "check_call", "check_output", "system"}:
+            record["kind"] = "subprocess"
+            command = constant(node.args[0]) if node.args else None
+            tokens = []
+            if isinstance(command, str):
+                tokens = command.split()
+            elif isinstance(node.args[0], (ast.List, ast.Tuple)) if node.args else False:
+                tokens = [constant(item) for item in node.args[0].elts]
+            if tokens and tokens[0] in SCAN_TOOLS:
+                findings.append(issue("scan-tool", "error", "network scanner invocation is outside solve scope", node.lineno))
+            for keyword in node.keywords:
+                if keyword.arg == "shell" and constant(keyword.value) is True:
+                    findings.append(issue("shell-true", "warning", "shell=True weakens command provenance", node.lineno))
+        calls.append(record)
+    return {"path": os.path.realpath(path), "calls": calls, "findings": findings}
+
+
+def load_manifest(path: str | None) -> tuple[dict | None, list[dict]]:
+    if not path:
+        return None, []
+    try:
+        with open(path, encoding="utf-8") as source:
+            manifest = json.load(source)
+    except (OSError, ValueError) as exc:
+        return None, [issue("manifest-invalid", "error", "cannot read run.json: %s" % exc)]
+    policy = manifest.get("target_policy")
+    if not isinstance(policy, dict):
+        return manifest, [issue("target-policy-missing", "error", "run.json has no target_policy")]
+    return manifest, []
+
+
+def target(policy: dict) -> tuple[str, int] | None:
+    allowlist = policy.get("allowlist")
+    if not isinstance(allowlist, list) or len(allowlist) != 1 or not isinstance(allowlist[0], str):
+        return None
+    match = TARGET_RE.fullmatch(allowlist[0])
+    if not match:
+        return None
+    port = int(match["port"])
+    if not 1 <= port <= 65535:
+        return None
+    return match["host"], port
+
+
+def evaluate(script_doc: dict, manifest: dict | None) -> dict:
+    findings = list(script_doc["findings"])
+    network = [call for call in script_doc["calls"] if call["kind"] == "network"]
+    local = [call for call in script_doc["calls"] if call["kind"] == "local-process"]
+    policy = manifest.get("target_policy", {}) if manifest else {}
+    mode = policy.get("network_mode", "missing")
+    allowed = target(policy)
+
+    if network and not manifest:
+        findings.append(issue("network-without-manifest", "error", "network code requires a run.json target policy"))
+    elif network and mode != "ctfguard-target":
+        findings.append(issue("network-mode", "error", "network code is present but network_mode is not ctfguard-target"))
+    elif network and allowed is None:
+        findings.append(issue("single-target", "error", "network code requires exactly one valid manifest endpoint"))
+
+    if allowed:
+        host, port = allowed
+        for call in network:
+            call_host = call.get("host")
+            call_port = call.get("port")
+            if call_host is not None and call_host != host:
+                findings.append(issue("host-mismatch", "error", "hardcoded host differs from manifest", call["line"]))
+            if call_port is not None and call_port != port:
+                findings.append(issue("port-mismatch", "error", "hardcoded port differs from manifest", call["line"]))
+            if call_host is None or call_port is None:
+                findings.append(issue(
+                    "dynamic-target",
+                    "warning",
+                    "target is dynamic; ctfguard/broker must enforce the manifest endpoint at runtime",
+                    call["line"],
+                ))
+
+    if not network and mode == "ctfguard-target":
+        findings.append(issue("unused-remote-policy", "warning", "manifest enables a target but this script is local-only"))
+    if network and not local:
+        findings.append(issue("no-local-transport", "warning", "script has network transport but no local process transport"))
+
+    errors = sum(item["severity"] == "error" for item in findings)
+    warnings = sum(item["severity"] == "warning" for item in findings)
+    return {
+        "schema": "rat.pwnscope/v1",
+        "script": script_doc["path"],
+        "network_mode": mode,
+        "manifest_target": None if allowed is None else "%s:%d" % allowed,
+        "summary": {
+            "network_calls": len(network),
+            "local_process_calls": len(local),
+            "errors": errors,
+            "warnings": warnings,
+            "verdict": "pass" if errors == 0 else "fail",
+        },
+        "findings": sorted(findings, key=lambda item: (item["severity"] != "error", item.get("line", 0), item["code"])),
+    }
+
+
+def discover_manifest(script: str, explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    candidate = os.path.join(os.path.dirname(os.path.realpath(script)), "run.json")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("script", help="Python solve script to inspect")
+    result.add_argument("--manifest", help="run.json path; defaults to the script directory")
+    result.add_argument("--json", action="store_true")
+    return result
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        script_doc = inspect_script(args.script)
+    except (OSError, SyntaxError) as exc:
+        print("pwnscope: %s" % exc, file=sys.stderr)
+        return 2
+    manifest_path = discover_manifest(args.script, args.manifest)
+    manifest, manifest_findings = load_manifest(manifest_path)
+    script_doc["findings"].extend(manifest_findings)
+    report = evaluate(script_doc, manifest)
+    if args.json:
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        summary = report["summary"]
+        print("verdict=%s errors=%d warnings=%d network_calls=%d local_calls=%d" % (
+            summary["verdict"], summary["errors"], summary["warnings"],
+            summary["network_calls"], summary["local_process_calls"],
+        ))
+        print("network_mode=%s target=%s" % (report["network_mode"], report["manifest_target"] or "-"))
+        for finding in report["findings"]:
+            location = ":%s" % finding["line"] if "line" in finding else ""
+            print("[%s] %s%s: %s" % (finding["severity"], finding["code"], location, finding["message"]))
+    return 0 if report["summary"]["errors"] == 0 else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
