@@ -11,7 +11,7 @@
 1. 제공된 바이너리·소스·libc·Docker를 문제별로 등록하고 `recon` 또는 `revq`로 우선순위를 정한다.
 2. 한 문제에는 한 명의 주 담당자를 둔다. 필요한 경우에만 최대 3개의 로컬 분석 가설을 병렬 검토한다.
 3. `state show` → decomp/도출 → primitive 로컬 실증 → `solve_local.py` 재현 → skeptic 반증 → `pkshare` 순서로 기록한다.
-4. 검증된 결과는 `WRITEUP.md`로 남기며, [WRITEUP_FORMAT.md](WRITEUP_FORMAT.md)의 문제 정보·재현·증거·AI 사용 사실 기재 항목을 따른다. 막힌 결과는 `SHARE.md`로 남겨 사람이 이어받는다.
+4. 기본 결과는 `HANDOFF.md`로 남기며, [WRITEUP_FORMAT.md](WRITEUP_FORMAT.md)의 상태·재현·증거·AI 사용 사실 기재 항목을 따른다. `PRIMITIVE_PASS`는 완료로 승격하지 않는다. 운영자가 후속 결과를 명시적으로 확인한 경우에만 `WRITEUP.md` 또는 `SUBMISSION.md`를 만든다.
 
 ## 완료 기준
 

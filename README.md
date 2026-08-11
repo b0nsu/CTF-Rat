@@ -18,7 +18,7 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 CLAUDE.md / AGENTS.md      에이전트 진입점 (심볼릭)
 SETUP.md                   환경무관 초기 세팅
 doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
-knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) · ctf-reverse/(rev) · ctf-writeup/
+knowledge/                 vendored pwn/rev 지식 + repo-owned learned/ + writeup 절차
 reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
 bin/                       도구 전체 (+ghidra_scripts/)
 solve/_template/rev/       symsolve · vmlift
@@ -45,6 +45,8 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
   revq 주소 = angr 로드베이스(PIE 0x400000) → `symsolve --find <주소>` 그대로 투입.
 - **pwn**: `pwnkit`/`pwnstage`/`primitives` · `pwncalc`/`pwnleak`/`pwnpayload`/`pwnropcheck`/`pwncrash`/`pwnscope`.
 - **버스**: `state`(확정/배제/다음 기록) · **커널**: `k_*`(kernel/).
+- **인계·지식화**: `pkshare` → `HANDOFF.md`, `writeupcheck` 품질 검사 → 검토된 교훈은 `knowledge/learned/`.
+  typed STATE v2가 우선하며 legacy PASS는 candidate로만 표시한다. 완료 문서는 증거 digest가 연결된 operator attestation이 필요하다.
 
 ## 테스트 (도구 수정 후 회귀검증)
 ```sh
@@ -52,6 +54,7 @@ python3 bin/revq selftest
 python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
 python3 bin/ctfpull selftest && python3 tests/e2e_mock.py
+python3 -m unittest tests.test_writeup_pipeline
 bash tests/e2e_rev.sh        # angr 있으면 실 crackme e2e, 없으면 selftest 만
 ```
 전부 `ALL GREEN ✅`이면 통과.

@@ -51,8 +51,8 @@
    hypothesis만으로 체이닝하지 않고, 기본 산출물은 네트워크를 사용하지 않는 `solve_local.py`다.
 6. **Adversarial verify** — SOLVE 선언 전 skeptic 으로 **반증 시도**(leak 위양성·libc mismatch·환경 차이).
    rev 는 `symsolve --find-str …`(복원 입력을 **실 바이너리 재실행**으로 concrete-verify)로 executable oracle 검증.
-7. **Writeup**(선택, 로컬 검증 후) — `knowledge/ctf-writeup/SKILL.md` 표준형식(메타 + Summary + 1~3 step + 로컬 재현 스크립트).
-   제출·공유용 필수 항목은 [doctrine/WRITEUP_FORMAT.md](doctrine/WRITEUP_FORMAT.md)를 따른다.
+7. **인계·지식화**(선택, 로컬 검증 후) — 기본 `HANDOFF.md`에 분석·primitive 증거·운영자 인계 조건을 남기고 `writeupcheck --strict`로 검사한다.
+   typed STATE v2가 legacy PASS보다 우선한다. [doctrine/WRITEUP_FORMAT.md](doctrine/WRITEUP_FORMAT.md)가 canonical 양식이며, 증거 digest가 연결된 operator attestation 전에는 `WRITEUP.md`/`SUBMISSION.md`로 승격하지 않는다. 일반화한 교훈은 `knowledge/learned/`에 candidate부터 기록한다.
    rev grounding 은 `knowledge/ctf-reverse/`, pwn 은 `knowledge/ctf-skills/` — 라우팅은 `knowledge/GROUNDING_INDEX.md`.
 
 ## 도구 (bin/) — 전부 `CTF_HOME`(레포루트) 자동 해석
@@ -97,5 +97,6 @@ tests/                     e2e_rev.sh(rev 루프) 등 로컬 회귀검증
 python3 bin/revq selftest
 python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
+python3 -m unittest tests.test_writeup_pipeline
 ```
 angr 설치 환경이면 `bash tests/e2e_rev.sh`(실 crackme e2e)까지.

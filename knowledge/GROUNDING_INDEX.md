@@ -17,7 +17,8 @@
 |---|---|---|
 | ctf-skills (=ctf-pwn) | `knowledge/ctf-skills/` (vendored, MIT) | **pwn**의 로컬 메모리 안전성·allocator 개념 참고 |
 | ctf-reverse | `knowledge/ctf-reverse/` (vendored, MIT) | **rev**: anti-analysis·언어별(Go/Rust/.NET…)·RE 패턴·VM·툴(Ghidra/angr/frida/qemu) |
-| ctf-writeup | `knowledge/ctf-writeup/SKILL.md` (vendored, MIT) | writeup 작성 표준(제출형식·체크리스트) — 참고용 |
+| ctf-writeup adapter | `knowledge/ctf-writeup/SKILL.md` (repo-owned, upstream-derived MIT) | local STATE·attestation·writeupcheck 통합 절차 |
+| locally learned | `knowledge/learned/` (repo-owned) | 로컬 증거에서 일반화한 candidate/validated/reused 패턴 |
 | how2heap | 외부: github.com/shellphish/how2heap (선택 clone) | glibc 버전별 heap 정밀(safe-linking/hook/tcache 게이팅) |
 | kernel env | `kernel/` + `ctf-skills/kernel*.md` | 커널 (환경이 상위, md는 개념 참조) |
 
@@ -59,10 +60,12 @@
 | .exe 실행/재현 | `wine`(symsolve concrete-verify 가 PE면 자동) | — |
 | .NET / Unity(IL2CPP) | `ilspycmd`/ILSpy · il2cppdumper · monodis | `ctf-reverse/languages.md`, `platforms.md` |
 
-## writeup 작성 (SOLVE 후 — 참고용)
-- `knowledge/ctf-writeup/SKILL.md` — 로컬 분석 기록 형식 참고(메타 + Summary + 1~3 step + **하나의 완결 스크립트**).
-- `doctrine/WRITEUP_FORMAT.md` — 문제 정보, 재현 과정, 코드·입력·명령어, 증거 캡처, AI·자동화 사용 사실 기재를 위한 공통 제출 양식.
-- 원칙: 재현 가능한 로컬 스크립트 하나, 터미널 덤프 복붙 금지, 1~3단계 간결.
+## 분석 기록·지식 승격
+- `doctrine/WRITEUP_FORMAT.md` — 내부 HANDOFF/WRITEUP의 canonical 필드와 상태 계약.
+- `knowledge/ctf-writeup/SKILL.md` — STATE와 로컬 증거를 위 계약으로 정리하는 절차.
+- `knowledge/learned/` — vendored corpus와 분리된 repo-owned 교훈. 한 문제의 관측은 `candidate`, 독립 검증은 `validated`, 다른 문제에서 실제 사용한 뒤 `reused`.
+- 원칙: 기본 산출물은 `HANDOFF.md`; 운영자 확인 없이 `WRITEUP.md`나 `SUBMISSION.md`로 승격하지 않는다.
+- `writeupcheck <file> --strict`로 상태 모순, 필수 섹션, PASS provenance를 fail-closed 검사한다.
 
 ## 채택 안 하는 부분 (우리 상위 규율이 이김)
 - SKILL.md의 **tool-setup / 설치 절 / 자체 gdb quickstart** → 무시. 우리 도구가 상위:

@@ -54,4 +54,6 @@ userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또�
 
 - `STATE.jsonl`: 사실, 가설, 측정값, 실패 경로, 다음 검증 단계
 - `solve_local.py`: 네트워크 없이 실행되는 재현 스크립트 또는 최소 입력
-- 선택적 `WRITEUP.md`: 분석 요약, 로컬 재현 단계, 전제조건과 한계
+- 기본 `HANDOFF.md`: primitive 입력·환경 digest, marker 증거, 제약 및 미검증 조건
+- 증거 digest가 연결된 operator attestation이 있는 경우에만 `WRITEUP.md` 또는 `SUBMISSION.md`
+- 검토 후 일반화한 교훈: `knowledge/learned/`의 candidate/validated/reused 문서

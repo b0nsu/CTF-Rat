@@ -1,74 +1,337 @@
 #!/usr/bin/env python3
-# STATE.jsonl -> 팀 공유물. 풀이과정(진행 순서=append 순서) + 최종 요약. SOLVED->WRITEUP.md, else->SHARE.md
-import sys, os, json, glob
-F="STATE.jsonl"
-def load():
-    chal=os.path.basename(os.path.abspath(os.getcwd())); events=[]
-    if os.path.exists(F):
-        for ln in open(F):
-            ln=ln.strip()
-            if not ln: continue
-            try: e=json.loads(ln)
-            except: continue
-            if e.get("t")=="init": chal=e.get("chal",chal)
-            events.append(e)
-    return chal,events
-def main():
-    chal,events=load()
-    ok=[e["text"] for e in events if e.get("t")=="ok"]
-    offs=[(e["k"],e.get("v"),e.get("src","")) for e in events if e.get("t")=="offset"]
-    no=[(e["text"],e.get("reason","")) for e in events if e.get("t")=="no"]
-    hyps=[e["text"] for e in events if e.get("t")=="hypothesis"]
-    prims=[e for e in events if e.get("t")=="primitive"]
-    nxt=[e["text"] for e in events if e.get("t")=="next"]
-    solved=("--solved" in sys.argv) or any(("SOLVED" in x.upper() or "flag" in x.lower() or "shell" in x.lower()) for x in ok)
-    if "--handoff" in sys.argv: solved=False
-    flag=""
-    if os.path.exists("flag"):
-        try: flag=open("flag").read().strip()
-        except: pass
-    scripts=sorted(glob.glob("solve*.py")+glob.glob("exploit*.py"))
-    tag={"note":"🔎 정찰/맥락","ok":"✓ 됨","no":"✗ 배제","alert":"⚠ 전환점","offset":"📏 측정","next":"→ 다음","hypothesis":"? 가설","primitive":"🧪 primitive"}
-    L=["# %s — %s"%(chal,"SOLVED ✅" if solved else "IN PROGRESS / STUCK ⏸"),""]
-    L.append("> 팀 공유용 %s. **풀이과정(어떻게 도달했나) 포함.**"%("writeup" if solved else "handoff"))
-    L.append("\n## 풀이과정 (진행 순서 — 시도·배제·핵심착상)")
-    n=0
-    for e in events:
-        t=e.get("t")
-        if t=="init": continue
-        n+=1
-        if t=="offset": L.append("%d. **[%s]** `%s = %s`%s"%(n,tag[t],e["k"],e.get("v"),"  (%s)"%e.get("src") if e.get("src") else ""))
-        elif t=="no": L.append("%d. **[%s]** %s%s"%(n,tag[t],e["text"]," — %s"%e.get("reason") if e.get("reason") else ""))
-        elif t=="primitive": L.append("%d. **[%s]** `%s` = **%s**%s"%(n,tag[t],e.get("name","primitive"),e.get("status","unknown").upper()," — %s"%e.get("evidence") if e.get("evidence") else ""))
-        elif t in tag: L.append("%d. **[%s]** %s"%(n,tag[t],e.get("text","")))
-    L.append("\n## Gate Status")
-    prim_pass=[e for e in prims if e.get("status")=="pass"]
-    if prim_pass:
-        L.append("- Primitive: PASS")
-        for e in prim_pass: L.append("  - `%s`: %s"%(e.get("name","primitive"),e.get("evidence","(no evidence text)")))
-    elif hyps:
-        L.append("- Primitive: BLOCKED — hypothesis exists but no `primitive ... pass` evidence is recorded.")
-        L.append("- Exploit chaining / remote attempt: BLOCKED until a primitive PASS is recorded.")
+"""Render authoritative state into an evidence-backed handoff or attested report."""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import platform
+import stat
+import sys
+
+from ratlib.artifact import get
+from ratlib.state_v2 import Stream
+from ratlib.writeup_contract import (
+    DOCUMENT_FILES,
+    primitive_publication_gaps,
+    validate_attestation,
+)
+
+
+STATE_FILE = "STATE.jsonl"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="authoritative state -> HANDOFF.md, WRITEUP.md, or SUBMISSION.md"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--handoff", action="store_true", help="write HANDOFF.md (default)")
+    mode.add_argument("--solved", action="store_true", help="write attested WRITEUP.md")
+    mode.add_argument("--submission", action="store_true", help="write attested SUBMISSION.md")
+    parser.add_argument("--attestation", help="operator attestation JSON; required for completed modes")
+    parser.add_argument("--force", action="store_true", help="replace an existing generated document")
+    return parser.parse_args()
+
+
+def challenge_name():
+    try:
+        with open("run.json", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        for field in ("challenge", "name"):
+            if isinstance(manifest.get(field), str) and manifest[field]:
+                return manifest[field]
+    except (OSError, ValueError):
+        pass
+    return os.path.basename(os.path.abspath(os.getcwd()))
+
+
+def load_legacy():
+    events = []
+    challenge = challenge_name()
+    if not os.path.exists(STATE_FILE):
+        return challenge, events
+    with open(STATE_FILE, encoding="utf-8") as stream:
+        for number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid legacy state at line %d" % number) from exc
+            if not isinstance(event, dict) or not isinstance(event.get("t"), str):
+                raise ValueError("invalid legacy state event at line %d" % number)
+            if event.get("t") == "init" and isinstance(event.get("chal"), str):
+                challenge = event["chal"]
+            events.append(event)
+    return challenge, events
+
+
+def load_state():
+    stream = Stream(os.getcwd())
+    if os.path.exists(stream.path):
+        events = stream.read()
+        return {
+            "version": 2,
+            "challenge": challenge_name(),
+            "events": events,
+            "view": stream.view(),
+            "artifact_root": stream.root,
+        }
+    challenge, events = load_legacy()
+    return {"version": 1, "challenge": challenge, "events": events, "view": None, "artifact_root": None}
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def artifact_digests():
+    paths = []
+    for pattern in ("artifact/*", "Dockerfile", "libc.so.6", "ld-linux*.so*", "*.elf", "*.bin", "run.json"):
+        paths.extend(glob.glob(pattern))
+    result = {}
+    for path in sorted(set(paths)):
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode) and not os.path.islink(path):
+            result[path] = sha256(path)
+    return result
+
+
+def script_paths():
+    paths = []
+    for pattern in ("solve_local.py", "solve*.py", "exploit*.py"):
+        paths.extend(glob.glob(pattern))
+    return sorted(path for path in set(paths) if os.path.isfile(path) and not os.path.islink(path))
+
+
+def document_mode(args):
+    if args.submission:
+        return "submission"
+    if args.solved:
+        return "writeup"
+    return "handoff"
+
+
+def available_evidence(state, artifacts):
+    evidence = set(artifacts.values())
+    if state["version"] == 2:
+        for observation in state["view"]["observations"].values():
+            if observation.get("quality", {}).get("level") == "direct" and observation.get("validity", {}).get("state") == "active":
+                for item in observation.get("evidence", []):
+                    if not isinstance(item, str):
+                        continue
+                    try:
+                        get(item, root=state["artifact_root"])
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    evidence.add(item)
+    return evidence
+
+
+def load_attestation(path, evidence):
+    if not path:
+        raise ValueError("--solved/--submission requires --attestation")
+    with open(path, encoding="utf-8") as stream:
+        return validate_attestation(json.load(stream), evidence)
+
+
+def materialized(state):
+    if state["version"] == 2:
+        view = state["view"]
+        primitives = list(view["primitives"].values())
+        hypotheses = [item.get("text", key) for key, item in view["hypotheses"].items()]
+        rejected = list(view["ruled_out"].values())
+        next_steps = [item.get("text", item.get("probe", "")) for item in view["next_probes"]]
+        observations = view["observations"]
+        return primitives, hypotheses, rejected, next_steps, observations
+    events = state["events"]
+    primitives = [event for event in events if event.get("t") == "primitive"]
+    hypotheses = [event.get("text", "") for event in events if event.get("t") == "hypothesis"]
+    rejected = [event for event in events if event.get("t") == "no"]
+    next_steps = [event.get("text", "") for event in events if event.get("t") == "next"]
+    return primitives, hypotheses, rejected, next_steps, {}
+
+
+def append_legacy_timeline(lines, events):
+    tags = {"note": "정찰/맥락", "ok": "확인된 사실", "no": "배제", "alert": "전환점", "offset": "측정", "next": "다음", "hypothesis": "가설", "primitive": "legacy primitive"}
+    count = 0
+    for event in events:
+        kind = event.get("t")
+        if kind not in tags:
+            continue
+        count += 1
+        if kind == "offset":
+            detail = "`%s = %s` — %s" % (event.get("k"), event.get("v"), event.get("src", "출처 없음"))
+        elif kind == "primitive":
+            detail = "`%s` = **CANDIDATE** (legacy `%s`; v2 검증 전 PASS 불신) — %s" % (
+                event.get("name", "primitive"), event.get("status", "unknown"), event.get("evidence", "증거 설명 없음")
+            )
+        else:
+            detail = event.get("text", "")
+            if kind == "no" and event.get("reason"):
+                detail += " — %s" % event["reason"]
+        lines.append("%d. **[%s]** %s" % (count, tags[kind], detail))
+    if not count:
+        lines.append("- 기록 없음")
+
+
+def append_v2_timeline(lines, events):
+    for event in events:
+        payload = event["payload"]
+        kind = event["type"]
+        identity = payload.get("primitive_id") or payload.get("finding_id") or payload.get("hypothesis_id") or payload.get("observation_id") or payload.get("fingerprint") or payload.get("probe") or event["event_id"]
+        state = payload.get("status") or payload.get("state") or payload.get("quality", {}).get("level") or "recorded"
+        lines.append("%d. **[%s]** `%s` — `%s`" % (event["seq"], kind, identity, state))
+    if not events:
+        lines.append("- 기록 없음")
+
+
+def primitive_details(primitive, observations):
+    evidence_artifacts = []
+    for observation_id in primitive.get("self_evidence", []):
+        evidence_artifacts.extend(observations.get(observation_id, {}).get("evidence", []))
+    extensions = primitive.get("extensions", {}) if isinstance(primitive.get("extensions", {}), dict) else {}
+    return {
+        "name": primitive.get("name") or primitive.get("primitive_id", "primitive"),
+        "input": primitive.get("input_digest", "기록 없음"),
+        "environment": primitive.get("environment_digest", "기록 없음"),
+        "command": extensions.get("reproduction_command", "기록 없음"),
+        "marker": extensions.get("marker_evidence", "기록 없음"),
+        "evidence": sorted(set(evidence_artifacts)),
+    }
+
+
+def render(state, mode, attestation, artifacts):
+    primitives, hypotheses, rejected, next_steps, observations = materialized(state)
+    active = [item for item in primitives if item.get("status") in {"pass", "consumed"}] if state["version"] == 2 else []
+    blocked_primitives = [item for item in primitives if item.get("status") in {"blocked", "fail", "stale"}]
+    ready = [item for item in active if not primitive_publication_gaps(item, observations, state["artifact_root"])] if state["version"] == 2 else []
+    legacy_pass = state["version"] == 1 and any(item.get("status") == "pass" for item in primitives)
+    if attestation:
+        status = "OPERATOR_COMPLETED"
+    elif ready:
+        status = "PRIMITIVE_PASS"
+    elif active or blocked_primitives or legacy_pass or hypotheses:
+        status = "BLOCKED"
     else:
-        L.append("- Primitive: NOT STARTED")
-    if hyps:
-        L.append("- Active hypotheses:")
-        for x in hyps: L.append("  - %s"%x)
-    if n==0: L.append("(STATE 기록 없음 — 진행하며 state ok/no/alert/offset 로 과정 남길 것)")
-    if offs:
-        L.append("\n## 검증된 오프셋/상수 (live 측정)"); L.append("| key | value | src |"); L.append("|---|---|---|")
-        for k,v,s in offs: L.append("| `%s` | `%s` | %s |"%(k,v,s))
-    if no:
-        L.append("\n## 배제된 것 (재시도 금지)")
-        for x,r in no: L.append("- ❌ %s%s"%(x," — %s"%r if r else ""))
-    if (not solved) and nxt:
-        L.append("\n## 막힌 지점 / 다음 단계")
-        for x in nxt: L.append("- %s"%x)
-    L.append("\n## 재현")
-    if scripts: L.append("- 스크립트: "+", ".join("`%s`"%s for s in scripts))
-    if flag: L.append("- flag/proof: `%s`"%flag)
-    L.append("- 실행: `cd %s && python3 %s`"%(os.path.basename(os.getcwd()),scripts[-1] if scripts else "solve.py"))
-    fn="WRITEUP.md" if solved else "SHARE.md"
-    open(fn,"w").write("\n".join(L)+"\n")
-    print("[pkshare] %s 생성 (%d줄, 풀이과정 %d스텝, solved=%s)"%(fn,len(L),n,solved))
-main()
+        status = "ANALYZING"
+
+    external = "운영자 attestation으로 결과 확인; 자동 제출은 수행하지 않음" if attestation else "이 문서만으로는 주장하지 않음"
+    lines = [
+        "# %s — %s" % (state["challenge"], status), "",
+        "## 상태와 범위", "",
+        "- 문서 유형: `%s`" % mode,
+        "- 상태: `%s`" % status,
+        "- 상태 원본: `STATE v%d`" % state["version"],
+        "- 검증 범위: 제공된 artifact와 로컬/Docker/loopback 분석",
+        "- 외부 결과·제출: %s" % external, "",
+        "## Artifact와 환경", "",
+        "- 호스트: `%s / %s`" % (platform.system(), platform.machine()), "",
+        "| 파일 | SHA-256 |", "|---|---|",
+    ]
+    if artifacts:
+        lines.extend("| `%s` | `%s` |" % (path, digest) for path, digest in artifacts.items())
+    else:
+        lines.append("| 기록 없음 | 기록 없음 |")
+    lines.extend(["", "## 핵심 요약", "", "- publishable primitive: %s" % (", ".join("`%s`" % primitive_details(item, observations)["name"] for item in ready) or "없음"), "- 활성 가설: %d개" % len(hypotheses), "- 배제된 경로: %d개" % len(rejected), "", "## 풀이과정", ""])
+    if state["version"] == 2:
+        append_v2_timeline(lines, state["events"])
+    else:
+        append_legacy_timeline(lines, state["events"])
+
+    lines.extend(["", "## Gate Status", ""])
+    if ready:
+        lines.append("- Primitive: **PASS** (authoritative v2 + publication evidence complete)")
+        for primitive in ready:
+            detail = primitive_details(primitive, observations)
+            lines.extend([
+                "  - 이름: `%s`" % detail["name"],
+                "  - 최소 입력 SHA-256: `%s`" % detail["input"],
+                "  - 환경 digest: `%s`" % detail["environment"],
+                "  - 재현 명령: `%s`" % detail["command"],
+                "  - marker/register 증거: %s" % detail["marker"],
+                "  - SELF evidence artifacts: %s" % (", ".join("`%s`" % item for item in detail["evidence"])),
+            ])
+    elif active:
+        lines.append("- Primitive: **BLOCKED FOR PUBLICATION** — v2 PASS이나 필수 출판 증거 누락")
+        for primitive in active:
+            lines.append("  - `%s`: %s" % (primitive.get("primitive_id"), ", ".join(primitive_publication_gaps(primitive, observations, state["artifact_root"]))))
+    elif blocked_primitives:
+        lines.append("- Primitive: **BLOCKED/STALE** — authoritative v2 상태를 따름")
+        for primitive in blocked_primitives:
+            lines.append("  - `%s`: `%s`" % (primitive.get("primitive_id"), primitive.get("status")))
+    elif legacy_pass:
+        lines.append("- Primitive: **LEGACY CANDIDATE** — v1 PASS 문구는 v2 직접 증거로 재검증 전 신뢰하지 않음")
+    elif hypotheses:
+        lines.append("- Primitive: **BLOCKED** — 가설은 있으나 active v2 PASS가 없음")
+    else:
+        lines.append("- Primitive: **NOT STARTED**")
+
+    found_scripts = script_paths()
+    lines.extend(["", "## 재현", ""])
+    if ready:
+        lines.extend("- `%s`" % primitive_details(item, observations)["command"] for item in ready)
+    elif found_scripts:
+        lines.append("- 후보 스크립트: %s" % ", ".join("`%s`" % path for path in found_scripts))
+    else:
+        lines.append("- 재현 스크립트: 기록 없음")
+
+    lines.extend(["", "## 배제된 경로", ""])
+    if rejected:
+        for item in rejected:
+            if isinstance(item, dict):
+                lines.append("- %s — %s" % (item.get("text", item.get("fingerprint", "경로")), item.get("reason", "근거는 STATE 참조")))
+            else:
+                lines.append("- %s" % item)
+    else:
+        lines.append("- 기록 없음")
+
+    lines.extend(["", "## 제약과 운영자 인계", ""])
+    lines.extend("- %s" % step for step in next_steps if step)
+    if not next_steps:
+        lines.append("- 다음 단계가 STATE에 기록되지 않음")
+    lines.append("- primitive PASS는 exploit chain, flag 획득 또는 제출 완료를 뜻하지 않음")
+
+    if attestation:
+        lines.extend(["", "## 운영자 Attestation", "", "- operator: `%s`" % attestation["operator"], "- confirmed_at: `%s`" % attestation["confirmed_at"], "- result: %s" % attestation["result"], "- evidence: %s" % ", ".join("`%s`" % item for item in attestation["evidence"])])
+
+    lines.extend(["", "## 재사용 가능한 지식", "", "- 일반화 후보는 적용·실패 조건 검토 후 `knowledge/learned/`에 candidate부터 기록", "", "## AI·자동화 사용", "", "- 사용 여부: 사용", "- 사용 도구: `pkshare`", "- 사용 범위: authoritative STATE materialization과 문서 포맷 생성", "- 사람이 재검증한 내용: %s" % ("운영자 attestation 참조" if attestation else "기록 없음; 본 문서는 handoff 상태")])
+    return lines
+
+
+def main():
+    args = parse_args()
+    mode = document_mode(args)
+    output = DOCUMENT_FILES[mode]
+    if os.path.exists(output) and not args.force:
+        print("[pkshare:error] refusing to overwrite %s; use --force" % output, file=sys.stderr)
+        return 2
+    try:
+        state = load_state()
+        artifacts = artifact_digests()
+        attestation = None
+        if mode != "handoff":
+            attestation = load_attestation(args.attestation, available_evidence(state, artifacts))
+        elif args.attestation:
+            raise ValueError("--attestation is only valid with --solved/--submission")
+        lines = render(state, mode, attestation, artifacts)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print("[pkshare:error] %s" % exc, file=sys.stderr)
+        return 2
+    with open(output, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+    print("[pkshare] %s 생성 (mode=%s, source=v%d)" % (output, mode, state["version"]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Lint CTF-RAT handoff/writeup structure and trust claims."""
+
+import argparse
+import os
+import re
+import sys
+
+from ratlib.writeup_contract import DOCUMENT_FILES, REQUIRED_SECTIONS, VALID_STATUSES
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="check a CTF-RAT handoff/writeup")
+    parser.add_argument("path")
+    parser.add_argument("--strict", action="store_true", help="treat quality warnings as errors")
+    return parser.parse_args()
+
+
+def has_digest_after(label, text):
+    return re.search(r"%s[^\n]*sha256:[0-9a-f]{64}" % re.escape(label), text, re.I) is not None
+
+
+def lint(path):
+    with open(path, encoding="utf-8") as stream:
+        text = stream.read()
+    errors = []
+    warnings = []
+
+    headings = set(re.findall(r"^##\s+(.+?)\s*$", text, re.MULTILINE))
+    for section in REQUIRED_SECTIONS:
+        if section not in headings:
+            errors.append("missing section: %s" % section)
+
+    status_match = re.search(r"^- 상태:\s*`?([A-Z_]+)`?\s*$", text, re.MULTILINE)
+    status = status_match.group(1) if status_match else None
+    if status not in VALID_STATUSES:
+        errors.append("missing or invalid explicit status")
+
+    mode_match = re.search(r"^- 문서 유형:\s*`?([a-z]+)`?\s*$", text, re.MULTILINE)
+    mode = mode_match.group(1) if mode_match else None
+    if mode not in DOCUMENT_FILES:
+        errors.append("missing or invalid document type")
+    if mode in DOCUMENT_FILES and os.path.basename(path) != DOCUMENT_FILES[mode]:
+        warnings.append("document type %s normally uses %s" % (mode, DOCUMENT_FILES[mode]))
+
+    source_match = re.search(r"^- 상태 원본:\s*`STATE v([12])`\s*$", text, re.MULTILINE)
+    source = int(source_match.group(1)) if source_match else None
+    if source is None:
+        errors.append("missing authoritative state source")
+    if status == "PRIMITIVE_PASS" and source != 2:
+        errors.append("PRIMITIVE_PASS requires authoritative STATE v2")
+
+    if mode == "handoff" and status == "OPERATOR_COMPLETED":
+        errors.append("handoff cannot claim OPERATOR_COMPLETED")
+    if mode in {"writeup", "submission"}:
+        if status != "OPERATOR_COMPLETED":
+            errors.append("writeup/submission requires OPERATOR_COMPLETED")
+        if "운영자 Attestation" not in headings:
+            errors.append("completed document requires operator attestation section")
+        for label in ("operator", "confirmed_at", "result"):
+            if not re.search(r"^- %s:\s*\S" % label, text, re.MULTILINE):
+                errors.append("operator attestation missing %s" % label)
+        if not has_digest_after("evidence:", text):
+            errors.append("operator attestation missing evidence digest")
+
+    if status == "PRIMITIVE_PASS":
+        required_evidence = (
+            ("최소 입력 SHA-256", "minimal-input SHA-256"),
+            ("환경 digest", "environment digest"),
+            ("SELF evidence artifacts", "SELF evidence artifacts"),
+        )
+        for label, description in required_evidence:
+            if not has_digest_after(label, text):
+                errors.append("primitive PASS missing %s" % description)
+        if not re.search(r"^\s*-\s+재현 명령:\s*`(?!기록 없음)[^`]+`", text, re.MULTILINE):
+            errors.append("primitive PASS missing reproduction command")
+        if not re.search(r"^\s*-\s+marker/register 증거:\s*(?!기록 없음)\S", text, re.MULTILINE):
+            errors.append("primitive PASS missing register/marker evidence")
+        if re.search(r"SOLVED\s*[✅!]|^- 외부 결과·제출:\s*`?(완료|성공)", text, re.I | re.MULTILINE):
+            errors.append("PRIMITIVE_PASS document contains a solve/submission claim")
+
+    placeholders = sorted(set(re.findall(r"<[A-Za-z가-힣][^>\n]{0,80}>", text)))
+    if placeholders:
+        errors.append("placeholder text remains: %s" % ", ".join(placeholders[:5]))
+    if not re.search(r"sha256:[0-9a-f]{64}", text):
+        warnings.append("no SHA-256 digest found")
+    if "재현 스크립트: 기록 없음" in text:
+        warnings.append("no reproduction script recorded")
+
+    return errors, warnings
+
+
+def main():
+    args = parse_args()
+    try:
+        errors, warnings = lint(args.path)
+    except OSError as exc:
+        print("[writeupcheck:error] %s" % exc, file=sys.stderr)
+        return 2
+    for message in errors:
+        print("ERROR: %s" % message)
+    for message in warnings:
+        print("WARN: %s" % message)
+    if errors or (args.strict and warnings):
+        print("[writeupcheck] FAIL errors=%d warnings=%d" % (len(errors), len(warnings)))
+        return 1
+    print("[writeupcheck] PASS errors=0 warnings=%d" % len(warnings))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

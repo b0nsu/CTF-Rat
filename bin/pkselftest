@@ -44,8 +44,11 @@ printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/d
 # T5 pwnkit.run_batch (headless gdb 플러밍) — 심볼불요, 상수 SNAP
 B=$CTF_HOME/solve/heapnote_G/main
 if [ -f "$B" ]; then cp "$B" ./m; $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"; else skip "run_batch (테스트 바이너리 없음)"; fi
-# T6 pkshare SHARE 생성
-pkshare --handoff >/dev/null 2>&1 && [ -f SHARE.md ] && ok "pkshare SHARE.md" || no "pkshare SHARE.md"
+# T6 pkshare HANDOFF 생성 + strict 구조 검사
+mkdir -p artifact
+printf 'fixture\n' > artifact/input.bin
+printf 'print("local fixture")\n' > solve_local.py
+pkshare --handoff >/dev/null 2>&1 && [ -f HANDOFF.md ] && writeupcheck HANDOFF.md --strict >/dev/null 2>&1 && ok "pkshare HANDOFF.md" || no "pkshare HANDOFF.md"
 # T7 libcgate provenance audit
 libcgate --selftest >/dev/null 2>&1 && ok "libcgate selftest" || no "libcgate selftest"
 # T8 decomp cache lookup: revq sub_40xxxx alias -> Ghidra FUN_0010xxxx
