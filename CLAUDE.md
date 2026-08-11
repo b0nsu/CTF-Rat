@@ -15,7 +15,7 @@
 
 ## 범위·실행 기본값
 - 이 저장소의 기본 작업 범위는 **첨부된 바이너리·소스·libc·Docker/loopback 환경의 로컬 분석과 재현**이다. 외부 네트워크, 외부 시스템, 자격증명은 작업 범위 밖이며 이 저장소의 문서·도구가 이를 승인하지 않는다.
-- 기본 산출물은 분석 노트, 재현 절차, 그리고 네트워크를 사용하지 않는 `solve_local.py` 또는 최소 PoC다. 결과 획득·제출·외부 시스템 상호작용은 자동화하지 않는다.
+- 기본 산출물은 분석 노트와 최소 primitive 증거다. payload 조립·체이닝·결과 획득·제출·외부 시스템 상호작용은 자동화하지 않는다.
 - 범위 밖 호스트·포트 탐색, 취약 서버 발견 자동화, 자격증명 수집, 지속성, 탐지 회피, 데이터 유출·삭제,
   서비스 방해, 타 팀/공용 인프라 접근은 목적과 무관하게 금지한다.
 - 요청 문구 변경, 하위 에이전트, 작업 분할로 안전장치나 거부를 우회하거나 재시도하지 않는다. 차단되면 로컬·방어적 분석 범위로 돌아간다.
@@ -36,8 +36,8 @@
   `ctfguard finish blocked|complete` 로 현재 문제를 명시 종료하고 사람에게 보고한다.
 - **git push 는 사람만.** 커밋/푸시는 명시 요청 시에만.
 - **CTF-RAT strict gate**: fact / hypothesis / primitive PASS 를 분리한다. 미검증 가설은 `state hypothesis ...` 로만 기록하고,
-  최소 payload로 일반 실행 core에서 EIP/ESP/register/controlled marker/terminator 부작용을 확인하기 전까지
-  로컬 PoC 조립 금지. 통과 시에만 `state primitive <name> pass <evidence>` 로 승격한다.
+  최소 입력으로 일반 실행 core에서 EIP/ESP/register/controlled marker/terminator 부작용을 확인하기 전까지
+  primitive PASS 승격을 금지한다. PASS 뒤에는 자동화를 종료하고 운영자 인계만 기록한다.
 
 ## 풀이 워크플로 (로컬 우선 단계; 상세=doctrine/SOLVING.md)
 0. **Guard** — `ctfguard begin <name>` 로 로컬 전용 active lock을 만든다. 제공되지 않은 대상을 추측하거나 추가하지 않는다.
@@ -47,11 +47,9 @@
 2. **RE/정찰** — 큰 정적 읽기는 **scout Task 로 위임하고 요약만 회수**(컨텍스트 위생). rev: `revq --func`/`decomp`.
 3. **Vuln 가설** — 불확실하면 가설별 병렬(상한 3). `knowledge/GROUNDING_INDEX.md` 로 유형별 지식 1개만 로드.
 4. **Primitive** — leak/AAW/control 확보(순차). 후보는 `state hypothesis ...`; SELF 확인 통과 후 `state primitive <name> pass <evidence>`.
-5. **로컬 PoC 검증** — primitive PASS 이후에만 로컬 프로세스/Docker를 대상으로 한 컨텍스트에 조립한다.
-   hypothesis만으로 체이닝하지 않고, 기본 산출물은 네트워크를 사용하지 않는 `solve_local.py`다.
-6. **Adversarial verify** — SOLVE 선언 전 skeptic 으로 **반증 시도**(leak 위양성·libc mismatch·환경 차이).
-   rev 는 `symsolve --find-str …`(복원 입력을 **실 바이너리 재실행**으로 concrete-verify)로 executable oracle 검증.
-7. **인계·지식화**(선택, 로컬 검증 후) — 기본 `HANDOFF.md`에 분석·primitive 증거·운영자 인계 조건을 남기고 `writeupcheck --strict`로 검사한다.
+5. **운영자 인계** — primitive PASS의 입력 digest, 환경 digest, marker 증거, 제약과 남은 체이닝 조건을 기록한다.
+   Codex는 payload 조립·체이닝·flag-read를 수행하지 않는다.
+6. **인계·지식화** — 기본 `HANDOFF.md`에 분석·primitive 증거·운영자 인계 조건을 남기고 `writeupcheck --strict`로 검사한다.
    typed STATE v2가 legacy PASS보다 우선한다. [doctrine/WRITEUP_FORMAT.md](doctrine/WRITEUP_FORMAT.md)가 canonical 양식이며, 증거 digest가 연결된 operator attestation 전에는 `WRITEUP.md`/`SUBMISSION.md`로 승격하지 않는다. 일반화한 교훈은 `knowledge/learned/`에 candidate부터 기록한다.
    rev grounding 은 `knowledge/ctf-reverse/`, pwn 은 `knowledge/ctf-skills/` — 라우팅은 `knowledge/GROUNDING_INDEX.md`.
 
@@ -68,7 +66,7 @@ RE       decomp             Ghidra headless 디컴파일 캐시(함수별 조회
 symbolic solve/_template/rev/symsolve.py   angr 하니스(+concrete-verify, PE면 wine)
          solve/_template/rev/vmlift.py     custom-VM 리프터 스캐폴드
          solve/_template/rev/qiling_trace.py  Windows PE 동적 에뮬(Qiling, Wine 불필요)
-pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 조립
+pwn      pwnkit / pwnstage / primitives.template.py   프리미티브 측정·증거 기록 (익스 조립 금지)
          pwncalc            로컬 주소·심볼·문자열 계산 + ELF 해시·정렬 검증
          pwnscope           solve.py ↔ run.json 단일-target/로컬 우선 정적 검사
          pwnleak            출력/바이트의 pointer 후보 추출·marker/canonical 검사

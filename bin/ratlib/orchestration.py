@@ -13,6 +13,7 @@ from .artifact import get, put_bytes
 from .state_v2 import Stream
 
 PHASES = tuple("solve-P%d" % n for n in range(6))
+AUTOMATION_TERMINAL_PHASE = "solve-P3"
 ROLES = {"orchestrator", "static-scout", "dynamic-scout", "hypothesis",
          "primitive-verifier", "exploit-builder", "skeptic"}
 ROLE_PHASES = {
@@ -151,6 +152,8 @@ def validate_contract(contract: dict[str,Any]):
 def enter(root, phase):
     root=_root(root); active,last=_phase_state(root)
     if phase not in PHASES: raise GateError("unknown phase")
+    if PHASES.index(phase) > PHASES.index(AUTOMATION_TERMINAL_PHASE):
+        raise GateError("automated execution ends after solve-P3; hand off approved final execution to an operator")
     expected=0 if last is None else PHASES.index(last)+1
     if active is not None or expected>=len(PHASES) or PHASES.index(phase)!=expected: raise GateError("previous phase must exit before the next phase enters")
     if phase=="solve-P4" and not _pass_primitives(root): raise GateError("solve-P4 requires an active primitive PASS")
@@ -191,7 +194,17 @@ def finish_phase(root, phase, terminal=False):
         skeptics=[t for t in _tasks(root) if t["phase"]==phase and t.get("phase_attempt_id")==attempt and t["role"]=="skeptic" and t["status"]=="completed"]
         if len(reports)!=1 or len(skeptics)!=1 or reports[0].get("task_id")!=skeptics[0]["task_id"] or reports[0].get("verdict")!="accept": raise GateError("verified solve requires one completed skeptic task with accept")
         if not any(v.get("verdict")=="pass" and v.get("exploit_task_id")==reports[0].get("exploit_task_id") for v in _verify_records(root,_lineage(root))): raise GateError("verified solve requires linked concrete verification")
+    if phase==AUTOMATION_TERMINAL_PHASE and terminal:
+        primitives=_pass_primitives(root)
+        if not primitives:
+            raise GateError("solve-P3 handoff requires an active primitive PASS")
     Stream(root).append("phase.exited",{"phase":phase,"terminal":terminal})
+    if phase==AUTOMATION_TERMINAL_PHASE and terminal:
+        Stream(root).append("operator.handoff.required",{
+            "phase":phase,
+            "primitive_ids":sorted(p.get("primitive_id",p.get("name","primitive")) for p in primitives),
+            "reason":"automated scope ends at verified primitive evidence",
+        })
     return _checkpoint(root,"phase-exit",phase)
 
 @_serialized

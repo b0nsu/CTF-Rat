@@ -1,11 +1,11 @@
 # Primitive Gate — SELF 확인 전 체이닝 금지
 
-목적: “될 것 같은 가설”을 “검증된 primitive”처럼 쓰는 실수를 막는다. 로컬 PoC를 조립하기 전에, 최소 입력으로 control primitive가 실제 바이너리에서 증명되어야 한다.
+목적: “될 것 같은 가설”을 “검증된 primitive”처럼 쓰는 실수를 막는다. 최소 입력으로 control primitive가 실제 바이너리에서 증명되면 자동 작업은 종료하고 운영자에게 인계한다.
 
 ## 상태 타입
 
 - `state hypothesis <text>`: 아직 검증 전인 풀이 가설. 체이닝 근거로 사용 금지.
-- `state primitive <name> pass <evidence>`: 최소 입력으로 검증된 primitive. 로컬 PoC의 근거로 사용 가능.
+- `state primitive <name> pass <evidence>`: 최소 입력으로 검증된 primitive. 자동 범위의 종료·운영자 인계 근거.
 - `state primitive <name> fail|blocked <evidence>`: primitive 실패/보류. 같은 경로로 체이닝 금지.
 - `state no <text> -- <reason>`: 재시도 금지 dead-end.
 
@@ -41,9 +41,13 @@ state hypothesis "saved EBP low-byte overwrite may pivot main epilogue into atta
 state primitive stack_pivot pass "core: ESP=0xfffc00bf, [ESP]=0x41424344 attacker marker, next ret=0x80000000"
 ```
 
+## 자동화 종료 규칙
+
+primitive PASS 뒤에는 Codex가 payload를 조립하거나 chain을 실행하지 않는다. 인계물에는 입력·환경 digest, marker 증거, 알려진 제약 및 남은 체이닝 조건을 포함한다.
+
 ## 금지 규칙
 
-아래 중 하나라도 해당하면 로컬 PoC 조립 금지:
+아래 중 하나라도 해당하면 primitive PASS 승격 금지:
 
 - `state hypothesis`만 있고 `state primitive ... pass`가 없다.
 - pivot 주소가 readable일 뿐 attacker-controlled marker가 없다.
@@ -56,13 +60,13 @@ state primitive stack_pivot pass "core: ESP=0xfffc00bf, [ESP]=0x41424344 attacke
 
 ## 재현성 규칙
 
-- 로컬 PoC는 deterministic하게 재현되어야 한다.
+- primitive 증거는 deterministic하게 재현되어야 한다.
 - 반복 실행으로 ASLR, canary, heap layout, timing race, partial overwrite 확률을 맞추는 경로는 풀이 전략으로 승격하지 않는다.
 - 측정용 반복은 가설 검증에만 사용하며, 불안정한 경로는 `state no`로 기록하고 분석으로 돌아간다.
 
 ## SELF 체크리스트
 
-로컬 PoC 작성 전에 확인:
+primitive PASS 기록 전에 확인:
 
 ```text
 [ ] 이건 hypothesis인가, primitive PASS인가?
@@ -75,4 +79,5 @@ state primitive stack_pivot pass "core: ESP=0xfffc00bf, [ESP]=0x41424344 attacke
 [ ] heap이면 tcache count/head/fd와 safe-linking encoding을 같은 sequence에서 확인했나?
 [ ] libc mismatch 가설이면 Docker image hash/loopback, leak, build-id 중 하나로 증명했나?
 [ ] 실패 경로는 state no 또는 primitive fail로 기록했나?
+[ ] PASS 뒤에 자동화를 종료하고 운영자 인계 조건을 기록했나?
 ```

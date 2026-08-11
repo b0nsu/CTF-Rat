@@ -1,53 +1,137 @@
 #!/usr/bin/env python3
-"""Deterministic P3 lifecycle checks, including a real cancelled child."""
-import argparse, json, os, subprocess, sys, tempfile, time
-sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
-from ratlib.orchestration import (DEFAULT_BUDGET, GateError, converge, enter,
- finish_phase, finish_task, invalidate, plan_fanout, record_verification,
- report_skeptic, start_task)
+"""Deterministic orchestration checks through the primitive handoff boundary."""
+import argparse, os, subprocess, sys, tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
+
 from ratlib.artifact import put_bytes
+from ratlib.orchestration import (
+    DEFAULT_BUDGET,
+    GateError,
+    converge,
+    enter,
+    finish_phase,
+    finish_task,
+    invalidate,
+    plan_fanout,
+    start_task,
+)
 from ratlib.state_v2 import Stream, revise_primitive
-D="sha256:"+"a"*64
-def contract(role, phase): return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"probe","allowed_inputs":[],"required_outputs":[],"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
-def output(t): return {"schema":"rat.task-output/v1","task_id":t["task_id"],"status":"completed","outputs":{},"evidence_ids":["obs"]}
-def observation(stream, oid):
- rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root,provenance={"evidence_policy":{"level":"direct","promotion_allowed":True}})
- return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
-def verification_report(root, task_id, primitive_id="p", environment=D):
- report={"schema":"rat.verification-report/v1","verdict":"pass","repetitions":1,"environment_match":True,"scope":"local-only","provenance":{"claim_id":"claim","primitive_id":primitive_id,"exploit_task_id":task_id,"trace_digest":D,"environment_digest":environment},"results":[{"conditions_met":True}],"producer":{"tool":"rat-verify","build_digest":D}}
- return put_bytes(json.dumps(report).encode(),kind="verification-report",media_type="application/json",logical_name="verification.json",root=os.path.join(root,".rat"))["digest"]
-def advance(d,p): enter(d,p); finish_phase(d,p)
-def p2(d):
- advance(d,"solve-P0"); advance(d,"solve-P1")
- s=Stream(d)
- for oid in ("o1","o2","obs"): s.append("observation.recorded",observation(s,oid))
- return enter(d,"solve-P2")
-def primitive(d):
- s=Stream(d)
- for oid in ("p1","p2","p3"): s.append("observation.recorded",observation(s,oid))
- revise_primitive(s,{"primitive_id":"p","status":"candidate","self_evidence":[],"input_digest":D,"environment_digest":D})
- revise_primitive(s,{"primitive_id":"p","status":"pass","self_evidence":["p1","p2","p3"],"input_digest":D,"environment_digest":D})
-def verified_pipeline(d, verdict):
- p2(d); finish_phase(d,"solve-P2"); enter(d,"solve-P3"); primitive(d); finish_phase(d,"solve-P3"); cp4=enter(d,"solve-P4")
- b=start_task(d,contract("exploit-builder","solve-P4"),checkpoint_id=cp4["checkpoint_id"],inputs=[],primitive_id="p",input_digest=D,environment_digest=D); finish_task(d,b["task_id"],"completed",output(b)); record_verification(d,verification_report(d,b["task_id"]),["obs"]); finish_phase(d,"solve-P4"); cp5=enter(d,"solve-P5")
- s=start_task(d,contract("skeptic","solve-P5"),checkpoint_id=cp5["checkpoint_id"],inputs=[]); finish_task(d,s["task_id"],"completed",output(s)); report_skeptic(d,{"schema":"rat.skeptic-report/v1","report_id":"r","run_id":"local","task_id":s["task_id"],"exploit_task_id":b["task_id"],"verdict":verdict,"counterexamples":[],"affected_ids":[],"residual_risks":[]}); return d
-p=argparse.ArgumentParser(); p.add_argument("--scenario",choices=["converge","invalidate-cancel","verified-only-exploit","skeptic-refute"],required=True); a=p.parse_args()
-with tempfile.TemporaryDirectory() as d:
- if a.scenario=="converge":
-  cp=p2(d); bs=[{"hypothesis_id":"h1","objective":"one","falsification":"no-one","evidence_ids":["o1"]},{"hypothesis_id":"h2","objective":"two","falsification":"no-two","evidence_ids":["o2"]}]; plan_fanout(d,bs,{"uncertainty_set":["h1","h2"],"evidence_ids":["o1","o2"]},{"remaining":80,"per_branch":20,"converge":20}); ts=[start_task(d,contract("hypothesis","solve-P2"),checkpoint_id=cp["checkpoint_id"],inputs=[x],dependencies=["o"+str(i+1)]) for i,x in enumerate(("one","two"))]
-  for t in ts: finish_task(d,t["task_id"],"completed",output(t))
-  assert converge(d,["h1"],["h2"],[],[{"evidence_ids":["o1"]}])["retained"]==["h1"]
- elif a.scenario=="invalidate-cancel":
-  cp=p2(d); child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"],start_new_session=True); t=start_task(d,contract("hypothesis","solve-P2"),checkpoint_id=cp["checkpoint_id"],inputs=["one"],dependencies=["o1"],child_pid=child.pid); assert invalidate(d,["o1"],"refuted")["cancelled"]==[t["task_id"]]
-  child.wait(timeout=3); assert child.poll() is not None
- elif a.scenario=="verified-only-exploit":
-  p2(d); finish_phase(d,"solve-P2"); enter(d,"solve-P3"); primitive(d); finish_phase(d,"solve-P3"); cp=enter(d,"solve-P4")
-  try: start_task(d,contract("exploit-builder","solve-P4"),checkpoint_id=cp["checkpoint_id"],inputs=[])
-  except GateError: pass
-  else: raise AssertionError("primitive provenance bypassed")
- else:
-  verified_pipeline(d,"refute")
-  try: finish_phase(d,"solve-P5",True)
-  except GateError: pass
-  else: raise AssertionError("refuted skeptic accepted")
-print("orchestration %s: PASS" % a.scenario)
+
+D = "sha256:" + "a" * 64
+
+
+def observation(stream, observation_id):
+    record = put_bytes(observation_id.encode(), kind="test-evidence", media_type="text/plain", logical_name=observation_id, root=stream.root, provenance={"evidence_policy": {"level": "direct", "promotion_allowed": True}})
+    return {"observation_id": observation_id, "quality": {"level": "direct"}, "validity": {"state": "active"}, "evidence": [record["digest"]]}
+
+
+def contract(role, phase):
+    return {
+        "schema": "rat.role-contract/v1",
+        "role": role,
+        "phase": phase,
+        "objective": "probe",
+        "allowed_inputs": [],
+        "required_outputs": [],
+        "forbidden_actions": [],
+        "state_write_scope": [],
+        "capabilities": {"network_write": False, "repository_write": False, "evidence_promote": False},
+        "budgets": dict(DEFAULT_BUDGET),
+        "stop_conditions": ["budget"],
+    }
+
+
+def output(task):
+    return {"schema": "rat.task-output/v1", "task_id": task["task_id"], "status": "completed", "outputs": {}, "evidence_ids": ["obs"]}
+
+
+def advance(root, phase):
+    enter(root, phase)
+    finish_phase(root, phase)
+
+
+def to_p2(root):
+    advance(root, "solve-P0")
+    advance(root, "solve-P1")
+    stream = Stream(root)
+    for observation_id in ("o1", "o2", "obs"):
+        stream.append("observation.recorded", observation(stream, observation_id))
+    return enter(root, "solve-P2")
+
+
+def to_p3_with_pass(root):
+    for phase in ("solve-P0", "solve-P1", "solve-P2"):
+        advance(root, phase)
+    stream = Stream(root)
+    for observation_id in ("o1", "o2", "o3"):
+        stream.append("observation.recorded", observation(stream, observation_id))
+    primitive = {"primitive_id": "p", "input_digest": D, "environment_digest": D}
+    revise_primitive(stream, {**primitive, "status": "candidate", "self_evidence": []})
+    revise_primitive(stream, {**primitive, "status": "pass", "self_evidence": ["o1", "o2", "o3"]})
+    enter(root, "solve-P3")
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--scenario",
+    choices=["converge", "invalidate-cancel", "handoff", "p4-blocked"],
+    required=True,
+)
+args = parser.parse_args()
+
+with tempfile.TemporaryDirectory() as root:
+    if args.scenario == "converge":
+        checkpoint = to_p2(root)
+        branches = [
+            {"hypothesis_id": "h1", "objective": "one", "falsification": "no-one", "evidence_ids": ["o1"]},
+            {"hypothesis_id": "h2", "objective": "two", "falsification": "no-two", "evidence_ids": ["o2"]},
+        ]
+        plan_fanout(
+            root,
+            branches,
+            {"uncertainty_set": ["h1", "h2"], "evidence_ids": ["o1", "o2"]},
+            {"remaining": 80, "per_branch": 20, "converge": 20},
+        )
+        tasks = [
+            start_task(
+                root,
+                contract("hypothesis", "solve-P2"),
+                checkpoint_id=checkpoint["checkpoint_id"],
+                inputs=[value],
+                dependencies=["o%d" % (index + 1)],
+            )
+            for index, value in enumerate(("one", "two"))
+        ]
+        for task in tasks:
+            finish_task(root, task["task_id"], "completed", output(task))
+        assert converge(root, ["h1"], ["h2"], [], [{"evidence_ids": ["o1"]}])["retained"] == ["h1"]
+    elif args.scenario == "invalidate-cancel":
+        checkpoint = to_p2(root)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        task = start_task(
+            root,
+            contract("hypothesis", "solve-P2"),
+            checkpoint_id=checkpoint["checkpoint_id"],
+            inputs=["one"],
+            dependencies=["o1"],
+            child_pid=child.pid,
+        )
+        assert invalidate(root, ["o1"], "refuted")["cancelled"] == [task["task_id"]]
+        child.wait(timeout=3)
+        assert child.poll() is not None
+    elif args.scenario == "handoff":
+        to_p3_with_pass(root)
+        finish_phase(root, "solve-P3", terminal=True)
+        assert any(event["type"] == "operator.handoff.required" for event in Stream(root).read())
+    elif args.scenario == "p4-blocked":
+        to_p3_with_pass(root)
+        finish_phase(root, "solve-P3")
+        try:
+            enter(root, "solve-P4")
+        except GateError:
+            pass
+        else:
+            raise AssertionError("post-primitive exploit phase was allowed")
+
+print("orchestration %s: PASS" % args.scenario)

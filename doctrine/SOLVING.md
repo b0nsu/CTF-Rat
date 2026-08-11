@@ -8,7 +8,7 @@
 
 ## 미션
 
-userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또는 검증 로직을 로컬에서 재현 가능한 증거와 최소 PoC로 정리한다. 완료 기준은 외부 결과가 아니라 **로컬에서 재현되는 분석 결론**이다.
+userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또는 검증 로직을 로컬에서 재현 가능한 **primitive 증거**로 정리한다. 완료 기준은 primitive PASS와 운영자 인계 기록이다.
 
 ## 고정 루프
 
@@ -17,9 +17,8 @@ userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또�
 2. `decomp <bin> <func>`로 관련 함수 하나씩 확인해 vuln class 또는 검증 경로를 확정한다.
 3. `knowledge/GROUNDING_INDEX.md`에서 해당하는 **로컬 분석 자료 하나**만 선택한다. 큰 읽기는 요약 작업으로 위임한다.
 4. 후보는 `state hypothesis ...`로 기록한다. `doctrine/PRIMITIVE_GATE.md`의 SELF 확인을 통과하기 전에는 PoC를 조립하지 않는다.
-5. primitive PASS 뒤에만 `solve_local.py` 또는 최소 PoC를 로컬 process/Docker에서 검증한다.
-6. skeptic 검토로 marker 오인, libc/loader mismatch, ASLR·입력 길이·환경 차이를 반증한다.
-7. 검증된 로컬 재현 절차와 한계를 `STATE.jsonl` 및 선택적 writeup에 남긴다.
+5. primitive PASS 뒤에는 자동 작업을 끝낸다. PASS 입력·환경 digest, marker 증거, 제약 및 남은 체이닝 조건을 운영자 인계물에 기록한다.
+6. payload 조립·exploit chain·flag-read·성공 판정은 자동화 범위 밖이다.
 
 ## 재현성 규칙
 
@@ -41,19 +40,18 @@ userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또�
 | 디컴파일 | `decomp <bin> [func]` |
 | 배치 관찰 | `gdbq <bin> "b *main" "run"` |
 | 로컬 스캐폴드 | `newchal <name> <bin> [libc]` |
-| 로컬 검증 | `./solve_local.py` 또는 `pwnkit.run_batch(...)` |
+| 로컬 검증 | 최소 입력의 core/marker 증거 (`gdbq`, `pwncrash`, Docker/loopback 관찰) |
 | 상태 기록 | `state hypothesis|primitive|offset|ok|no|alert ...` |
 
 ## 협업
 
 - 한 번에 활성 문제는 하나다. 팬아웃은 큰 정적 읽기 또는 vuln class가 불확실한 경우에만 최대 3개까지 사용한다.
-- primitive 검증과 PoC 조립은 순차적으로 수렴한다. skeptic은 완료 선언 전 로컬 재현을 반증한다.
+- primitive 검증 뒤에는 자동화를 종료한다. 이후 실행은 Codex 작업 범위 밖의 운영자 인계다.
 - 에이전트는 외부 상호작용을 수행하거나 다른 에이전트에게 맡기지 않는다. 범위 밖 요구는 기록하고 멈춘다.
 
 ## 산출물
 
 - `STATE.jsonl`: 사실, 가설, 측정값, 실패 경로, 다음 검증 단계
-- `solve_local.py`: 네트워크 없이 실행되는 재현 스크립트 또는 최소 입력
-- 기본 `HANDOFF.md`: primitive 입력·환경 digest, marker 증거, 제약 및 미검증 조건
-- 증거 digest가 연결된 operator attestation이 있는 경우에만 `WRITEUP.md` 또는 `SUBMISSION.md`
+- 기본 `HANDOFF.md`: primitive 입력·환경 digest, marker 증거, 제약 및 미검증 체이닝 조건
+- 운영자가 후속 결과를 명시적으로 확인한 경우에만 `WRITEUP.md` 또는 `SUBMISSION.md`
 - 검토 후 일반화한 교훈: `knowledge/learned/`의 candidate/validated/reused 문서

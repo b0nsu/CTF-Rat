@@ -20,4 +20,6 @@ jobs:
       - run: python3 tests/e2e_analysis.py --category core
       - run: python3 tests/e2e_orchestration.py --scenario converge
       - run: python3 tests/e2e_orchestration.py --scenario invalidate-cancel
+      - run: python3 tests/e2e_orchestration.py --scenario handoff
+      - run: python3 tests/e2e_orchestration.py --scenario p4-blocked
       - run: bin/pkselftest --format json
