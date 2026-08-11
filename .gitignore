@@ -18,6 +18,8 @@ core.*
 /.tools/
 /STATE.jsonl
 /SHARE.md
+# OMX 플러그인 로컬 상태
+.omx/
 # 로컬 문제 풀이 작업물. 공용 템플릿만 main에서 추적한다.
 /solve/*
 !/solve/_template/
