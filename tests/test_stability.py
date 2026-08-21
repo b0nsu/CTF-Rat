@@ -453,6 +453,10 @@ class NewchalTests(unittest.TestCase):
             output = os.path.join(temp, "solve", "safe_slug", "run.json")
             with open(output) as f: materialized = json.load(f)
             self.assertEqual(materialized["run_id"], source["run_id"])
+            with open(os.path.join(temp, "solve", "safe_slug", "exploit.py"), encoding="utf-8") as f:
+                exploit = f.read()
+            self.assertIn("remote('host.test', 31337)", exploit)
+            self.assertNotIn("remote(HOST, PORT)", exploit)
             self.assertEqual(materialized["manifest_owner"],
                              {"kind": "solve", "path": "solve/safe_slug/run.json"})
             self.assertTrue(materialized["custom_ingest_field"]["keep"])

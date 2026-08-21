@@ -156,8 +156,8 @@ def evaluate(script_doc: dict, manifest: dict | None) -> dict:
             if call_host is None or call_port is None:
                 findings.append(issue(
                     "dynamic-target",
-                    "warning",
-                    "target is dynamic; ctfguard/broker must enforce the manifest endpoint at runtime",
+                    "error",
+                    "target is dynamic and cannot be proven to match the manifest endpoint",
                     call["line"],
                 ))
 
