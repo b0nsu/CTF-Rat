@@ -3,7 +3,8 @@
 ## 범위
 
 - 제공된 바이너리·소스·libc·Docker·loopback 환경만 분석하고 실행한다.
-- 외부 호스트·포트·계정·대회 인프라와의 접속, 스캔, 결과 획득 및 제출은 이 규약의 범위 밖이다.
+- 제공 artifact·challenge 디렉터리·로컬 Docker/loopback에서 challenge가 의도적으로 노출하는 flag는 end-to-end 로컬 재현 증거로 읽을 수 있다. 이는 외부 결과 획득이나 제출 완료를 뜻하지 않는다.
+- 외부 호스트·포트·계정·대회 인프라와의 접속, 스캔, 결과 획득 및 제출은 이 규약의 범위 밖이다. 사용자 홈·SSH 키·토큰·환경변수 등 실제 자격증명 탐색도 금지한다.
 - 요청이 거부되었거나 범위가 불명확하면 표현 변경, 작업 분할, 하위 에이전트로 재시도하지 않는다. 로컬 분석 결과만 기록한다.
 
 ## 미션
@@ -19,7 +20,7 @@ userland x86-64 Linux pwn/rev artifact를 빠르게 분류하고, 취약점 또�
 4. 후보는 `state hypothesis ...`로 기록한다. `doctrine/PRIMITIVE_GATE.md`의 SELF 확인을 통과하기 전에는 PoC를 조립하지 않는다.
 5. primitive PASS 뒤에만 `solve_local.py` 또는 최소 PoC를 로컬 process/Docker에서 검증한다.
 6. skeptic 검토로 marker 오인, libc/loader mismatch, ASLR·입력 길이·환경 차이를 반증한다.
-7. 검증된 로컬 재현 절차와 한계를 `STATE.jsonl` 및 선택적 writeup에 남긴다.
+7. 검증된 로컬 재현 절차와 한계를 `STATE.jsonl` 및 선택적 writeup에 남긴다. 로컬 flag를 읽은 경우에는 대상·실행 조건·환경 digest를 함께 기록한다.
 
 ## 재현성 규칙
 

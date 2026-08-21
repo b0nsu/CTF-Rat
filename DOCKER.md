@@ -1,5 +1,10 @@
 # Docker Runtime Reproduction
 
+The CTF-RAT Codex analysis container does not receive the host Docker socket,
+`SYS_PTRACE`, or an unconfined seccomp profile. Start and manage challenge
+service containers from the host. Codex automation stops after primitive PASS;
+any final execution is an operator handoff.
+
 CTF pwn problems often ship a `Dockerfile`. Treat it as the authoritative
 runtime description: libc, loader, env, cwd, user, file permissions, and service
 wrapper all matter. Prefer Docker verification before hand-built host emulation.

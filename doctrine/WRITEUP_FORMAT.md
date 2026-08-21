@@ -53,6 +53,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - 문서 유형: <handoff / writeup / submission>
 - 상태: <ANALYZING / PRIMITIVE_PASS / BLOCKED / OPERATOR_COMPLETED>
 - 검증 범위: <로컬 process / Docker / loopback>
+- 로컬 flag 검증: <수행하지 않음 / 의도된 challenge flag를 로컬에서 확인; 대상·실행 조건·환경 digest>
 - 외부 결과·제출: <수행하지 않음 / 운영자 확인>
 
 ## Artifact와 환경
@@ -129,7 +130,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - 명령어·코드·입력은 실제로 사용한 로컬 재현본만 기록한다.
 - PASS에는 입력 및 환경 digest, 실행 명령, marker를 포함한 직접 증거를 연결한다.
 - 스크린샷과 dump에는 파일 경로, 생성 조건, 대상 digest를 함께 남긴다.
-- `PRIMITIVE_PASS` 문서에 flag 획득이나 제출 완료를 암시하지 않는다.
+- 의도된 로컬 challenge flag 확인은 재현 증거로 기록할 수 있으나, `PRIMITIVE_PASS` 문서에서 외부 flag 획득이나 제출 완료를 암시하지 않는다.
 - AI·자동화가 한 일과 사람이 검토·검증한 범위를 분리한다.
 - 문제 하나에서 얻은 교훈은 `candidate`로 시작한다. 독립 artifact 재현 또는 반례
   검토 후 `validated`, 다른 문제에서 실제 재사용한 뒤 `reused`로 승격한다.

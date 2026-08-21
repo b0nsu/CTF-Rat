@@ -13,17 +13,18 @@ if [ -z "$GHIDRA" ] && command -v analyzeHeadless >/dev/null 2>&1; then
 fi
 GHIDRA="${GHIDRA:-/opt/ghidra_11.2.1_PUBLIC}"
 SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
-# Sandboxed runners often mount $HOME read-only.  Ghidra persists its Java
-# discovery and tool state under XDG_CONFIG_HOME before headless analysis.
-# Keep that disposable state inside the kit unless a caller chose a location.
+# Ghidra persists Java discovery and tool state under XDG_CONFIG_HOME before
+# headless analysis.  Keep that disposable state out of the repo by default:
+# stale copied kit directories can have user-owned, non-writable .rat trees.
 if [ -z "${XDG_CONFIG_HOME:-}" ]; then
-  if [ -w "$CTF_HOME" ]; then
-    export XDG_CONFIG_HOME="$CTF_HOME/.rat/ghidra-config"
-  else
-    export XDG_CONFIG_HOME="${XDG_CACHE_HOME:-${TMPDIR:-/tmp}}/ctf-rat-ghidra-${UID:-user}"
-  fi
+  export XDG_CONFIG_HOME="${XDG_CACHE_HOME:-${TMPDIR:-/tmp}}/ctf-rat-ghidra-${UID:-user}"
 fi
 mkdir -p "$XDG_CONFIG_HOME"
+# OpenJDK 21 JIT can SIGILL/SIGSEGV on some virtualized CTF workspaces while
+# Ghidra is starting.  Disabling tiered compilation keeps headless stable.
+if [ -z "${JAVA_TOOL_OPTIONS:-}" ]; then
+  export JAVA_TOOL_OPTIONS="-XX:-TieredCompilation"
+fi
 REFRESH=0; TIMEOUT_SEC=120; FORMAT=text; positional=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
