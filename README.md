@@ -12,6 +12,7 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 - **풀이 doctrine**: [doctrine/SOLVING.md](doctrine/SOLVING.md)(ROE+6-phase) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md) · [doctrine/FINALS.md](doctrine/FINALS.md)
 - **지식**: [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md) → `knowledge/ctf-skills/`
 - benchmark corpus, ablation, 설계 검토 문서는 `dev` 브랜치에서 관리한다. `main`은 실제 풀이와 검증에 필요한 운영 도구만 제공한다.
+- **도구 커버리지/추가 우선순위**: [doctrine/TOOLING_GAP_ANALYSIS.md](doctrine/TOOLING_GAP_ANALYSIS.md) — 기존 `bin/` 계층, 통합 갭, 신규 도구 gate.
 
 ## 레이아웃
 ```
@@ -34,6 +35,11 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
   ```
   설정: CLI > 환경변수(`CTFD_URL`/`CTFD_TOKEN`) > dotenv(`--env`, 기본 `./.ctfd.env`).
 - **`recon <bin>`** — pwn 정적 프로파일 + 보수적 triage.
+- **환경/실행 계획**: `rat-doctor <bin> --format json`으로 현재 artifact에 실제 사용 가능한
+  native/GDB/angr/Ghidra/QEMU/Qiling/Wine 경로와 차단 원인을 먼저 확인한다. 회귀검증은
+  별도로 `pkselftest`가 담당한다.
+- **재현 scenario**: `rat-scenario init|validate|show`로 `rat-dyn`/`rat-runtime`/`rat-verify`가
+  공유하는 입력·argv·env·oracle을 정규화한다. binary stdin은 `--stdin-file`로 보존한다.
 - **rev 루프** — `revq`(정적 배치: 함수/문자열/xref/interesting/**evasion**) → `decomp`(Ghidra) →
   `symsolve.py`(angr 하니스 + **concrete-verify**) → 커스텀 VM 은 `vmlift.py`.
   ```sh

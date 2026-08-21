@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Create, validate, and canonicalize local rat scenario documents."""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+SCHEMA = "rat.scenario/v1"
+FIELDS = {"schema", "name", "argv", "stdin", "stdin_base64", "env", "cwd", "expect", "markers"}
+EXPECT = {"exit_code", "stdout_regex", "stderr_regex", "file_digests"}
+
+
+class ScenarioError(ValueError):
+    pass
+
+
+def canonical(doc):
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def digest(doc):
+    return "sha256:" + hashlib.sha256(canonical(doc)).hexdigest()
+
+
+def validate(doc, *, source_dir=None):
+    if not isinstance(doc, dict):
+        raise ScenarioError("scenario must be a JSON object")
+    unknown = set(doc) - FIELDS
+    if unknown:
+        raise ScenarioError("unknown fields: " + ", ".join(sorted(unknown)))
+    if doc.get("schema") != SCHEMA:
+        raise ScenarioError("schema must be rat.scenario/v1")
+    if "stdin" in doc and "stdin_base64" in doc:
+        raise ScenarioError("stdin and stdin_base64 are mutually exclusive")
+    for key in ("name", "stdin", "stdin_base64", "cwd"):
+        if key in doc and not isinstance(doc[key], str):
+            raise ScenarioError("%s must be a string" % key)
+    for key in ("argv", "markers"):
+        if key in doc and (not isinstance(doc[key], list) or not all(isinstance(x, str) for x in doc[key])):
+            raise ScenarioError("%s must be an array of strings" % key)
+    if "env" in doc and (not isinstance(doc["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in doc["env"].items())):
+        raise ScenarioError("env must map strings to strings")
+    if "stdin_base64" in doc:
+        try:
+            base64.b64decode(doc["stdin_base64"], validate=True)
+        except ValueError as exc:
+            raise ScenarioError("stdin_base64 is not valid base64") from exc
+    expected = doc.get("expect")
+    if expected is not None:
+        if not isinstance(expected, dict) or set(expected) - EXPECT:
+            raise ScenarioError("expect contains unsupported conditions")
+        if "exit_code" in expected and not isinstance(expected["exit_code"], int):
+            raise ScenarioError("expect.exit_code must be an integer")
+        for key in ("stdout_regex", "stderr_regex"):
+            if key in expected and not isinstance(expected[key], str):
+                raise ScenarioError("expect.%s must be a string" % key)
+        files = expected.get("file_digests")
+        if files is not None and (not isinstance(files, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.startswith("sha256:") for k, v in files.items())):
+            raise ScenarioError("expect.file_digests must map paths to sha256 digests")
+    if doc.get("cwd") and source_dir:
+        root = Path(source_dir).resolve()
+        candidate = Path(doc["cwd"])
+        candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ScenarioError("cwd escapes the scenario directory")
+    return doc
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ScenarioError("cannot read scenario: %s" % exc) from exc
+    return validate(doc, source_dir=os.path.dirname(os.path.abspath(path)))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init")
+    init.add_argument("--name", required=True); init.add_argument("--output", required=True)
+    init.add_argument("--arg", action="append", default=[]); init.add_argument("--env", action="append", default=[])
+    group = init.add_mutually_exclusive_group(); group.add_argument("--stdin"); group.add_argument("--stdin-file")
+    check = sub.add_parser("validate"); check.add_argument("scenario")
+    show = sub.add_parser("show"); show.add_argument("scenario"); show.add_argument("--canonical", action="store_true"); show.add_argument("--digest", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "init":
+            env = {}
+            for item in args.env:
+                if "=" not in item: raise ScenarioError("--env must be KEY=VALUE")
+                key, value = item.split("=", 1)
+                if not key: raise ScenarioError("environment key cannot be empty")
+                env[key] = value
+            doc = {"schema": SCHEMA, "name": args.name}
+            if args.arg: doc["argv"] = args.arg
+            if env: doc["env"] = env
+            if args.stdin is not None: doc["stdin"] = args.stdin
+            if args.stdin_file is not None: doc["stdin_base64"] = base64.b64encode(Path(args.stdin_file).read_bytes()).decode("ascii")
+            validate(doc, source_dir=os.path.dirname(os.path.abspath(args.output)))
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print("created %s %s" % (output, digest(doc)))
+        else:
+            doc = load(args.scenario)
+            if args.command == "validate": print("valid %s" % digest(doc))
+            else:
+                if args.canonical: print(canonical(doc).decode())
+                else: print(json.dumps(doc, indent=2, ensure_ascii=False))
+                if args.digest: print(digest(doc))
+        return 0
+    except (ScenarioError, OSError) as exc:
+        print("rat-scenario: %s" % exc, file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

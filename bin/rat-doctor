@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Read-only, artifact-specific capability planner for CTF-RAT."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+TOOLS = {
+    "file": ("file",), "binutils": ("readelf", "objdump"), "gdb": ("gdb",),
+    "ghidra": ("analyzeHeadless",), "wine": ("wine", "wine64"),
+    "qemu": ("qemu-x86_64", "qemu-i386", "qemu-aarch64", "qemu-arm"),
+}
+MODULES = {"angr": "angr", "pwntools": "pwn", "qiling": "qiling"}
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""): h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def executable(names):
+    found = next((shutil.which(name) for name in names if shutil.which(name)), None)
+    if not found: return {"status": "unavailable", "path": None, "version": None}
+    try:
+        version = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=2).stdout.splitlines()[0][:160]
+    except (OSError, subprocess.TimeoutExpired, IndexError): version = "unknown"
+    return {"status": "available", "path": found, "version": version}
+
+
+def module(name, import_name):
+    try:
+        if importlib.util.find_spec(import_name) is None:
+            return {"status": "unavailable", "version": None, "reason": "module not installed"}
+        try: version = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError: version = "unknown"
+        return {"status": "available", "version": version}
+    except (ImportError, ValueError) as exc:
+        return {"status": "unavailable", "version": None, "reason": str(exc)}
+
+
+def format_info(binary):
+    raw = Path(binary).read_bytes()[:64]
+    info = {"format": "unknown", "architecture": "unknown", "bits": None, "host_executable": False}
+    if raw.startswith(b"\x7fELF") and len(raw) >= 20:
+        machine = int.from_bytes(raw[18:20], "little" if raw[5] == 1 else "big")
+        info.update(format="ELF", bits={1: 32, 2: 64}.get(raw[4]), architecture={3: "x86", 40: "arm", 62: "x86_64", 183: "aarch64"}.get(machine, "machine-%d" % machine))
+        host = platform.machine().lower(); info["host_executable"] = info["architecture"] in ({"x86_64", "x86"} if host in {"x86_64", "amd64"} else {host})
+    elif raw.startswith(b"MZ"): info.update(format="PE", architecture="unknown", host_executable=False)
+    return info
+
+
+def identity(path):
+    if not path: return None
+    p = Path(path)
+    return {"path": str(p.resolve()), "exists": p.is_file(), "digest": sha256(p) if p.is_file() else None}
+
+
+def main(argv=None):
+    started = time.monotonic()
+    parser = argparse.ArgumentParser(); parser.add_argument("binary"); parser.add_argument("--libc"); parser.add_argument("--loader"); parser.add_argument("--rootfs"); parser.add_argument("--format", choices=("text", "json"), default="text")
+    args = parser.parse_args(argv)
+    if not os.path.isfile(args.binary):
+        print("rat-doctor: binary is missing or not a regular file", file=sys.stderr); return 4
+    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
+    capabilities.update({name: module(name, import_name) for name, import_name in MODULES.items()})
+    fmt = format_info(args.binary)
+    routes = {
+        "native": {"status": "available" if fmt["host_executable"] else "unavailable", "reason": None if fmt["host_executable"] else "foreign or unsupported format"},
+        "gdb": {"status": "available" if fmt["host_executable"] and capabilities["gdb"]["status"] == "available" else "unavailable"},
+        "angr": {"status": capabilities["angr"]["status"]},
+        "ghidra": {"status": capabilities["ghidra"]["status"]},
+        "qiling": {"status": "available" if capabilities["qiling"]["status"] == "available" and args.rootfs and os.path.isdir(args.rootfs) else "unavailable", "reason": None if args.rootfs and os.path.isdir(args.rootfs) else "rootfs missing"},
+        "wine": {"status": "available" if fmt["format"] == "PE" and capabilities["wine"]["status"] == "available" else "unavailable"},
+        "qemu": {"status": capabilities["qemu"]["status"]},
+    }
+    report = {"binary": {"path": str(Path(args.binary).resolve()), "digest": sha256(args.binary), **fmt}, "companions": {"libc": identity(args.libc), "loader": identity(args.loader), "rootfs": {"path": str(Path(args.rootfs).resolve()), "exists": os.path.isdir(args.rootfs)} if args.rootfs else None}, "capabilities": capabilities, "routes": routes, "regression": {"checked": False, "reason": "rat-doctor reports capability; run pkselftest separately"}}
+    if args.format == "json":
+        now = datetime.now(timezone.utc).isoformat()
+        build = sha256(__file__); policy = "sha256:" + hashlib.sha256(b"rat-doctor-read-only-v1").hexdigest()
+        doc = {"schema": "rat.tool-result/v1", "tool": {"name": "rat-doctor", "version": "1", "build_digest": build}, "run_id": "local", "invocation_id": "invoke_" + uuid.uuid4().hex, "status": "ok", "started_at": now, "finished_at": now, "duration_ms": int((time.monotonic() - started) * 1000), "inputs": [{"role": "binary", "digest": report["binary"]["digest"], "size": os.path.getsize(args.binary)}], "parameters": {"libc": args.libc, "loader": args.loader, "rootfs": args.rootfs}, "summary": report, "artifacts": [], "findings": [], "diagnostics": [], "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False}, "provenance": {"platform": {"os": sys.platform, "arch": platform.machine()}, "dependency_versions": {name: value.get("version") for name, value in capabilities.items()}, "policy_digest": policy, "cache": {"key": None, "hit": False, "source_invocation": None}}}
+        print(json.dumps(doc, sort_keys=True))
+    else:
+        print("artifact: %(format)s %(architecture)s %(bits)s-bit %(digest)s" % report["binary"])
+        for name, route in routes.items(): print("%-8s %s%s" % (name, route["status"], " — " + route["reason"] if route.get("reason") else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
