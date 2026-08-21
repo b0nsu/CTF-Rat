@@ -5,7 +5,7 @@ exploit.  They share one small envelope/artifact implementation so a later
 tool consumes IDs/artifacts rather than a previous tool's terminal output.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, platform, re, shutil, sys, tempfile, time, uuid
+import argparse, base64, hashlib, json, os, platform, re, shutil, sys, tempfile, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from .artifact import put_bytes, put_file, digest_bytes, get
@@ -79,8 +79,16 @@ def scenario(path):
     with open(path,encoding="utf-8") as f: s=json.load(f)
     if s.get("schema") not in (None,"rat.scenario/v1"): raise ValueError("unsupported scenario schema")
     return s
+def scenario_stdin(sc):
+    if "stdin" in sc and "stdin_base64" in sc: raise ValueError("scenario stdin encodings are mutually exclusive")
+    if "stdin_base64" in sc:
+        try: return base64.b64decode(sc["stdin_base64"],validate=True)
+        except (ValueError,TypeError) as exc: raise ValueError("invalid scenario stdin_base64") from exc
+    value=sc.get("stdin","")
+    if not isinstance(value,str): raise ValueError("scenario stdin must be text")
+    return value.encode()
 def execute_binary(binary, sc, timeout):
-    stdin=sc.get("stdin","").encode() if isinstance(sc.get("stdin",""),str) else bytes(sc.get("stdin",[]))
+    stdin=scenario_stdin(sc)
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
     return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
@@ -161,7 +169,7 @@ def dyn(a):
             # The debugger observation must exercise the same invocation as
             # the ordinary trace; otherwise a breakpoint hit is not evidence
             # about the scenario that produced the trace artifact.
-            gp=command(["gdb","-q","-nx","-batch","-ex","break "+a.break_loc,"-ex","run","-ex","info registers","--args",a.binary,*[str(x) for x in sc.get("argv",[])]],a.timeout,stdin=sc.get("stdin","").encode(),cwd=sc.get("cwd"),env={str(k):str(v) for k,v in sc.get("env",{}).items()})
+            gp=command(["gdb","-q","-nx","-batch","-ex","break "+a.break_loc,"-ex","run","-ex","info registers","--args",a.binary,*[str(x) for x in sc.get("argv",[])]],a.timeout,stdin=scenario_stdin(sc),cwd=sc.get("cwd"),env={str(k):str(v) for k,v in sc.get("env",{}).items()})
             gtext=(gp.stdout.preview+gp.stderr.preview).decode(errors="replace")
             for key,val in re.findall(r"\b([a-z]{2,3})\s+0x([0-9a-f]+)",gtext): registers[key]="0x"+val
             events.append({"event":"breakpoint","location":a.break_loc,"hit":bool(registers),"registers":registers})
@@ -296,7 +304,7 @@ def runtime(a):
         qemu=shutil.which("qemu-x86_64")
         if not qemu:
             return emit(envelope("rat-runtime",a.binary,a,{"backend":backend,"unsupported":"qemu-x86_64 dependency missing"},status="partial",diagnostics=["install qemu-user"],started=started),a)
-        stdin=sc.get("stdin","").encode(); p=command([qemu,a.binary,*[str(x) for x in sc.get("argv",[])]],a.timeout,stdin=stdin,cwd=sc.get("cwd"),env={str(k):str(v) for k,v in sc.get("env",{}).items()})
+        stdin=scenario_stdin(sc); p=command([qemu,a.binary,*[str(x) for x in sc.get("argv",[])]],a.timeout,stdin=stdin,cwd=sc.get("cwd"),env={str(k):str(v) for k,v in sc.get("env",{}).items()})
     else:
         p=execute_binary(a.binary,sc,a.timeout)
     arts=[artifact({"backend":backend,"exit":p.exit_code,"binary_digest":fdigest(a.binary)},"runtime-manifest","runtime.json",r)]
