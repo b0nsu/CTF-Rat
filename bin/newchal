@@ -110,17 +110,17 @@ import sys,os
 D,BN,HOST,PORT=sys.argv[1:5]
 exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
 haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
+remote_branch = ('    if args.REMOTE: return remote(%r, %s)\n' % (HOST, PORT)) if HOST else ''
 open(os.path.join(D,"exploit.py"),"w").write('''#!/usr/bin/env python3
 from pwn import *
 context.binary = exe = ELF("./%s", checksec=False)
 %scontext.log_level = "info"
-HOST, PORT = "%s", %s
 GS = """
 b main
 continue
 """
 def conn():
-    if args.REMOTE: return remote(HOST, PORT)
+%s    if args.REMOTE: raise SystemExit("remote target was not configured by newchal")
     if args.GDB:    return gdb.debug([exe.path], gdbscript=GS)   # heap/인터랙티브 디버깅 주력
     return process([exe.path])
 
@@ -129,7 +129,7 @@ io = conn()
 # === exploit ===
 
 io.interactive()
-''' % (exe, ('libc = ELF("./libc.so.6", checksec=False)\\n' if haslibc else ''), HOST, PORT))
+''' % (exe, ('libc = ELF("./libc.so.6", checksec=False)\\n' if haslibc else ''), remote_branch))
 PY
 sed "s/{{NAME}}/$NAME/; s#{{BIN}}#$BN#; s#{{REMOTE}}#${REMOTE:-'-'}#" "$CTF/solve/_template/state.md" > state.md 2>/dev/null || cp "$CTF/solve/_template/state.md" state.md
 PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" <<'PY'

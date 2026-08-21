@@ -87,6 +87,14 @@ class PwnscopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("single-target", {item["code"] for item in report["findings"]})
 
+    def test_dynamic_target_fails_closed(self):
+        result, report = self.run_case(
+            "from pwn import *\nHOST, PORT = 'ctf.test', 31337\nio = remote(HOST, PORT)\n",
+            manifest("ctfguard-target", ["ctf.test:31337"]),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("dynamic-target", {item["code"] for item in report["findings"]})
+
 
 if __name__ == "__main__":
     unittest.main()

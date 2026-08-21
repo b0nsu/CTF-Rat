@@ -12,7 +12,9 @@ def main():
     if len(sys.argv) < 2:
         print("usage: recon <binary> [libc.so.6]"); return 1
     path = sys.argv[1]; libc_path = sys.argv[2] if len(sys.argv) > 2 else None
-    ft0 = sh("file '%s'" % path)
+    # The bounded runner accepts argv only; a shell-shaped string would make
+    # it try to execute the first character and leave PE routing inoperative.
+    ft0 = sh(["file", "--", path])
     if "PE32" in ft0 or "MS Windows" in ft0:
         print("[recon] PE/Windows 바이너리 감지 — recon(pwn/ELF triage) 대상 아님.")
         print("  → rev 로 처리: revq %s  |  decomp %s <fn>  |  동적=Qiling/Frida" % (path, path))
