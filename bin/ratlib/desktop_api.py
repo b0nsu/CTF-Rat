@@ -8,7 +8,7 @@ import base64, json, os
 from collections import Counter
 from typing import Any
 
-from .artifact import get as artifact_get, metadata as artifact_metadata
+from .artifact import metadata as artifact_metadata, preview as artifact_read_preview
 from .state_v2 import Stream, cursor
 
 SNAPSHOT_SCHEMA = "rat.desktop.snapshot/v1"
@@ -247,9 +247,7 @@ def artifact_preview(challenge_root: str, digest: str, *, max_bytes: int = 65536
     if not isinstance(max_bytes, int) or max_bytes < 1 or max_bytes > MAX_PREVIEW:
         raise ValueError("max_bytes must be between 1 and %d" % MAX_PREVIEW)
     store = Stream(os.path.abspath(challenge_root)).root
-    meta = artifact_metadata(digest, root=store)
-    data = artifact_get(digest, root=store)
-    chunk = data[:max_bytes]
+    meta, chunk, total = artifact_read_preview(digest, max_bytes=max_bytes, root=store)
     media = str(meta.get("media_type", "application/octet-stream"))
     textual = media.startswith("text/") or "json" in media or "xml" in media or "javascript" in media
     if textual:
@@ -261,7 +259,7 @@ def artifact_preview(challenge_root: str, digest: str, *, max_bytes: int = 65536
         "metadata": meta,
         "encoding": encoding,
         "content": content,
-        "truncated": len(data) > len(chunk),
+        "truncated": total > len(chunk),
         "preview_bytes": len(chunk),
-        "total_bytes": len(data),
+        "total_bytes": total,
     }
