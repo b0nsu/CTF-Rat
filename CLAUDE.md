@@ -8,7 +8,7 @@
 
 1. **ROE**: 로컬 artifact(바이너리·소스·libc·Docker/loopback) 기본 + 사용자가 대화에서 명시한 **단일** remote(host:port)만. 그 외 호스트·포트·계정·인프라 탐색·스캔·추측 접속은 목적 불문 항상 금지(요청 문구 변경·하위 에이전트로도 우회 금지). 자격증명 탐색(홈·SSH키·토큰·env) 금지.
 2. **목표**: 실제 verifier/flag까지, honest-mode(받은 응답/원문 없이 성공 주장 금지). 오프셋·주소는 실측.
-3. **시작**: `ctfguard begin <chal>`로 active lock → `revq <bin>`(rev) / `recon <bin>`(pwn)로 triage. (route 판정 로직은 `ratlib.route`에 있음 — `rat route` 통합 CLI는 M4에서 노출 예정, 그때까진 revq/recon 신호로 직접 판단.)
+3. **시작**: `ctfguard begin <chal>`로 active lock → `rat route <bin>`으로 track/subroute/skill 판정(내부적으로 rat-doctor+rat-profile+revq를 얇게 조합, 새 분석 없음) → `revq <bin>`(rev) / `recon <bin>`(pwn)로 세부 triage.
 4. **skill 1개만**: route에 해당하는 `skills/<route>/SKILL.md`(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY) 또는 `knowledge/GROUNDING_INDEX.md` 라우팅표에서 **하나**만 로드.
 5. **bounded query**: raw dump 금지. `revq --func`/`decomp <func>`/`state compact --budget-tokens N` 같은 범위 제한된 조회만.
 6. **DEEP 승격 조건(아래 하나라도)**: 결과 모호·env-민감(패킹/anti-debug/커널)·같은 실패 반복·evidence 충돌·Progress Novelty Governor stuck(최근 5회 tool/query에 새 artifact digest·finding 개정·ruled-out route·primitive 상태변화 전무, `ratlib.governor.check_progress` 훅) → 강제 re-route 또는 DEEP.
@@ -34,6 +34,7 @@
 ## 도구 (bin/) — 전부 `CTF_HOME`(레포루트) 자동 해석
 
 ```
+FRONT-DOOR rat            route|query{func,oracle,slice}|dyn|verify|state compact|cache stats (thin dispatcher, M4)
 GUARD    ctfguard          active 문제 로컬 락
 INGEST   newchal            제공된 artifact의 로컬 스캐폴드 (+run.json)
 triage   recon              pwn 정적 프로파일 + 보수적 triage
@@ -56,6 +57,7 @@ rev 시너지: `revq` 주소 = angr 로드베이스(PIE 0x400000) → `symsolve 
 
 ```sh
 python3 bin/revq selftest
+python3 bin/rat selftest
 python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
 python3 -m unittest tests.test_writeup_pipeline

@@ -1,6 +1,7 @@
 import os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.route import route
+from ratlib.schema import validate
 
 def profile(imports=(), facts=()):
     return {"imports": list(imports), "facts": [{"kind": k, "value": v} for k, v in facts]}
@@ -74,6 +75,42 @@ class RouteDegradation(unittest.TestCase):
         r = route()
         self.assertEqual(r["subroute"], "unknown")
         self.assertEqual(r["capabilities"], {"profile": False, "revq": False})
+
+class RouteResultShape(unittest.TestCase):
+    """signals/next must be structured, not plain strings."""
+    def test_signals_are_structured_kind_value_quality(self):
+        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
+        self.assertTrue(r["signals"])
+        for s in r["signals"]:
+            self.assertEqual(set(s), {"kind", "value", "quality"})
+            self.assertIn(s["quality"], {"fact", "heuristic"})
+
+    def test_next_is_a_list_of_query_target_pairs(self):
+        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
+        self.assertIsInstance(r["next"], list)
+        for n in r["next"]:
+            self.assertEqual(set(n), {"query", "target"})
+
+    def test_revq_interesting_signal_carries_func_and_score_as_heuristic(self):
+        r = route(revq=revq(imports=["memcmp"]),
+                   interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        interesting_signals = [s for s in r["signals"] if s["kind"] == "revq-interesting"]
+        self.assertEqual(len(interesting_signals), 1)
+        self.assertEqual(interesting_signals[0]["quality"], "heuristic")
+        self.assertEqual(interesting_signals[0]["value"]["func"], "check")
+        self.assertEqual(r["next"][0]["target"], "check")
+
+    def test_import_based_signals_are_facts(self):
+        r = route(profile=profile(imports=["malloc", "free"]))
+        self.assertTrue(all(s["quality"] == "fact" for s in r["signals"]))
+
+    def test_route_result_validates_against_schema(self):
+        for r in (
+            route(profile=profile(imports=["gets"], facts=[("elf.nx", True)])),
+            route(revq=revq(evasion=["패커 섹션 UPX0"])),
+            route(),
+        ):
+            validate(r, "rat.route-result/v1")
 
 if __name__ == "__main__":
     unittest.main()

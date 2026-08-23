@@ -32,7 +32,9 @@ def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str
       "rat.finding/v1": finding, "rat.checkpoint/v1": checkpoint, "rat.primitive/v1": primitive,
       "rat.run/v1": run, "rat.role-contract/v1": role_contract,
       "rat.task-output/v1": task_output, "rat.skeptic-report/v1": skeptic_report,
-      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2}
+      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2,
+      "rat.route-result/v1": route_result, "rat.query-result/v1": query_result,
+      "rat.cache-stats/v1": cache_stats}
     try: dispatch[schema](doc)
     except KeyError: raise ValidationError("unknown schema %s" % schema)
     return doc
@@ -111,3 +113,34 @@ def benchmark_result_v2(d):
     if metrics["cache"]["cold_warm"] not in {"cold","warm"}: raise ValidationError("invalid metrics.cache.cold_warm")
     ratio = metrics["cache"]["cache_hit_ratio"]
     if ratio is not None and not (isinstance(ratio,(int,float)) and 0 <= ratio <= 1): raise ValidationError("invalid metrics.cache.cache_hit_ratio")
+
+def route_result(d):
+    _need(d,("schema","track","subroute","confidence","signals","capabilities","skill","next"))
+    if not isinstance(d["confidence"],(int,float)) or not 0 <= d["confidence"] <= 1: raise ValidationError("invalid confidence")
+    if not isinstance(d["signals"],list) or any(
+        not isinstance(s,Mapping) or {"kind","value","quality"} - set(s) or s["quality"] not in {"fact","heuristic"}
+        for s in d["signals"]): raise ValidationError("invalid signals")
+    if not isinstance(d["capabilities"],Mapping) or not all(isinstance(v,bool) for v in d["capabilities"].values()):
+        raise ValidationError("invalid capabilities")
+    if d["skill"] is not None and not isinstance(d["skill"],str): raise ValidationError("invalid skill")
+    if not isinstance(d["next"],list) or any(
+        not isinstance(n,Mapping) or {"query","target"} - set(n) for n in d["next"]): raise ValidationError("invalid next")
+    if "alternatives" in d and not isinstance(d["alternatives"],list): raise ValidationError("invalid alternatives")
+
+_QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
+def query_result(d):
+    _need(d,("schema","query","status","facts","heuristics","artifacts","coverage","diagnostics","provenance"))
+    if d["status"] not in {"ok","partial","error"}: raise ValidationError("invalid query status")
+    if not isinstance(d["coverage"],Mapping) or {"complete","scope","omitted"} - set(d["coverage"]):
+        raise ValidationError("invalid coverage")
+    if not isinstance(d["diagnostics"],list) or any(not isinstance(x,Mapping) or "code" not in x for x in d["diagnostics"]):
+        raise ValidationError("invalid diagnostics")
+    if any(x["code"] not in _QUERY_DIAGNOSTIC_CODES for x in d["diagnostics"]): raise ValidationError("unknown diagnostic code")
+    if not isinstance(d["provenance"],Mapping) or "cache" not in d["provenance"]: raise ValidationError("invalid provenance")
+    if not isinstance(d["artifacts"],list): raise ValidationError("invalid artifacts")
+
+def cache_stats(d):
+    _need(d,("schema","store","total_entries","by_backend","oldest_produced_at","newest_produced_at"))
+    _strict(d,{"schema","store","total_entries","by_backend","oldest_produced_at","newest_produced_at"})
+    if not isinstance(d["total_entries"],int) or d["total_entries"] < 0: raise ValidationError("invalid total_entries")
+    if not isinstance(d["by_backend"],Mapping): raise ValidationError("invalid by_backend")

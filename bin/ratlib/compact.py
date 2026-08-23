@@ -1,4 +1,4 @@
-"""C5 bounded state-compact projection (M1-4, DESIGN_v2 S10.1).
+"""Bounded state-compact projection.
 
 Priority order (never-drop tiers first): invalidating findings > confirmed
 facts > PASS primitives > active hypotheses > next probes > recent
@@ -18,6 +18,39 @@ def _findings_by_priority(findings):
     confirmed = {k: v for k, v in findings.items()
                  if v.get("state") in ("confirmed", "verified") and k not in invalidating}
     return invalidating, confirmed
+
+def truncate_by_item(items, budget_bytes, *, size_fn=None):
+    """Item-boundary truncation for `rat query *` list-valued facts.
+
+    Keeps items in original order, stopping at the first item boundary that
+    would exceed budget_bytes -- never splits an item across the boundary.
+    Independent of `_take_newest_first` (state-compact's newest-first/tiered
+    semantics are a different concern and must not be touched by this)."""
+    size_fn = size_fn or (lambda v: len(json.dumps(v, ensure_ascii=False, sort_keys=True).encode()))
+    kept, used = [], 0
+    for item in items:
+        cost = size_fn(item)
+        if used + cost > budget_bytes:
+            break
+        kept.append(item); used += cost
+    return kept, len(kept) < len(items), len(items) - len(kept)
+
+def truncate_lists_sharing_budget(named_lists, budget_bytes, *, size_fn=None):
+    """Same contract as ``truncate_by_item``, but budget_bytes is a
+    single per-query pool shared across several ordered fact-lists instead of
+    being applied independently to each -- an envelope with N lists must not
+    be able to grow to N*budget_bytes. Earlier lists in ``named_lists`` get
+    priority: they see the full remaining pool before later ones."""
+    size_fn = size_fn or (lambda v: len(json.dumps(v, ensure_ascii=False, sort_keys=True).encode()))
+    remaining = budget_bytes
+    kept, omitted, any_truncated = {}, {}, False
+    for name, items in named_lists:
+        k, trunc, omit = truncate_by_item(items, remaining, size_fn=size_fn)
+        kept[name] = k
+        omitted[name] = omit
+        any_truncated = any_truncated or trunc
+        remaining -= sum(size_fn(i) for i in k)
+    return kept, any_truncated, omitted
 
 def _take_newest_first(name, pairs, rebuild, remaining, omitted_counts):
     kept = []

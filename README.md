@@ -30,6 +30,10 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
 ```
 
 ## 핵심 도구
+- **`rat`** — 단일 front-door 디스패처. `rat route <bin>`로 track/subroute/skill을 판정하고
+  (rat-doctor+rat-profile+revq를 얇게 조합, 새 분석 없음), `rat query {func,oracle,slice}` ·
+  `rat dyn|verify` · `rat state compact` · `rat cache stats`를 한 진입점으로 노출한다.
+  기존 CLI(revq/recon 등)는 그대로 독립 동작한다.
 - **`ctfpull`** — CTFd 문제 수집 → `newchal` 스캐폴드. flag 자동제출 안 함(ToS+honest-mode).
   ```sh
   ctfpull ctfd --list [--category pwn]
@@ -59,6 +63,7 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev 루프)
 ## 테스트 (도구 수정 후 회귀검증)
 ```sh
 python3 bin/revq selftest
+python3 bin/rat selftest
 python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
 python3 bin/ctfpull selftest && python3 tests/e2e_mock.py
