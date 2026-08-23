@@ -43,7 +43,8 @@ class InputValidation(unittest.TestCase):
         code, out, _ = run_rat("route", "/definitely/missing", "--format", "json")
         self.assertEqual(code, 4)
         doc = json.loads(out)
-        self.assertEqual(doc["schema"], "rat.route-result/v1")
+        validate(doc, "rat.route-result/v1")
+        self.assertEqual(doc["error"]["code"], "input_invalid")
 
     def test_query_func_missing_binary_is_input_error(self):
         code, out, _ = run_rat("query", "func", "/definitely/missing", "main", "--format", "json")
@@ -122,6 +123,37 @@ class GovernorWiring(unittest.TestCase):
         self.assertTrue(docs[-1]["governor"]["stuck"])
         self.assertEqual(docs[-1]["governor"]["action"], "re-route-or-deep-escalate")
 
+    def test_state_progress_between_identical_calls_prevents_false_stuck(self):
+        # Same 5 identical calls that make the 6th call "stuck" above -- but
+        # with a real STATE v2 progress event recorded before the 6th call,
+        # the governor must see that as novel even though the route result
+        # itself hasn't changed.
+        from ratlib.state_v2 import Stream
+        for _ in range(5):
+            code, out, err = run_rat("route", self.binary, "--format", "json")
+            self.assertEqual(code, 0, err)
+        Stream(self.tmp.name).append("route.ruled_out", {"fingerprint": "dead-end-1", "text": "ruled out"})
+        code, out, err = run_rat("route", self.binary, "--format", "json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertNotIn("governor", doc)
+
+class FrontDoorTextRendering(unittest.TestCase):
+    """Default text output must surface the route-result's essential fields,
+    not collapse to a bare `label: status` line."""
+    def test_route_text_output_shows_track_confidence_skill_next(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, "silent")
+            with open(binary, "wb") as f:
+                f.write(b"\x00" * 16)
+            os.chmod(binary, 0o755)
+            code, out, err = run_rat("route", binary)
+            self.assertEqual(code, 0, err)
+            self.assertIn("ROUTE", out)
+            self.assertIn("CONFIDENCE", out)
+            self.assertIn("SKILL", out)
+            self.assertIn("NEXT", out)
+
 class DynVerifyStateCompactPassthrough(unittest.TestCase):
     """Pure argv-forwarding -- exercised against a legacy CLI's own usage/
     error path so no analysis engine is required."""
@@ -179,6 +211,21 @@ class FullEngineDependent(unittest.TestCase):
         validate(doc, "rat.query-result/v1")
         self.assertNotIn("claim", doc["facts"])
         self.assertIn("claim", doc["heuristics"])
+
+    def test_route_with_custom_store_registers_revq_in_the_same_index(self):
+        # A custom --store must be the one canonical index for every backend
+        # `rat route` touches -- rat-profile and revq must not diverge onto
+        # the default dirname(binary)/.rat index.
+        code, out, err = run_rat("route", str(self.exe), "--store", self.store, "--format", "json")
+        self.assertEqual(code, 0, err)
+        default_index = self.exe.parent / ".rat" / "indexes" / "cache.sqlite3"
+        self.assertFalse(default_index.exists())
+        custom_index = pathlib.Path(self.store) / "indexes" / "cache.sqlite3"
+        self.assertTrue(custom_index.exists())
+        rows = subprocess.run(["sqlite3", str(custom_index), "select distinct backend from cache"],
+                               text=True, capture_output=True, check=True).stdout
+        self.assertIn("revq_json", rows)
+        self.assertIn("profile_artifact", rows)
 
 if __name__ == "__main__":
     unittest.main()
