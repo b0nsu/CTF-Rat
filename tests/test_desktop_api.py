@@ -3,6 +3,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib.artifact import put_bytes
+import ratlib.artifact as artifact_store
 import ratlib.desktop_api as desktop_api
 from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, snapshot, telemetry
 from ratlib.state_v2 import Stream
@@ -136,6 +137,25 @@ class DesktopApiTests(unittest.TestCase):
             self.assertEqual(preview["content"], '{"answer":42}')
             self.assertFalse(preview["truncated"])
 
+    def test_artifact_listing_does_not_hash_object_contents(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            record = put_bytes(
+                b"Z" * (2 * 1024 * 1024),
+                kind="desktop-test",
+                media_type="application/octet-stream",
+                logical_name="large.bin",
+                root=stream.root,
+            )
+            with patch.object(
+                artifact_store,
+                "_checked_prefix",
+                side_effect=AssertionError("artifact listing hashed object contents"),
+            ):
+                listing = list_artifacts(root)
+            self.assertEqual(listing["total"], 1)
+            self.assertEqual(listing["artifacts"][0]["digest"], record["digest"])
+
     def test_artifact_preview_is_single_pass_and_bounded(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
@@ -150,8 +170,8 @@ class DesktopApiTests(unittest.TestCase):
             original_preview = desktop_api.artifact_read_preview
             with patch.object(desktop_api, "artifact_read_preview", wraps=original_preview) as store_preview, patch.object(
                 desktop_api,
-                "artifact_metadata",
-                side_effect=AssertionError("desktop preview performed a second artifact verification"),
+                "artifact_describe",
+                side_effect=AssertionError("desktop preview performed a separate listing-style metadata read"),
             ):
                 preview = desktop_api.artifact_preview(root, record["digest"], max_bytes=1024)
             store_preview.assert_called_once()
