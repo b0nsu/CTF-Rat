@@ -29,14 +29,34 @@ rat route ./chall --category rev
 
 `route` performs cheap local fingerprinting only. It reports file/hash signals, rev/pwn routing hints, current cache visibility, a small ordered `NEXT` list, and explicit DEEP triggers. It deliberately does not create phase state, hypotheses, primitives, or skeptic tasks.
 
-### Function card
+### Function Card v2
 
 ```bash
-rat func ./chall verify_input
-rat func ./chall 0x401240 --json
+rat-func-v2 ./chall verify_input
+rat-func-v2 ./chall 0x401240 --format json
 ```
 
-This delegates to the existing `revq --func` implementation rather than creating another analysis engine. Function Card v2 should evolve this surface rather than add a parallel frontend.
+Function Card v2 reuses the existing `revq --json` facts through the structured cache. It reports callers/callees, compare/input calls, role signals, lexical oracle signals, and call-graph oracle distance. Fields that require branch/value/stack analysis remain empty with explicit coverage notes rather than being guessed.
+
+### Oracle candidates
+
+```bash
+rat-oracle ./chall
+rat-oracle ./chall --command --stdin 16 --printable
+```
+
+`rat-oracle` classifies unambiguous lexical success/failure strings. `revq` string-xref instruction addresses remain evidence locators only: an xref may be in the middle of an angr block, so it is not automatically promoted to a safe `--find/--avoid` control-flow target. Generated `symsolve` commands prefer `--find-str/--avoid-str`, which also keeps concrete re-execution verification enabled.
+
+### Experimental bounded backward slice (A5 candidate)
+
+```bash
+rat-bslice ./chall check 0x401234
+rat-bslice ./chall check 0x401234 --json
+```
+
+The anchor may be an instruction/xref inside a target CFG block. `rat-bslice` examines in-function predecessor-block VEX Exit guards, resolves temporary and same-block register definitions, and recognizes direct stack-base plus constant slots. It explicitly reports whether reaching the anchor block requires the branch to be `taken` or `must-not-take`.
+
+It does **not** claim inter-block value flow, memory alias resolution, or whole-program taint. Keep it experimental until A5 benchmarks show measurable value.
 
 ### Context snapshot
 
@@ -103,7 +123,7 @@ The current telemetry cache ratio is therefore the **structured query cache rati
 
 ## Verification invariants
 
-- Heuristic route signals never auto-promote to facts or primitive PASS.
+- Heuristic route signals, function roles, oracle strings, xref locators, and bounded slices never auto-promote to facts or primitive PASS.
 - Rev recovery must be concretely rerun against the real binary before SOLVED.
 - A deterministic executable oracle can replace an LLM skeptic when it directly proves the rev claim.
 - Environment-sensitive pwn remains strict: primitive, assumptions, and observed final behavior must be validated in the relevant environment.
@@ -135,23 +155,21 @@ A0 current/main baseline
 A1 + FAST front door
 A2 + bounded startup instructions / lazy doctrine
 A3 + transparent structured query cache
-A4 + Function Card v2
-A5 + one measured rev improvement (oracle wiring or bounded backward slice)
+A4 + Function Card v2 + lexical oracle wiring
+A5 + experimental bounded backward slice
 ```
 
 Conditional DEEP is a policy exercised across A2+ rather than a separate unsupported A6 label.
 
-## Next implementation targets
-
-### P0/P1 now
+## Implementation status
 
 - [x] FAST front door (`rat route`, `rat func`, `rat snapshot`)
 - [x] opt-in benchmark telemetry
 - [x] bounded Codex startup instructions
 - [x] transparent structured-cache adapter for revq/recon/gdbq/symsolve/decomp
-- [ ] Function Card v2 with stable structured fields
-- [ ] oracle detector wiring existing success/fail signals into symbolic find/avoid targets
-- [ ] bounded backward data slice from compare/branch/output sinks
+- [x] Function Card v2 with stable structured fields and explicit coverage gaps
+- [x] conservative oracle detector; xrefs stay locators, generated solving uses lexical output conditions
+- [x] bounded predecessor-block backward slice as an experimental A5 query
 
 ### Only if benchmarks identify a bottleneck
 
