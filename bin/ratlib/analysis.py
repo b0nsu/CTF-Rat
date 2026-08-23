@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse, base64, hashlib, json, os, platform, re, shutil, sys, tempfile, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from .artifact import put_bytes, put_file, digest_bytes, get
+from .artifact import put_bytes, put_file, digest_bytes, get, metadata
 from .runner import run, EXIT_DEPENDENCY, EXIT_INPUT, EXIT_POLICY, EXIT_TIMEOUT
 
 VERSION="p2-mvp/1"; POLICY="sha256:"+hashlib.sha256(b"p2-local-executable-only").hexdigest()
@@ -92,23 +92,56 @@ def execute_binary(binary, sc, timeout):
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
     return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
+def _profile_cache_keys(bdig):
+    from .cache import canonical_key
+    return {k: canonical_key(binary_sha256=bdig,tool_name="rat-profile",tool_version=VERSION,params={"artifact":k},dep_versions={})
+            for k in ("profile","string-index")}
+def _profile_cache_lookup(r, bdig):
+    """M2-4: read-through the shared canonical index; miss on any inconsistency."""
+    try:
+        from .cache import Cache
+        idx=Cache(r); keys=_profile_cache_keys(bdig)
+        pe,se=idx.get_entry(keys["profile"]),idx.get_entry(keys["string-index"])
+        if not (pe and se): return idx,keys,None,None
+        profile_doc=json.loads(get(pe["path"],root=r))
+        if profile_doc.get("binary_digest")!=bdig: return idx,keys,None,None
+        profile_art={k:metadata(pe["path"],root=r)[k] for k in ("kind","digest","media_type","size","logical_name")}
+        strings_art={k:metadata(se["path"],root=r)[k] for k in ("kind","digest","media_type","size","logical_name")}
+        return idx,keys,profile_doc,(profile_art,strings_art)
+    except Exception:
+        return None,None,None,None
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
-    r=root(a,a.binary); started=iso(); facts=[]; signals=[]; routes=[]
-    fileout=command(["file","--",a.binary],a.timeout).stdout.preview.decode(errors="replace").strip()
-    readelf=command(["readelf","-hW","-lW","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
-    is_elf=fileout.startswith("ELF ")
-    facts.append({"kind":"format","value":fileout,"quality":"direct"})
-    if is_elf:
-        facts.extend([{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
-    imports=re.findall(r"\b(?:UND\s+)?([_A-Za-z][\w@.]*)$",readelf,re.M)
-    strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
-    for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
-        if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
-    if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
-    arts=[artifact({"binary_digest":fdigest(a.binary),"environment":profile_environment(a),"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+    r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary)
+    idx,keys,cached_doc,cached_arts=_profile_cache_lookup(r,bdig)
+    if cached_doc and cached_arts:
+        cache_state="hit"; facts,signals,routes=cached_doc["facts"],cached_doc["signals"],cached_doc["routes"]
+        arts=list(cached_arts)
+    else:
+        cache_state="miss"; facts=[]; signals=[]; routes=[]
+        fileout=command(["file","--",a.binary],a.timeout).stdout.preview.decode(errors="replace").strip()
+        readelf=command(["readelf","-hW","-lW","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        is_elf=fileout.startswith("ELF ")
+        facts.append({"kind":"format","value":fileout,"quality":"direct"})
+        if is_elf:
+            facts.extend([{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
+        imports=re.findall(r"\b(?:UND\s+)?([_A-Za-z][\w@.]*)$",readelf,re.M)
+        strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
+            if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
+        if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
+        arts=[artifact({"binary_digest":bdig,"environment":profile_environment(a),"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+        if idx and keys:
+            try:
+                idx.put_entry(keys["profile"],backend="profile_artifact",path=arts[0]["digest"])
+                idx.put_entry(keys["string-index"],backend="profile_artifact",path=arts[1]["digest"])
+            except Exception: pass
+    is_elf=next((f["value"] for f in facts if f["kind"]=="format"),"").startswith("ELF ")
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
-    return emit(envelope("rat-profile",a.binary,a,{"format":fileout,"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started),a)
+    doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
+    doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state
+    doc["provenance"]["cache"]={"key":keys["profile"] if keys else None,"hit":cache_state=="hit","source_invocation":None}
+    return emit(doc,a)
 def slice_(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)

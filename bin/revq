@@ -660,9 +660,27 @@ def render_xrefs(rev, target):
 
 
 # ─────────────────────────── 오케스트레이션 ───────────────────────────
+def _canonical_index(binpath, want_engine, cur_sha):
+    """Best-effort registration in the M2 canonical cache index (bin/ratlib/cache.py).
+
+    revq's own sidecar-file validity check above remains the source of truth
+    for hit/miss; this only makes that decision observable to other tools
+    (rat-metrics, a future `rat` dispatcher) through one shared index.
+    """
+    try:
+        from ratlib.cache import Cache, canonical_key
+        idx_root = os.path.join(os.path.dirname(os.path.abspath(binpath)) or ".", ".rat")
+        ck = canonical_key(binary_sha256="sha256:" + cur_sha, tool_name="revq", tool_version=str(SCHEMA),
+                            params={"engine": want_engine}, dep_versions={})
+        return Cache(idx_root), ck
+    except Exception:
+        return None, None
+
+
 def load_or_extract(binpath, want_engine, refresh):
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
+    idx, ck = _canonical_index(binpath, want_engine, cur_sha)
     if not refresh and os.path.isfile(cp):
         try:
             with open(cp) as f:
@@ -671,6 +689,10 @@ def load_or_extract(binpath, want_engine, refresh):
             if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
+                rev["cache_state"] = "hit"
+                if idx and ck:
+                    try: idx.put_entry(ck, backend="revq_json", path=cp)
+                    except Exception: pass
                 return annotate_counts(rev)
         except Exception:
             pass
@@ -678,6 +700,7 @@ def load_or_extract(binpath, want_engine, refresh):
     rev["bin"] = binpath
     rev["sha256"] = cur_sha
     rev["generated_at"] = now_iso()
+    rev["cache_state"] = "miss"
     annotate_counts(rev)
     try:
         with open(cp, "w") as f:
@@ -685,6 +708,9 @@ def load_or_extract(binpath, want_engine, refresh):
         info("캐시 기록: %s" % cp)
     except Exception as e:
         info("캐시 기록 실패(무시): %s" % e)
+    if idx and ck:
+        try: idx.put_entry(ck, backend="revq_json", path=cp)
+        except Exception: pass
     return rev
 
 
