@@ -58,6 +58,20 @@ jobs:
         if: github.event_name == 'pull_request'
         working-directory: desktop
         run: npm run tauri -- build --bundles deb,appimage
+      - name: Validate Linux bundles
+        if: github.event_name == 'pull_request'
+        run: |
+          debs=(desktop/src-tauri/target/release/bundle/deb/*.deb)
+          appimages=(desktop/src-tauri/target/release/bundle/appimage/*.AppImage)
+          test -s "${debs[0]}"
+          test -s "${appimages[0]}"
+          dpkg-deb --info "${debs[0]}" >/dev/null
+          chmod +x "${appimages[0]}"
+          tmp="$(mktemp -d)"
+          appimage="$GITHUB_WORKSPACE/${appimages[0]}"
+          (cd "$tmp" && "$appimage" --appimage-extract >/dev/null)
+          test -x "$tmp/squashfs-root/usr/bin/ctf-rat-desktop"
+          rm -rf "$tmp"
       - name: Verify lockfiles unchanged
         run: git diff --exit-code -- desktop/package-lock.json desktop/src-tauri/Cargo.lock
       - name: Upload Linux bundles
