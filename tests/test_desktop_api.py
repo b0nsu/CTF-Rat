@@ -22,6 +22,22 @@ class DesktopApiTests(unittest.TestCase):
             self.assertIn("H1", doc["view"]["hypotheses"])
             self.assertEqual(doc["view"]["next_probes"][-1]["probe"], "inspect transform")
 
+    def test_live_snapshot_parses_state_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            stream.append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            original_read = Stream.read
+            calls = []
+
+            def counted(instance):
+                calls.append(instance.path)
+                return original_read(instance)
+
+            with patch.object(Stream, "read", counted):
+                doc = snapshot(root)
+            self.assertEqual(doc["event_count"], 1)
+            self.assertEqual(len(calls), 1)
+
     def test_snapshot_can_replay_historical_state(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
