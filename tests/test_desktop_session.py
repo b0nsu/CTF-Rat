@@ -66,6 +66,26 @@ class DesktopSessionTests(unittest.TestCase):
             self.assertIn("second", replay)
             self.assertNotIn("first", replay)
 
+    def test_stale_cursor_from_previous_session_replays_new_log_from_start(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = SessionManager(root, [sys.executable, "-u", "-c", "print('A'*512)"])
+            manager.start()
+            self.wait_finished(manager)
+            first = manager.log_delta(0, 4096)
+            old_cursor = first["cursor"]
+            self.assertGreater(old_cursor, 0)
+
+            second_payload = "BEGIN-SECOND-" + ("B" * (old_cursor + 64))
+            manager.solver_argv = [sys.executable, "-u", "-c", "print(%r)" % second_payload]
+            manager.start()
+            self.wait_finished(manager)
+
+            # A byte-only cursor would seek into the new, longer file and lose
+            # its prefix. Session-safe cursors must map an old cursor to offset 0.
+            second = manager.log_delta(old_cursor, 4096)
+            self.assertTrue(second["text"].startswith("BEGIN-SECOND-"))
+            self.assertGreater(second["cursor"], old_cursor)
+
 
 if __name__ == "__main__":
     unittest.main()
