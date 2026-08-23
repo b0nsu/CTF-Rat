@@ -49,14 +49,6 @@ class SessionManager:
     def _running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def _read_meta(self) -> dict[str, Any]:
-        try:
-            with open(self.meta_path, encoding="utf-8") as source:
-                doc = json.load(source)
-            return doc if isinstance(doc, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
     def _status_doc(self) -> dict[str, Any]:
         running = self._running()
         pid = self._proc.pid if self._proc is not None and running else None
@@ -75,6 +67,14 @@ class SessionManager:
             "log_size": os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0,
         }
 
+    def _read_meta(self) -> dict[str, Any]:
+        try:
+            with open(self.meta_path, encoding="utf-8") as source:
+                doc = json.load(source)
+            return doc if isinstance(doc, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             if self._proc is not None and self._proc.poll() is not None and self._exit_code is None:
@@ -91,6 +91,10 @@ class SessionManager:
                 raise ValueError("solver session is already running")
             os.makedirs(self.base, mode=0o700, exist_ok=True)
             open(self.log_path, "wb").close()
+            if self._reader is not None and self._reader.is_alive():
+                self._reader.join(timeout=0.5)
+                if self._reader.is_alive():
+                    raise ValueError("previous solver session is still cleaning up")
             master_fd, slave_fd = pty.openpty()
             env = dict(os.environ)
             env["CTF_RAT_DESKTOP"] = "1"
@@ -115,14 +119,12 @@ class SessionManager:
             self._stopped_at = None
             started_at = _now()
             _atomic_json(self.meta_path, {**self._status_doc(), "started_at": started_at})
-            self._reader = threading.Thread(target=self._pump, name="ratd-pty", daemon=True)
+            session_id = self._session_id
+            self._reader = threading.Thread(target=self._pump, args=(proc, master_fd, session_id), name="ratd-pty", daemon=True)
             self._reader.start()
             return self._status_doc()
 
-    def _pump(self) -> None:
-        fd = self._master_fd
-        if fd is None:
-            return
+    def _pump(self, proc: subprocess.Popen[bytes], fd: int, session_id: str) -> None:
         try:
             with open(self.log_path, "ab", buffering=0) as log:
                 while True:
@@ -138,12 +140,14 @@ class SessionManager:
                 os.close(fd)
             except OSError:
                 pass
+            exit_code = proc.wait()
             with self._lock:
-                if self._proc is not None:
-                    self._exit_code = self._proc.wait()
-                self._stopped_at = _now()
-                self._master_fd = None
-                _atomic_json(self.meta_path, self._status_doc())
+                if self._proc is proc and self._session_id == session_id:
+                    self._exit_code = exit_code
+                    self._stopped_at = _now()
+                    if self._master_fd == fd:
+                        self._master_fd = None
+                    _atomic_json(self.meta_path, self._status_doc())
 
     def stop(self, grace_seconds: float = 2.0) -> dict[str, Any]:
         with self._lock:
