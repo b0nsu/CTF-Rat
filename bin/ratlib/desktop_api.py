@@ -8,7 +8,7 @@ import base64, json, os
 from collections import Counter
 from typing import Any
 
-from .artifact import metadata as artifact_metadata, preview as artifact_read_preview
+from .artifact import describe as artifact_describe, preview as artifact_read_preview
 from .state_v2 import Stream, cursor
 
 SNAPSHOT_SCHEMA = "rat.desktop.snapshot/v1"
@@ -215,6 +215,12 @@ def telemetry(challenge_root: str) -> dict[str, Any]:
 
 
 def list_artifacts(challenge_root: str, *, limit: int = 500) -> dict[str, Any]:
+    """List artifact metadata without hashing every object in the store.
+
+    Listing is a discovery operation: schema/digest/object existence/size are
+    checked through ``artifact.describe``. Any byte-consuming path such as
+    preview/get/verify still performs the full SHA-256 verification.
+    """
     if not isinstance(limit, int) or limit < 1 or limit > MAX_ARTIFACTS:
         raise ValueError("artifact limit must be between 1 and %d" % MAX_ARTIFACTS)
     store = Stream(os.path.abspath(challenge_root)).root
@@ -230,7 +236,7 @@ def list_artifacts(challenge_root: str, *, limit: int = 500) -> dict[str, Any]:
                     continue
                 digest = "sha256:" + prefix + name[:-5]
                 try:
-                    records.append(artifact_metadata(digest, root=store))
+                    records.append(artifact_describe(digest, root=store))
                 except (OSError, ValueError, RuntimeError):
                     continue
     records.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("digest", ""))), reverse=True)
