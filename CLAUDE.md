@@ -19,7 +19,7 @@ CTF-Rat is a local-first pwn/rev kit. Optimize for **time-to-first-action and bo
 2. Route: `rat route <artifact>`.
 3. Run one bounded query:
    - rev: `revq <bin> --interesting` → `rat-func-v2 <bin> <candidate>`.
-   - if the card exposes success/failure signals: `rat-oracle <bin> --command ...` to produce a cache-aware `symsolve` find/avoid command.
+   - if the card exposes success/failure signals: `rat-oracle <bin> --command ...` to produce a cache-aware `symsolve` command using lexical output oracles; xref addresses remain evidence locators.
    - decompile only one named function when the remaining question requires code.
    - pwn: `recon <bin>` or one evidence-driven helper.
    - expensive/repeatable deterministic query: use `rat-adapt --root . --emit stdout ...` so structured cache can replay it.
@@ -58,7 +58,7 @@ Do not create a second DEEP engine.
 ```text
 rat route <artifact>                     cheap deterministic routing
 rat-func-v2 <bin> <func|addr>           structured Function Card v2
-rat-oracle <bin> --command ...           success/failure xref → symsolve wiring
+rat-oracle <bin> --command ...           lexical success/failure oracle → symsolve; xrefs stay locators
 rat snapshot --root . --budget-bytes N   bounded typed-state projection
 rat-adapt --root . --emit stdout ...     structured-cache wrapper
 revq <bin> --interesting                 rev candidate selection
@@ -67,12 +67,14 @@ decomp <bin> <func>                      named-function decompile
 state ...                                durable evidence state
 ```
 
+`rat-bslice` is an experimental A5 query, not part of the default hot path. Use it only when a concrete oracle/xref anchor needs bounded same/predecessor-block branch dependency evidence; it does not prove inter-block value flow or memory aliases.
+
 Other tools are lazy-loaded only when current evidence calls for them.
 
 ## Verification boundary
 
 - FAST routing, role labels, oracle strings, and xref anchors are candidates, not proof.
-- `rat-oracle` may wire deterministic xref anchors into `symsolve`, but the recovered solution must still pass concrete execution.
+- `rat-oracle` keeps xref instruction addresses as evidence locators and generates `symsolve` commands from lexical success/failure output conditions so concrete re-execution remains available.
 - A deterministic executable oracle can replace an LLM skeptic for a directly proven rev result.
 - Remote/environment-sensitive pwn remains strict.
 - Actual output/log/flag bytes are evidence; inferred success is not.
