@@ -74,6 +74,8 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
+    let polling = false;
+    let timer: number | undefined;
 
     const initial = async () => {
       try {
@@ -101,6 +103,8 @@ export default function App() {
     };
 
     const poll = async () => {
+      if (polling) return;
+      polling = true;
       try {
         const [delta, currentSession, log] = await Promise.all([
           getEvents(eventCursor.current), getSession(), getTerminal(terminalCursor.current)
@@ -133,14 +137,17 @@ export default function App() {
           setConnection("offline");
           setError(exc instanceof Error ? exc.message : "poll failed");
         }
+      } finally {
+        polling = false;
       }
     };
 
-    void initial();
-    const timer = window.setInterval(() => void poll(), 500);
+    void initial().finally(() => {
+      if (mounted) timer = window.setInterval(() => void poll(), 500);
+    });
     return () => {
       mounted = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearInterval(timer);
     };
   }, []);
 
