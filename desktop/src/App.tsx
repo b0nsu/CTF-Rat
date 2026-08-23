@@ -52,6 +52,29 @@ function stateCounters(snapshot: Snapshot | null) {
   ];
 }
 
+function objectField(value: unknown, keys: string[]): string | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const field = record[key];
+    if (typeof field === "string" && field.length) return field;
+  }
+  return null;
+}
+
+function stateSummary(records: Record<string, unknown>, key: string): string {
+  const counts = new Map<string, number>();
+  for (const value of Object.values(records)) {
+    const status = objectField(value, [key]) ?? "unknown";
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  if (!counts.size) return "none";
+  return [...counts.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([status, count]) => `${count} ${status}`)
+    .join(" · ");
+}
+
 export default function App() {
   const [liveSnapshot, setLiveSnapshot] = useState<Snapshot | null>(null);
   const [displaySnapshot, setDisplaySnapshot] = useState<Snapshot | null>(null);
@@ -163,6 +186,16 @@ export default function App() {
   }, [terminal]);
 
   const counters = useMemo(() => stateCounters(displaySnapshot), [displaySnapshot]);
+  const focus = useMemo(() => {
+    const view = displaySnapshot?.view;
+    if (!view) return { nextProbe: "waiting for STATE", primitives: "none", findings: "none" };
+    const nextProbe = objectField(view.next_probes.at(-1), ["probe", "text"]) ?? "no next probe recorded";
+    return {
+      nextProbe,
+      primitives: stateSummary(view.primitives, "status"),
+      findings: stateSummary(view.findings, "state")
+    };
+  }, [displaySnapshot]);
   const challengeName = liveSnapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
 
   const runControl = async (action: "start" | "stop") => {
@@ -250,6 +283,12 @@ export default function App() {
         />
         <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
         <span className="telemetry-inline">events {liveSnapshot?.total_event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
+      </section>
+
+      <section className={`focus-bar ${displaySnapshot?.historical ? "historical" : ""}`}>
+        <div className="focus-main"><span>NEXT PROBE</span><strong title={focus.nextProbe}>{focus.nextProbe}</strong></div>
+        <div className="focus-stat"><span>PRIMITIVES</span><code>{focus.primitives}</code></div>
+        <div className="focus-stat"><span>FINDINGS</span><code>{focus.findings}</code></div>
       </section>
 
       <main className="workspace">
