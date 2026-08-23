@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rat.oracle-candidates/v1",
+  "type": "object",
+  "required": ["schema", "binary", "binary_sha256", "engine", "analysis_complete", "signals", "targets", "ready", "ambiguity", "cache", "confidence", "note"],
+  "properties": {
+    "schema": {"const": "rat.oracle-candidates/v1"},
+    "binary": {"type": ["string", "null"]},
+    "binary_sha256": {"type": ["string", "null"]},
+    "engine": {"type": ["string", "null"]},
+    "analysis_complete": {"type": "boolean"},
+    "signals": {
+      "type": "array",
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "required": ["kind", "text", "string_addr", "xrefs"],
+        "properties": {
+          "kind": {"enum": ["success", "failure"]},
+          "text": {"type": "string", "maxLength": 160},
+          "string_addr": {"type": "integer", "minimum": 0},
+          "xrefs": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "required": ["func", "addr"],
+              "properties": {
+                "func": {"type": "string"},
+                "addr": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "targets": {
+      "type": "object",
+      "required": ["find", "avoid", "find_str", "avoid_str"],
+      "properties": {
+        "find": {"type": "array", "maxItems": 8, "items": {"type": "integer", "minimum": 1}},
+        "avoid": {"type": "array", "maxItems": 8, "items": {"type": "integer", "minimum": 1}},
+        "find_str": {"type": "array", "maxItems": 4, "items": {"type": "string"}},
+        "avoid_str": {"type": "array", "maxItems": 4, "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "ready": {"type": "boolean"},
+    "ambiguity": {"type": "array", "items": {"type": "string"}},
+    "cache": {"type": "object"},
+    "confidence": {"const": "candidate-only"},
+    "note": {"type": "string"}
+  },
+  "additionalProperties": false
+}
