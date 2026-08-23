@@ -50,7 +50,9 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
    doc=json.loads(get(hit,root=root))
    source_invocation=doc.get("invocation_id")
    doc=copy.deepcopy(doc); now=_iso()
-   doc["run_id"]=_active_run(root) or doc.get("run_id","local")
+   # A cache hit is a new invocation. Do not leak the run_id of the invocation
+   # that originally populated the cache when no benchmark run is active now.
+   doc["run_id"]=_active_run(root) or "local"
    doc["invocation_id"]="invoke_"+uuid.uuid4().hex
    doc["started_at"]=now; doc["finished_at"]=_iso()
    doc["duration_ms"]=max(0,int((time.monotonic()-cache_started)*1000))
