@@ -32,13 +32,22 @@ export type Snapshot = {
   view: StateView;
 };
 
+export type EventCursor = {
+  stream_id: string | null;
+  seq: number;
+  source_size?: number;
+  source_mtime_ns?: number;
+};
+
 export type Delta = {
   schema: string;
   stream_id: string | null;
   after_seq: number;
   events: EventRecord[];
-  cursor: { stream_id: string | null; seq: number };
+  cursor: EventCursor;
   has_more: boolean;
+  reset: boolean;
+  unchanged: boolean;
 };
 
 export type Session = {
@@ -122,8 +131,17 @@ export function getSnapshot(untilSeq?: number): Promise<Snapshot> {
   return request(`/api/snapshot${suffix}`);
 }
 
-export function getEvents(afterSeq: number, limit = 500): Promise<Delta> {
-  return request(`/api/events?after_seq=${afterSeq}&limit=${limit}`);
+export function getEvents(cursor: EventCursor | null, limit = 500): Promise<Delta> {
+  const params = new URLSearchParams({
+    after_seq: String(cursor?.seq ?? 0),
+    limit: String(limit)
+  });
+  if (cursor?.stream_id) params.set("stream_id", cursor.stream_id);
+  if (typeof cursor?.source_size === "number" && typeof cursor?.source_mtime_ns === "number") {
+    params.set("known_size", String(cursor.source_size));
+    params.set("known_mtime_ns", String(cursor.source_mtime_ns));
+  }
+  return request(`/api/events?${params.toString()}`);
 }
 
 export function getSession(): Promise<Session> {
