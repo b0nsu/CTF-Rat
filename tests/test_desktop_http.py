@@ -45,12 +45,12 @@ class DesktopHttpTests(unittest.TestCase):
             status, first = self.read_json(Request(base + "/api/events?after_seq=0&limit=10"))
             self.assertEqual(status, 200)
             cursor = first["cursor"]
+            self.assertIsInstance(cursor["source_generation"], str)
             params = urlencode({
                 "after_seq": cursor["seq"],
                 "limit": 10,
                 "stream_id": cursor["stream_id"],
-                "known_size": cursor["source_size"],
-                "known_mtime_ns": cursor["source_mtime_ns"],
+                "known_generation": cursor["source_generation"],
             })
             status, unchanged = self.read_json(Request(base + "/api/events?" + params))
             self.assertEqual(status, 200)
