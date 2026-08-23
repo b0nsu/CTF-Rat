@@ -75,28 +75,50 @@ class SessionManager:
         except (OSError, ValueError):
             return {}
 
+    def _finished_reader(self) -> threading.Thread | None:
+        with self._lock:
+            if self._running():
+                return None
+            reader = self._reader
+            if reader is None or reader is threading.current_thread() or not reader.is_alive():
+                return None
+            return reader
+
+    def _join_finished_reader(self, timeout: float = 0.5, *, required: bool = False) -> bool:
+        """Drain a completed process' PTY without holding the manager lock."""
+        reader = self._finished_reader()
+        if reader is None:
+            return True
+        reader.join(timeout=timeout)
+        if reader.is_alive() and required:
+            raise ValueError("previous solver session is still cleaning up")
+        return not reader.is_alive()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
-            if self._proc is not None and self._proc.poll() is not None and self._exit_code is None:
+            finished = self._proc is not None and self._proc.poll() is not None
+            if finished and self._exit_code is None:
                 self._exit_code = self._proc.returncode
                 self._stopped_at = _now()
                 _atomic_json(self.meta_path, self._status_doc())
+        if finished:
+            self._join_finished_reader(timeout=0.5)
+        with self._lock:
             return self._status_doc()
 
     def start(self) -> dict[str, Any]:
+        if not self.solver_argv:
+            raise ValueError("ratd was started without --solver-command")
         with self._lock:
-            if not self.solver_argv:
-                raise ValueError("ratd was started without --solver-command")
+            if self._running():
+                raise ValueError("solver session is already running")
+        # Reader finalization takes the manager lock, so joining it while
+        # holding that lock can deadlock. Drain it first, then re-check state.
+        self._join_finished_reader(timeout=0.5, required=True)
+        with self._lock:
             if self._running():
                 raise ValueError("solver session is already running")
             os.makedirs(self.base, mode=0o700, exist_ok=True)
-            # The previous PTY reader must finish before the shared log is
-            # truncated, otherwise a final old-session write can leak into the
-            # next session's replay stream.
-            if self._reader is not None and self._reader.is_alive():
-                self._reader.join(timeout=0.5)
-                if self._reader.is_alive():
-                    raise ValueError("previous solver session is still cleaning up")
             open(self.log_path, "wb").close()
             master_fd, slave_fd = pty.openpty()
             env = dict(os.environ)
@@ -154,14 +176,14 @@ class SessionManager:
 
     def stop(self, grace_seconds: float = 2.0) -> dict[str, Any]:
         with self._lock:
-            if not self._running():
-                return self.status()
-            assert self._proc is not None
-            try:
-                os.killpg(self._proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            proc = self._proc
+            proc = self._proc if self._running() else None
+            if proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        if proc is None:
+            return self.status()
         try:
             proc.wait(timeout=grace_seconds)
         except subprocess.TimeoutExpired:
@@ -174,7 +196,7 @@ class SessionManager:
             self._exit_code = proc.returncode
             self._stopped_at = _now()
             _atomic_json(self.meta_path, self._status_doc())
-            return self._status_doc()
+        return self.status()
 
     def write(self, data: str) -> dict[str, Any]:
         raw = data.encode("utf-8")
