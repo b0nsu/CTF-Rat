@@ -101,27 +101,29 @@ class LocalPwnToolTests(unittest.TestCase):
         self.assertIn("outside the selected word size", "\n".join(json.loads(result.stdout)["errors"]))
 
     def test_pwncrash_reproduces_local_core_evidence(self):
-        # stack_overflow.c is a plain return-address overwrite: the corrupted
-        # return address is (virtually always) non-canonical, so `ret` faults
-        # as a #GP rather than a #PF. On x86_64 a #GP carries no linear fault
-        # address, so the kernel reports siginfo si_addr=0 -- core.fault_addr
-        # (and therefore fault_cyclic_offset) is legitimately null for this
-        # crash class on any x86_64 Linux, emulated or native.
-        #
-        # Which register holds the controlled value in the core is NOT
-        # portable: some kernels snapshot RIP as the popped controlled value
-        # (pc_cyclic_offset == 72), others snapshot the faulting `ret`
-        # instruction address (pc_cyclic_offset is null). pwncrash therefore
-        # exposes control_cyclic_offset, which falls back to the popped return
-        # slot at [sp-8] -- program memory that reads back the controlled
-        # value identically on every x86_64 Linux. That is the honest,
-        # environment-independent RIP-hijack evidence.
+        # stack_overflow.c is a plain return-address overwrite: `ret` transfers
+        # to the controlled (offset-72) value and faults. How the core records
+        # that fault is NOT portable across x86_64 kernels, on two axes:
+        #   - the controlled value surfaces in RIP (post-pop RSP snapshot) or
+        #     in the top-of-stack word at [sp] (pre-pop snapshot); pwncrash
+        #     reconciles both into control_cyclic_offset.
+        #   - siginfo si_addr is either cleared to 0 (reported as a #GP) or set
+        #     to the controlled target itself (reported as a #PF); core.fault_addr
+        #     therefore is legitimately 0 on some kernels and the hijack value
+        #     on others.
+        # The environment-independent RIP-hijack evidence is control_cyclic_offset;
+        # fault_addr is only required to be consistent with it (unset, or the same
+        # controlled value -- never some unrelated address).
         result = self.tool("pwncrash", str(self.binary), "--pattern-length", "256", "--repetitions", "2", "--json")
         report = json.loads(result.stdout)
         self.assertEqual(report["verdict"], "crash-reproduced")
         self.assertEqual(report["stable_signal"], 11)
         self.assertEqual(report["core"]["control_cyclic_offset"], 72)
-        self.assertEqual(report["core"]["fault_addr"], 0)
+        fault_addr = report["core"]["fault_addr"]
+        self.assertTrue(
+            fault_addr == 0 or report["core"]["fault_cyclic_offset"] == 72,
+            "fault_addr %r is neither cleared nor the controlled hijack value" % (fault_addr,),
+        )
         self.assertEqual(report["promotion"], "candidate-evidence-only")
 
 
