@@ -8,7 +8,9 @@ on:
       - 'desktop/**'
       - 'bin/ratd'
       - 'bin/ratlib/desktop_*.py'
+      - 'bin/ratlib/artifact.py'
       - 'tests/test_desktop_*.py'
+      - 'tests/test_artifact_*.py'
       - 'tests/bench_desktop_*.py'
       - '.github/workflows/desktop.yml'
 
@@ -28,17 +30,21 @@ jobs:
         with:
           python-version: '3.12'
       - name: Desktop backend tests
-        run: python3 -m unittest tests.test_desktop_api tests.test_desktop_session tests.test_desktop_http tests.test_desktop_e2e
+        run: python3 -m unittest tests.test_artifact_describe tests.test_desktop_api tests.test_desktop_session tests.test_desktop_http tests.test_desktop_e2e
       - name: Syntax check daemon modules
-        run: python3 -m py_compile bin/ratd bin/ratlib/desktop_api.py bin/ratlib/desktop_session.py tests/bench_desktop_polling.py
+        run: python3 -m py_compile bin/ratd bin/ratlib/artifact.py bin/ratlib/desktop_api.py bin/ratlib/desktop_session.py tests/bench_desktop_polling.py tests/bench_desktop_artifacts.py
       - name: Measure desktop polling baseline
         run: python3 tests/bench_desktop_polling.py --events 100,1000,5000 --iterations 3 | tee desktop-poll-benchmark.jsonl
-      - name: Upload desktop polling baseline
+      - name: Measure desktop artifact baseline
+        run: python3 tests/bench_desktop_artifacts.py --artifacts 10,100,500 --object-bytes 65536 --iterations 3 | tee desktop-artifact-benchmark.jsonl
+      - name: Upload desktop measurement baselines
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: ctf-rat-desktop-poll-benchmark-${{ github.event.pull_request.head.sha }}
-          path: desktop-poll-benchmark.jsonl
+          name: ctf-rat-desktop-benchmarks-${{ github.event.pull_request.head.sha }}
+          path: |
+            desktop-poll-benchmark.jsonl
+            desktop-artifact-benchmark.jsonl
           if-no-files-found: error
           retention-days: 7
 
