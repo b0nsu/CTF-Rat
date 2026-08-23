@@ -115,7 +115,8 @@ def _append(path: str, doc: dict[str, Any]) -> None:
         os.close(fd)
 
 
-def begin(root: str, *, run_id: Optional[str] = None, variant: str = "manual",
+def begin(root: str, *, run_id: Optional[str] = None, ablation_id: str = "A0",
+          challenge_id: Optional[str] = None, attempt: int = 1, eligible: bool = True,
           model: Optional[str] = None, force: bool = False) -> dict[str, Any]:
     rr = _rat_root(root)
     current = _read_json(_active_path(rr))
@@ -124,10 +125,21 @@ def begin(root: str, *, run_id: Optional[str] = None, variant: str = "manual",
     run_id = run_id or ("run_" + uuid.uuid4().hex[:16])
     if not RUN_ID_RE.match(run_id):
         raise ValueError("invalid run_id")
+    if ablation_id not in {"A0", "A1", "A2", "A3", "A4", "A5"}:
+        raise ValueError("invalid ablation_id")
+    if not isinstance(attempt, int) or attempt < 1:
+        raise ValueError("attempt must be >= 1")
+    root_abs = os.path.abspath(root)
+    default_challenge = (os.path.basename(os.path.dirname(root_abs)) if os.path.basename(root_abs) == ".rat"
+                         else os.path.basename(root_abs))
+    challenge_id = challenge_id or default_challenge or "challenge"
     meta = {
         "schema": "rat.telemetry-run/v1",
         "run_id": run_id,
-        "variant": variant,
+        "ablation_id": ablation_id,
+        "challenge_id": challenge_id,
+        "attempt": attempt,
+        "eligible": bool(eligible),
         "model": model,
         "started_at": _iso(),
         "started_ms": _epoch_ms(),
@@ -224,16 +236,22 @@ def record_model(*, input_tokens: int = 0, output_tokens: int = 0,
     return record("model", payload, root=root)
 
 
-def finish(root: str, *, status: str, verified: bool = False,
-           flag_found: bool = False) -> dict[str, Any]:
+def finish(root: str, *, status: str = "completed", outcome: str = "unknown",
+           verified: bool = False, flag_found: bool = False) -> dict[str, Any]:
     rr = _rat_root(root)
     current = _read_json(_active_path(rr))
     if not current:
         raise ValueError("no active telemetry run")
     run_id = str(current["run_id"])
+    if status not in {"completed", "timeout", "partial", "infra-failure", "skipped"}:
+        raise ValueError("invalid benchmark status")
+    if outcome not in {"verified", "solve-claimed", "failed", "censored", "unknown", "skipped"}:
+        raise ValueError("invalid benchmark outcome")
+    verified = bool(verified or outcome == "verified")
     payload = {
         "status": status,
-        "verified": bool(verified),
+        "outcome": outcome,
+        "verified": verified,
         "flag_found": bool(flag_found),
         "finished_at": _iso(),
         "finished_ms": _epoch_ms(),
@@ -326,11 +344,7 @@ def summarize(root: str, run_id: Optional[str] = None) -> dict[str, Any]:
     flag_ms = int(flag_ev.get("ts_ms", flag_ev.get("finished_ms", 0))) if flag_ev else 0
     verified_ms = int(verified_ev.get("ts_ms", verified_ev.get("finished_ms", 0))) if verified_ev else 0
 
-    return {
-        "schema": "rat.benchmark-result/v1",
-        "run_id": selected,
-        "variant": begin_ev.get("variant", "manual"),
-        "status": finish_ev.get("status", "running" if not finish_ev else "unknown"),
+    metrics = {
         "verified_solve": bool(finish_ev.get("verified") or verified_ev),
         "flag_found": bool(finish_ev.get("flag_found") or flag_ev),
         "time_to_flag_ms": (max(0, flag_ms - start_ms) if flag_ms else None),
@@ -364,3 +378,21 @@ def summarize(root: str, run_id: Optional[str] = None) -> dict[str, Any]:
         },
         "deep_escalations": sum(1 for e in events if e.get("type") == "deep"),
     }
+    doc = {
+        "schema": "rat.benchmark-result/v1",
+        "benchmark_run_id": selected,
+        "ablation_id": begin_ev.get("ablation_id", "A0"),
+        "challenge_id": begin_ev.get("challenge_id", "challenge"),
+        "attempt": int(begin_ev.get("attempt", 1) or 1),
+        "status": finish_ev.get("status", "partial"),
+        "eligible": bool(begin_ev.get("eligible", True)),
+        "outcome": finish_ev.get("outcome", "unknown"),
+        "started_at": begin_ev.get("started_at", events[0].get("ts")),
+        "finished_at": finish_ev.get("finished_at", events[-1].get("ts")),
+        "metrics": metrics,
+        "oracle": {"verified": metrics["verified_solve"], "flag_found": metrics["flag_found"]},
+        "ground_truth": {},
+    }
+    from .schema import validate
+    validate(doc, "rat.benchmark-result/v1")
+    return doc
