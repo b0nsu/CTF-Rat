@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rat.backward-slice/v1",
+  "type": "object",
+  "required": ["schema", "binary", "function", "anchor", "anchor_block", "branches", "coverage", "note"],
+  "properties": {
+    "schema": {"const": "rat.backward-slice/v1"},
+    "binary": {"type": "string"},
+    "function": {
+      "type": "object",
+      "required": ["name", "addr", "size"],
+      "properties": {
+        "name": {"type": "string"},
+        "addr": {"type": "integer", "minimum": 0},
+        "size": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "anchor": {"type": "integer", "minimum": 1},
+    "anchor_block": {"type": "integer", "minimum": 1},
+    "branches": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["branch_insn", "taken_target", "register_dependencies", "stack_dependencies", "trace", "predecessor_block", "target_block", "reaches_anchor_block"],
+        "properties": {
+          "branch_insn": {"type": "integer", "minimum": 1},
+          "taken_target": {"type": ["integer", "null"]},
+          "register_dependencies": {"type": "array", "items": {"type": "string"}},
+          "stack_dependencies": {"type": "array", "items": {"type": "string"}},
+          "trace": {"type": "array", "maxItems": 64},
+          "predecessor_block": {"type": "integer", "minimum": 1},
+          "target_block": {"type": "integer", "minimum": 1},
+          "reaches_anchor_block": {"const": true}
+        },
+        "additionalProperties": false
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["scope", "tmp_def_use", "same_block_register_defs", "direct_stack_slots", "inter_block_value_flow", "memory_aliasing"]
+    },
+    "note": {"type": "string"}
+  },
+  "additionalProperties": false
+}
