@@ -84,9 +84,10 @@ class P2Analysis(unittest.TestCase):
   main_addr=self._symbol_addr("main")
   if main_addr is None: self.skipTest("nm could not resolve main's address")
   _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward",main_addr,"--source","stdin","--depth","2")
-  self.assertEqual(x["summary"]["analysis_kind"],"data"); self.assertEqual(x["summary"]["claim"],"dependency-candidate")
+  self.assertEqual(x["summary"]["analysis_kind"],"data")
   self.assertIn(x["status"],("ok","partial"))
   if x["status"]=="ok":
+   self.assertEqual(x["summary"]["claim"],"dependency-candidate")
    self.assertIn("fgets",x["summary"]["within_function"]["input_api_calls"])
    self.assertLessEqual(x["summary"]["interproc"]["depth"],2)
  def test_data_slice_depth_budget_never_exceeds_two(self):

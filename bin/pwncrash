@@ -119,6 +119,29 @@ def main(argv=None) -> int:
                     stack = core.read(sp, 64)
                 except Exception:
                     stack = b""
+                # Recovering the controlled return address from a core is not
+                # portable across kernels, along two independent axes:
+                #   1. RIP snapshot: after `ret` transfers to a non-canonical
+                #      (controlled) address, some kernels record the popped
+                #      controlled value in RIP, others record the address of
+                #      the faulting `ret` instruction.
+                #   2. RSP snapshot: some kernels record RSP already advanced
+                #      past the popped slot (post-pop), others record it still
+                #      pointing at the return slot (pre-pop).
+                # The controlled value itself is deterministic; only which
+                # register/slot exposes it varies. RIP is the clean signal
+                # when it holds the controlled value (post-pop kernels); when
+                # it does not (RIP == faulting `ret`, offset unresolved), the
+                # return address is still the top-of-stack word at [sp],
+                # because such kernels also report the pre-pop RSP. Reading
+                # program memory at [sp] therefore recovers it identically on
+                # every x86_64 Linux.
+                try:
+                    top_word = int.from_bytes(core.read(sp, 8), "little")
+                except Exception:
+                    top_word = None
+                pc_offset = cyclic_offset(pc, args.cyclic_width)
+                top_offset = cyclic_offset(top_word, args.cyclic_width)
                 core_doc = {
                     "sha256": sha256(core_path),
                     "size": os.path.getsize(core_path),
@@ -127,7 +150,13 @@ def main(argv=None) -> int:
                     "pc": pc,
                     "sp": sp,
                     "fault_addr": fault,
-                    "pc_cyclic_offset": cyclic_offset(pc, args.cyclic_width),
+                    "pc_cyclic_offset": pc_offset,
+                    "top_word": top_word,
+                    "top_cyclic_offset": top_offset,
+                    # Portable RIP-hijack offset: the popped value in RIP when
+                    # the kernel snapshotted it there, else the top-of-stack
+                    # return word left by a pre-pop RSP snapshot.
+                    "control_cyclic_offset": pc_offset if pc_offset is not None else top_offset,
                     "fault_cyclic_offset": cyclic_offset(fault, args.cyclic_width),
                     "stack_hex": stack.hex(),
                 }
