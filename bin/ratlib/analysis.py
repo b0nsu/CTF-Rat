@@ -231,14 +231,19 @@ def slice_(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
     except ValueError as exc: return emit(envelope("rat-slice",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=[str(exc)],started=started),a)
+    # Input-contract validation is independent of angr availability: a malformed
+    # request is a usage error whether or not the analysis engine is present.
+    mode=getattr(a,"mode","call-path")
+    if mode=="data" and _parse_addr(a.backward_addr) is None:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data"},status="error",code=EXIT_INPUT,diagnostics=["--backward requires an address"],started=started),a)
+    if mode!="data" and not a.from_loc:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path"},status="error",code=EXIT_INPUT,diagnostics=["--from is required in call-path mode"],started=started),a)
     try:
         import angr
     except ImportError:
-        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":getattr(a,"mode","call-path"),"coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
-    if getattr(a,"mode","call-path")=="data":
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":mode,"coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
+    if mode=="data":
         return _data_slice(a,r,started,profile)
-    if not a.from_loc:
-        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path"},status="error",code=EXIT_INPUT,diagnostics=["--from is required in call-path mode"],started=started),a)
     try:
         project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
         funcs=list(cfg.kb.functions.values())
