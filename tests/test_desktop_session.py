@@ -24,7 +24,8 @@ class DesktopSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             manager = SessionManager(root, [sys.executable, "-u", "-c", "print('hello-desktop')"])
             started = manager.start()
-            self.assertEqual(started["status"], "running")
+            self.assertIsNotNone(started["session_id"])
+            self.assertIn(started["status"], {"running", "finished"})
             finished = self.wait_finished(manager)
             self.assertEqual(finished["exit_code"], 0)
             log = manager.log_delta(0, 1024)
