@@ -49,6 +49,12 @@ export type Delta = {
   unchanged: boolean;
 };
 
+export type LiveUpdate = {
+  schema: string;
+  delta: Delta;
+  snapshot: Snapshot | null;
+};
+
 export type Session = {
   schema: string;
   configured: boolean;
@@ -125,19 +131,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function getSnapshot(untilSeq?: number): Promise<Snapshot> {
-  const suffix = untilSeq === undefined ? "" : `?until_seq=${untilSeq}`;
-  return request(`/api/snapshot${suffix}`);
-}
-
-export function getEvents(cursor: EventCursor | null, limit = 500): Promise<Delta> {
+function cursorParams(cursor: EventCursor | null, limit: number): URLSearchParams {
   const params = new URLSearchParams({
     after_seq: String(cursor?.seq ?? 0),
     limit: String(limit)
   });
   if (cursor?.stream_id) params.set("stream_id", cursor.stream_id);
   if (cursor?.source_generation) params.set("known_generation", cursor.source_generation);
-  return request(`/api/events?${params.toString()}`);
+  return params;
+}
+
+export function getSnapshot(untilSeq?: number): Promise<Snapshot> {
+  const suffix = untilSeq === undefined ? "" : `?until_seq=${untilSeq}`;
+  return request(`/api/snapshot${suffix}`);
+}
+
+export function getEvents(cursor: EventCursor | null, limit = 500): Promise<Delta> {
+  return request(`/api/events?${cursorParams(cursor, limit).toString()}`);
+}
+
+export function getLiveUpdate(cursor: EventCursor | null, limit = 500): Promise<LiveUpdate> {
+  return request(`/api/live?${cursorParams(cursor, limit).toString()}`);
 }
 
 export function getSession(): Promise<Session> {
