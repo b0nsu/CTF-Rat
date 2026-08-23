@@ -142,19 +142,28 @@ class DesktopApiTests(unittest.TestCase):
     def test_live_update_does_not_mutate_delta_payload_while_materializing_view(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
+            input_digest = "sha256:" + "1" * 64
+            environment_digest = "sha256:" + "2" * 64
             stream.append(
                 "primitive.revised",
-                {"primitive_id": "P1", "status": "candidate", "self_evidence": []},
+                {
+                    "primitive_id": "P1",
+                    "status": "candidate",
+                    "self_evidence": [],
+                    "input_digest": input_digest,
+                    "environment_digest": environment_digest,
+                },
                 actor="migration",
             )
             stream.append(
                 "primitive.consumed",
-                {"primitive_id": "P1", "input_digest": "sha256:" + "1" * 64, "environment_digest": "sha256:" + "2" * 64},
+                {"primitive_id": "P1", "input_digest": input_digest, "environment_digest": environment_digest},
                 actor="migration",
             )
             doc = live_update(root, after_seq=0, limit=10)
             revised = doc["delta"]["events"][0]
             self.assertEqual(revised["payload"]["status"], "candidate")
+            self.assertEqual(doc["snapshot"]["view"]["primitives"]["P1"]["status"], "consumed")
 
     def test_live_update_unchanged_skips_state_parse_and_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
