@@ -4,7 +4,7 @@ STATE v2 and the existing content-addressed artifact store remain canonical.
 This module adds bounded projections only; it never creates a second database.
 """
 from __future__ import annotations
-import base64, copy, json, os
+import base64, json, os
 from collections import Counter
 from typing import Any
 
@@ -22,12 +22,12 @@ MAX_PREVIEW = 256 * 1024
 
 
 class _EventBackedStream(Stream):
-    """Feed already-validated events through the canonical Stream.view().
+    """Feed validated events through the canonical Stream.view() without JSONL reread.
 
-    ``Stream.view`` mutates some projected payload dictionaries while applying
-    invalidation/consumption state, so live_update supplies a deep copy. This
-    adapter owns no state semantics; it only prevents a second JSONL parse while
-    reusing the canonical materializer unchanged.
+    Stream.view() may revise top-level payload fields in its projection. Yield a
+    minimal event facade with a shallow payload copy so those revisions cannot
+    mutate the delta events returned to the client. This adapter owns no STATE
+    semantics; Stream.view() remains the sole materializer.
     """
 
     def __init__(self, challenge_root: str, events: list[dict[str, Any]]):
@@ -35,7 +35,15 @@ class _EventBackedStream(Stream):
         self._validated_events = events
 
     def read(self):
-        return self._validated_events
+        return (
+            {
+                "seq": event["seq"],
+                "event_id": event["event_id"],
+                "type": event["type"],
+                "payload": dict(event["payload"]),
+            }
+            for event in self._validated_events
+        )
 
 
 def _manifest(challenge_root: str) -> dict[str, Any] | None:
@@ -110,8 +118,7 @@ def _delta_document(
     latest_seq = selected[-1]["seq"] if selected else effective_after
     cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
     # A generation token means the cursor is fully caught up with that exact
-    # file generation. Do not issue it while pagination still has unread events,
-    # or the next unchanged poll could incorrectly skip the remaining page.
+    # file generation. Do not issue it while pagination still has unread events.
     if source_generation is not None and not has_more:
         cursor_doc["source_generation"] = source_generation
     return {
@@ -243,7 +250,7 @@ def live_update(
 
     Unchanged polls preserve the generation fast path and return ``snapshot`` as
     ``None``. Changed polls parse/validate JSONL once, then reuse the canonical
-    ``Stream.view`` materializer over a deep copy of those validated events.
+    ``Stream.view`` materializer over shallow payload facades of those events.
     """
     _validate_delta_request(after_seq, limit, stream_id, known_generation)
     root = os.path.abspath(challenge_root)
@@ -274,8 +281,7 @@ def live_update(
         stream_id=stream_id,
         source_generation=source_generation,
     )
-    view_events = copy.deepcopy(events)
-    view = _EventBackedStream(root, view_events).view()
+    view = _EventBackedStream(root, events).view()
     return {
         "schema": LIVE_SCHEMA,
         "delta": delta,
