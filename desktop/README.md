@@ -9,6 +9,7 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - Tauri 2 shell + React/TypeScript UI
 - live Activity Timeline from append-only STATE v2
 - materialized current/historical STATE view
+- live solver focus strip for the latest recorded next probe plus current primitive/finding status counts
 - replay slider: inspect what the solver knew at event `#N`
 - serialized polling and latest-request-wins replay updates
 - opaque generation-token fast path for unchanged STATE polling
@@ -21,6 +22,7 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - failed solver spawn preserves the previous terminal log/cursor generation
 - artifact browser backed by the existing content-addressed store
 - text/JSON artifact preview and bounded base64 preview for binary artifacts
+- artifact preview uses the canonical store's single-pass streaming verifier and retains only the requested bounded prefix
 - event telemetry API without duplicate telemetry polling in the UI
 - loopback-only HTTP API with restricted browser origins
 - POST controls require `X-CTF-Rat-Desktop: 1`
@@ -141,6 +143,8 @@ GET /api/artifacts/<sha256:digest>?max_bytes=<n>
 If the canonical STATE `stream_id` changes, `/api/events` returns `reset: true` and restarts the sequence cursor from zero. The workbench then resets timeline/replay/terminal presentation and reloads the current snapshot/artifacts rather than mixing two runs.
 
 The terminal `cursor` is an opaque, monotonically increasing value returned by the previous `/api/terminal` response. Clients must pass that returned value back as `after`; it is not a raw byte offset. Cursor generation is persisted in the existing `.rat/desktop/session.json`, so a cursor from an older solver session or a restarted `ratd` safely maps to the beginning of the current truncated terminal log rather than skipping its prefix.
+
+Artifact previews retain at most the requested `max_bytes` prefix while hashing the complete immutable object once. The returned `total_bytes` is the verified object size, so a large artifact no longer needs to be materialized in full by the Desktop projection just to display a small preview.
 
 Bounded controls:
 
