@@ -1,11 +1,86 @@
 #!/usr/bin/env python3
-"""P1 adapter for legacy recon/revq/gdbq/symsolve commands."""
-import argparse, json, os, sys
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+"""Structured-cache adapter for deterministic legacy analysis tools."""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+from ratlib.artifact import get as artifact_get
 from ratlib.contracts import execute
-p=argparse.ArgumentParser(); p.add_argument("--root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60); p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
-a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
-paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"..","solve","_template","rev","symsolve.py")}
-argv=[paths[a.tool],*a.args]
-if a.tool=="symsolve": argv=[sys.executable,*argv]
-print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout),ensure_ascii=False))
+
+
+def _rat_root(value):
+    if value is None:
+        return None
+    root = os.path.abspath(value)
+    return root if os.path.basename(root) == ".rat" else os.path.join(root, ".rat")
+
+
+def _existing_inputs(args, explicit):
+    out = []
+    seen = set()
+    for path in list(explicit) + list(args):
+        if not isinstance(path, str) or path.startswith("-"):
+            continue
+        candidate = os.path.realpath(path)
+        if os.path.isfile(candidate) and candidate not in seen:
+            seen.add(candidate)
+            out.append(candidate)
+    return out
+
+
+def _artifact_bytes(result, kind, root):
+    for artifact in result.get("artifacts", []):
+        if artifact.get("kind") == kind:
+            return artifact_get(artifact["digest"], root=root)
+    return b""
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="rat-adapt")
+    p.add_argument("--root", help="challenge root or .rat root")
+    p.add_argument("--input", action="append", default=[], help="additional semantic input file")
+    p.add_argument("--timeout", type=float, default=60)
+    p.add_argument("--emit", choices=["result", "stdout", "stderr"], default="result",
+                   help="result envelope (default) or cached tool stream")
+    p.add_argument("--cache-meta", action="store_true",
+                   help="print cache hit/key metadata to stderr when emitting a stream")
+    p.add_argument("tool", choices=["recon", "revq", "gdbq", "symsolve", "decomp"])
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    a = p.parse_args(argv)
+
+    home = os.path.dirname(os.path.realpath(__file__))
+    paths = {
+        "recon": os.path.join(home, "recon"),
+        "revq": os.path.join(home, "revq"),
+        "gdbq": os.path.join(home, "gdbq"),
+        "symsolve": os.path.join(home, "..", "solve", "_template", "rev", "symsolve.py"),
+        "decomp": os.path.join(home, "decomp"),
+    }
+    tool_path = paths[a.tool]
+    tool_argv = [tool_path, *a.args]
+    if a.tool == "symsolve":
+        tool_argv = [sys.executable, *tool_argv]
+
+    root = _rat_root(a.root)
+    inputs = _existing_inputs(a.args, a.input)
+    result = execute(tool_argv, root=root, input_paths=inputs,
+                     parameters={"args": a.args}, timeout=a.timeout)
+
+    if a.emit == "result":
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("status") == "ok" else int(result.get("exit", {}).get("code", 1) or 1)
+
+    if a.cache_meta:
+        cache = result.get("provenance", {}).get("cache", {})
+        print("[rat-adapt] cache=%s key=%s" %
+              ("hit" if cache.get("hit") else "miss", cache.get("key", "?")), file=sys.stderr)
+    data = _artifact_bytes(result, a.emit, root or os.path.join(os.getcwd(), ".rat"))
+    if data:
+        os.write(1 if a.emit == "stdout" else 2, data)
+    return 0 if result.get("status") == "ok" else int(result.get("exit", {}).get("code", 1) or 1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
