@@ -9,7 +9,7 @@ import {
   Snapshot,
   getArtifactPreview,
   getArtifacts,
-  getEvents,
+  getLiveUpdate,
   getSession,
   getSnapshot,
   getTerminal,
@@ -101,10 +101,13 @@ export default function App() {
 
     const initial = async () => {
       try {
-        const [snapshot, delta, currentSession, listing, log] = await Promise.all([
-          getSnapshot(), getEvents(null, 1000), getSession(), getArtifacts(), getTerminal(0)
+        const [live, currentSession, listing, log] = await Promise.all([
+          getLiveUpdate(null, 1000), getSession(), getArtifacts(), getTerminal(0)
         ]);
         if (!mounted) return;
+        if (!live.snapshot) throw new Error("initial live projection omitted snapshot");
+        const delta = live.delta;
+        const snapshot = live.snapshot;
         setLiveSnapshot(snapshot);
         setDisplaySnapshot(snapshot);
         setEvents(delta.events);
@@ -127,10 +130,11 @@ export default function App() {
       if (polling) return;
       polling = true;
       try {
-        const [delta, currentSession, log] = await Promise.all([
-          getEvents(eventCursor.current), getSession(), getTerminal(terminalCursor.current)
+        const [live, currentSession, log] = await Promise.all([
+          getLiveUpdate(eventCursor.current), getSession(), getTerminal(terminalCursor.current)
         ]);
         if (!mounted) return;
+        const delta = live.delta;
         let stateChanged = false;
         eventCursor.current = delta.cursor;
         if (delta.reset) {
@@ -153,10 +157,11 @@ export default function App() {
         }
         setSession(currentSession);
         if (stateChanged) {
-          const [snapshot, listing] = await Promise.all([getSnapshot(), getArtifacts()]);
+          if (!live.snapshot) throw new Error("changed live projection omitted snapshot");
+          const listing = await getArtifacts();
           if (!mounted) return;
-          setLiveSnapshot(snapshot);
-          if (replaySeqRef.current === null) setDisplaySnapshot(snapshot);
+          setLiveSnapshot(live.snapshot);
+          if (replaySeqRef.current === null) setDisplaySnapshot(live.snapshot);
           setArtifacts(listing.artifacts);
         }
         setConnection("live");
