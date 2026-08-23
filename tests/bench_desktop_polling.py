@@ -106,7 +106,10 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             "telemetry": _measure(lambda: telemetry(root), iterations),
             "artifact_listing_empty": _measure(lambda: list_artifacts(root, limit=500), iterations),
         }
-        changed_names = ("event_delta_10_new", "snapshot_live", "telemetry", "artifact_listing_empty")
+        # The workbench changed-state refresh performs delta first, then live
+        # snapshot + artifact listing. Telemetry remains an API projection but
+        # is no longer polled by the UI because snapshot already carries count.
+        changed_names = ("event_delta_10_new", "snapshot_live", "artifact_listing_empty")
         idle_full = operations["event_delta_idle_full_scan"]
         idle_fast = operations["event_delta_idle_unchanged_hint"]
         wall_speedup = idle_full["wall_p50_ms"] / idle_fast["wall_p50_ms"] if idle_fast["wall_p50_ms"] else None
@@ -127,7 +130,7 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             "estimated_idle_poll_cpu_ms_p50": idle_fast["cpu_p50_ms"],
             "estimated_changed_poll_wall_ms_p50": round(sum(operations[name]["wall_p50_ms"] for name in changed_names), 3),
             "estimated_changed_poll_cpu_ms_p50": round(sum(operations[name]["cpu_p50_ms"] for name in changed_names), 3),
-            "note": "changed poll totals are sequential cost estimates; the UI issues refresh requests concurrently",
+            "note": "changed poll total mirrors UI request sequence; telemetry is measured separately but not polled by the workbench",
         }
 
 
