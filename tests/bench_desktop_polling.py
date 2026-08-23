@@ -94,8 +94,7 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             after_seq=count,
             limit=500,
             stream_id=cursor["stream_id"],
-            known_size=cursor.get("source_size"),
-            known_mtime_ns=cursor.get("source_mtime_ns"),
+            known_generation=cursor.get("source_generation"),
         )
 
         operations = {
