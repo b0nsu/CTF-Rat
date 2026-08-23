@@ -61,13 +61,14 @@ class FunctionCardV2Tests(unittest.TestCase):
         rev = fixture()
         rev["functions"].append({"name": "check_extra", "addr": 0x401400, "calls": [], "strings": []})
         with self.assertRaises(ValueError):
-            find_function(rev, "check_")
+            find_function(rev, "chec")
 
     def test_cli_can_render_fixture_without_angr(self):
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")
             revmap = os.path.join(d, "rev.json")
-            open(binary, "wb").write(b"fixture")
+            with open(binary, "wb") as f:
+                f.write(b"fixture")
             with open(revmap, "w", encoding="utf-8") as f:
                 json.dump(fixture(), f)
             cli = os.path.join(BIN, "rat-func-v2")
