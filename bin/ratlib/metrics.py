@@ -101,10 +101,15 @@ def first_primitive_pass_ts(state_dir):
     """Typed STATE v2 is the authoritative PASS gate (>=3 active direct SELF
     observations, enforced by ratlib.state_v2.revise_primitive) -- prefer it.
     Legacy STATE.jsonl is only consulted for pre-v2 sessions that never wrote
-    a v2 stream; the legacy `state primitive ... pass` command is rejected."""
-    v2 = _first_primitive_pass_ts_v2(state_dir)
-    if v2 is not None:
-        return v2
+    a v2 stream; the legacy `state primitive ... pass` command is rejected.
+
+    Once a v2 stream exists it is authoritative: a session that wrote typed
+    events but has no typed PASS has NOT passed, so we must not silently fall
+    back to a legacy PASS (that would let a rejected legacy write leak into v2
+    time-to-flag telemetry). Legacy is consulted only when no v2 stream ever
+    existed."""
+    if os.path.exists(Stream(state_dir).path):
+        return _first_primitive_pass_ts_v2(state_dir)
     return _first_primitive_pass_ts_legacy(state_dir)
 
 def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
