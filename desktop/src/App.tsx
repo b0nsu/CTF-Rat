@@ -1,60 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-
-type EventRecord = {
-  schema: string;
-  stream_id: string;
-  seq: number;
-  event_id: string;
-  at: string;
-  actor: string;
-  task_id: string;
-  type: string;
-  payload: Record<string, unknown>;
-  caused_by: string[];
-};
-
-type Snapshot = {
-  schema: string;
-  challenge_root: string;
-  run: Record<string, unknown> | null;
-  cursor: { stream_id: string | null; seq: number };
-  event_count: number;
-  view: {
-    observations: Record<string, unknown>;
-    findings: Record<string, unknown>;
-    primitives: Record<string, unknown>;
-    hypotheses: Record<string, unknown>;
-    ruled_out: Record<string, unknown>;
-    unknowns: Record<string, unknown>;
-    next_probes: unknown[];
-  };
-};
-
-type Delta = {
-  schema: string;
-  stream_id: string | null;
-  after_seq: number;
-  events: EventRecord[];
-  cursor: { stream_id: string | null; seq: number };
-  has_more: boolean;
-};
-
-const API = import.meta.env.VITE_RATD_URL ?? "http://127.0.0.1:8765";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  API,
+  Artifact,
+  ArtifactPreview,
+  EventRecord,
+  Session,
+  Snapshot,
+  Telemetry,
+  getArtifactPreview,
+  getArtifacts,
+  getEvents,
+  getSession,
+  getSnapshot,
+  getTelemetry,
+  getTerminal,
+  sendTerminalInput,
+  startSession,
+  stopSession
+} from "./api";
 
 function eventLabel(event: EventRecord): string {
   const payload = event.payload ?? {};
-  const preferred = [
-    "text",
-    "probe",
-    "phase",
-    "status",
-    "state",
-    "hypothesis_id",
-    "finding_id",
-    "primitive_id",
-    "observation_id"
-  ];
-  for (const key of preferred) {
+  for (const key of ["text", "probe", "phase", "status", "state", "hypothesis_id", "finding_id", "primitive_id", "observation_id"]) {
     const value = payload[key];
     if (typeof value === "string" && value.length) return value;
   }
@@ -62,10 +29,10 @@ function eventLabel(event: EventRecord): string {
 }
 
 function group(type: string): string {
-  if (type.startsWith("observation.")) return "OBSERVATION";
-  if (type.startsWith("hypothesis.")) return "HYPOTHESIS";
-  if (type.startsWith("primitive.")) return "PRIMITIVE";
-  if (type.startsWith("finding.")) return "FINDING";
+  if (type.startsWith("observation.")) return "OBS";
+  if (type.startsWith("hypothesis.")) return "HYP";
+  if (type.startsWith("primitive.")) return "PRIM";
+  if (type.startsWith("finding.")) return "FIND";
   if (type.startsWith("verification.")) return "VERIFY";
   if (type.startsWith("phase.")) return "PHASE";
   if (type.startsWith("task.")) return "TASK";
@@ -73,58 +40,103 @@ function group(type: string): string {
   return "EVENT";
 }
 
+function stateCounters(snapshot: Snapshot | null) {
+  const view = snapshot?.view;
+  if (!view) return [] as [string, number][];
+  return [
+    ["Observations", Object.keys(view.observations).length],
+    ["Findings", Object.keys(view.findings).length],
+    ["Hypotheses", Object.keys(view.hypotheses).length],
+    ["Primitives", Object.keys(view.primitives).length],
+    ["Unknowns", Object.keys(view.unknowns).length],
+    ["Next probes", view.next_probes.length]
+  ];
+}
+
 export default function App() {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [liveSnapshot, setLiveSnapshot] = useState<Snapshot | null>(null);
+  const [displaySnapshot, setDisplaySnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<EventRecord[]>([]);
-  const [selected, setSelected] = useState<EventRecord | null>(null);
-  const [status, setStatus] = useState<"connecting" | "live" | "offline">("connecting");
-  const cursor = useRef(0);
+  const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [terminal, setTerminal] = useState("");
+  const [terminalInput, setTerminalInput] = useState("");
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [selectedArtifact, setSelectedArtifact] = useState<ArtifactPreview | null>(null);
+  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
+  const [error, setError] = useState<string | null>(null);
+  const [replaySeq, setReplaySeq] = useState<number | null>(null);
+  const eventCursor = useRef(0);
+  const terminalCursor = useRef(0);
+  const replaySeqRef = useRef<number | null>(null);
+  const terminalRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
     let mounted = true;
 
-    const refreshSnapshot = async () => {
-      const response = await fetch(`${API}/api/snapshot`, { cache: "no-store" });
-      if (!response.ok) throw new Error(`snapshot ${response.status}`);
-      const next = (await response.json()) as Snapshot;
-      if (mounted) setSnapshot(next);
-    };
-
-    const loadInitial = async () => {
+    const initial = async () => {
       try {
-        await refreshSnapshot();
-        const response = await fetch(`${API}/api/events?after_seq=0&limit=1000`, { cache: "no-store" });
-        if (!response.ok) throw new Error(`events ${response.status}`);
-        const delta = (await response.json()) as Delta;
+        const [snapshot, delta, currentSession, listing, stats, log] = await Promise.all([
+          getSnapshot(), getEvents(0, 1000), getSession(), getArtifacts(), getTelemetry(), getTerminal(0)
+        ]);
         if (!mounted) return;
+        setLiveSnapshot(snapshot);
+        setDisplaySnapshot(snapshot);
         setEvents(delta.events);
-        cursor.current = delta.cursor.seq;
-        setSelected(delta.events.at(-1) ?? null);
-        setStatus("live");
-      } catch {
-        if (mounted) setStatus("offline");
+        setSelectedEvent(delta.events.at(-1) ?? null);
+        eventCursor.current = delta.cursor.seq;
+        setSession(currentSession);
+        setArtifacts(listing.artifacts);
+        setTelemetry(stats);
+        setTerminal(log.text);
+        terminalCursor.current = log.cursor;
+        setConnection("live");
+      } catch (exc) {
+        if (mounted) {
+          setConnection("offline");
+          setError(exc instanceof Error ? exc.message : "Unable to connect to ratd");
+        }
       }
     };
 
     const poll = async () => {
       try {
-        const response = await fetch(`${API}/api/events?after_seq=${cursor.current}&limit=500`, { cache: "no-store" });
-        if (!response.ok) throw new Error(`events ${response.status}`);
-        const delta = (await response.json()) as Delta;
+        const [delta, currentSession, log] = await Promise.all([
+          getEvents(eventCursor.current), getSession(), getTerminal(terminalCursor.current)
+        ]);
         if (!mounted) return;
+        let stateChanged = false;
         if (delta.events.length) {
-          setEvents((current) => [...current, ...delta.events].slice(-2000));
-          setSelected(delta.events.at(-1) ?? null);
-          cursor.current = delta.cursor.seq;
-          await refreshSnapshot();
+          setEvents((current) => [...current, ...delta.events].slice(-3000));
+          setSelectedEvent((current) => current ?? delta.events.at(-1) ?? null);
+          eventCursor.current = delta.cursor.seq;
+          stateChanged = true;
         }
-        setStatus("live");
-      } catch {
-        if (mounted) setStatus("offline");
+        if (log.text) {
+          setTerminal((current) => (current + log.text).slice(-300000));
+          terminalCursor.current = log.cursor;
+        }
+        setSession(currentSession);
+        if (stateChanged) {
+          const [snapshot, listing, stats] = await Promise.all([getSnapshot(), getArtifacts(), getTelemetry()]);
+          if (!mounted) return;
+          setLiveSnapshot(snapshot);
+          if (replaySeqRef.current === null) setDisplaySnapshot(snapshot);
+          setArtifacts(listing.artifacts);
+          setTelemetry(stats);
+        }
+        setConnection("live");
+        setError(null);
+      } catch (exc) {
+        if (mounted) {
+          setConnection("offline");
+          setError(exc instanceof Error ? exc.message : "poll failed");
+        }
       }
     };
 
-    void loadInitial();
+    void initial();
     const timer = window.setInterval(() => void poll(), 500);
     return () => {
       mounted = false;
@@ -132,92 +144,175 @@ export default function App() {
     };
   }, []);
 
-  const counters = useMemo(() => {
-    const view = snapshot?.view;
-    if (!view) return [];
-    return [
-      ["Observations", Object.keys(view.observations).length],
-      ["Findings", Object.keys(view.findings).length],
-      ["Hypotheses", Object.keys(view.hypotheses).length],
-      ["Primitives", Object.keys(view.primitives).length],
-      ["Unknowns", Object.keys(view.unknowns).length],
-      ["Next probes", view.next_probes.length]
-    ] as const;
-  }, [snapshot]);
+  useEffect(() => {
+    const element = terminalRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [terminal]);
 
-  const challengeName = snapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
+  const counters = useMemo(() => stateCounters(displaySnapshot), [displaySnapshot]);
+  const challengeName = liveSnapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
+
+  const runControl = async (action: "start" | "stop") => {
+    try {
+      setError(null);
+      const next = action === "start" ? await startSession() : await stopSession();
+      if (action === "start") {
+        setTerminal("");
+        terminalCursor.current = 0;
+      }
+      setSession(next);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "session control failed");
+    }
+  };
+
+  const submitTerminal = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!terminalInput) return;
+    try {
+      await sendTerminalInput(terminalInput.endsWith("\n") ? terminalInput : terminalInput + "\n");
+      setTerminalInput("");
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "terminal input failed");
+    }
+  };
+
+  const selectArtifact = async (artifact: Artifact) => {
+    try {
+      setSelectedArtifact(await getArtifactPreview(artifact.digest));
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "artifact preview failed");
+    }
+  };
+
+  const changeReplay = async (value: number) => {
+    const max = liveSnapshot?.total_event_count ?? 0;
+    if (value >= max) {
+      replaySeqRef.current = null;
+      setReplaySeq(null);
+      setDisplaySnapshot(liveSnapshot);
+      return;
+    }
+    replaySeqRef.current = value;
+    setReplaySeq(value);
+    try {
+      setDisplaySnapshot(await getSnapshot(value));
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "replay failed");
+    }
+  };
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <div className="eyebrow">CTF-RAT DESKTOP</div>
+        <div className="brand-block">
+          <div className="eyebrow">CTF-RAT WORKBENCH</div>
           <h1>{challengeName}</h1>
+          <span className="root-inline">{liveSnapshot?.challenge_root ?? API}</span>
         </div>
-        <div className={`connection ${status}`}>
-          <span className="dot" /> {status.toUpperCase()}
+        <div className="top-actions">
+          <div className={`session-pill ${session?.status ?? "idle"}`}>{session?.status?.toUpperCase() ?? "IDLE"}</div>
+          <button className="primary" disabled={!session?.configured || session?.status === "running"} onClick={() => void runControl("start")}>Start Solver</button>
+          <button className="danger" disabled={session?.status !== "running"} onClick={() => void runControl("stop")}>Stop</button>
+          <div className={`connection ${connection}`}><span className="dot" />{connection.toUpperCase()}</div>
         </div>
       </header>
 
+      {error && <div className="error-banner">{error}</div>}
+
+      <section className="replay-bar">
+        <span>REPLAY</span>
+        <input
+          type="range"
+          min={0}
+          max={liveSnapshot?.total_event_count ?? 0}
+          value={replaySeq ?? liveSnapshot?.total_event_count ?? 0}
+          onChange={(event) => void changeReplay(Number(event.target.value))}
+        />
+        <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
+        <span className="telemetry-inline">events {telemetry?.event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
+      </section>
+
       <main className="workspace">
-        <aside className="summary panel">
-          <div className="panel-title">STATE</div>
-          <div className="root-path">{snapshot?.challenge_root ?? `Waiting for ${API}`}</div>
+        <aside className="state-panel panel">
+          <div className="panel-title">STATE {displaySnapshot?.historical ? "· HISTORICAL" : "· LIVE"}</div>
           <div className="counter-grid">
-            {counters.map(([label, value]) => (
-              <div className="counter" key={label}>
-                <span>{label}</span>
-                <strong>{value}</strong>
-              </div>
-            ))}
+            {counters.map(([label, value]) => <div className="counter" key={label}><span>{label}</span><strong>{value}</strong></div>)}
           </div>
           <div className="meta-block">
-            <span>Events</span><strong>{snapshot?.event_count ?? 0}</strong>
-            <span>Cursor</span><strong>#{snapshot?.cursor.seq ?? 0}</strong>
+            <span>Cursor</span><strong>#{displaySnapshot?.cursor.seq ?? 0}</strong>
+            <span>Total</span><strong>{liveSnapshot?.total_event_count ?? 0}</strong>
+            <span>PID</span><strong>{session?.pid ?? "—"}</strong>
+            <span>Exit</span><strong>{session?.exit_code ?? "—"}</strong>
+          </div>
+          <div className="panel-title subsection">ARTIFACTS · {artifacts.length}</div>
+          <div className="artifact-list">
+            {artifacts.slice(0, 80).map((artifact) => (
+              <button key={artifact.digest} className="artifact-row" onClick={() => void selectArtifact(artifact)}>
+                <strong>{artifact.logical_name}</strong>
+                <span>{artifact.kind}</span>
+                <code>{artifact.digest.slice(0, 19)}…</code>
+              </button>
+            ))}
+            {!artifacts.length && <div className="empty compact">No artifacts yet.</div>}
           </div>
         </aside>
 
-        <section className="timeline panel">
-          <div className="panel-title">ACTIVITY TIMELINE</div>
-          <div className="event-list">
-            {events.length === 0 && <div className="empty">Waiting for STATE v2 events...</div>}
-            {events.map((event) => (
-              <button
-                className={`event-row ${selected?.event_id === event.event_id ? "selected" : ""}`}
-                key={event.event_id}
-                onClick={() => setSelected(event)}
-              >
-                <span className="seq">#{event.seq}</span>
-                <span className="kind">{group(event.type)}</span>
-                <span className="event-main">
-                  <strong>{event.type}</strong>
-                  <small>{eventLabel(event)}</small>
-                </span>
-                <time>{new Date(event.at).toLocaleTimeString()}</time>
-              </button>
-            ))}
-          </div>
+        <section className="center-stack">
+          <section className="timeline panel">
+            <div className="panel-title">ACTIVITY TIMELINE</div>
+            <div className="event-list">
+              {!events.length && <div className="empty">Waiting for STATE v2 events…</div>}
+              {events.map((event) => {
+                const future = replaySeq !== null && event.seq > replaySeq;
+                return (
+                  <button className={`event-row ${selectedEvent?.event_id === event.event_id ? "selected" : ""} ${future ? "future" : ""}`} key={event.event_id} onClick={() => setSelectedEvent(event)}>
+                    <span className="seq">#{event.seq}</span>
+                    <span className="kind">{group(event.type)}</span>
+                    <span className="event-main"><strong>{event.type}</strong><small>{eventLabel(event)}</small></span>
+                    <time>{new Date(event.at).toLocaleTimeString()}</time>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="terminal-panel panel">
+            <div className="terminal-head"><span className="panel-title">LIVE TERMINAL</span><code>{session?.argv?.join(" ") || "ratd started without --solver-command"}</code></div>
+            <pre className="terminal" ref={terminalRef}>{terminal || "No terminal output yet."}</pre>
+            <form className="terminal-input" onSubmit={submitTerminal}>
+              <span>›</span>
+              <input disabled={session?.status !== "running"} value={terminalInput} onChange={(event) => setTerminalInput(event.target.value)} placeholder={session?.status === "running" ? "send input to solver PTY" : "solver is not running"} />
+            </form>
+          </section>
         </section>
 
         <aside className="inspector panel">
           <div className="panel-title">INSPECTOR</div>
-          {selected ? (
+          {selectedArtifact ? (
             <>
-              <div className="inspector-head">
-                <span>{group(selected.type)}</span>
-                <strong>#{selected.seq}</strong>
-              </div>
-              <h2>{selected.type}</h2>
+              <div className="inspector-head"><span>ARTIFACT</span><strong>{selectedArtifact.metadata.kind}</strong></div>
+              <h2>{selectedArtifact.metadata.logical_name}</h2>
               <div className="inspector-meta">
-                <span>actor</span><code>{selected.actor}</code>
-                <span>task</span><code>{selected.task_id}</code>
-                <span>event</span><code>{selected.event_id}</code>
+                <span>digest</span><code>{selectedArtifact.metadata.digest}</code>
+                <span>media</span><code>{selectedArtifact.metadata.media_type}</code>
+                <span>size</span><code>{selectedArtifact.total_bytes} B</code>
               </div>
-              <pre>{JSON.stringify(selected.payload, null, 2)}</pre>
+              <button className="link-button" onClick={() => setSelectedArtifact(null)}>Show selected event</button>
+              <pre>{selectedArtifact.encoding === "utf-8" ? selectedArtifact.content : `[base64 preview]\n${selectedArtifact.content}`}</pre>
             </>
-          ) : (
-            <div className="empty">Select an event.</div>
-          )}
+          ) : selectedEvent ? (
+            <>
+              <div className="inspector-head"><span>{group(selectedEvent.type)}</span><strong>#{selectedEvent.seq}</strong></div>
+              <h2>{selectedEvent.type}</h2>
+              <div className="inspector-meta">
+                <span>actor</span><code>{selectedEvent.actor}</code>
+                <span>task</span><code>{selectedEvent.task_id}</code>
+                <span>event</span><code>{selectedEvent.event_id}</code>
+              </div>
+              <pre>{JSON.stringify(selectedEvent.payload, null, 2)}</pre>
+            </>
+          ) : <div className="empty">Select an event or artifact.</div>}
         </aside>
       </main>
     </div>
