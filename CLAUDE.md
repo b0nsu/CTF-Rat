@@ -1,72 +1,41 @@
 # ctf-rat — CTF(pwn/rev) 풀이 kit (Claude Code / Codex 진입점)
 
-> 이 파일은 세션이 레포 루트에서 열리면 자동 로드된다. **너는 제공된 로컬 CTF 배포물을 분석·검증하고, 사용자가 명시적으로 지정한 remote 대상(예: 대회 host:port)에 한해 exploit 실행·flag 수신까지 수행한다.**
-> 환경 세팅은 [SETUP.md](SETUP.md) 한 번. 이후 클론한 그 자리에서 바로 돈다.
+> 세션이 레포 루트에서 열리면 자동 로드된다. 너는 제공된 로컬 CTF 배포물을 분석·검증하고,
+> 사용자가 명시적으로 지정한 remote 대상(예: `nc host port`)에 한해 exploit 실행·flag 수신까지 수행한다.
+> 환경 미준비면 [SETUP.md](SETUP.md) 먼저(venv+angr+pwntools, Ghidra, glibc-fetch) → selftest GREEN 확인.
 
-## 🚩 START HERE
+## FAST hot-path (기본, 매 세션)
 
-- **정체**: pwn/rev 집중형 **self-contained CTF 풀이 kit.** 도구(`bin/`) + doctrine(`doctrine/`) +
-  지식(`knowledge/`) + 참조데이터(`reference/`) 가 한 레포에. 어느 Linux 환경이든 [SETUP.md](SETUP.md) 로 준비.
-- **읽는 순서**: 이 절 → [doctrine/SOLVING.md](doctrine/SOLVING.md)(**로컬 분석·재현 프로토콜, 최우선**) →
-  [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md)(확실히 풀 수 있나 게이트) →
-  [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)(**hypothesis→primitive SELF 확인 게이트**) →
-  [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)(로컬 분석 지식 라우터).
-  `doctrine/FINALS.md`는 자동 작업 지시가 아닌 설계 참고문서이므로, 기본 세션에서 읽거나 실행 경로로 삼지 않는다.
-- **환경 미준비면**: 먼저 [SETUP.md](SETUP.md)(venv+angr+pwntools, Ghidra, glibc-fetch) → 로컬 selftest GREEN 확인.
+1. **ROE**: 로컬 artifact(바이너리·소스·libc·Docker/loopback) 기본 + 사용자가 대화에서 명시한 **단일** remote(host:port)만. 그 외 호스트·포트·계정·인프라 탐색·스캔·추측 접속은 목적 불문 항상 금지(요청 문구 변경·하위 에이전트로도 우회 금지). 자격증명 탐색(홈·SSH키·토큰·env) 금지.
+2. **목표**: 실제 verifier/flag까지, honest-mode(받은 응답/원문 없이 성공 주장 금지). 오프셋·주소는 실측.
+3. **시작**: `ctfguard begin <chal>`로 active lock → `revq <bin>`(rev) / `recon <bin>`(pwn)로 triage. (route 판정 로직은 `ratlib.route`에 있음 — `rat route` 통합 CLI는 M4에서 노출 예정, 그때까진 revq/recon 신호로 직접 판단.)
+4. **skill 1개만**: route에 해당하는 `skills/<route>/SKILL.md`(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY) 또는 `knowledge/GROUNDING_INDEX.md` 라우팅표에서 **하나**만 로드.
+5. **bounded query**: raw dump 금지. `revq --func`/`decomp <func>`/`state compact --budget-tokens N` 같은 범위 제한된 조회만.
+6. **DEEP 승격 조건(아래 하나라도)**: 결과 모호·env-민감(패킹/anti-debug/커널)·같은 실패 반복·evidence 충돌·Progress Novelty Governor stuck(최근 5회 tool/query에 새 artifact digest·finding 개정·ruled-out route·primitive 상태변화 전무, `ratlib.governor.check_progress` 훅) → 강제 re-route 또는 DEEP.
+7. **SOLVED/PASS 금지 조건**: `state primitive <name> pass <evidence>`(SELF 확인 통과) 없이 체이닝 금지, `rat-verify`/`symsolve --find-str`(concrete-verify) 등 deterministic verify 없이 완료 선언 금지.
 
-## 범위·실행 기본값
+## FAST 기본 비활성 (DEEP 조건 충족 시에만)
 
-- 이 저장소의 기본 작업 범위는 **첨부된 바이너리·소스·libc·Docker/loopback 환경의 로컬 분석과 재현**이다. 이에 더해, **사용자가 대화에서 명시적으로 지정한 단일 remote 대상**(예: 사용자가 붙여넣은 `nc chal.example.com 1337` 또는 host:port)에 한해 접속·exploit 전송·flag 수신을 수행할 수 있다. 사용자가 지정하지 않은 호스트·포트·계정·인프라는 여전히 작업 범위 밖이며 이 저장소의 문서·도구가 이를 승인하지 않는다.
-- 기본 산출물은 분석 노트, 재현 절차, 그리고 로컬 검증에는 네트워크를 사용하지 않는 `solve_local.py` 또는 최소 PoC다. 제공된 challenge artifact 또는 로컬 Docker에 의도적으로 포함된 flag는 end-to-end 재현 증거로 읽을 수 있다. 사용자가 지정한 remote 대상에서 받은 flag/출력도 동일하게 end-to-end 성공 증거로 읽을 수 있으며, 실제 연결·응답을 근거로만 성공을 주장한다(honest-mode). 사용자가 지정하지 않은 대상에 대한 결과 획득·제출·상호작용은 자동화하지 않는다.
-- 범위 밖 호스트·포트 **탐색**, 취약 서버 발견 자동화, 자격증명 수집, 지속성, 탐지 회피, 데이터 유출·삭제,
-  서비스 방해(DoS), 타 팀/공용 인프라 접근은 사용자가 지정한 단일 remote 대상에 대해서도 목적과 무관하게 금지한다. 여러 대상 스캔·무차별 대입·mass targeting은 금지한다.
-- 요청 문구 변경, 하위 에이전트, 작업 분할로 위 금지사항(탐색·자격증명 수집·DoS 등)이나 "사용자 지정 단일 대상" 제약을 우회하지 않는다. 차단되면 로컬·방어적 분석 범위로 돌아간다.
+전체 doctrine preload · STATE 원본 전체 열람(compact만 사용) · raw Ghidra 덤프 · 가설 fan-out(기본 순차, 불확실 시만 상한 3) · skeptic 서브태스크 · full CFG/symbolic 실행 · scout subagent 상시 사용 — 전부 기본 OFF.
 
-## 계산·자동화 도구 원칙
+## 운영 규칙 (항상)
 
-- 주소·오프셋·정렬·relocation 계산은 정확도와 재현성을 위해 로컬 프로그램에 맡길 수 있다. 계산 결과는 입력값,
-  사용한 바이너리/libc의 해시, 산식과 함께 `state`에 기록하고 범위·정렬을 검증한다.
-- 외부 계산기 사용은 작업의 권한이나 위험도를 바꾸지 않는다. 계산기를 안전장치 회피, 공격 의도 은닉, 또는 외부 상호작용을 포함한 자율 파이프라인 구축에 사용하지 않는다.
-- 범용 주소 계산기·패킷 파서·크래시 분석기는 로컬 분석 도구로 유지한다. 네트워크 접속, 대상 탐색, payload 전송, 반복 실행 기능을 결합하지 않는다.
-- LLM은 계산식과 전제조건을 설명·검토하고, 로컬 도구는 결정적 산술을 수행한다. 모든 실행 검증은 로컬 process/Docker에서 끝낸다.
+- **한 문제 1개**: `ctfguard begin/finish`로 active lock 강제. 전환 시 `finish blocked|complete` 없이 새 문제 착수 금지.
+- **git push는 사람만**: 커밋/푸시는 명시 요청 시에만.
+- **계산기 원칙**: 주소·오프셋·정렬 계산은 로컬 결정론적 도구(`pwncalc` 등)에 맡기고 입력·해시·산식을 `state`에 기록. 계산기를 안전장치 회피·외부 상호작용 자동화에 쓰지 않는다.
+- **flag 검증**: 로컬 artifact/Docker가 의도적으로 노출하는 flag, 또는 사용자가 지정한 remote가 실제 응답한 flag만 성공 증거.
 
-## ⛔ 규칙 (위반 금지)
+## DEEP 전용 (명시 요청 또는 위 승격 조건 충족 시에만 로드)
 
-- **로컬 우선 + 사용자 지정 remote 허용**: 제공된 artifact와 loopback/Docker를 기본으로 사용한다. 사용자가 대화에서 명시적으로 지정한 단일 host:port 에는 접속·exploit 전송·flag 수신을 수행할 수 있다. 사용자가 지정하지 않은 호스트·포트·계정·대회 인프라에 대한 탐색·스캔·추측 접속은 금지한다.
-- **flag 검증**: 로컬 artifact·challenge 디렉터리·Docker/loopback 안에서 challenge가 의도적으로 노출하는 flag, 그리고 사용자가 지정한 remote 대상이 실제 응답으로 반환한 flag만 성공 증거로 읽는다. 사용자 홈·SSH 키·토큰·환경변수 등 실제 자격증명 탐색은 여전히 금지한다.
-- **honest-mode**: 실제로 받은 연결 응답/출력이 있을 때만 remote 성공을 주장한다. 로컬이든 remote든 재현 증거(실행 로그, 수신한 flag 원문)가 없는 완료 보고를 금지하며, 오프셋/주소는 실측한다.
-- **한 번에 활성 문제 1개.** 팬아웃은 문제 "안"에서만(vuln class 좁히기·verify 확신 올리기). 문제-간 자동배분 안 함.
-- **활성 문제 락 강제**: CTF 작업 시작 전 `ctfguard begin <chal>` 로 로컬 전용 단일 active lock 을 먼저 잡는다.
-  `state init`/`newchal` 은 active challenge 와 이름이 다르면 실패해야 정상이다. 다른 문제로 전환하려면 먼저
-  `ctfguard finish blocked|complete` 로 현재 문제를 명시 종료하고 사람에게 보고한다.
-- **git push 는 사람만.** 커밋/푸시는 명시 요청 시에만.
-- **CTF-RAT strict gate**: fact / hypothesis / primitive PASS 를 분리한다. 미검증 가설은 `state hypothesis ...` 로만 기록하고,
-  최소 payload로 일반 실행 core에서 EIP/ESP/register/controlled marker/terminator 부작용을 확인하기 전까지
-  로컬 PoC 조립 금지. 통과 시에만 `state primitive <name> pass <evidence>` 로 승격한다.
-
-## 풀이 워크플로 (로컬 우선 단계; 상세=doctrine/SOLVING.md)
-
-0. **Guard** — `ctfguard begin <name>` 로 로컬 전용 active lock을 만든다. 제공되지 않은 대상을 추측하거나 추가하지 않는다.
-   시작 전 `ctfguard check` 가 GREEN 이어야 한다. 새 문제 전환은 `ctfguard finish blocked|complete` 없이는 금지.
-1. **Triage** — 제공된 artifact에 `newchal <name> <bin> [libc]`로 스캐폴드.
-   pwn 이면 `recon <bin>`, rev 이면 `revq <bin>`. `doctrine/SOLVABILITY.md` 로 확신도 게이트.
-2. **RE/정찰** — 큰 정적 읽기는 **scout Task 로 위임하고 요약만 회수**(컨텍스트 위생). rev: `revq --func`/`decomp`.
-3. **Vuln 가설** — 불확실하면 가설별 병렬(상한 3). `knowledge/GROUNDING_INDEX.md` 로 유형별 지식 1개만 로드.
-4. **Primitive** — leak/AAW/control 확보(순차). 후보는 `state hypothesis ...`; SELF 확인 통과 후 `state primitive <name> pass <evidence>`.
-5. **PoC 검증** — primitive PASS 이후에만 로컬 프로세스/Docker(기본) 또는 사용자가 지정한 remote 대상(명시된 경우)에 조립한다.
-   hypothesis만으로 체이닝하지 않는다. 로컬 검증이 기본 산출물(`solve_local.py`, 네트워크 미사용)이며, 사용자가 remote 대상을 지정한 경우 동일한 exploit을 그 대상에 실행해 실제 flag 수신까지 시도한다. 의도된 로컬 flag를 읽었거나 remote에서 flag를 수신했다면 대상·실행 조건·환경 digest(remote는 host:port·수신 원문 포함)를 검증 증거로 기록한다.
-6. **Adversarial verify** — SOLVE 선언 전 skeptic 으로 **반증 시도**(leak 위양성·libc mismatch·환경 차이, remote는 offset/leak이 remote 환경에 그대로 유효한지).
-   rev 는 `symsolve --find-str …`(복원 입력을 **실 바이너리 재실행**으로 concrete-verify)로 executable oracle 검증.
-7. **인계·지식화**(선택, 로컬 검증 후) — 기본 `HANDOFF.md`에 분석·primitive 증거·운영자 인계 조건을 남기고 `writeupcheck --strict`로 검사한다.
-   typed STATE v2가 legacy PASS보다 우선한다. [doctrine/WRITEUP_FORMAT.md](doctrine/WRITEUP_FORMAT.md)가 canonical 양식이며, 증거 digest가 연결된 operator attestation 전에는 `WRITEUP.md`/`SUBMISSION.md`로 승격하지 않는다. 일반화한 교훈은 `knowledge/learned/`에 candidate부터 기록한다.
-   rev grounding 은 `knowledge/ctf-reverse/`, pwn 은 `knowledge/ctf-skills/` — 라우팅은 `knowledge/GROUNDING_INDEX.md`.
+[doctrine/SOLVING.md](doctrine/SOLVING.md)(로컬 분석·재현 프로토콜) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md)(확신도 게이트) ·
+[doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)(hypothesis→primitive SELF 확인) · [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)(지식 라우터).
+`doctrine/FINALS.md`는 설계 참고문서이며 실행 경로가 아니다.
 
 ## 도구 (bin/) — 전부 `CTF_HOME`(레포루트) 자동 해석
 
 ```
 GUARD    ctfguard          active 문제 로컬 락
-INGEST   newchal            제공된 artifact의 로컬 스캐폴드
-스캐폴드  newchal            solve 디렉토리 스캐폴딩 (+run.json)
+INGEST   newchal            제공된 artifact의 로컬 스캐폴드 (+run.json)
 triage   recon              pwn 정적 프로파일 + 보수적 triage
          revq               rev 정적 배치 — 함수/문자열/xref/interesting/evasion (angr 주 엔진)
          analyze            그래프+1-hop 전파 vuln localizer (prior only)
@@ -74,32 +43,14 @@ RE       decomp             Ghidra headless 디컴파일 캐시(함수별 조회
          gdbq               GDB batch (노이즈 제거)
 symbolic solve/_template/rev/symsolve.py   angr 하니스(+concrete-verify, PE면 wine)
          solve/_template/rev/vmlift.py     custom-VM 리프터 스캐폴드
-         solve/_template/rev/qiling_trace.py  Windows PE 동적 에뮬(Qiling, Wine 불필요)
 pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 조립
-         pwncalc            로컬 주소·심볼·문자열 계산 + ELF 해시·정렬 검증
-         pwnscope           solve.py ↔ run.json 단일-target/로컬 우선 정적 검사
-         pwnleak            출력/바이트의 pointer 후보 추출·marker/canonical 검사
-         pwnpayload         payload bad byte·transport·terminator·qword layout 검사
-         pwnropcheck        로컬 ELF mapping·code segment·SysV stack alignment 검사
-         pwncrash           로컬 cyclic crash 재현 + GDB core 증거 수집(자동 PASS 승격 안 함)
-버스     state              STATE.jsonl (확정/배제/다음 기록 — 재도출 방지)
+         pwncalc / pwnleak / pwnpayload / pwnropcheck / pwncrash / pwnscope
+버스     state              STATE.jsonl (+`compact --budget-tokens N`)
+계측     rat-metrics        세션 duplicate/cache/time-to-flag 집계(read-only)
 검증     pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate
 ```
 
 rev 시너지: `revq` 주소 = angr 로드베이스(PIE 0x400000) → `symsolve --find <그 주소>` 그대로 투입.
-
-## 레이아웃
-
-```
-CLAUDE.md / AGENTS.md      이 진입점 (AGENTS.md→CLAUDE.md 심볼릭, Codex 호환)
-SETUP.md                   환경무관 초기 세팅
-doctrine/                  SOLVING(로컬 재현) · SOLVABILITY · calibration · FINALS(참고)
-knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) + ctf-reverse/(rev) + ctf-writeup/
-reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
-bin/                       도구 전체 (+ghidra_scripts/)
-solve/_template/rev/       symsolve · vmlift (챌린지 dir 로 복사해 사용)
-tests/                     e2e_rev.sh(rev 루프) 등 로컬 회귀검증
-```
 
 ## 테스트 (도구 수정 후 회귀검증 — 전부 ALL GREEN)
 
@@ -110,4 +61,4 @@ python3 solve/_template/rev/vmlift.py selftest
 python3 -m unittest tests.test_writeup_pipeline
 ```
 
-angr 설치 환경이면 `bash tests/e2e_rev.sh`(실 crackme e2e)까지.
+angr 설치 환경이면 `bash tests/e2e_rev.sh`(실 crackme e2e)까지. 도구 전체 목록·레이아웃은 [README.md](README.md).

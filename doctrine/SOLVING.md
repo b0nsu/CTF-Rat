@@ -1,5 +1,8 @@
 # 로컬 CTF artifact 분석·재현 규약
 
+> **DEEP 전용 문서.** CLAUDE.md FAST hot-path에서는 로드하지 않는다. DEEP 승격 조건(모호한 결과·env-민감·
+> 같은 실패 반복·evidence 충돌·Progress Novelty Governor stuck) 충족 시, 또는 사용자가 명시적으로 요청할 때만 읽는다.
+
 ## 범위
 
 - 제공된 바이너리·소스·libc·Docker·loopback 환경만 분석하고 실행한다.

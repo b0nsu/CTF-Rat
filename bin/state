@@ -2,7 +2,8 @@
 # 챌린지별 STATE.jsonl (append-only, flock 병렬안전, 사망 내성). LLM이 읽기 좋은 digest.
 import sys, os, json, fcntl, time
 from ratlib.runner import run
-from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive
+from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive, cursor as event_cursor
+from ratlib.compact import budget_compact
 from ratlib.schema import validate, ValidationError
 STATE = "STATE.jsonl"
 CTF_HOME = os.environ.get("CTF_HOME", os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")))
@@ -209,8 +210,13 @@ def main():
         except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
         return
     if a[0] == "compact":
-        view=Stream(os.path.dirname(fpath or state_file())).view()
-        print(json.dumps({"observations":view["observations"],"findings":view["findings"],"primitives":view["primitives"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
+        import argparse
+        p=argparse.ArgumentParser(prog="state compact"); p.add_argument("--budget-tokens",type=int,default=None); ns=p.parse_args(a[1:])
+        stream=Stream(os.path.dirname(fpath or state_file())); view=stream.view()
+        if ns.budget_tokens is None:
+            print(json.dumps({"observations":view["observations"],"findings":view["findings"],"primitives":view["primitives"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
+        events=stream.read(); cur=event_cursor(events[-1]) if events else None
+        print(json.dumps(budget_compact(view,budget_tokens=ns.budget_tokens,cursor=cur),ensure_ascii=False)); return
     if a[0] == "checkpoint" and len(a)>1:
         if a[1] == "create":
             import argparse

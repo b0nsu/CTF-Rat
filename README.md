@@ -7,9 +7,11 @@ pwn/rev 집중형 **환경 무관 self-contained CTF 풀이 kit.** 도구 + doct
 Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 
 - **세팅**: [SETUP.md](SETUP.md) (venv+angr+pwntools, Ghidra, glibc-fetch — 한 번)
-- **에이전트 진입점/규칙**: [CLAUDE.md](CLAUDE.md) (= `AGENTS.md`, Codex 호환). ROE·6-phase·도구맵.
+- **에이전트 진입점/규칙**: [CLAUDE.md](CLAUDE.md) (= `AGENTS.md`, Codex 호환). FAST hot-path(7-rule ROE·도구맵)를
+  매 세션 자동 로드하고, doctrine 전문은 DEEP 승격 조건 충족 시 또는 명시 요청 시에만 지연 로드한다(M1 slim entrypoint).
   실제 CTF 교전은 먼저 `ctfguard begin <challenge> [target]`으로 대상 allowlist/active lock을 만든다.
-- **풀이 doctrine**: [doctrine/SOLVING.md](doctrine/SOLVING.md)(ROE+6-phase) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md) · [doctrine/FINALS.md](doctrine/FINALS.md)
+- **풀이 doctrine(DEEP 전용)**: [doctrine/SOLVING.md](doctrine/SOLVING.md)(ROE+6-phase) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md) · [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md) · [doctrine/FINALS.md](doctrine/FINALS.md)
+- **operator skill (FAST, route당 1개)**: `skills/<route>/SKILL.md` — SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY.
 - **지식**: [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md) → `knowledge/ctf-skills/`
 - benchmark corpus, ablation, 설계 검토 문서는 `dev` 브랜치에서 관리한다. `main`은 실제 풀이와 검증에 필요한 운영 도구만 제공한다.
 - **도구 커버리지/추가 우선순위**: [doctrine/TOOLING_GAP_ANALYSIS.md](doctrine/TOOLING_GAP_ANALYSIS.md) — 기존 `bin/` 계층, 통합 갭, 신규 도구 gate.
