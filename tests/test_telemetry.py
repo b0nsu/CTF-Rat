@@ -19,7 +19,7 @@ class TelemetryTests(unittest.TestCase):
     def test_opt_in_and_summary(self):
         with tempfile.TemporaryDirectory() as root:
             self.assertFalse(record("tool", {"tool": "x"}, root=root))
-            begin(root, run_id="A0-001", variant="A0", model="solver-medium")
+            begin(root, run_id="A0-001", ablation_id="A0", challenge_id="fixture", attempt=1, model="solver-medium")
             artifact = os.path.join(root, "chall")
             with open(artifact, "wb") as f:
                 f.write(b"x")
@@ -36,26 +36,26 @@ class TelemetryTests(unittest.TestCase):
                          duration_ms=400, root=root)
             record("deep", {"reason": "ambiguous"}, root=root)
             record("verify", {"verified": True, "flag_found": True}, root=root)
-            finish(root, status="solved", verified=True, flag_found=True)
+            finish(root, status="completed", outcome="verified", verified=True, flag_found=True)
             doc = summarize(root, "A0-001")
-            self.assertEqual(doc["tools"]["calls"], 3)
-            self.assertEqual(doc["tools"]["duplicate_calls"], 1)
-            self.assertEqual(doc["tools"]["counts"]["revq"], 2)
-            self.assertEqual(doc["cache"]["reads"], 2)
-            self.assertEqual(doc["cache"]["hits"], 1)
-            self.assertEqual(doc["cache"]["writes"], 1)
-            self.assertEqual(doc["cache"]["hit_ratio"], 0.5)
-            self.assertEqual(doc["peak_context_tokens"], 9000)
-            self.assertEqual(doc["tokens"]["input"], 1500)
-            self.assertEqual(doc["tokens"]["cache_read"], 600)
-            self.assertEqual(doc["deep_escalations"], 1)
-            self.assertTrue(doc["verified_solve"])
-            self.assertTrue(doc["flag_found"])
-            self.assertIsNotNone(doc["time_to_flag_ms"])
+            self.assertEqual(doc["metrics"]["tools"]["calls"], 3)
+            self.assertEqual(doc["metrics"]["tools"]["duplicate_calls"], 1)
+            self.assertEqual(doc["metrics"]["tools"]["counts"]["revq"], 2)
+            self.assertEqual(doc["metrics"]["cache"]["reads"], 2)
+            self.assertEqual(doc["metrics"]["cache"]["hits"], 1)
+            self.assertEqual(doc["metrics"]["cache"]["writes"], 1)
+            self.assertEqual(doc["metrics"]["cache"]["hit_ratio"], 0.5)
+            self.assertEqual(doc["metrics"]["peak_context_tokens"], 9000)
+            self.assertEqual(doc["metrics"]["tokens"]["input"], 1500)
+            self.assertEqual(doc["metrics"]["tokens"]["cache_read"], 600)
+            self.assertEqual(doc["metrics"]["deep_escalations"], 1)
+            self.assertTrue(doc["metrics"]["verified_solve"])
+            self.assertTrue(doc["metrics"]["flag_found"])
+            self.assertIsNotNone(doc["metrics"]["time_to_flag_ms"])
 
     def test_structured_cache_reports_real_hit_provenance(self):
         with tempfile.TemporaryDirectory() as root:
-            begin(root, run_id="cache-001", variant="cache")
+            begin(root, run_id="cache-001", ablation_id="A0", challenge_id="cache")
             tool = os.path.join(root, "fixture-tool")
             with open(tool, "w", encoding="utf-8") as f:
                 f.write("#!/usr/bin/env python3\nprint(\"fixture-output\")\n")
@@ -67,18 +67,18 @@ class TelemetryTests(unittest.TestCase):
             self.assertTrue(second["provenance"]["cache"]["hit"])
             self.assertEqual(second["provenance"]["cache"]["source_invocation"], first["invocation_id"])
             self.assertNotEqual(second["invocation_id"], first["invocation_id"])
-            finish(root, status="solved")
+            finish(root, status="completed", outcome="unknown")
             doc = summarize(root, "cache-001")
-            self.assertEqual((doc["cache"]["reads"], doc["cache"]["hits"], doc["cache"]["writes"]), (2, 1, 1))
+            self.assertEqual((doc["metrics"]["cache"]["reads"], doc["metrics"]["cache"]["hits"], doc["metrics"]["cache"]["writes"]), (2, 1, 1))
 
     def test_active_run_is_fail_closed_without_force(self):
         with tempfile.TemporaryDirectory() as root:
-            begin(root, run_id="first")
+            begin(root, run_id="first", ablation_id="A0")
             with self.assertRaises(ValueError):
-                begin(root, run_id="second")
-            begin(root, run_id="second", force=True)
-            finish(root, status="abandoned")
-            self.assertEqual(summarize(root, "second")["run_id"], "second")
+                begin(root, run_id="second", ablation_id="A0")
+            begin(root, run_id="second", ablation_id="A0", force=True)
+            finish(root, status="completed", outcome="unknown")
+            self.assertEqual(summarize(root, "second")["benchmark_run_id"], "second")
 
 
 if __name__ == "__main__":
