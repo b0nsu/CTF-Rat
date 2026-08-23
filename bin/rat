@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""rat — single front door thin dispatcher.
+
+Not a new analysis engine: every subcommand is a thin adapter over an
+existing implementation (route.py, revq, rat-profile, rat-slice, rat-dyn,
+rat-verify, state, ratlib.cache). Legacy CLIs are unchanged and still work
+standalone -- this is an additional canonical entrypoint, not a replacement.
+"""
+from __future__ import annotations
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, subprocess, sys
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+
+from ratlib.artifact import get as artifact_get
+from ratlib.cache import Cache, resolve_index_root
+from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
+from ratlib.governor import check_progress
+from ratlib.route import route as route_fn
+from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
+from ratlib.schema import validate
+from ratlib.state_v2 import Stream
+
+DEFAULT_BUDGET_BYTES = 16384
+
+def _canonical_digest(value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+def _print(doc, fmt):
+    if fmt == "json":
+        print(json.dumps(doc, sort_keys=True, ensure_ascii=False))
+    else:
+        label = doc.get("query") or doc.get("subroute") or doc.get("schema")
+        status = doc.get("status") or ("stuck" if doc.get("governor", {}).get("stuck") else "ok")
+        print("%s: %s" % (label, status))
+
+def _emit(doc, code, fmt):
+    """Single validate->print->return exit shared by every subcommand.
+    Validates against the doc's own schema, matching the explicit-literal
+    validate() calls this replaced -- behavior identical, one call site."""
+    validate(doc, doc["schema"]); _print(doc, fmt); return code
+
+def _check_binary(binary):
+    if not os.path.isfile(binary):
+        return {"code": "input_invalid", "message": "binary is missing or not a regular file: %s" % binary}
+    return None
+
+# ---- revq: loaded in-process (no new CLI surface on revq, no subprocess hop) ----
+_REVQ_MODULE = None
+def _load_revq_module():
+    global _REVQ_MODULE
+    if _REVQ_MODULE is None:
+        loader = importlib.machinery.SourceFileLoader("_rat_revq", os.path.join(BIN, "revq"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _REVQ_MODULE = mod
+    return _REVQ_MODULE
+
+def _gather_revq(binary, fast):
+    mod = _load_revq_module()
+    # revq's extract_* helpers call die()/sys.exit() on missing angr / wrong
+    # format when used as a standalone CLI -- reinterpret as a catchable
+    # error when loaded in-process so one binary's degradation can't kill rat.
+    try:
+        rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False)
+    except SystemExit as exc:
+        raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
+    return mod, rev
+
+# ---- legacy tool delegation (subprocess capture -- these tools only print, never return a doc) ----
+def _run_subprocess(argv, timeout=120):
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as exc:
+        return 3, "", str(exc)
+
+def _doctor_capabilities(binary):
+    code, out, _ = _run_subprocess([os.path.join(BIN, "rat-doctor"), binary, "--format", "json"])
+    if code != 0:
+        return {"native": False, "angr": False, "ghidra": False}
+    try:
+        routes = json.loads(out)["summary"]["routes"]
+        return {name: routes.get(name, {}).get("status") == "available" for name in ("native", "angr", "ghidra")}
+    except Exception:
+        return {"native": False, "angr": False, "ghidra": False}
+
+def _gather_profile(binary, store):
+    code, out, _ = _run_subprocess([os.path.join(BIN, "rat-profile"), binary, "--store", store, "--format", "json"])
+    if code != 0:
+        return None
+    try:
+        digest = json.loads(out)["artifacts"][0]["digest"]
+        return json.loads(artifact_get(digest, root=store))
+    except Exception:
+        return None
+
+# ---- Progress Novelty Governor wiring -- route/query only ----
+def _governor_wrap(store, action, novelty_key, doc):
+    digest = _canonical_digest(novelty_key)
+    stream = Stream(os.path.dirname(store))
+    events = [e for e in stream.read() if e["type"] == "governor.checked"]
+    novel = digest not in {e["payload"]["digest"] for e in events}
+    history = [e["payload"]["novel"] for e in events] + [novel]
+    stream.append("governor.checked", {"action": action, "novel": novel, "digest": digest})
+    check = check_progress(history)
+    if check["stuck"]:
+        doc["governor"] = {"stuck": True, "action": check["action"], "reason": check["reason"]}
+    return doc
+
+# ---- rat.query-result/v1 envelope ----
+def _query_envelope(query, *, status, facts, heuristics, artifacts, coverage, diagnostics, provenance, budget_bytes=None):
+    doc = {"schema": "rat.query-result/v1", "query": query, "status": status, "facts": facts,
+           "heuristics": heuristics, "artifacts": artifacts, "coverage": coverage,
+           "diagnostics": diagnostics, "provenance": provenance}
+    if budget_bytes is not None:
+        doc["budget_bytes"] = budget_bytes
+    return doc
+
+def _query_error(query, code, message, exit_code):
+    doc = _query_envelope(query, status="error", facts={}, heuristics={}, artifacts=[],
+                           coverage={"complete": False, "scope": query, "omitted": [code]},
+                           diagnostics=[{"code": code, "severity": "error", "message": message}],
+                           provenance={"cache": {"hit": False}})
+    return doc, exit_code
+
+# ---- subcommands ----
+def cmd_route(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        if args.format == "json":
+            print(json.dumps({"schema": "rat.route-result/v1", "error": bad}, ensure_ascii=False))
+        else:
+            print("route: error (%s)" % bad["message"])
+        return EXIT_INPUT
+    store = resolve_index_root(binary, override=args.store)
+    caps = _doctor_capabilities(binary)
+    profile = _gather_profile(binary, store)
+    fast = args.fast or not caps.get("angr", False)
+    rev, interesting = None, None
+    try:
+        mod, rev = _gather_revq(binary, fast)
+        interesting = mod.compute_interesting(rev)
+    except Exception:
+        rev, interesting = None, None
+    result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    result["capabilities"] = {**result["capabilities"], **caps}
+    novelty_key = {"track": result["track"], "subroute": result["subroute"],
+                   "signals": [s["value"] for s in result["signals"]]}
+    result = _governor_wrap(store, "route", novelty_key, result)
+    return _emit(result, EXIT_OK, args.format)
+
+def cmd_query_func(args):
+    binary, name = args.binary, args.name
+    query = "func:%s" % name
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    try:
+        mod, rev = _gather_revq(binary, args.fast)
+    except Exception as exc:
+        return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+    card = mod.compute_function_card(rev, name)
+    if card is None:
+        return _emit(*_query_error(query, "input_invalid", "function '%s' not found" % name, EXIT_INPUT), args.format)
+    budget = args.budget_bytes
+    # budget_bytes is a per-query pool, not per-list -- share it across
+    # callers/callees/strings instead of granting each its own full budget.
+    kept, truncated, omit = truncate_lists_sharing_budget(
+        [("callers", card["facts"]["callers"]), ("callees", card["facts"]["callees"]),
+         ("strings", card["facts"]["strings"])], budget)
+    callers_omit, callees_omit, strings_omit = omit["callers"], omit["callees"], omit["strings"]
+    facts = {**card["facts"], **kept}
+    unresolved = card["unresolved"]
+    status = "partial" if unresolved or truncated else "ok"
+    diagnostics = [{"code": "partial", "severity": "warning", "message": u["detail"]} for u in unresolved]
+    if truncated:
+        diagnostics.append({"code": "partial", "severity": "warning",
+                             "message": "facts truncated at item boundary (budget_bytes=%d)" % budget})
+    doc = _query_envelope(query, status=status, facts=facts,
+                           heuristics={**card["heuristics"], "next": card["next"]}, artifacts=[],
+                           coverage={"complete": not (unresolved or truncated), "scope": query,
+                                     "omitted": {"unresolved": [u["kind"] for u in unresolved],
+                                                 "truncated_counts": {"callers": callers_omit, "callees": callees_omit, "strings": strings_omit}}},
+                           diagnostics=diagnostics,
+                           provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
+                           budget_bytes=budget)
+    doc = _governor_wrap(store, "query:func", {"query": query, "facts": facts}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+def cmd_query_oracle(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("oracle", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    try:
+        mod, rev = _gather_revq(binary, args.fast)
+    except Exception as exc:
+        return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+    oracle = mod.compute_oracle(rev)
+    facts = {"success_candidates": oracle["success_candidates"], "failure_candidates": oracle["failure_candidates"]}
+    heuristics = {"resolved": oracle["resolved"], "auto_connect": oracle["auto_connect"]}
+    diagnostics = []
+    if oracle["ambiguous"]:
+        diagnostics.append({"code": "ambiguous", "severity": "warning",
+                             "message": "multiple success/failure candidates; auto-connect withheld"})
+    elif not oracle["success_candidates"] and not oracle["failure_candidates"]:
+        diagnostics.append({"code": "partial", "severity": "warning", "message": "no success/failure string candidates found"})
+    if oracle["auto_connect"]:
+        r = oracle["resolved"]
+        heuristics["next"] = [{"query": "symsolve.py --find %#x --avoid %#x" % (r["success"]["addr"], r["failure"]["addr"]), "target": binary}]
+    status = "ok" if oracle["auto_connect"] else "partial"
+    doc = _query_envelope("oracle", status=status, facts=facts, heuristics=heuristics, artifacts=[],
+                           coverage={"complete": oracle["auto_connect"], "scope": "binary-strings+xrefs",
+                                     "omitted": None if oracle["auto_connect"] else "unresolved-candidates"},
+                           diagnostics=diagnostics,
+                           provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}})
+    doc = _governor_wrap(store, "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+def cmd_query_slice(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("slice", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    code, out, err = _run_subprocess([os.path.join(BIN, "rat-profile"), binary, "--store", store, "--format", "json"])
+    if code != 0:
+        return _emit(*_query_error("slice", "dependency_missing", err or "rat-profile failed", EXIT_DEPENDENCY), args.format)
+    try:
+        profile_digest = json.loads(out)["artifacts"][0]["digest"]
+    except Exception as exc:
+        return _emit(*_query_error("slice", "dependency_missing", "rat-profile produced no artifact: %s" % exc, EXIT_DEPENDENCY), args.format)
+    slice_argv = [os.path.join(BIN, "rat-slice"), binary, "--profile", profile_digest, "--mode", "data",
+                  "--backward", args.backward, "--depth", str(args.depth), "--store", store, "--format", "json"]
+    if args.source:
+        slice_argv += ["--source", args.source]
+    code, out, err = _run_subprocess(slice_argv)
+    try:
+        slice_doc = json.loads(out)
+    except Exception:
+        return _emit(*_query_error("slice", "timeout" if code == 124 else "input_invalid",
+                                   err or "rat-slice produced no output", EXIT_INPUT), args.format)
+    if slice_doc.get("status") == "error":
+        msgs = [d.get("message", "") for d in slice_doc.get("diagnostics", [])] or ["rat-slice reported error"]
+        return _emit(*_query_error("slice", "input_invalid", "; ".join(msgs), EXIT_INPUT), args.format)
+    s = slice_doc.get("summary", {})
+    unresolved = bool(s.get("unresolved_aliases", 0)) or s.get("unresolved_indirect_calls", 0) == 1
+    status = "partial" if unresolved or slice_doc.get("status") == "partial" else "ok"
+    # C9: `claim` is a heuristic label, never a fact -- it must not appear in `facts`.
+    facts = {"target": s.get("target"), "within_function": s.get("within_function"), "interproc": s.get("interproc")}
+    heuristics = {"claim": s.get("claim")}
+    diagnostics = []
+    for d in slice_doc.get("diagnostics", []):
+        msg = d.get("message", "")
+        code_tag = "dependency_missing" if "angr dependency missing" in msg else "partial"
+        diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
+    doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
+                           artifacts=slice_doc.get("artifacts", []),
+                           coverage={"complete": not unresolved,
+                                     "scope": "backward-data-slice depth=%s" % (s.get("interproc") or {}).get("depth"),
+                                     "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
+                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls")}},
+                           diagnostics=diagnostics,
+                           provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
+                                       "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
+    doc = _governor_wrap(store, "query:slice", {"facts": facts, "heuristics": heuristics}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+def cmd_dyn(rest):
+    code, out, err = _run_subprocess([os.path.join(BIN, "rat-dyn")] + rest)
+    sys.stdout.write(out); sys.stderr.write(err)
+    return code
+
+def cmd_verify(rest):
+    code, out, err = _run_subprocess([os.path.join(BIN, "rat-verify")] + rest)
+    sys.stdout.write(out); sys.stderr.write(err)
+    return code
+
+def cmd_state_compact(rest):
+    code, out, err = _run_subprocess([os.path.join(BIN, "state"), "compact"] + rest)
+    sys.stdout.write(out); sys.stderr.write(err)
+    return code
+
+def cmd_cache_stats(args):
+    store = resolve_index_root(None, override=args.store)
+    stats = Cache(store).stats()
+    doc = {"schema": "rat.cache-stats/v1", "store": store, **stats}
+    return _emit(doc, EXIT_OK, args.format)
+
+def cmd_selftest(_args=None):
+    r = route_fn(profile={"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
+    assert r["subroute"] == "pwn-rop", r
+    validate(r, "rat.route-result/v1")
+    q = _query_envelope("selftest", status="ok", facts={}, heuristics={}, artifacts=[],
+                         coverage={"complete": True, "scope": "selftest", "omitted": None},
+                         diagnostics=[], provenance={"cache": {"hit": False}})
+    validate(q, "rat.query-result/v1")
+    c = {"schema": "rat.cache-stats/v1", "store": "/tmp/x", "total_entries": 0, "by_backend": {},
+         "oldest_produced_at": None, "newest_produced_at": None}
+    validate(c, "rat.cache-stats/v1")
+    check = check_progress([False] * 5)
+    assert check["stuck"] is True, check
+    kept, truncated, omitted = truncate_by_item([1, 2, 3], 1)
+    assert truncated and omitted == 2, (kept, truncated, omitted)
+    shared_kept, shared_trunc, shared_omit = truncate_lists_sharing_budget(
+        [("a", [1, 2, 3]), ("b", [4, 5, 6])], 2)
+    assert shared_kept == {"a": [1, 2], "b": []}, shared_kept
+    assert shared_trunc and shared_omit == {"a": 1, "b": 3}, (shared_trunc, shared_omit)
+    print("rat selftest: OK")
+    return EXIT_OK
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="rat")
+    sub = p.add_subparsers(dest="command")
+
+    pr = sub.add_parser("route")
+    pr.add_argument("binary"); pr.add_argument("--store"); pr.add_argument("--fast", action="store_true")
+    pr.add_argument("--format", choices=("text", "json"), default="text")
+
+    pq = sub.add_parser("query")
+    qsub = pq.add_subparsers(dest="subcommand")
+    pf = qsub.add_parser("func")
+    pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
+    pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pf.add_argument("--format", choices=("text", "json"), default="text")
+    po = qsub.add_parser("oracle")
+    po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
+    po.add_argument("--format", choices=("text", "json"), default="text")
+    ps = qsub.add_parser("slice")
+    ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)
+    ps.add_argument("--source", default="stdin"); ps.add_argument("--store")
+    ps.add_argument("--format", choices=("text", "json"), default="text")
+
+    # dyn/verify/state-compact forward an open-ended, flag-first argv to a
+    # legacy tool; argparse.REMAINDER mis-parses a leading option-like token
+    # (e.g. "--budget-tokens" with nothing before it), so main() intercepts
+    # these three by slicing sys.argv directly (same convention bin/state's
+    # own top-level dispatch uses) before this parser ever sees them. These
+    # placeholders exist only so `--help` lists the subcommands.
+    sub.add_parser("dyn", add_help=False)
+    sub.add_parser("verify", add_help=False)
+    sub.add_parser("state", add_help=False)
+
+    pcache = sub.add_parser("cache")
+    cachesub = pcache.add_subparsers(dest="subcommand")
+    pcachestats = cachesub.add_parser("stats")
+    pcachestats.add_argument("--store"); pcachestats.add_argument("--format", choices=("text", "json"), default="text")
+
+    sub.add_parser("selftest")
+    return p
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:
+        build_parser().print_help()
+        return EXIT_USAGE
+    # Manual argv slicing for the pure forwarding subcommands -- see the
+    # comment in build_parser() on why these bypass argparse.REMAINDER.
+    if argv[0] == "selftest":
+        return cmd_selftest()
+    if argv[0] == "dyn":
+        return cmd_dyn(argv[1:])
+    if argv[0] == "verify":
+        return cmd_verify(argv[1:])
+    if argv[0] == "state" and len(argv) >= 2 and argv[1] == "compact":
+        return cmd_state_compact(argv[2:])
+
+    p = build_parser()
+    args = p.parse_args(argv)
+    if args.command == "route": return cmd_route(args)
+    if args.command == "query":
+        if args.subcommand == "func": return cmd_query_func(args)
+        if args.subcommand == "oracle": return cmd_query_oracle(args)
+        if args.subcommand == "slice": return cmd_query_slice(args)
+        p.parse_args(["query", "--help"]); return EXIT_USAGE
+    if args.command == "cache":
+        if args.subcommand == "stats": return cmd_cache_stats(args)
+        p.parse_args(["cache", "--help"]); return EXIT_USAGE
+    if args.command in ("dyn", "verify", "state"):
+        print("usage: rat %s ..." % args.command, file=sys.stderr)
+        return EXIT_USAGE
+    if args.command == "selftest": return cmd_selftest()
+    p.print_help()
+    return EXIT_USAGE
+
+if __name__ == "__main__":
+    sys.exit(main())

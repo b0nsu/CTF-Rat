@@ -104,6 +104,10 @@ class Stream:
    if not isinstance(payload.get("fingerprint"),str) or not payload["fingerprint"]: raise ValueError("route requires fingerprint")
   elif typ=="next.recorded":
    if not isinstance(payload.get("probe"),str) or not payload["probe"]: raise ValueError("next probe requires probe")
+  elif typ=="governor.checked":
+   if not isinstance(payload.get("action"),str) or not payload["action"]: raise ValueError("governor.checked requires action")
+   if not isinstance(payload.get("novel"),bool): raise ValueError("governor.checked requires novel bool")
+   if not isinstance(payload.get("digest"),str) or not payload["digest"]: raise ValueError("governor.checked requires digest")
  def append(self, typ, payload, *, actor="local", task_id="local", caused_by=None):
   os.makedirs(os.path.dirname(self.path),mode=0o700,exist_ok=True)
   with open(self.path,"a+",encoding="utf-8") as f:

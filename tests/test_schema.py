@@ -1,0 +1,99 @@
+import os, sys, unittest
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
+from ratlib.schema import validate, ValidationError
+
+def route_result(**overrides):
+    doc = {"schema": "rat.route-result/v1", "track": "pwn", "subroute": "pwn-stack", "confidence": 0.6,
+           "signals": [{"kind": "overflow-imports", "value": ["gets"], "quality": "fact"}],
+           "capabilities": {"profile": True, "revq": False}, "skill": "pwn-stack",
+           "next": [{"query": "pwncalc", "target": None}]}
+    doc.update(overrides)
+    return doc
+
+def query_result(**overrides):
+    doc = {"schema": "rat.query-result/v1", "query": "func:main", "status": "ok", "facts": {},
+           "heuristics": {}, "artifacts": [], "coverage": {"complete": True, "scope": "x", "omitted": None},
+           "diagnostics": [], "provenance": {"cache": {"hit": False}}}
+    doc.update(overrides)
+    return doc
+
+def cache_stats(**overrides):
+    doc = {"schema": "rat.cache-stats/v1", "store": "/tmp/x", "total_entries": 0, "by_backend": {},
+           "oldest_produced_at": None, "newest_produced_at": None}
+    doc.update(overrides)
+    return doc
+
+class RouteResultSchema(unittest.TestCase):
+    def test_valid_doc_passes(self):
+        validate(route_result())
+
+    def test_missing_field_raises(self):
+        d = route_result(); del d["skill"]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_confidence_out_of_range_raises(self):
+        with self.assertRaises(ValidationError): validate(route_result(confidence=1.5))
+
+    def test_signal_missing_quality_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(route_result(signals=[{"kind": "x", "value": "y"}]))
+
+    def test_signal_bad_quality_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(route_result(signals=[{"kind": "x", "value": "y", "quality": "guess"}]))
+
+    def test_next_missing_target_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(route_result(next=[{"query": "x"}]))
+
+    def test_alternatives_field_allowed_when_a_list(self):
+        d = route_result(); d["alternatives"] = ["rev-symbolic"]
+        validate(d)
+
+    def test_alternatives_field_rejected_when_not_a_list(self):
+        d = route_result(); d["alternatives"] = "rev-symbolic"
+        with self.assertRaises(ValidationError): validate(d)
+
+class QueryResultSchema(unittest.TestCase):
+    def test_valid_doc_passes_for_each_status(self):
+        for status in ("ok", "partial", "error"):
+            validate(query_result(status=status))
+
+    def test_invalid_status_raises(self):
+        with self.assertRaises(ValidationError): validate(query_result(status="pending"))
+
+    def test_missing_coverage_field_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(query_result(coverage={"complete": True, "scope": "x"}))
+
+    def test_unknown_diagnostic_code_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(query_result(diagnostics=[{"code": "not-a-real-code", "message": "x"}]))
+
+    def test_known_diagnostic_codes_pass(self):
+        for code in ("input_invalid", "dependency_missing", "timeout", "partial", "stale_cache", "ambiguous", "verification_fail"):
+            validate(query_result(diagnostics=[{"code": code, "message": "x"}]))
+
+    def test_missing_provenance_cache_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(query_result(provenance={}))
+
+    def test_extra_fields_allowed_not_strict(self):
+        # bin/rat's dispatcher attaches an extra `governor` key onto route/query
+        # results; the validator is deliberately _need-only, not _strict.
+        d = query_result(); d["governor"] = {"stuck": True, "action": "re-route-or-deep-escalate", "reason": "x"}
+        validate(d)
+
+class CacheStatsSchema(unittest.TestCase):
+    def test_valid_doc_passes(self):
+        validate(cache_stats())
+
+    def test_negative_total_entries_raises(self):
+        with self.assertRaises(ValidationError): validate(cache_stats(total_entries=-1))
+
+    def test_unknown_field_raises_because_strict(self):
+        d = cache_stats(); d["extra"] = 1
+        with self.assertRaises(ValidationError): validate(d)
+
+if __name__ == "__main__":
+    unittest.main()
