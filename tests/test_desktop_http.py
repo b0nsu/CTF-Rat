@@ -6,6 +6,7 @@ from urllib.request import Request, urlopen
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN)
+from ratlib.artifact import put_bytes
 from ratlib.desktop_session import SessionManager
 from ratlib.state_v2 import Stream
 
@@ -79,6 +80,28 @@ class DesktopHttpTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(unchanged["delta"]["unchanged"])
             self.assertIsNone(unchanged["snapshot"])
+
+    def test_artifact_generation_hint_round_trips_over_http(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            put_bytes(
+                b"desktop-artifact",
+                kind="test",
+                media_type="application/octet-stream",
+                logical_name="artifact.bin",
+                root=stream.root,
+            )
+            base = self.server(root)
+            status, first = self.read_json(Request(base + "/api/artifacts?limit=10"))
+            self.assertEqual(status, 200)
+            self.assertFalse(first["unchanged"])
+            self.assertEqual(first["total"], 1)
+            params = urlencode({"limit": 10, "known_generation": first["generation"]})
+            status, unchanged = self.read_json(Request(base + "/api/artifacts?" + params))
+            self.assertEqual(status, 200)
+            self.assertTrue(unchanged["unchanged"])
+            self.assertEqual(unchanged["artifacts"], [])
+            self.assertIsNone(unchanged["total"])
 
     def test_disallowed_browser_origin_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
