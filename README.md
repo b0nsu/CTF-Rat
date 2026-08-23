@@ -1,6 +1,6 @@
 # ctf-rat — CTF(pwn/rev) 풀이 kit
 
-<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/64cf751b-64c8-4666-8b34-9a83ec0710c5" />
+<img width="1672" height="941" alt="ctf-rat — route · verify · reuse" src="assets/banner.png" />
 
 pwn/rev 집중형 **환경 무관 self-contained CTF 풀이 kit.** 도구 + doctrine + 지식 + 참조데이터가
 한 레포에 들어 있어, 어느 Linux 환경(네이티브/VM/WSL2/컨테이너)에든 한 번 세팅하면
