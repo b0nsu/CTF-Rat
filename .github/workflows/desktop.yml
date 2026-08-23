@@ -47,3 +47,13 @@ jobs:
         run: npm run build
       - name: Rust compile check
         run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Capture generated lockfiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-lockfiles
+          path: |
+            desktop/package-lock.json
+            desktop/src-tauri/Cargo.lock
+          if-no-files-found: error
+          retention-days: 3
