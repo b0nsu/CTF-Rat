@@ -49,13 +49,65 @@ def _generation(stat: tuple[int, int]) -> str:
     return "%d:%d" % stat
 
 
+def _stream_tail_summary(stream: Stream) -> tuple[dict[str, Any], int]:
+    """Summarize a stream already validated by ``Stream.view()``.
+
+    This does not materialize STATE semantics. It only counts complete JSONL
+    records and decodes the final complete event for its canonical cursor. A
+    crash-truncated final record is ignored exactly as ``Stream.read()`` does.
+    Callers must compare stream stat before/after the validating view + summary.
+    """
+    try:
+        with open(stream.path, "rb") as source:
+            data = source.read()
+    except OSError:
+        return {"stream_id": None, "seq": 0}, 0
+    if not data:
+        return {"stream_id": None, "seq": 0}, 0
+    if not data.endswith(b"\n"):
+        boundary = data.rfind(b"\n")
+        data = b"" if boundary < 0 else data[:boundary + 1]
+    if not data:
+        return {"stream_id": None, "seq": 0}, 0
+    count = data.count(b"\n")
+    last_line = data[:-1].rsplit(b"\n", 1)[-1]
+    event = json.loads(last_line.decode("utf-8"))
+    return cursor(event), count
+
+
 def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, Any]:
     """Return a materialized view, optionally at a historical event sequence."""
     root = os.path.abspath(challenge_root)
     stream = Stream(root)
-    events = stream.read()
     if until_seq is not None and (not isinstance(until_seq, int) or until_seq < 0):
         raise ValueError("until_seq must be a non-negative integer")
+
+    if until_seq is None:
+        # Live refresh is latency-sensitive. Stream.view() is the canonical
+        # materializer and already performs one strict Stream.read(). Reuse that
+        # validation and derive only cursor/count from raw JSONL bytes, avoiding
+        # the previous second full JSON parse. Retry if a writer races the read.
+        for _ in range(3):
+            before_stat = _stream_stat(stream)
+            view = stream.view()
+            latest, count = _stream_tail_summary(stream)
+            after_stat = _stream_stat(stream)
+            if before_stat == after_stat:
+                return {
+                    "schema": SNAPSHOT_SCHEMA,
+                    "challenge_root": root,
+                    "run": _manifest(root),
+                    "cursor": latest,
+                    "event_count": count,
+                    "total_event_count": count,
+                    "historical": False,
+                    "view": view,
+                }
+
+    # Historical replay is interactive rather than a 500 ms polling path, and
+    # this fallback also preserves correctness if a live stream changes during
+    # all retry attempts.
+    events = stream.read()
     visible = events if until_seq is None else [event for event in events if event["seq"] <= until_seq]
     latest = cursor(visible[-1]) if visible else {"stream_id": events[0]["stream_id"] if events else None, "seq": 0}
     return {
