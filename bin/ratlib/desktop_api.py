@@ -316,7 +316,10 @@ def _artifact_inventory(meta_root: str) -> tuple[str, list[str]]:
     if not os.path.isdir(meta_root):
         return "sha256:" + hasher.hexdigest(), digests
     try:
-        prefixes = sorted(entry for entry in os.scandir(meta_root) if entry.is_dir(follow_symlinks=False), key=lambda entry: entry.name)
+        prefixes = sorted(
+            (entry for entry in os.scandir(meta_root) if entry.is_dir(follow_symlinks=False)),
+            key=lambda entry: entry.name,
+        )
     except OSError:
         return "sha256:" + hasher.hexdigest(), digests
     for prefix in prefixes:
