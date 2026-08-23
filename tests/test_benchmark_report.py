@@ -16,13 +16,19 @@ from ratlib.telemetry import begin, finish, record_cache, record_model, record_t
 class BenchmarkReportTests(unittest.TestCase):
     def _run(self, root, run_id, ablation, attempt, *, verified, context, input_tokens,
              duplicate=False, cache_hit=False, eligible=True, status="completed"):
+        chall = os.path.join(root, "chall")
+        if not os.path.exists(chall):
+            with open(chall, "wb") as f:
+                f.write(b"fixture")
         begin(root, run_id=run_id, ablation_id=ablation, challenge_id="babyrev",
               attempt=attempt, eligible=eligible, model="model-x")
         record_model(input_tokens=input_tokens, output_tokens=100, context_tokens=context,
                      duration_ms=20, root=root)
-        record_tool(["revq", "./chall", "--interesting"], duration_ms=10, exit_code=0, root=root)
+        record_tool(["revq", "./chall", "--interesting"], duration_ms=10, exit_code=0,
+                    cwd=root, root=root)
         if duplicate:
-            record_tool(["revq", "chall", "--interesting"], duration_ms=11, exit_code=0, root=root)
+            record_tool(["revq", "chall", "--interesting"], duration_ms=11, exit_code=0,
+                        cwd=root, root=root)
         record_cache(tool="revq", key="sha256:" + ("a" if cache_hit else "b") * 64,
                      hit=cache_hit, root=root)
         finish(root, status=status,
