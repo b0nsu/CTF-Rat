@@ -106,9 +106,13 @@ def _delta_document(
     effective_after = 0 if reset else after_seq
     remaining = [event for event in events if event["seq"] > effective_after]
     selected = remaining[:limit]
+    has_more = len(remaining) > len(selected)
     latest_seq = selected[-1]["seq"] if selected else effective_after
     cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
-    if source_generation is not None:
+    # A generation token means the cursor is fully caught up with that exact
+    # file generation. Do not issue it while pagination still has unread events,
+    # or the next unchanged poll could incorrectly skip the remaining page.
+    if source_generation is not None and not has_more:
         cursor_doc["source_generation"] = source_generation
     return {
         "schema": EVENTS_SCHEMA,
@@ -116,7 +120,7 @@ def _delta_document(
         "after_seq": effective_after,
         "events": selected,
         "cursor": cursor_doc,
-        "has_more": len(remaining) > len(selected),
+        "has_more": has_more,
         "reset": reset,
         "unchanged": False,
     }
