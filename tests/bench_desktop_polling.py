@@ -19,7 +19,7 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "bin"))
 
-from ratlib.desktop_api import event_delta, list_artifacts, snapshot, telemetry
+from ratlib.desktop_api import event_delta, list_artifacts, live_update, snapshot, telemetry
 from ratlib.state_v2 import EVENT_SCHEMA, stream_path
 
 SCHEMA = "rat.desktop-poll-benchmark/v1"
@@ -62,9 +62,6 @@ def _stats(samples: list[float], prefix: str) -> dict[str, float]:
 
 
 def _measure(fn, iterations: int) -> dict[str, float]:
-    # Warm filesystem/page cache once; repeated samples then model steady-state
-    # desktop polling rather than first-open disk latency. Wall-clock latency
-    # and process CPU time are distinct signals and must not be conflated.
     fn()
     wall_samples = []
     cpu_samples = []
@@ -85,11 +82,16 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
         stream_bytes = _write_stream(root, count)
         midpoint = count // 2
 
-        # Prime the opaque generation hint using the same validated fallback
-        # path a real first poll uses. Subsequent unchanged polls echo it.
         primed = event_delta(root, after_seq=count, limit=500)
         cursor = primed["cursor"]
         hinted_idle = lambda: event_delta(
+            root,
+            after_seq=count,
+            limit=500,
+            stream_id=cursor["stream_id"],
+            known_generation=cursor.get("source_generation"),
+        )
+        hinted_live_idle = lambda: live_update(
             root,
             after_seq=count,
             limit=500,
@@ -100,20 +102,26 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
         operations = {
             "event_delta_idle_full_scan": _measure(lambda: event_delta(root, after_seq=count, limit=500), iterations),
             "event_delta_idle_unchanged_hint": _measure(hinted_idle, iterations),
+            "live_update_idle_unchanged_hint": _measure(hinted_live_idle, iterations),
             "event_delta_10_new": _measure(lambda: event_delta(root, after_seq=max(0, count - 10), limit=500), iterations),
+            "live_update_10_new": _measure(lambda: live_update(root, after_seq=max(0, count - 10), limit=500), iterations),
             "snapshot_live": _measure(lambda: snapshot(root), iterations),
             "snapshot_midpoint": _measure(lambda: snapshot(root, until_seq=midpoint), iterations),
             "telemetry": _measure(lambda: telemetry(root), iterations),
             "artifact_listing_empty": _measure(lambda: list_artifacts(root, limit=500), iterations),
         }
-        # The workbench changed-state refresh performs delta first, then live
-        # snapshot + artifact listing. Telemetry remains an API projection but
-        # is no longer polled by the UI because snapshot already carries count.
-        changed_names = ("event_delta_10_new", "snapshot_live", "artifact_listing_empty")
+        legacy_changed_names = ("event_delta_10_new", "snapshot_live", "artifact_listing_empty")
+        combined_changed_names = ("live_update_10_new", "artifact_listing_empty")
         idle_full = operations["event_delta_idle_full_scan"]
-        idle_fast = operations["event_delta_idle_unchanged_hint"]
+        idle_fast = operations["live_update_idle_unchanged_hint"]
+        legacy_wall = sum(operations[name]["wall_p50_ms"] for name in legacy_changed_names)
+        combined_wall = sum(operations[name]["wall_p50_ms"] for name in combined_changed_names)
+        legacy_cpu = sum(operations[name]["cpu_p50_ms"] for name in legacy_changed_names)
+        combined_cpu = sum(operations[name]["cpu_p50_ms"] for name in combined_changed_names)
         wall_speedup = idle_full["wall_p50_ms"] / idle_fast["wall_p50_ms"] if idle_fast["wall_p50_ms"] else None
         cpu_speedup = idle_full["cpu_p50_ms"] / idle_fast["cpu_p50_ms"] if idle_fast["cpu_p50_ms"] else None
+        changed_wall_speedup = legacy_wall / combined_wall if combined_wall else None
+        changed_cpu_speedup = legacy_cpu / combined_cpu if combined_cpu else None
         return {
             "schema": SCHEMA,
             "event_count": count,
@@ -126,11 +134,15 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             "operations": operations,
             "unchanged_hint_wall_speedup_p50": None if wall_speedup is None else round(wall_speedup, 2),
             "unchanged_hint_cpu_speedup_p50": None if cpu_speedup is None else round(cpu_speedup, 2),
+            "changed_refresh_wall_speedup_p50": None if changed_wall_speedup is None else round(changed_wall_speedup, 2),
+            "changed_refresh_cpu_speedup_p50": None if changed_cpu_speedup is None else round(changed_cpu_speedup, 2),
             "estimated_idle_poll_wall_ms_p50": idle_fast["wall_p50_ms"],
             "estimated_idle_poll_cpu_ms_p50": idle_fast["cpu_p50_ms"],
-            "estimated_changed_poll_wall_ms_p50": round(sum(operations[name]["wall_p50_ms"] for name in changed_names), 3),
-            "estimated_changed_poll_cpu_ms_p50": round(sum(operations[name]["cpu_p50_ms"] for name in changed_names), 3),
-            "note": "changed poll total mirrors UI request sequence; telemetry is measured separately but not polled by the workbench",
+            "legacy_changed_poll_wall_ms_p50": round(legacy_wall, 3),
+            "legacy_changed_poll_cpu_ms_p50": round(legacy_cpu, 3),
+            "estimated_changed_poll_wall_ms_p50": round(combined_wall, 3),
+            "estimated_changed_poll_cpu_ms_p50": round(combined_cpu, 3),
+            "note": "combined live_update replaces the UI's legacy event_delta + snapshot sequence; artifact listing remains a separate changed-state refresh",
         }
 
 
