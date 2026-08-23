@@ -3,6 +3,7 @@ import {
   API,
   Artifact,
   ArtifactPreview,
+  EventCursor,
   EventRecord,
   Session,
   Snapshot,
@@ -67,7 +68,7 @@ export default function App() {
   const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [replaySeq, setReplaySeq] = useState<number | null>(null);
-  const eventCursor = useRef(0);
+  const eventCursor = useRef<EventCursor | null>(null);
   const terminalCursor = useRef(0);
   const replaySeqRef = useRef<number | null>(null);
   const replayRequest = useRef(0);
@@ -81,14 +82,14 @@ export default function App() {
     const initial = async () => {
       try {
         const [snapshot, delta, currentSession, listing, stats, log] = await Promise.all([
-          getSnapshot(), getEvents(0, 1000), getSession(), getArtifacts(), getTelemetry(), getTerminal(0)
+          getSnapshot(), getEvents(null, 1000), getSession(), getArtifacts(), getTelemetry(), getTerminal(0)
         ]);
         if (!mounted) return;
         setLiveSnapshot(snapshot);
         setDisplaySnapshot(snapshot);
         setEvents(delta.events);
         setSelectedEvent(delta.events.at(-1) ?? null);
-        eventCursor.current = delta.cursor.seq;
+        eventCursor.current = delta.cursor;
         setSession(currentSession);
         setArtifacts(listing.artifacts);
         setTelemetry(stats);
@@ -112,13 +113,22 @@ export default function App() {
         ]);
         if (!mounted) return;
         let stateChanged = false;
-        if (delta.events.length) {
+        eventCursor.current = delta.cursor;
+        if (delta.reset) {
+          setEvents(delta.events.slice(-3000));
+          setSelectedEvent(delta.events.at(-1) ?? null);
+          setSelectedArtifact(null);
+          replaySeqRef.current = null;
+          setReplaySeq(null);
+          setTerminal("");
+          terminalCursor.current = 0;
+          stateChanged = true;
+        } else if (delta.events.length) {
           setEvents((current) => [...current, ...delta.events].slice(-3000));
           setSelectedEvent((current) => current ?? delta.events.at(-1) ?? null);
-          eventCursor.current = delta.cursor.seq;
           stateChanged = true;
         }
-        if (log.text) {
+        if (!delta.reset && log.text) {
           setTerminal((current) => (current + log.text).slice(-300000));
           terminalCursor.current = log.cursor;
         }
