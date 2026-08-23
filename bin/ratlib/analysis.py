@@ -150,6 +150,83 @@ def profile(a):
         except Exception: pass
     doc["provenance"]["cache"]={"key":keys["profile"] if keys else None,"hit":cache_state=="hit","source_invocation":src_inv if cache_state=="hit" else None}
     return emit(doc,a)
+DATA_SLICE_INPUT_APIS={"read","fgets","gets","scanf","__isoc99_scanf","recv","getchar","fgetc"}
+def _data_slice_locate_function(cfg,project,target):
+    for func in cfg.kb.functions.values():
+        for ba in func.block_addrs_set:
+            try: size=project.factory.block(ba).size
+            except Exception: continue
+            if ba<=target<ba+size: return func
+    return None
+def _data_slice_scan_registers(project,func,target,max_blocks=16):
+    """Bounded, best-effort register/stack-local/memory-load scan over this
+    function's blocks at or before the target address (VEX pretty-print
+    regex, not a real def-use graph -- a summary, not a proof)."""
+    stack_reg_names={"rsp","rbp","esp","ebp","sp","bp"}
+    def reg_name(offset):
+        try: return project.arch.register_names.get(int(offset))
+        except Exception: return None
+    registers=set(); stack_local=False; loads=0; stack_loads=0
+    blocks=sorted(b for b in func.block_addrs_set if b<=target)[-max_blocks:]
+    for ba in blocks:
+        try: irsb=project.factory.block(ba).vex
+        except Exception: continue
+        for stmt in irsb.statements:
+            text=str(stmt)
+            for off in re.findall(r"GET:\w+\(offset=(\d+)\)",text):
+                name=reg_name(off)
+                if name: registers.add(name)
+            offsets_here=re.findall(r"(?:GET:\w+|PUT)\(offset=(\d+)\)",text)
+            if any(reg_name(o) in stack_reg_names for o in offsets_here): stack_local=True
+            if re.search(r"\bLD[bl]e:",text):
+                loads+=1
+                if any(reg_name(o) in stack_reg_names for o in offsets_here): stack_loads+=1
+    return sorted(registers),stack_local,loads,(loads-stack_loads)
+def _parse_addr(value):
+    try: return int(value,0)
+    except (TypeError,ValueError): return None
+def _data_slice(a,r,started,profile):
+    target=_parse_addr(a.backward_addr)
+    if target is None:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data"},status="error",code=EXIT_INPUT,diagnostics=["--backward requires an address"],started=started),a)
+    try:
+        import angr
+        project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
+        func=_data_slice_locate_function(cfg,project,target)
+        if func is None:
+            return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data","coverage":"incomplete"},status="partial",diagnostics=["target address not found in any recovered function"],started=started),a)
+        registers,stack_local,loads,unresolved_aliases=_data_slice_scan_registers(project,func,target)
+        callgraph=cfg.kb.functions.callgraph
+        def callee_names(addr):
+            return sorted({cfg.kb.functions[n].name for n in callgraph.successors(addr) if n in cfg.kb.functions}) if addr in callgraph else []
+        direct_calls=callee_names(func.addr)
+        input_calls=sorted(set(direct_calls)&DATA_SLICE_INPUT_APIS)
+        depth_budget=max(0,min(int(a.depth or 0),2))
+        callers_by_depth={}
+        frontier={func.addr}; seen={func.addr}
+        for d in range(1,depth_budget+1):
+            nxt=set()
+            for addr in frontier:
+                if addr in callgraph:
+                    nxt |= {p for p in callgraph.predecessors(addr) if p in cfg.kb.functions and p not in seen}
+            if not nxt: break
+            callers_by_depth[d]=sorted(cfg.kb.functions[n].name for n in nxt)
+            seen |= nxt; frontier=nxt
+        unresolved_indirect=1 if getattr(func,"has_unresolved_calls",False) else 0
+        payload={
+            "analysis_kind":"data","source":a.source,
+            "target":{"address":"%#x"%target,"function":func.name},
+            "within_function":{"registers_read":registers,"stack_locals_referenced":stack_local,
+                                 "direct_calls":direct_calls,"input_api_calls":input_calls},
+            "interproc":{"depth":depth_budget,"callers_by_depth":callers_by_depth},
+            "claim":"dependency-candidate",
+            "unresolved_aliases":unresolved_aliases,"unresolved_indirect_calls":unresolved_indirect,
+        }
+        diagnostics=["backward data slice is a bounded VEX-text summary, not a proven def-use graph",
+                     "heap/global aliasing and indirect calls are not resolved; see unresolved_* counts"]
+        return emit(envelope("rat-slice",a.binary,a,payload,status="ok",diagnostics=diagnostics,started=started),a)
+    except Exception as exc:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data","coverage":"incomplete"},status="partial",diagnostics=["angr analysis incomplete: %s"%type(exc).__name__],started=started),a)
 def slice_(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
@@ -157,7 +234,11 @@ def slice_(a):
     try:
         import angr
     except ImportError:
-        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path","coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":getattr(a,"mode","call-path"),"coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
+    if getattr(a,"mode","call-path")=="data":
+        return _data_slice(a,r,started,profile)
+    if not a.from_loc:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"call-path"},status="error",code=EXIT_INPUT,diagnostics=["--from is required in call-path mode"],started=started),a)
     try:
         project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
         funcs=list(cfg.kb.functions.values())
@@ -379,7 +460,7 @@ def parser():
 def main(which, argv=None):
     p=parser()
     if which=="rat-profile": p.add_argument("--libc"); p.add_argument("--loader"); fn=profile
-    elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc",required=True); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); fn=slice_
+    elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc"); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); p.add_argument("--mode",choices=["call-path","data"],default="call-path"); p.add_argument("--backward",dest="backward_addr"); p.add_argument("--source",default=None); fn=slice_
     elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); fn=dyn
     elif which=="rat-verify": p.add_argument("--profile",required=True); p.add_argument("--trace",required=True); p.add_argument("--scenario",required=True); p.add_argument("--claim"); p.add_argument("--primitive"); p.add_argument("--exploit-task"); p.add_argument("--oracle"); p.add_argument("--runs",type=int,default=3); fn=verify
     elif which=="rat-fuzz": p.add_argument("--harness"); p.add_argument("--budget",type=float,default=.2); p.add_argument("--corpus"); p.add_argument("--engine",default="builtin"); fn=fuzz

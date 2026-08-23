@@ -50,6 +50,16 @@ INTERESTING_STR = re.compile(
     re.I,
 )
 FLAG_STR = re.compile(r"flag|\bctf\b|\}$|\{.*\}", re.I)
+# M3-1: oracle success/failure classification (DESIGN_v2 S14.1) — reuses the
+# same extracted strings/xrefs, no new analysis.
+ORACLE_SUCCESS_STR = re.compile(
+    r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|valid\b",
+    re.I,
+)
+ORACLE_FAILURE_STR = re.compile(
+    r"incorrect|wrong|denied|reject(?:ed)?|invalid|fail(?:ed|ure)?|try\s*again",
+    re.I,
+)
 CMP_FUNCS = {
     "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "strstr",
     "strcoll", "bcmp", "wcscmp", "wcsncmp",
@@ -489,6 +499,47 @@ def compute_interesting(rev):
     return out
 
 
+# ─────────────────────────── 분석: oracle→symsolve 자동연결 ───────────────────────────
+def _oracle_candidates(rev, pattern, kind):
+    out = []
+    for s in rev.get("strings", []):
+        if pattern.search(s.get("val", "")):
+            out.append({"kind": kind, "string": s.get("val", ""), "string_addr": s.get("addr", 0),
+                        "xrefs": list(s.get("xrefs", []))})
+    return out
+
+
+def compute_oracle(rev):
+    """success/failure 문자열의 xref BB를 symsolve 좌표로 wiring (§14.1).
+
+    단일·명확(문자열 후보 1개 + xref 1개)일 때만 auto_connect=True 로
+    resolve 를 채운다. 다수면 ambiguous=True 로 후보만 나열하고 자동
+    커맨드는 만들지 않는다 — symbolic candidate 는 증거가 아니므로 실행은
+    항상 사람/에이전트가 명시적으로 한다.
+    """
+    success = _oracle_candidates(rev, ORACLE_SUCCESS_STR, "success")
+    failure = _oracle_candidates(rev, ORACLE_FAILURE_STR, "failure")
+
+    def resolve(cands):
+        if len(cands) != 1:
+            return None, ("ambiguous" if len(cands) > 1 else "none")
+        xrefs = cands[0]["xrefs"]
+        if len(xrefs) != 1:
+            return None, ("ambiguous" if len(xrefs) > 1 else "none")
+        return {"kind": cands[0]["kind"], "string": cands[0]["string"],
+                "func": xrefs[0]["func"], "addr": xrefs[0]["addr"]}, "resolved"
+
+    succ_hit, succ_reason = resolve(success)
+    fail_hit, fail_reason = resolve(failure)
+    ambiguous = "ambiguous" in (succ_reason, fail_reason)
+    auto_connect = succ_hit is not None and fail_hit is not None and not ambiguous
+    return {
+        "success_candidates": success, "failure_candidates": failure,
+        "resolved": {"success": succ_hit, "failure": fail_hit} if auto_connect else None,
+        "ambiguous": ambiguous, "auto_connect": auto_connect,
+    }
+
+
 def _q(s):
     s = s if len(s) <= 40 else s[:37] + "..."
     return '"%s"' % s.replace("\n", "\\n")
@@ -546,6 +597,21 @@ def render_summary(rev):
         for s in isr[:12]:
             xf = ",".join(sorted({x["func"] for x in s.get("xrefs", [])})) or "-"
             L.append("  %-42s  ← %s" % (_q(s["val"]), xf))
+
+    # oracle→symsolve 자동연결
+    oracle = compute_oracle(rev)
+    L.append("-" * 64)
+    if oracle["auto_connect"]:
+        succ, fail = oracle["resolved"]["success"], oracle["resolved"]["failure"]
+        L.append("ORACLE  success@%#x (%s: %s)  ·  fail@%#x (%s: %s)"
+                  % (succ["addr"], succ["func"], _q(succ["string"]), fail["addr"], fail["func"], _q(fail["string"])))
+        L.append("SUGGEST symsolve.py %s --find %#x --avoid %#x --stdin <n> --printable"
+                  % (rev.get("bin", "?"), succ["addr"], fail["addr"]))
+    elif oracle["ambiguous"]:
+        L.append("ORACLE  ambiguous — success 후보 %d개, failure 후보 %d개 (자동연결 안 함, 수동 --xrefs 확인)"
+                  % (len(oracle["success_candidates"]), len(oracle["failure_candidates"])))
+    else:
+        L.append("ORACLE  (success/failure 문자열 신호 없음 — VM/커스텀 인코딩 가능성)")
 
     L.append("-" * 64)
     top = _sorted_funcs(rev["functions"], "size")[:1]
@@ -628,6 +694,73 @@ def render_func(rev, target):
     L.append("strings: " + ("; ".join(_q(s) for s in f.get("strings", [])) or "-"))
     L.append("→ 본문: decomp <bin> %s" % f["name"])
     return "\n".join(L)
+
+
+# ─────────────────────────── M3-2: Function Card v2 (rat.function-card/v2) ───────────────────────────
+FUNCTION_CARD_SCHEMA = "rat.function-card/v2"
+INTERESTING_DETECTOR_VERSION = "interesting-score/v1"
+_CAP = 30
+
+
+def _capped(items):
+    items = list(items)
+    return items[:_CAP], len(items) > _CAP
+
+
+def compute_function_card(rev, target):
+    """--func/--interesting/--xrefs 를 한 함수 스코프로 합친 stable JSON.
+
+    facts 는 revmap 에서 그대로 뽑은 결정론적 사실만(새 분석 없음).
+    heuristics 는 점수/근거만(단정 아님). unresolved 는 이 함수 스코프에서
+    확인할 수 없는 것을 숨기지 않고 명시한다.
+    """
+    f = _find_func(rev, target)
+    if not f:
+        return None
+    name = f["name"]
+    callers, callers_truncated = _capped(sorted({c["name"] for c in rev.get("functions", []) if name in c.get("calls", [])}))
+    callees, callees_truncated = _capped(f.get("calls", []))
+    strings, strings_truncated = _capped(f.get("strings", []))
+    input_apis = sorted(set(f.get("calls", [])) & INPUT_FUNCS)
+    # 호출부(콜사이트) 개별 주소는 revq 의 함수-단위 calls 리스트 granularity 에선 알 수 없다 —
+    # 있는 그대로: api 이름만 사실로 남기고 address/length 는 unresolved 에 명시.
+    compare_sites = [{"address": None, "api": api, "length": None} for api in sorted(set(f.get("calls", [])) & CMP_FUNCS)]
+    func_strings = set(f.get("strings", []))
+    oracle = compute_oracle(rev)
+    oracle_candidates = []
+    for kind, cands in (("success", oracle["success_candidates"]), ("failure", oracle["failure_candidates"])):
+        for c in cands:
+            if c["string"] not in func_strings:
+                continue
+            for xr in c["xrefs"]:
+                if xr["func"] == name:
+                    oracle_candidates.append({"kind": kind, "xref": xr["addr"], "string": c["string"]})
+    interesting_hit = next((it for it in compute_interesting(rev) if it["func"] == name), None)
+    unresolved = []
+    if compare_sites:
+        unresolved.append({"kind": "compare_site_address", "detail": "call-site address/length not tracked at function-call-list granularity; use --xrefs or decomp for site-level detail"})
+    if rev.get("engine") != "angr":
+        unresolved.append({"kind": "engine_limited", "detail": "binutils engine: calls/xrefs may be incomplete"})
+    if callers_truncated or callees_truncated or strings_truncated:
+        unresolved.append({"kind": "truncated", "detail": "callers/callees/strings capped at %d" % _CAP})
+    return {
+        "schema": FUNCTION_CARD_SCHEMA,
+        "function": {"name": name, "addr": f.get("addr", 0), "size": f.get("size", 0),
+                     "nblocks": f.get("nblocks", 0), "ninstr": f.get("ninstr", 0)},
+        "facts": {
+            "callers": callers, "callees": callees, "strings": strings,
+            "input_apis": input_apis, "compare_sites": compare_sites,
+            "oracle_candidates": oracle_candidates,
+        },
+        "heuristics": {
+            "check_routine_score": interesting_hit["score"] if interesting_hit else 0,
+            "reasons": interesting_hit["why"] if interesting_hit else [],
+            "detector_version": INTERESTING_DETECTOR_VERSION,
+        },
+        "unresolved": unresolved,
+        "next": "decomp %s %s" % (rev.get("bin", "?"), name),
+        "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"), "engine": rev.get("engine")},
+    }
 
 
 def _find_func(rev, target):
@@ -725,6 +858,7 @@ def build_parser():
     g.add_argument("--strings", action="store_true", help="문자열 + 참조함수")
     g.add_argument("--imports", action="store_true", help="import 분류")
     g.add_argument("--interesting", action="store_true", help="check-루틴 후보만")
+    g.add_argument("--oracle", action="store_true", help="success/failure 문자열→symsolve 좌표 자동연결(JSON)")
     g.add_argument("--func", metavar="NAME", help="한 함수 컨텍스트 카드")
     g.add_argument("--xrefs", metavar="TARGET", help="심볼/문자열 참조처")
     g.add_argument("--json", action="store_true", help="revmap 원본")
@@ -766,8 +900,14 @@ def main(argv):
             print("[%d] %s @%#x (size %d)" % (it["score"], it["func"], it["addr"], it["size"]))
             for w in it["why"]:
                 print("     - " + w)
+    elif args.oracle:
+        print(json.dumps(compute_oracle(rev), ensure_ascii=False, separators=(",", ":")))
     elif args.func:
-        print(render_func(rev, args.func))
+        card = compute_function_card(rev, args.func)
+        if card is None:
+            print("[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % args.func)
+            return 1
+        print(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
     elif args.xrefs:
         print(render_xrefs(rev, args.xrefs))
     else:
@@ -835,6 +975,28 @@ def selftest():
     chk(top.get("score", 0) >= 5, "check 점수 >= 5 (판별문자열+비교함수)")
     chk(all(i["func"] != "helper_noise" for i in inter), "noise 함수 제외")
 
+    # M3-2: Function Card v2
+    check_card = compute_function_card(rev, "check")
+    chk(check_card["schema"] == "rat.function-card/v2", "function-card: schema")
+    chk(set(check_card) == {"schema", "function", "facts", "heuristics", "unresolved", "next", "provenance"},
+        "function-card: top-level facts/heuristics/unresolved 분리")
+    chk(check_card["facts"]["callers"] == ["main"] and check_card["facts"]["callees"] == ["memcmp", "strlen"],
+        "function-card: callers/callees 사실")
+    chk({c["kind"] for c in check_card["facts"]["oracle_candidates"]} == {"success", "failure"} and
+        all(c["xref"] in (0x11a0, 0x11b0) for c in check_card["facts"]["oracle_candidates"]),
+        "function-card: oracle_candidates 이 함수 스코프로 정확")
+    chk(check_card["facts"]["compare_sites"] == [{"address": None, "api": "memcmp", "length": None}],
+        "function-card: compare_sites 는 사실(api)만, 없는 정보(address)는 조작 안 함")
+    chk(any(u["kind"] == "compare_site_address" for u in check_card["unresolved"]),
+        "function-card: 콜사이트 주소 미해결을 unresolved 에 명시(숨기지 않음)")
+    chk(check_card["heuristics"]["check_routine_score"] == top.get("score", 0) and check_card["heuristics"]["reasons"],
+        "function-card: heuristics 는 점수+근거(단정 아님)")
+    main_card = compute_function_card(rev, "main")
+    chk(main_card["facts"]["oracle_candidates"] == [] and main_card["facts"]["compare_sites"] == [],
+        "function-card: false-positive 회피 — main 은 check 의 oracle/compare 사실을 물려받지 않음")
+    chk(len(json.dumps(check_card, ensure_ascii=False)) // 4 < 1500, "function-card: <1.5K 토큰 추정치")
+    chk(compute_function_card(rev, "does-not-exist") is None, "function-card: 없는 함수는 None")
+
     # 문자열 유틸
     chk(list(_iter_cstrings(b"ab\x00hello\x00\x01\x02worldd", 4)) ==
         [(3, "hello"), (11, "worldd")], "_iter_cstrings offset/필터")
@@ -871,6 +1033,25 @@ def selftest():
     chk(_detect_platform("chall: ELF 64-bit LSB pie executable, x86-64") == "elf", "platform: ELF 감지")
     chk("PE/Windows" in render_summary({**_fixture(), "platform": "pe"}), "render_summary: PE 배너")
     chk("PLATFORM" not in render_summary({**_fixture(), "platform": "elf"}), "render_summary: ELF 은 배너 없음")
+
+    # M3-1: oracle→symsolve 자동연결
+    oracle = compute_oracle(rev)
+    chk(oracle["auto_connect"] is True, "oracle: 단일·명확 success/fail → auto_connect")
+    chk(oracle["resolved"]["success"]["addr"] == 0x11a0 and oracle["resolved"]["failure"]["addr"] == 0x11b0,
+        "oracle: xref BB 주소 정확 (angr 로드베이스와 일치, symsolve 그대로 투입 가능)")
+    s = render_summary(rev)
+    chk("ORACLE  success@0x11a0" in s and "fail@0x11b0" in s, "render_summary: ORACLE 라인")
+    chk("SUGGEST symsolve.py" in s and "--find 0x11a0" in s and "--avoid 0x11b0" in s,
+        "render_summary: 복붙 가능한 symsolve SUGGEST 커맨드")
+    ambiguous_rev = {**_fixture(), "strings": rev["strings"] + [
+        {"addr": 0x2080, "val": "Access granted, welcome", "sec": ".rodata",
+         "xrefs": [{"func": "check2", "addr": 0x1400}]},
+    ]}
+    amb = compute_oracle(ambiguous_rev)
+    chk(amb["ambiguous"] is True and amb["auto_connect"] is False,
+        "oracle: success 후보 2개 → ambiguous, 자동연결 안 함")
+    chk("ORACLE  ambiguous" in render_summary(ambiguous_rev) and "SUGGEST" not in render_summary(ambiguous_rev),
+        "render_summary: ambiguous 시 SUGGEST 커맨드 미생성")
 
     print("-" * 40)
     if fails:

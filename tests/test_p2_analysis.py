@@ -73,4 +73,44 @@ class P2Analysis(unittest.TestCase):
   slow=self.work/"slow.json"; slow.write_text(json.dumps({"schema":"rat.scenario/v1","stdin":"SLEEP\n"}))
   p,dyn=self.tool("rat-dyn","--profile",pd,"--scenario",str(slow),"--timeout","0.05",ok=False); self.assertEqual(p.returncode,124)
   self.assertEqual(dyn["status"],"timeout")
+ def _symbol_addr(self,name):
+  out=subprocess.run(["nm",str(self.exe)],text=True,capture_output=True,check=True).stdout
+  for line in out.splitlines():
+   parts=line.split()
+   if len(parts)==3 and parts[2]==name: return "0x"+parts[0]
+  return None
+ def test_data_slice_finds_input_api_and_reports_dependency_candidate(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  main_addr=self._symbol_addr("main")
+  if main_addr is None: self.skipTest("nm could not resolve main's address")
+  _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward",main_addr,"--source","stdin","--depth","2")
+  self.assertEqual(x["summary"]["analysis_kind"],"data"); self.assertEqual(x["summary"]["claim"],"dependency-candidate")
+  self.assertIn(x["status"],("ok","partial"))
+  if x["status"]=="ok":
+   self.assertIn("fgets",x["summary"]["within_function"]["input_api_calls"])
+   self.assertLessEqual(x["summary"]["interproc"]["depth"],2)
+ def test_data_slice_depth_budget_never_exceeds_two(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  main_addr=self._symbol_addr("main")
+  if main_addr is None: self.skipTest("nm could not resolve main's address")
+  _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward",main_addr,"--source","stdin","--depth","50")
+  if x["status"]=="ok":
+   self.assertLessEqual(x["summary"]["interproc"]["depth"],2)
+   self.assertTrue(set(x["summary"]["interproc"]["callers_by_depth"]).issubset({"1","2"}))
+ def test_data_slice_never_promotes_to_proof_when_unresolved(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  main_addr=self._symbol_addr("main")
+  if main_addr is None: self.skipTest("nm could not resolve main's address")
+  _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward",main_addr,"--source","stdin")
+  if x["status"]=="ok":
+   self.assertEqual(x["summary"]["claim"],"dependency-candidate")
+   self.assertIn("unresolved_aliases",x["summary"]); self.assertIn("unresolved_indirect_calls",x["summary"])
+ def test_data_slice_missing_address_is_input_error(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  p,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward","not-an-address","--source","stdin",ok=False)
+  self.assertEqual(p.returncode,4); self.assertEqual(x["status"],"error")
+ def test_data_slice_unresolved_target_address_is_partial(self):
+  _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
+  _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward","0xdeadbeef","--source","stdin")
+  self.assertEqual(x["status"],"partial")
 if __name__=="__main__": unittest.main()
