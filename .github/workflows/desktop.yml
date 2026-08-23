@@ -64,7 +64,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: ctf-rat-desktop-linux-${{ github.sha }}
+          name: ctf-rat-desktop-linux-${{ github.event.pull_request.head.sha }}
           path: |
             desktop/src-tauri/target/release/bundle/deb/*.deb
             desktop/src-tauri/target/release/bundle/appimage/*.AppImage
