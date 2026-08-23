@@ -26,7 +26,13 @@ P2_LIMITATIONS={
 def iso(): return datetime.now(timezone.utc).isoformat()
 # Artifacts belong to the active challenge/CWD unless the caller explicitly
 # selects a store.  Never attempt to create ``<system-binary-dir>/.rat``.
-def root(a, binary=None): return os.path.abspath(a.store or os.path.join(os.getcwd(), ".rat"))
+def root(a, binary=None):
+    # M2 rework: the canonical index + artifact store resolve through the one
+    # shared resolver so rat-profile lands in the same sqlite as revq/decomp.
+    # --store stays honored as an explicit override (back-compat); the default
+    # (no --store) converges to dirname(binary)/.rat like the other two tools.
+    from .cache import resolve_index_root
+    return resolve_index_root(binary or getattr(a, "binary", None), override=getattr(a, "store", None))
 def fdigest(p):
  h=hashlib.sha256()
  with open(p,"rb") as f:
@@ -102,18 +108,18 @@ def _profile_cache_lookup(r, bdig):
         from .cache import Cache
         idx=Cache(r); keys=_profile_cache_keys(bdig)
         pe,se=idx.get_entry(keys["profile"]),idx.get_entry(keys["string-index"])
-        if not (pe and se): return idx,keys,None,None
+        if not (pe and se): return idx,keys,None,None,None
         profile_doc=json.loads(get(pe["path"],root=r))
-        if profile_doc.get("binary_digest")!=bdig: return idx,keys,None,None
+        if profile_doc.get("binary_digest")!=bdig: return idx,keys,None,None,None
         profile_art={k:metadata(pe["path"],root=r)[k] for k in ("kind","digest","media_type","size","logical_name")}
         strings_art={k:metadata(se["path"],root=r)[k] for k in ("kind","digest","media_type","size","logical_name")}
-        return idx,keys,profile_doc,(profile_art,strings_art)
+        return idx,keys,profile_doc,(profile_art,strings_art),pe.get("source_invocation")
     except Exception:
-        return None,None,None,None
+        return None,None,None,None,None
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
     r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary)
-    idx,keys,cached_doc,cached_arts=_profile_cache_lookup(r,bdig)
+    idx,keys,cached_doc,cached_arts,src_inv=_profile_cache_lookup(r,bdig)
     if cached_doc and cached_arts:
         cache_state="hit"; facts,signals,routes=cached_doc["facts"],cached_doc["signals"],cached_doc["routes"]
         arts=list(cached_arts)
@@ -131,16 +137,18 @@ def profile(a):
             if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
         if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
         arts=[artifact({"binary_digest":bdig,"environment":profile_environment(a),"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
-        if idx and keys:
-            try:
-                idx.put_entry(keys["profile"],backend="profile_artifact",path=arts[0]["digest"])
-                idx.put_entry(keys["string-index"],backend="profile_artifact",path=arts[1]["digest"])
-            except Exception: pass
     is_elf=next((f["value"] for f in facts if f["kind"]=="format"),"").startswith("ELF ")
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
     doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state
-    doc["provenance"]["cache"]={"key":keys["profile"] if keys else None,"hit":cache_state=="hit","source_invocation":None}
+    # Register on miss AFTER the envelope exists so this run's invocation_id is
+    # recorded as the source of any later hit (DESIGN_v2 §9.3).
+    if cache_state=="miss" and idx and keys:
+        try:
+            idx.put_entry(keys["profile"],backend="profile_artifact",path=arts[0]["digest"],source_invocation=doc["invocation_id"])
+            idx.put_entry(keys["string-index"],backend="profile_artifact",path=arts[1]["digest"],source_invocation=doc["invocation_id"])
+        except Exception: pass
+    doc["provenance"]["cache"]={"key":keys["profile"] if keys else None,"hit":cache_state=="hit","source_invocation":src_inv if cache_state=="hit" else None}
     return emit(doc,a)
 def slice_(a):
     r=root(a,a.binary); started=iso()

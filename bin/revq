@@ -668,8 +668,8 @@ def _canonical_index(binpath, want_engine, cur_sha):
     (rat-metrics, a future `rat` dispatcher) through one shared index.
     """
     try:
-        from ratlib.cache import Cache, canonical_key
-        idx_root = os.path.join(os.path.dirname(os.path.abspath(binpath)) or ".", ".rat")
+        from ratlib.cache import Cache, canonical_key, resolve_index_root
+        idx_root = resolve_index_root(binpath)
         ck = canonical_key(binary_sha256="sha256:" + cur_sha, tool_name="revq", tool_version=str(SCHEMA),
                             params={"engine": want_engine}, dep_versions={})
         return Cache(idx_root), ck

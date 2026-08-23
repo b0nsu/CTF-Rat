@@ -13,17 +13,19 @@ from datetime import datetime, timezone
 SCHEMA = "rat.decomp-cache/v1"
 
 
-def _register_index(cache: str, prov: dict) -> None:
+def _register_index(cache: str, prov: dict, binary: str) -> None:
     """M2-3: best-effort registration in the shared canonical cache index.
 
     The existing provenance key (`cache_key(prov)`) stays the source of
     truth for hit/stale/partial here; this only makes that decision
-    observable through the same index revq/rat-profile use.
+    observable through the same index revq/rat-profile use. Anchoring the
+    root off the binary (via the shared resolver) is what makes "one index"
+    actually hold across all three tools.
     """
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-        from ratlib.cache import Cache
-        idx_root = os.path.join(os.path.dirname(os.path.abspath(cache)) or ".", ".rat")
+        from ratlib.cache import Cache, resolve_index_root
+        idx_root = resolve_index_root(binary)
         Cache(idx_root).put_entry("sha256:" + cache_key(prov), backend="decomp_dir", path=cache)
     except Exception:
         pass
@@ -84,7 +86,7 @@ def validate(cache: str, binary: str, ghidra_home: str, script_dir: str) -> tupl
         return False, "stale"
     if meta.get("status") != "complete" or not os.path.isfile(os.path.join(cache, "_index.txt")):
         return False, "partial"
-    _register_index(cache, prov)
+    _register_index(cache, prov, binary)
     return True, "hit"
 
 
@@ -119,7 +121,7 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     if payload["status"] == "complete":
-        _register_index(cache, prov)
+        _register_index(cache, prov, binary)
 
 
 def main(argv=None) -> int:
