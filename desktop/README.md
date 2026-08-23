@@ -11,13 +11,17 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - materialized current/historical STATE view
 - replay slider: inspect what the solver knew at event `#N`
 - serialized polling and latest-request-wins replay updates
+- opaque generation-token fast path for unchanged STATE polling
+- automatic workbench reset when the canonical STATE stream ID changes
+- single-parse live snapshot projection; historical replay keeps the conservative canonical path
 - bounded PTY session manager with process-group shutdown
 - Start/Stop controls for one daemon-configured solver command
 - live terminal output + bounded terminal input
 - session-safe terminal cursors across solver and `ratd` restarts
+- failed solver spawn preserves the previous terminal log/cursor generation
 - artifact browser backed by the existing content-addressed store
 - text/JSON artifact preview and bounded base64 preview for binary artifacts
-- event telemetry and session status
+- event telemetry API without duplicate telemetry polling in the UI
 - loopback-only HTTP API with restricted browser origins
 - POST controls require `X-CTF-Rat-Desktop: 1`
 - locked npm/Cargo dependency resolution
@@ -132,6 +136,10 @@ GET /api/artifacts?limit=<n>
 GET /api/artifacts/<sha256:digest>?max_bytes=<n>
 ```
 
+`/api/events` returns an event cursor containing `stream_id`, `seq`, and, after a stable validated read, an opaque `source_generation` string. The workbench echoes that generation as `known_generation` on its next poll. If the append-only STATE file is unchanged, `ratd` can answer without reparsing JSONL. Any generation mismatch falls back to canonical `Stream.read()` validation. Clients must treat the generation as opaque; it intentionally encodes filesystem timing data as a string because nanosecond timestamps exceed JavaScript's safe integer range.
+
+If the canonical STATE `stream_id` changes, `/api/events` returns `reset: true` and restarts the sequence cursor from zero. The workbench then resets timeline/replay/terminal presentation and reloads the current snapshot/artifacts rather than mixing two runs.
+
 The terminal `cursor` is an opaque, monotonically increasing value returned by the previous `/api/terminal` response. Clients must pass that returned value back as `after`; it is not a raw byte offset. Cursor generation is persisted in the existing `.rat/desktop/session.json`, so a cursor from an older solver session or a restarted `ratd` safely maps to the beginning of the current truncated terminal log rather than skipping its prefix.
 
 Bounded controls:
@@ -151,6 +159,26 @@ Content-Type: application/json
 
 The daemon only accepts loopback bind addresses and only permits the development/Tauri origins declared in `bin/ratd`.
 
+## Polling benchmark
+
+The repository contains a deterministic, non-gating microbenchmark for the read-only Desktop projections:
+
+```bash
+python3 tests/bench_desktop_polling.py --events 100,1000,5000 --iterations 7
+```
+
+It writes a valid synthetic STATE v2 JSONL fixture directly, warms the filesystem cache, and records wall-clock and process-CPU p50/p95/max. CI runs a shorter three-iteration sample and uploads the JSONL result as `ctf-rat-desktop-poll-benchmark-<sha>`. These numbers are evidence for ablation comparisons, not fixed performance thresholds; absolute values vary with runner load.
+
+GitHub Actions run `32657156715` on source commit `4fb12d406f800c4ae9e11efedc97399d582c44b3` measured:
+
+| STATE events | idle full scan p50 | unchanged fast path p50 | fast-path ratio | live snapshot p50 | UI changed-refresh estimate p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.572 ms | 0.016 ms | 35.75x | 0.640 ms | 1.214 ms |
+| 1,000 | 9.872 ms | 0.023 ms | 429.22x | 5.898 ms | 15.659 ms |
+| 5,000 | 28.762 ms | 0.013 ms | 2,212.46x | 29.862 ms | 57.606 ms |
+
+The live snapshot path uses the canonical `Stream.view()` materializer once, then derives only cursor/count from the same stable validated JSONL generation. It does not introduce a second STATE model. Historical replay remains on the conservative full canonical path because it is interactive rather than part of the 500 ms live polling loop. The workbench also no longer requests `/api/telemetry` on every state change because `Snapshot.total_event_count` already supplies the only telemetry value displayed by the UI; the telemetry endpoint remains available for external inspection.
+
 ## Test
 
 Desktop backend and end-to-end tests:
@@ -163,7 +191,7 @@ python3 -m unittest \
   tests.test_desktop_e2e
 ```
 
-The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store. Session tests additionally verify rapid solver restart and stale terminal cursor recovery across a reconstructed `SessionManager`, modeling a `ratd` restart.
+The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store. Session tests additionally verify rapid solver restart, failed-spawn preservation, and stale terminal cursor recovery across a reconstructed `SessionManager`, modeling a `ratd` restart. API/HTTP tests verify stream-reset behavior, opaque generation round-tripping, and that unchanged generation polling does not call `Stream.read()`.
 
 All repository Python tests still include these through normal discovery:
 
@@ -200,11 +228,12 @@ The desktop CI also verifies that `package-lock.json` and `Cargo.lock` remain un
 The desktop branch CI verifies:
 
 1. desktop API/session/HTTP/E2E tests,
-2. Python syntax checks for daemon modules,
-3. `npm ci` against the committed lockfile,
-4. TypeScript/Vite production build,
-5. `cargo check --locked`,
-6. `.deb` and AppImage bundle generation on PR validation runs,
-7. Debian metadata and AppImage internal executable validation,
-8. unchanged npm/Cargo lockfiles after the build,
-9. upload of both installer artifacts.
+2. Python syntax checks for daemon modules and the polling benchmark,
+3. reproducible polling benchmark artifact generation,
+4. `npm ci` against the committed lockfile,
+5. TypeScript/Vite production build,
+6. `cargo check --locked`,
+7. `.deb` and AppImage bundle generation on PR validation runs,
+8. Debian metadata and AppImage internal executable validation,
+9. unchanged npm/Cargo lockfiles after the build,
+10. upload of both installer artifacts.
