@@ -82,9 +82,11 @@ export type Artifact = {
 
 export type ArtifactListing = {
   schema: string;
+  generation: string;
+  unchanged: boolean;
   artifacts: Artifact[];
-  total: number;
-  has_more: boolean;
+  total: number | null;
+  has_more: boolean | null;
 };
 
 export type ArtifactPreview = {
@@ -162,8 +164,10 @@ export function getTerminal(after: number, limit = 65536): Promise<TerminalDelta
   return request(`/api/terminal?after=${after}&limit=${limit}`);
 }
 
-export function getArtifacts(limit = 500): Promise<ArtifactListing> {
-  return request(`/api/artifacts?limit=${limit}`);
+export function getArtifacts(knownGeneration: string | null = null, limit = 500): Promise<ArtifactListing> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (knownGeneration) params.set("known_generation", knownGeneration);
+  return request(`/api/artifacts?${params.toString()}`);
 }
 
 export function getArtifactPreview(digest: string): Promise<ArtifactPreview> {
