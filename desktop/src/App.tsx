@@ -70,6 +70,7 @@ export default function App() {
   const eventCursor = useRef(0);
   const terminalCursor = useRef(0);
   const replaySeqRef = useRef<number | null>(null);
+  const replayRequest = useRef(0);
   const terminalRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
@@ -193,6 +194,7 @@ export default function App() {
   };
 
   const changeReplay = async (value: number) => {
+    const request = ++replayRequest.current;
     const max = liveSnapshot?.total_event_count ?? 0;
     if (value >= max) {
       replaySeqRef.current = null;
@@ -203,9 +205,14 @@ export default function App() {
     replaySeqRef.current = value;
     setReplaySeq(value);
     try {
-      setDisplaySnapshot(await getSnapshot(value));
+      const snapshot = await getSnapshot(value);
+      if (request === replayRequest.current && replaySeqRef.current === value) {
+        setDisplaySnapshot(snapshot);
+      }
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "replay failed");
+      if (request === replayRequest.current) {
+        setError(exc instanceof Error ? exc.message : "replay failed");
+      }
     }
   };
 
