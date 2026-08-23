@@ -109,7 +109,11 @@ def _handler(challenge_root, sessions):
                 if parsed.path == "/api/terminal":
                     return self._send(200, sessions.log_delta(after=int(query.get("after", ["0"])[0]), limit=int(query.get("limit", ["65536"])[0])))
                 if parsed.path == "/api/artifacts":
-                    return self._send(200, list_artifacts(challenge_root, limit=int(query.get("limit", ["500"])[0])))
+                    return self._send(200, list_artifacts(
+                        challenge_root,
+                        limit=int(query.get("limit", ["500"])[0]),
+                        known_generation=query.get("known_generation", [None])[0],
+                    ))
                 if parsed.path.startswith("/api/artifacts/"):
                     digest = unquote(parsed.path[len("/api/artifacts/"):])
                     return self._send(200, artifact_preview(challenge_root, digest, max_bytes=int(query.get("max_bytes", ["65536"])[0])))
