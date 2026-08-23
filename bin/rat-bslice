@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Backward-slice a branch leading to an oracle/xref anchor."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.backward_slice import slice_to_anchor
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="rat-bslice", description="bounded VEX branch backward slice")
+    p.add_argument("binary")
+    p.add_argument("function")
+    p.add_argument("anchor", type=lambda s: int(s, 0), help="xref/instruction address inside the target block")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--max-predecessors", type=int, default=8)
+    a = p.parse_args(argv)
+    binary = os.path.realpath(a.binary)
+    if not os.path.isfile(binary):
+        print("[rat-bslice:err] binary not found: %s" % a.binary, file=sys.stderr)
+        return 2
+    if a.max_predecessors < 1 or a.max_predecessors > 32:
+        print("[rat-bslice:err] --max-predecessors must be 1..32", file=sys.stderr)
+        return 2
+    try:
+        doc = slice_to_anchor(binary, a.function, a.anchor, max_predecessors=a.max_predecessors)
+    except ValueError as exc:
+        print("[rat-bslice:err] %s" % exc, file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    f = doc["function"]
+    print("== BACKWARD SLICE ==")
+    print("FUNC   %s @%#x" % (f["name"], f["addr"]))
+    print("ANCHOR %#x block=%#x" % (doc["anchor"], doc["anchor_block"]))
+    if not doc["branches"]:
+        print("BRANCH none found in in-function predecessors")
+    for item in doc["branches"]:
+        print("BRANCH %#x  pred=%#x -> target-block=%#x" %
+              (item["branch_insn"], item["predecessor_block"], item["target_block"]))
+        print("  regs : %s" % (", ".join(item["register_dependencies"]) or "-"))
+        print("  stack: %s" % (", ".join(item["stack_dependencies"]) or "-"))
+    print("SCOPE  same-block tmp/register def-use + direct stack slots; no inter-block value-flow claim")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
