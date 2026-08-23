@@ -1,11 +1,13 @@
 import importlib.machinery, importlib.util, json, os, sys, tempfile, threading, unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN)
 from ratlib.desktop_session import SessionManager
+from ratlib.state_v2 import Stream
 
 loader = importlib.machinery.SourceFileLoader("_ratd_test", os.path.join(BIN, "ratd"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -35,6 +37,27 @@ class DesktopHttpTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(doc["status"], "ok")
             self.assertFalse(doc["session"]["configured"])
+
+    def test_event_generation_hint_round_trips_over_http(self):
+        with tempfile.TemporaryDirectory() as root:
+            Stream(root).append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            base = self.server(root)
+            status, first = self.read_json(Request(base + "/api/events?after_seq=0&limit=10"))
+            self.assertEqual(status, 200)
+            cursor = first["cursor"]
+            params = urlencode({
+                "after_seq": cursor["seq"],
+                "limit": 10,
+                "stream_id": cursor["stream_id"],
+                "known_size": cursor["source_size"],
+                "known_mtime_ns": cursor["source_mtime_ns"],
+            })
+            status, unchanged = self.read_json(Request(base + "/api/events?" + params))
+            self.assertEqual(status, 200)
+            self.assertTrue(unchanged["unchanged"])
+            self.assertFalse(unchanged["reset"])
+            self.assertEqual(unchanged["events"], [])
+            self.assertEqual(unchanged["cursor"], cursor)
 
     def test_disallowed_browser_origin_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
