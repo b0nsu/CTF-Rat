@@ -20,7 +20,9 @@ def _captured_bytes(stream):
 
 
 def command_begin(a):
-    print(json.dumps(begin(a.root, run_id=a.run_id, variant=a.variant, model=a.model, force=a.force), ensure_ascii=False))
+    print(json.dumps(begin(a.root, run_id=a.run_id, ablation_id=a.ablation, challenge_id=a.challenge_id,
+                           attempt=a.attempt, eligible=not a.ineligible, model=a.model, force=a.force),
+                     ensure_ascii=False))
     return 0
 
 
@@ -31,7 +33,9 @@ def command_exec(a):
     if not argv:
         print("[rat-metrics:err] command required after --", file=sys.stderr)
         return 2
-    spool = os.path.join(os.path.abspath(a.root), ".rat", "telemetry", "tmp")
+    root_abs = os.path.abspath(a.root)
+    rat_root = root_abs if os.path.basename(root_abs) == ".rat" else os.path.join(root_abs, ".rat")
+    spool = os.path.join(rat_root, "telemetry", "tmp")
     result = run(argv, cwd=a.cwd, timeout_seconds=a.timeout, spool_dir=spool,
                  env={"RAT_TELEMETRY_ROOT": os.path.abspath(a.root)})
     out, err = _captured_bytes(result.stdout), _captured_bytes(result.stderr)
@@ -70,7 +74,8 @@ def command_verify(a):
 
 
 def command_finish(a):
-    print(json.dumps(finish(a.root, status=a.status, verified=a.verified, flag_found=a.flag_found), ensure_ascii=False))
+    print(json.dumps(finish(a.root, status=a.status, outcome=a.outcome,
+                            verified=a.verified, flag_found=a.flag_found), ensure_ascii=False))
     return 0
 
 
@@ -79,23 +84,26 @@ def command_summary(a):
     if a.json:
         print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        print("RUN      %s  variant=%s status=%s" % (doc["run_id"], doc["variant"], doc["status"]))
+        m = doc["metrics"]
+        print("RUN      %s  ablation=%s challenge=%s attempt=%s status=%s outcome=%s" %
+              (doc["benchmark_run_id"], doc["ablation_id"], doc["challenge_id"],
+               doc["attempt"], doc["status"], doc["outcome"]))
         print("SOLVE    verified=%s flag=%s ttf=%s verify=%s wall=%sms" %
-              (doc["verified_solve"], doc["flag_found"], doc["time_to_flag_ms"],
-               doc["time_to_verified_ms"], doc["wall_time_ms"]))
-        print("CONTEXT  peak_tokens=%s" % doc["peak_context_tokens"])
+              (m["verified_solve"], m["flag_found"], m["time_to_flag_ms"],
+               m["time_to_verified_ms"], m["wall_time_ms"]))
+        print("CONTEXT  peak_tokens=%s" % m["peak_context_tokens"])
         print("TOOLS    calls=%d duplicate=%d wall=%dms" %
-              (doc["tools"]["calls"], doc["tools"]["duplicate_calls"], doc["tools"]["wall_ms"]))
-        ratio = doc["cache"]["hit_ratio"]
+              (m["tools"]["calls"], m["tools"]["duplicate_calls"], m["tools"]["wall_ms"]))
+        ratio = m["cache"]["hit_ratio"]
         print("CACHE    %d/%d hit  ratio=%s  writes=%d" %
-              (doc["cache"]["hits"], doc["cache"]["reads"],
-               "n/a" if ratio is None else "%.3f" % ratio, doc["cache"]["writes"]))
+              (m["cache"]["hits"], m["cache"]["reads"],
+               "n/a" if ratio is None else "%.3f" % ratio, m["cache"]["writes"]))
         print("TOKENS   in=%d out=%d cache_read=%d cache_create=%d" %
-              (doc["tokens"]["input"], doc["tokens"]["output"],
-               doc["tokens"]["cache_read"], doc["tokens"]["cache_creation"]))
-        if doc["tools"]["top_duplicates"]:
+              (m["tokens"]["input"], m["tokens"]["output"],
+               m["tokens"]["cache_read"], m["tokens"]["cache_creation"]))
+        if m["tools"]["top_duplicates"]:
             print("DUPLICATES")
-            for item in doc["tools"]["top_duplicates"][:5]:
+            for item in m["tools"]["top_duplicates"][:5]:
                 print("  x%d %s" % (item["count"], " ".join(item["argv"])))
     return 0
 
@@ -103,12 +111,12 @@ def command_summary(a):
 def parser():
     p = argparse.ArgumentParser(prog="rat-metrics", description="CTF-Rat opt-in benchmark telemetry")
     sub = p.add_subparsers(dest="cmd", required=True)
-    q = sub.add_parser("begin"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--run-id"); q.add_argument("--variant", default="manual"); q.add_argument("--model"); q.add_argument("--force", action="store_true"); q.set_defaults(func=command_begin)
+    q = sub.add_parser("begin"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--run-id"); q.add_argument("--ablation", choices=["A0","A1","A2","A3","A4","A5"], default="A0"); q.add_argument("--challenge-id"); q.add_argument("--attempt", type=int, default=1); q.add_argument("--ineligible", action="store_true"); q.add_argument("--model"); q.add_argument("--force", action="store_true"); q.set_defaults(func=command_begin)
     q = sub.add_parser("exec"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--cwd"); q.add_argument("--timeout", type=float, default=120); q.add_argument("argv", nargs=argparse.REMAINDER); q.set_defaults(func=command_exec)
     q = sub.add_parser("model"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--input-tokens", type=int, default=0); q.add_argument("--output-tokens", type=int, default=0); q.add_argument("--cache-read-tokens", type=int, default=0); q.add_argument("--cache-creation-tokens", type=int, default=0); q.add_argument("--context-tokens", type=int); q.add_argument("--duration-ms", type=int, default=0); q.add_argument("--model"); q.set_defaults(func=command_model)
     q = sub.add_parser("deep"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--reason", required=True); q.set_defaults(func=command_deep)
     q = sub.add_parser("verify"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--verified", action="store_true"); q.add_argument("--flag-found", action="store_true"); q.set_defaults(func=command_verify)
-    q = sub.add_parser("finish"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--status", choices=["solved", "failed", "abandoned", "timeout"], required=True); q.add_argument("--verified", action="store_true"); q.add_argument("--flag-found", action="store_true"); q.set_defaults(func=command_finish)
+    q = sub.add_parser("finish"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--status", choices=["completed","timeout","partial","infra-failure","skipped"], default="completed"); q.add_argument("--outcome", choices=["verified","solve-claimed","failed","censored","unknown","skipped"], default="unknown"); q.add_argument("--verified", action="store_true"); q.add_argument("--flag-found", action="store_true"); q.set_defaults(func=command_finish)
     q = sub.add_parser("summary"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--run-id"); q.add_argument("--json", action="store_true"); q.set_defaults(func=command_summary)
     return p
 
