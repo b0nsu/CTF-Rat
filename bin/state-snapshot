@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+from ratlib.context_snapshot import snapshot
+from ratlib.state_v2 import Stream
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="state-snapshot",
+        description="Render a bounded, read-only STATE v2 projection for agent context.",
+    )
+    parser.add_argument("--root", default=os.getcwd(), help="challenge root containing .rat/")
+    parser.add_argument("--budget", type=int, default=1200, help="approximate token budget (default: 1200)")
+    parser.add_argument("--max-bytes", type=int, help="optional stricter UTF-8 byte ceiling")
+    parser.add_argument("--json", action="store_true", help="emit structured snapshot JSON")
+    args = parser.parse_args()
+
+    try:
+        view = Stream(args.root).view()
+        result = snapshot(view, budget_tokens=args.budget, max_bytes=args.max_bytes)
+    except (OSError, ValueError) as exc:
+        print(f"[state-snapshot:err] {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(result["text"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
