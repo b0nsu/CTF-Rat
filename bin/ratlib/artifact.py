@@ -60,6 +60,27 @@ def _metadata_record(digest: str, *, root: str) -> dict:
     return record
 
 
+def describe(digest: str, *, root: str | None = None) -> dict:
+    """Return validated metadata without hashing object contents.
+
+    This is the bounded discovery/listing contract. It validates the metadata
+    schema/digest and checks that the immutable object exists with the recorded
+    size, but deliberately does not claim content verification. Call
+    ``metadata()``, ``preview()``, ``get()``, or ``verify()`` before consuming
+    artifact bytes.
+    """
+    checked_root = _root(root)
+    obj, _ = _paths(checked_root, digest)
+    record = _metadata_record(digest, root=checked_root)
+    try:
+        size = os.path.getsize(obj)
+    except OSError as exc:
+        raise RuntimeError("artifact object missing") from exc
+    if record.get("size") != size:
+        raise RuntimeError("artifact metadata corruption")
+    return record
+
+
 def put_bytes(
     data: bytes,
     *,
@@ -152,8 +173,8 @@ def get(digest: str, *, root: str | None = None) -> bytes:
 def metadata(digest: str, *, root: str | None = None) -> dict:
     """Return immutable metadata after streaming content verification."""
     checked_root = _root(root)
+    record = describe(digest, root=checked_root)
     _, total = _checked_prefix(digest, root=checked_root)
-    record = _metadata_record(digest, root=checked_root)
     if record.get("size") != total:
         raise RuntimeError("artifact metadata corruption")
     return record
@@ -162,8 +183,8 @@ def metadata(digest: str, *, root: str | None = None) -> dict:
 def preview(digest: str, *, max_bytes: int, root: str | None = None) -> tuple[dict, bytes, int]:
     """Return metadata plus a verified bounded object prefix in one hash pass."""
     checked_root = _root(root)
+    record = describe(digest, root=checked_root)
     prefix, total = _checked_prefix(digest, root=checked_root, max_bytes=max_bytes)
-    record = _metadata_record(digest, root=checked_root)
     if record.get("size") != total:
         raise RuntimeError("artifact metadata corruption")
     return record, prefix, total
