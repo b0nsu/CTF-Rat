@@ -5,7 +5,7 @@ HTTP clients cannot choose commands. A single solver argv is configured by the
 operator at daemon startup and process control is limited to that command.
 """
 from __future__ import annotations
-import argparse, json, os, shlex, sys
+import argparse, json, os, shlex, signal, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -134,6 +134,10 @@ def _handler(challenge_root, sessions):
     return Handler
 
 
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(description="CTF-Rat desktop daemon")
     parser.add_argument("--challenge", default=".", help="challenge directory containing .rat/")
@@ -152,6 +156,8 @@ def main():
     solver_argv = shlex.split(args.solver_command) if args.solver_command else []
     sessions = SessionManager(root, solver_argv)
     server = ThreadingHTTPServer((args.host, args.port), _handler(root, sessions))
+    signal.signal(signal.SIGTERM, _interrupt)
+    signal.signal(signal.SIGINT, _interrupt)
     print("ratd: http://%s:%d  challenge=%s" % (args.host, args.port, root), file=sys.stderr)
     if solver_argv:
         print("ratd: configured solver argv=%r" % solver_argv, file=sys.stderr)
