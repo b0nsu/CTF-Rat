@@ -3,6 +3,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib.artifact import put_bytes
+import ratlib.desktop_api as desktop_api
 from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, snapshot, telemetry
 from ratlib.state_v2 import Stream
 
@@ -134,6 +135,30 @@ class DesktopApiTests(unittest.TestCase):
             self.assertEqual(preview["encoding"], "utf-8")
             self.assertEqual(preview["content"], '{"answer":42}')
             self.assertFalse(preview["truncated"])
+
+    def test_artifact_preview_is_single_pass_and_bounded(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            payload = b"A" * (300 * 1024)
+            record = put_bytes(
+                payload,
+                kind="desktop-test",
+                media_type="application/octet-stream",
+                logical_name="large.bin",
+                root=stream.root,
+            )
+            original_preview = desktop_api.artifact_read_preview
+            with patch.object(desktop_api, "artifact_read_preview", wraps=original_preview) as store_preview, patch.object(
+                desktop_api,
+                "artifact_metadata",
+                side_effect=AssertionError("desktop preview performed a second artifact verification"),
+            ):
+                preview = desktop_api.artifact_preview(root, record["digest"], max_bytes=1024)
+            store_preview.assert_called_once()
+            self.assertEqual(preview["preview_bytes"], 1024)
+            self.assertEqual(preview["total_bytes"], len(payload))
+            self.assertTrue(preview["truncated"])
+            self.assertEqual(preview["encoding"], "base64")
 
     def test_telemetry_counts_existing_event_types(self):
         with tempfile.TemporaryDirectory() as root:
