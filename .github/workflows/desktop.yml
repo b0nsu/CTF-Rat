@@ -50,5 +50,17 @@ jobs:
         run: npm run build
       - name: Rust compile check
         run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Build Linux bundles
+        working-directory: desktop
+        run: npm run tauri -- build --bundles deb,appimage
       - name: Verify lockfiles unchanged
         run: git diff --exit-code -- desktop/package-lock.json desktop/src-tauri/Cargo.lock
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-desktop-linux-${{ github.sha }}
+          path: |
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
