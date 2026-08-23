@@ -1,7 +1,6 @@
 """Deterministic success/failure oracle extraction from revq facts."""
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Mapping
 
@@ -41,20 +40,24 @@ def detect(rev: Mapping[str, Any], *, binary: str | None = None,
             "xrefs": sorted(xrefs, key=lambda r: (r["addr"], r["func"]))[:16],
         })
 
-    # Prefer executable xref anchors. symsolve and revq share the same angr load
-    # base, so these instruction addresses are directly consumable as find/avoid.
+    # revq xrefs identify the instruction that references a string. That is a
+    # deterministic evidence locator, but it is not necessarily an angr basic
+    # block entry address. Keep the addresses in the candidate document for
+    # inspection/future CFG normalization, while generated symsolve commands
+    # prefer lexical stdout targets so explore() cannot silently miss a
+    # mid-block xref address and concrete verification remains enabled.
     find = sorted({x["addr"] for s in signals if s["kind"] == "success" for x in s["xrefs"]})
     avoid = sorted({x["addr"] for s in signals if s["kind"] == "failure" for x in s["xrefs"]})
-    find_str = [] if find else [s["text"] for s in signals if s["kind"] == "success"]
-    avoid_str = [] if avoid else [s["text"] for s in signals if s["kind"] == "failure"]
+    find_str = list(dict.fromkeys(s["text"] for s in signals if s["kind"] == "success"))
+    avoid_str = list(dict.fromkeys(s["text"] for s in signals if s["kind"] == "failure"))
 
     ambiguity = []
-    if not any(s["kind"] == "success" for s in signals):
-        ambiguity.append("no lexical success signal")
-    if not find and not find_str:
-        ambiguity.append("no usable find target")
-    if not avoid and any(s["kind"] == "failure" for s in signals):
-        ambiguity.append("failure strings exist but have no executable xref anchors; use string avoid")
+    if not find_str:
+        ambiguity.append("no unambiguous lexical success signal")
+    if find_str and not find:
+        ambiguity.append("success string has no xref locator; string oracle remains usable")
+    if avoid_str and not avoid:
+        ambiguity.append("failure string has no xref locator; string avoid remains usable")
 
     return {
         "schema": "rat.oracle-candidates/v1",
@@ -69,11 +72,11 @@ def detect(rev: Mapping[str, Any], *, binary: str | None = None,
             "find_str": find_str[:4],
             "avoid_str": avoid_str[:4],
         },
-        "ready": bool(find or find_str),
+        "ready": bool(find_str),
         "ambiguity": ambiguity,
         "cache": dict(cache or {}),
         "confidence": "candidate-only",
-        "note": "xref anchors are deterministic evidence locators, not proof that the branch condition is understood",
+        "note": "xref addresses are evidence locators only; generated symsolve commands use lexical stdout targets until CFG block-entry normalization is proven",
     }
 
 
@@ -88,14 +91,25 @@ def symsolve_argv(doc: Mapping[str, Any], *, stdin: int | None = None,
         raise ValueError("oracle binary path missing")
     argv = [binary]
     targets = doc["targets"]
-    for addr in targets.get("find", []):
-        argv += ["--find", hex(int(addr))]
-    for addr in targets.get("avoid", []):
-        argv += ["--avoid", hex(int(addr))]
-    for text in targets.get("find_str", []):
-        argv += ["--find-str", str(text)]
-    for text in targets.get("avoid_str", []):
-        argv += ["--avoid-str", str(text)]
+
+    # Prefer string conditions. Besides being safe for mid-block xrefs, this
+    # keeps symsolve's concrete_verify path active. Address candidates remain
+    # visible in the oracle document but are not promoted to control-flow facts.
+    find_strs = list(targets.get("find_str", []))
+    avoid_strs = list(targets.get("avoid_str", []))
+    if find_strs:
+        for text in find_strs:
+            argv += ["--find-str", str(text)]
+    else:
+        for addr in targets.get("find", []):
+            argv += ["--find", hex(int(addr))]
+    if avoid_strs:
+        for text in avoid_strs:
+            argv += ["--avoid-str", str(text)]
+    else:
+        for addr in targets.get("avoid", []):
+            argv += ["--avoid", hex(int(addr))]
+
     if stdin is not None:
         argv += ["--stdin", str(stdin)]
     if arg is not None:
@@ -123,9 +137,13 @@ def render_text(doc: Mapping[str, Any]) -> str:
         anchors = ",".join(hex(x["addr"]) for x in signal.get("xrefs", [])[:4]) or "no-xref"
         lines.append("%s %-48r -> %s" % (signal["kind"].upper(), signal["text"], anchors))
     t = doc.get("targets", {})
-    lines.append("FIND   " + (", ".join(hex(x) for x in t.get("find", [])) or "; ".join(repr(x) for x in t.get("find_str", [])) or "-"))
-    lines.append("AVOID  " + (", ".join(hex(x) for x in t.get("avoid", [])) or "; ".join(repr(x) for x in t.get("avoid_str", [])) or "-"))
-    lines.append("READY  %s" % ("yes" if doc.get("ready") else "no"))
+    lines.append("FIND-STR   " + ("; ".join(repr(x) for x in t.get("find_str", [])) or "-"))
+    lines.append("AVOID-STR  " + ("; ".join(repr(x) for x in t.get("avoid_str", [])) or "-"))
+    if t.get("find") or t.get("avoid"):
+        lines.append("XREF-LOC   find=%s avoid=%s" %
+                     (", ".join(hex(x) for x in t.get("find", [])) or "-",
+                      ", ".join(hex(x) for x in t.get("avoid", [])) or "-"))
+    lines.append("READY      %s" % ("yes" if doc.get("ready") else "no"))
     if doc.get("ambiguity"):
-        lines.append("CHECK  " + "; ".join(doc["ambiguity"]))
+        lines.append("CHECK      " + "; ".join(doc["ambiguity"]))
     return "\n".join(lines)
