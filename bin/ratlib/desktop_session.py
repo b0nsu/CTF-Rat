@@ -46,9 +46,11 @@ class SessionManager:
         self._exit_code: int | None = None
         self._stopped_at: str | None = None
         # Terminal cursors are opaque and monotonically increase across solver
-        # restarts. This lets a client safely use a cursor from the previous
-        # session even though terminal.log itself is truncated on start.
-        self._log_base = 0
+        # and ratd restarts. Persist the base inside the existing session
+        # metadata rather than creating a second state/cache subsystem.
+        previous_meta = self._read_meta()
+        previous_base = previous_meta.get("_log_cursor_base", 0)
+        self._log_base = previous_base if isinstance(previous_base, int) and previous_base >= 0 else 0
 
     def _running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -79,6 +81,9 @@ class SessionManager:
         except (OSError, ValueError):
             return {}
 
+    def _write_meta(self, doc: dict[str, Any]) -> None:
+        _atomic_json(self.meta_path, {**doc, "_log_cursor_base": self._log_base})
+
     def _finished_reader(self) -> threading.Thread | None:
         with self._lock:
             if self._running():
@@ -104,7 +109,7 @@ class SessionManager:
             if finished and self._exit_code is None:
                 self._exit_code = self._proc.returncode
                 self._stopped_at = _now()
-                _atomic_json(self.meta_path, self._status_doc())
+                self._write_meta(self._status_doc())
         if finished:
             self._join_finished_reader(timeout=0.5)
         with self._lock:
@@ -154,7 +159,7 @@ class SessionManager:
             self._exit_code = None
             self._stopped_at = None
             started_at = _now()
-            _atomic_json(self.meta_path, {**self._status_doc(), "started_at": started_at})
+            self._write_meta({**self._status_doc(), "started_at": started_at})
             session_id = self._session_id
             self._reader = threading.Thread(target=self._pump, args=(proc, master_fd, session_id), name="ratd-pty", daemon=True)
             self._reader.start()
@@ -183,7 +188,7 @@ class SessionManager:
                     self._stopped_at = _now()
                     if self._master_fd == fd:
                         self._master_fd = None
-                    _atomic_json(self.meta_path, self._status_doc())
+                    self._write_meta(self._status_doc())
 
     def stop(self, grace_seconds: float = 2.0) -> dict[str, Any]:
         with self._lock:
@@ -206,7 +211,7 @@ class SessionManager:
         with self._lock:
             self._exit_code = proc.returncode
             self._stopped_at = _now()
-            _atomic_json(self.meta_path, self._status_doc())
+            self._write_meta(self._status_doc())
         return self.status()
 
     def write(self, data: str) -> dict[str, Any]:
