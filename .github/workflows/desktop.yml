@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Desktop backend tests
-        run: python3 -m unittest tests.test_desktop_api tests.test_desktop_session tests.test_desktop_http
+        run: python3 -m unittest tests.test_desktop_api tests.test_desktop_session tests.test_desktop_http tests.test_desktop_e2e
       - name: Syntax check daemon modules
         run: python3 -m py_compile bin/ratd bin/ratlib/desktop_api.py bin/ratlib/desktop_session.py
 
