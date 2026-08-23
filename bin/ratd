@@ -87,16 +87,12 @@ def _handler(challenge_root, sessions):
                     until = query.get("until_seq", [None])[0]
                     return self._send(200, snapshot(challenge_root, until_seq=None if until is None else int(until)))
                 if parsed.path == "/api/events":
-                    stream_id = query.get("stream_id", [None])[0]
-                    known_size = query.get("known_size", [None])[0]
-                    known_mtime_ns = query.get("known_mtime_ns", [None])[0]
                     return self._send(200, event_delta(
                         challenge_root,
                         after_seq=int(query.get("after_seq", ["0"])[0]),
                         limit=int(query.get("limit", ["500"])[0]),
-                        stream_id=stream_id,
-                        known_size=None if known_size is None else int(known_size),
-                        known_mtime_ns=None if known_mtime_ns is None else int(known_mtime_ns),
+                        stream_id=query.get("stream_id", [None])[0],
+                        known_generation=query.get("known_generation", [None])[0],
                     ))
                 if parsed.path == "/api/telemetry":
                     return self._send(200, telemetry(challenge_root))
