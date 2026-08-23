@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Experimental structured Function Card v2 for A4 benchmarking."""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.function_card import build_card, load_revmap, render_text
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="rat-func-v2")
+    p.add_argument("binary")
+    p.add_argument("target")
+    p.add_argument("--root", default=os.getcwd(), help="challenge root or .rat root")
+    p.add_argument("--fast", action="store_true", help="use revq binutils tier")
+    p.add_argument("--timeout", type=float, default=90)
+    p.add_argument("--format", choices=["text", "json"], default="text")
+    p.add_argument("--revmap", help=argparse.SUPPRESS)
+    a = p.parse_args(argv)
+
+    if not os.path.isfile(a.binary):
+        print("[rat-func-v2:err] binary not found: " + a.binary, file=sys.stderr)
+        return 2
+    try:
+        if a.revmap:
+            with open(a.revmap, encoding="utf-8") as f:
+                rev = json.load(f)
+            cache = {"hit": None, "source": "fixture"}
+        else:
+            rev, cache = load_revmap(a.binary, root=a.root, fast=a.fast, timeout=a.timeout)
+        card = build_card(rev, a.target, binary=a.binary, cache=cache)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print("[rat-func-v2:err] %s" % exc, file=sys.stderr)
+        return 2
+
+    if a.format == "json":
+        print(json.dumps(card, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_text(card))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
