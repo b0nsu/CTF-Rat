@@ -2,6 +2,8 @@
 
 <img width="1672" height="941" alt="ctf-rat — route · verify · reuse" src="assets/banner.png" />
 
+**route → verify → reuse.** 작은 컨텍스트로 빠르게 검증하고, 캐시 재사용으로 반복 분석을 없앤다 (v2).
+
 pwn/rev 집중형 **환경 무관 self-contained CTF 풀이 kit.** 도구 + doctrine + 지식 + 참조데이터가
 한 레포에 들어 있어, 어느 Linux 환경(네이티브/VM/WSL2/컨테이너)에든 한 번 세팅하면
 Claude·Codex 가 이 레포에서 바로 문제를 푼다.
