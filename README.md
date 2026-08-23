@@ -14,7 +14,6 @@ Claude·Codex 가 이 레포에서 바로 문제를 푼다.
 - **operator skill (FAST, route당 1개)**: `skills/<route>/SKILL.md` — SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY.
 - **지식**: [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md) → `knowledge/ctf-skills/`
 - benchmark corpus, ablation, 설계 검토 문서는 `dev` 브랜치에서 관리한다. `main`은 실제 풀이와 검증에 필요한 운영 도구만 제공한다.
-- **도구 커버리지/추가 우선순위**: [doctrine/TOOLING_GAP_ANALYSIS.md](doctrine/TOOLING_GAP_ANALYSIS.md) — 기존 `bin/` 계층, 통합 갭, 신규 도구 gate.
 
 ## 레이아웃
 ```

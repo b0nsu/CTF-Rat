@@ -408,10 +408,18 @@ class Qiling:
             self.assertFalse(os.path.exists("/proc/%d" % pid))
 
             wall_rootfs = os.path.join(temp, "wall-rootfs"); os.makedirs(wall_rootfs)
+            # 0.1s previously: too tight under amd64-under-emulation (docker/dev on
+            # Apple Silicon) where a single Python interpreter cold-start already
+            # costs ~0.1s, and rat-qiling spawns a *second* nested interpreter for
+            # the bounded run -- the wall-clock deadline could fire before the
+            # child even reached Qiling.run(). 1.5s keeps ample headroom below the
+            # instruction-budget of 1e9 (which the pure-Python mock hook loop
+            # would take far longer than 1.5s to reach), so this still reliably
+            # exercises the wall_timeout branch rather than instruction_budget.
             wall = subprocess.run([os.path.join(BIN, "rat-qiling"), binary, "--rootfs", wall_rootfs,
-                                   "--instruction-budget", "1000000000", "--timeout", "0.1"],
+                                   "--instruction-budget", "1000000000", "--timeout", "1.5"],
                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                  timeout=5)
+                                  timeout=10)
             wall_payload = json.loads(wall.stdout)
             self.assertEqual((wall.returncode, wall_payload["reason"]),
                              (EXIT_TIMEOUT, "wall_timeout"), wall.stderr)

@@ -14,7 +14,7 @@ SCHEMA = "rat.decomp-cache/v1"
 
 
 def _register_index(cache: str, prov: dict, binary: str) -> None:
-    """M2-3: best-effort registration in the shared canonical cache index.
+    """Best-effort registration in the shared canonical cache index.
 
     The existing provenance key (`cache_key(prov)`) stays the source of
     truth for hit/stale/partial here; this only makes that decision

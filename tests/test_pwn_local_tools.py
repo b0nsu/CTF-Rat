@@ -101,11 +101,20 @@ class LocalPwnToolTests(unittest.TestCase):
         self.assertIn("outside the selected word size", "\n".join(json.loads(result.stdout)["errors"]))
 
     def test_pwncrash_reproduces_local_core_evidence(self):
+        # stack_overflow.c is a plain return-address overwrite: the corrupted
+        # return address is (virtually always) non-canonical, so `ret` faults
+        # as a #GP rather than a #PF. On x86_64 a #GP carries no linear fault
+        # address, so the kernel reports siginfo si_addr=0 -- core.fault_addr
+        # (and therefore fault_cyclic_offset) is legitimately null for this
+        # crash class on any x86_64 Linux, emulated or native. The correct,
+        # honest RIP-hijack evidence is pc_cyclic_offset (core.pc IS the
+        # corrupted value that faulted).
         result = self.tool("pwncrash", str(self.binary), "--pattern-length", "256", "--repetitions", "2", "--json")
         report = json.loads(result.stdout)
         self.assertEqual(report["verdict"], "crash-reproduced")
         self.assertEqual(report["stable_signal"], 11)
-        self.assertEqual(report["core"]["fault_cyclic_offset"], 72)
+        self.assertEqual(report["core"]["pc_cyclic_offset"], 72)
+        self.assertEqual(report["core"]["fault_addr"], 0)
         self.assertEqual(report["promotion"], "candidate-evidence-only")
 
 

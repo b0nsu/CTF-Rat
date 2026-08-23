@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+**/.DS_Store
 # 캐시·분석 산출물
 __pycache__/
 *.pyc
@@ -42,3 +45,10 @@ kernel/logs/
 # Python venv
 .venv/
 venv/
+# 로컬 전용 계획/설계 문서 (레포 실행경로에서 미참조 — 세션 인수인계용, 커밋 안 함)
+/plans/
+# 개발자 로컬 검증 환경 (배포용 아님 — 각자 로컬에서만 사용, 커밋 안 함)
+/docker/dev/
+# 내부 벤치마크·A/B 측정 하니스와 측정 결과물 (kit 사용자에겐 불필요 — 개발 측정용)
+/benchmarks/
+/tests/telemetry/

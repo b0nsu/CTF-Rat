@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ctfpull — CTF 문제 수집 어댑터 (RUNNER 아키텍처 L1 INGEST).
+ctfpull — CTF 문제 수집 어댑터 (INGEST).
 
 CTFd 플랫폼에서 문제 목록/상세를 당겨, 첨부를 스테이징하고 `newchal` 스캐폴드로 넘긴다.
 flag 자동제출은 하지 않는다 (ToS + honest-mode).

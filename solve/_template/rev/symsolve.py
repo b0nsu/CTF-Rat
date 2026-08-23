@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-symsolve — angr symbolic 하니스 (RUNNER 아키텍처 §6.1 rev 루프).
+symsolve — angr symbolic 하니스 (rev 루프).
 
 "제약 풀이를 서브에이전트에 위임"하는 스캐폴드. **흔한 crackme 는 코드 수정 없이
 CLI 인자만으로** 풀리고, 복잡한 경우(훅·simprocedure·커스텀 제약)는 아래

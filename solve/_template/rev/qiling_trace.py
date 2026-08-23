@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-qiling_trace — Windows PE/DLL 동적 에뮬레이션 스캐폴드 (RUNNER §6.1 rev 루프, Windows 축).
+qiling_trace — Windows PE/DLL 동적 에뮬레이션 스캐폴드 (rev 루프, Windows 축).
 
 x64dbg 는 Windows 네이티브(Wine 억지구동 불안정 → 인터랙티브는 Windows VM). **Linux 호스트에서
 PE 를 동적으로 볼 땐 Qiling(Unicorn 기반 에뮬레이션, Wine 불필요)** 이 정석. 이건 그 스캐폴드다.

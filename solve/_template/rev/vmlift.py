@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vmlift — custom-VM 리프터 스캐폴드 (RUNNER 아키텍처 §6.1 rev 루프).
+vmlift — custom-VM 리프터 스캐폴드 (rev 루프).
 
 CTF rev 에서 자주 나오는 **커스텀 바이트코드 VM**(license_checker 류)을 만났을 때의
 작업을 템플릿화한다. 빈 stub 이 아니라 **작동하는 toy-VM 레퍼런스 구현**(disasm +
