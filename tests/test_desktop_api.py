@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.artifact import put_bytes
 import ratlib.artifact as artifact_store
 import ratlib.desktop_api as desktop_api
-from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, snapshot, telemetry
+from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, live_update, snapshot, telemetry
 from ratlib.state_v2 import Stream
 
 
@@ -63,10 +63,11 @@ class DesktopApiTests(unittest.TestCase):
             self.assertTrue(first["has_more"])
             self.assertFalse(first["reset"])
             self.assertFalse(first["unchanged"])
-            self.assertIsInstance(first["cursor"].get("source_generation"), str)
-            second = event_delta(root, after_seq=first["cursor"]["seq"], limit=2)
+            self.assertNotIn("source_generation", first["cursor"])
+            second = event_delta(root, after_seq=first["cursor"]["seq"], limit=2, stream_id=first["cursor"]["stream_id"])
             self.assertEqual([event["seq"] for event in second["events"]], [4])
             self.assertFalse(second["has_more"])
+            self.assertIsInstance(second["cursor"].get("source_generation"), str)
 
     def test_event_delta_unchanged_hint_skips_state_parse(self):
         with tempfile.TemporaryDirectory() as root:
@@ -117,6 +118,61 @@ class DesktopApiTests(unittest.TestCase):
                 event_delta(root, limit=5001)
             with self.assertRaises(ValueError):
                 event_delta(root, known_generation="")
+
+    def test_live_update_changed_parses_state_once_and_returns_snapshot(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            stream.append("hypothesis.recorded", {"hypothesis_id": "H1", "text": "first"})
+            stream.append("next.recorded", {"probe": "inspect checker"})
+            original_read = Stream.read
+            calls = []
+
+            def counted(instance):
+                calls.append(instance.path)
+                return original_read(instance)
+
+            with patch.object(Stream, "read", counted):
+                doc = live_update(root, after_seq=0, limit=10)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(doc["schema"], "rat.desktop.live/v1")
+            self.assertEqual([event["seq"] for event in doc["delta"]["events"]], [1, 2])
+            self.assertEqual(doc["snapshot"]["cursor"]["seq"], 2)
+            self.assertEqual(doc["snapshot"]["view"]["next_probes"][-1]["probe"], "inspect checker")
+
+    def test_live_update_does_not_mutate_delta_payload_while_materializing_view(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            stream.append(
+                "primitive.revised",
+                {"primitive_id": "P1", "status": "candidate", "self_evidence": []},
+                actor="migration",
+            )
+            stream.append(
+                "primitive.consumed",
+                {"primitive_id": "P1", "input_digest": "sha256:" + "1" * 64, "environment_digest": "sha256:" + "2" * 64},
+                actor="migration",
+            )
+            doc = live_update(root, after_seq=0, limit=10)
+            revised = doc["delta"]["events"][0]
+            self.assertEqual(revised["payload"]["status"], "candidate")
+
+    def test_live_update_unchanged_skips_state_parse_and_snapshot(self):
+        with tempfile.TemporaryDirectory() as root:
+            Stream(root).append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            first = live_update(root, after_seq=0, limit=10)
+            cursor = first["delta"]["cursor"]
+            self.assertIsNotNone(first["snapshot"])
+            self.assertIsInstance(cursor.get("source_generation"), str)
+            with patch.object(Stream, "read", side_effect=AssertionError("unchanged live poll parsed STATE")):
+                unchanged = live_update(
+                    root,
+                    after_seq=cursor["seq"],
+                    stream_id=cursor["stream_id"],
+                    known_generation=cursor["source_generation"],
+                    limit=10,
+                )
+            self.assertTrue(unchanged["delta"]["unchanged"])
+            self.assertIsNone(unchanged["snapshot"])
 
     def test_artifact_list_and_preview_reuse_canonical_store(self):
         with tempfile.TemporaryDirectory() as root:
