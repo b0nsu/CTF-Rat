@@ -8,7 +8,7 @@ BIN = os.path.join(HERE, "..", "bin")
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 
-from ratlib.backward_slice import _expr_uses, _stack_slot
+from ratlib.backward_slice import _anchor_relation, _expr_uses, _stack_slot
 
 
 class Arch:
@@ -55,6 +55,21 @@ class SliceHelperTests(unittest.TestCase):
         self.assertEqual(_stack_slot(expr, Arch()), "rbp+32")
         expr = Binop("Iop_Sub64", Get(48), Const(0x18))
         self.assertEqual(_stack_slot(expr, Arch()), "rsp-24")
+
+    def test_nested_stack_slot_accumulates_displacement(self):
+        expr = Binop("Iop_Add64", Binop("Iop_Add64", Get(48), Const(0x20)), Const(8))
+        self.assertEqual(_stack_slot(expr, Arch()), "rsp+40")
+        expr = Binop("Iop_Sub64", Binop("Iop_Add64", Get(56), Const(0x20)), Const(8))
+        self.assertEqual(_stack_slot(expr, Arch()), "rbp+24")
+
+    def test_symbolic_or_two_stack_bases_are_not_guessed(self):
+        self.assertIsNone(_stack_slot(Binop("Iop_Add64", Get(48), Get(16)), Arch()))
+        self.assertIsNone(_stack_slot(Binop("Iop_Add64", Get(48), Get(56)), Arch()))
+
+    def test_anchor_edge_polarity_is_explicit(self):
+        self.assertEqual(_anchor_relation(0x401100, 0x401100), "taken")
+        self.assertEqual(_anchor_relation(0x401200, 0x401100), "must-not-take")
+        self.assertEqual(_anchor_relation(None, 0x401100), "must-not-take")
 
     def test_tmp_def_use_reaches_register(self):
         defs = {1: {"expr": Get(16), "insn": 0x401000, "stmt": 1}}
