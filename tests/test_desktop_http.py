@@ -59,6 +59,27 @@ class DesktopHttpTests(unittest.TestCase):
             self.assertEqual(unchanged["events"], [])
             self.assertEqual(unchanged["cursor"], cursor)
 
+    def test_live_projection_returns_snapshot_on_change_and_none_when_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            Stream(root).append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            base = self.server(root)
+            status, first = self.read_json(Request(base + "/api/live?after_seq=0&limit=10"))
+            self.assertEqual(status, 200)
+            self.assertEqual(first["schema"], "rat.desktop.live/v1")
+            self.assertIsNotNone(first["snapshot"])
+            self.assertEqual(first["snapshot"]["cursor"]["seq"], 1)
+            cursor = first["delta"]["cursor"]
+            params = urlencode({
+                "after_seq": cursor["seq"],
+                "limit": 10,
+                "stream_id": cursor["stream_id"],
+                "known_generation": cursor["source_generation"],
+            })
+            status, unchanged = self.read_json(Request(base + "/api/live?" + params))
+            self.assertEqual(status, 200)
+            self.assertTrue(unchanged["delta"]["unchanged"])
+            self.assertIsNone(unchanged["snapshot"])
+
     def test_disallowed_browser_origin_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             base = self.server(root)
