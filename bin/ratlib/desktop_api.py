@@ -4,7 +4,7 @@ STATE v2 and the existing content-addressed artifact store remain canonical.
 This module adds bounded projections only; it never creates a second database.
 """
 from __future__ import annotations
-import base64, json, os
+import base64, hashlib, json, os
 from collections import Counter
 from typing import Any
 
@@ -303,30 +303,71 @@ def telemetry(challenge_root: str) -> dict[str, Any]:
     }
 
 
-def list_artifacts(challenge_root: str, *, limit: int = 500) -> dict[str, Any]:
-    """List artifact metadata without hashing every object in the store."""
+def _artifact_inventory(meta_root: str) -> tuple[str, list[str]]:
+    """Return an opaque metadata-tree generation and discovered digest names.
+
+    Artifact metadata is immutable under the canonical store API. The generation
+    therefore hashes only directory-entry identity plus file size/mtime, avoiding
+    JSON parsing and object-content hashing on unchanged discovery refreshes.
+    It is a performance hint, never evidence of object integrity.
+    """
+    hasher = hashlib.sha256()
+    digests: list[str] = []
+    if not os.path.isdir(meta_root):
+        return "sha256:" + hasher.hexdigest(), digests
+    try:
+        prefixes = sorted(entry for entry in os.scandir(meta_root) if entry.is_dir(follow_symlinks=False), key=lambda entry: entry.name)
+    except OSError:
+        return "sha256:" + hasher.hexdigest(), digests
+    for prefix in prefixes:
+        try:
+            entries = sorted(
+                (entry for entry in os.scandir(prefix.path) if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json")),
+                key=lambda entry: entry.name,
+            )
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            hasher.update(("%s/%s:%d:%d\n" % (prefix.name, entry.name, stat.st_size, stat.st_mtime_ns)).encode("ascii"))
+            digests.append("sha256:" + prefix.name + entry.name[:-5])
+    return "sha256:" + hasher.hexdigest(), digests
+
+
+def list_artifacts(challenge_root: str, *, limit: int = 500, known_generation: str | None = None) -> dict[str, Any]:
+    """List artifact metadata, with a cheap unchanged-inventory fast path."""
     if not isinstance(limit, int) or limit < 1 or limit > MAX_ARTIFACTS:
         raise ValueError("artifact limit must be between 1 and %d" % MAX_ARTIFACTS)
+    if known_generation is not None and (not isinstance(known_generation, str) or not known_generation):
+        raise ValueError("known_generation must be a non-empty string")
     store = Stream(os.path.abspath(challenge_root)).root
     meta_root = os.path.join(store, "metadata", "sha256")
+    generation, digests = _artifact_inventory(meta_root)
+    if known_generation is not None and known_generation == generation:
+        return {
+            "schema": ARTIFACTS_SCHEMA,
+            "generation": generation,
+            "unchanged": True,
+            "artifacts": [],
+            "total": None,
+            "has_more": None,
+        }
+
     records: list[dict[str, Any]] = []
-    if os.path.isdir(meta_root):
-        for prefix in sorted(os.listdir(meta_root)):
-            directory = os.path.join(meta_root, prefix)
-            if not os.path.isdir(directory):
-                continue
-            for name in sorted(os.listdir(directory)):
-                if not name.endswith(".json"):
-                    continue
-                digest = "sha256:" + prefix + name[:-5]
-                try:
-                    records.append(artifact_describe(digest, root=store))
-                except (OSError, ValueError, RuntimeError):
-                    continue
+    for digest in digests:
+        try:
+            records.append(artifact_describe(digest, root=store))
+        except (OSError, ValueError, RuntimeError):
+            continue
     records.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("digest", ""))), reverse=True)
     selected = records[:limit]
     return {
         "schema": ARTIFACTS_SCHEMA,
+        "generation": generation,
+        "unchanged": False,
         "artifacts": selected,
         "total": len(records),
         "has_more": len(records) > len(selected),
