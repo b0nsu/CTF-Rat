@@ -17,5 +17,5 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/kernel.md` (+`ke
 - SMEP/SMAP/KPTI bypass requirements uncertain → DEEP, confirm via the actual boot config (`k_run_qemu` boot args), not assumption.
 
 ## VERIFY
-- `state primitive <name> pass <evidence>` only after a minimal primitive (e.g. controlled write via `copy_from_user` misuse) is demonstrated inside the real QEMU environment.
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`) only after a minimal primitive (e.g. controlled write via `copy_from_user` misuse) is demonstrated inside the real QEMU environment.
 - SOLVED requires privilege escalation or flag read evidence from the actual booted kernel image (`k_run_qemu`), never a userland simulation.

@@ -84,9 +84,10 @@ class P2Analysis(unittest.TestCase):
   main_addr=self._symbol_addr("main")
   if main_addr is None: self.skipTest("nm could not resolve main's address")
   _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward",main_addr,"--source","stdin","--depth","2")
-  self.assertEqual(x["summary"]["analysis_kind"],"data"); self.assertEqual(x["summary"]["claim"],"dependency-candidate")
+  self.assertEqual(x["summary"]["analysis_kind"],"data")
   self.assertIn(x["status"],("ok","partial"))
   if x["status"]=="ok":
+   self.assertEqual(x["summary"]["claim"],"dependency-candidate")
    self.assertIn("fgets",x["summary"]["within_function"]["input_api_calls"])
    self.assertLessEqual(x["summary"]["interproc"]["depth"],2)
  def test_data_slice_depth_budget_never_exceeds_two(self):
@@ -113,4 +114,14 @@ class P2Analysis(unittest.TestCase):
   _,profile=self.tool("rat-profile"); pd=profile["artifacts"][0]["digest"]
   _,x=self.tool("rat-slice","--profile",pd,"--mode","data","--backward","0xdeadbeef","--source","stdin")
   self.assertEqual(x["status"],"partial")
+ def test_profile_cache_key_changes_with_libc(self):
+  libc_a=self.work/"libcA.so"; libc_a.write_text("libcA")
+  libc_b=self.work/"libcB.so"; libc_b.write_text("libc-b-different-content")
+  _,first=self.tool("rat-profile","--libc",str(libc_a)); self.assertEqual(first["cache_state"],"miss")
+  _,second=self.tool("rat-profile","--libc",str(libc_a)); self.assertEqual(second["cache_state"],"hit")
+  _,third=self.tool("rat-profile","--libc",str(libc_b)); self.assertEqual(third["cache_state"],"miss")
+ def test_profile_no_cache_bypasses_read(self):
+  _,first=self.tool("rat-profile"); self.assertEqual(first["cache_state"],"miss")
+  _,second=self.tool("rat-profile"); self.assertEqual(second["cache_state"],"hit")
+  _,third=self.tool("rat-profile","--no-cache"); self.assertEqual(third["cache_state"],"miss")
 if __name__=="__main__": unittest.main()

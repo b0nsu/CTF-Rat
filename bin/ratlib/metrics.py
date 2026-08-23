@@ -5,7 +5,9 @@ emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, sys
+from datetime import datetime
 from .artifact import get as artifact_get
+from .state_v2 import Stream
 
 def iter_tool_results(root):
     meta_base = os.path.join(root, "metadata", "sha256")
@@ -57,7 +59,24 @@ def guard_started_at(ctf_home, chal=None):
         return None
     return obj.get("started_at")
 
-def first_primitive_pass_ts(state_dir):
+def _first_primitive_pass_ts_v2(state_dir):
+    best = None
+    try:
+        events = Stream(state_dir).read()
+    except (OSError, ValueError):
+        return None
+    for e in events:
+        if e.get("type") != "primitive.revised" or e.get("payload", {}).get("status") != "pass":
+            continue
+        try:
+            ts = int(datetime.fromisoformat(e["at"]).timestamp())
+        except (KeyError, ValueError):
+            continue
+        if best is None or ts < best:
+            best = ts
+    return best
+
+def _first_primitive_pass_ts_legacy(state_dir):
     path = os.path.join(state_dir, "STATE.jsonl")
     best = None
     try:
@@ -77,6 +96,16 @@ def first_primitive_pass_ts(state_dir):
     except OSError:
         return None
     return best
+
+def first_primitive_pass_ts(state_dir):
+    """Typed STATE v2 is the authoritative PASS gate (>=3 active direct SELF
+    observations, enforced by ratlib.state_v2.revise_primitive) -- prefer it.
+    Legacy STATE.jsonl is only consulted for pre-v2 sessions that never wrote
+    a v2 stream; the legacy `state primitive ... pass` command is rejected."""
+    v2 = _first_primitive_pass_ts_v2(state_dir)
+    if v2 is not None:
+        return v2
+    return _first_primitive_pass_ts_legacy(state_dir)
 
 def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
     docs = list(docs)

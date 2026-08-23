@@ -19,5 +19,5 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/overflow-basics.
 - Offset uncertain after one `pwncrash` pass → re-measure, do not copy example offsets from knowledge docs.
 
 ## VERIFY
-- `state primitive <name> pass <evidence>` only after the minimal payload demonstrably controls EIP/RIP (or a marker/terminator) in a plain local run — per `doctrine/PRIMITIVE_GATE.md`.
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`) only after the minimal payload demonstrably controls EIP/RIP (or a marker/terminator) in a plain local run.
 - SOLVED requires the assembled exploit to run against the local process/Docker (or the user's designated remote) and produce the real flag/shell.
