@@ -1,4 +1,4 @@
-"""Read-only session telemetry aggregator (M0-2).
+"""Read-only session telemetry aggregator.
 
 Reads tool-result envelopes from a .rat artifact store plus STATE.jsonl and
 emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
@@ -33,7 +33,7 @@ def iter_tool_results(root):
                 yield doc
 
 def operation_fingerprint(doc):
-    """C1 (DESIGN_v2 §7.2): sha256 over tool build + inputs + normalized params + deps + policy + output schema."""
+    """sha256 over tool build + inputs + normalized params + deps + policy + output schema."""
     tool = doc.get("tool", {}) or {}
     provenance = doc.get("provenance", {}) or {}
     key = {

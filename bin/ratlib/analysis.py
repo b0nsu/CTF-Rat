@@ -103,7 +103,7 @@ def _profile_cache_keys(bdig):
     return {k: canonical_key(binary_sha256=bdig,tool_name="rat-profile",tool_version=VERSION,params={"artifact":k},dep_versions={})
             for k in ("profile","string-index")}
 def _profile_cache_lookup(r, bdig):
-    """M2-4: read-through the shared canonical index; miss on any inconsistency."""
+    """Read-through the shared canonical index; miss on any inconsistency."""
     try:
         from .cache import Cache
         idx=Cache(r); keys=_profile_cache_keys(bdig)
@@ -142,7 +142,7 @@ def profile(a):
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
     doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state
     # Register on miss AFTER the envelope exists so this run's invocation_id is
-    # recorded as the source of any later hit (DESIGN_v2 §9.3).
+    # recorded as the source of any later hit.
     if cache_state=="miss" and idx and keys:
         try:
             idx.put_entry(keys["profile"],backend="profile_artifact",path=arts[0]["digest"],source_invocation=doc["invocation_id"])

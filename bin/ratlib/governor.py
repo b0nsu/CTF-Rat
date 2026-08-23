@@ -1,4 +1,4 @@
-"""Progress Novelty Governor (M1-5b, DESIGN_v2 C10 / S8.3).
+"""Progress Novelty Governor.
 
 Time-based "stuck" detection is replaced by a novelty check: if the last
 `window` tool/query actions produced no new artifact digest, finding

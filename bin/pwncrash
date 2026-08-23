@@ -17,6 +17,10 @@ from pwn import Corefile, cyclic, cyclic_find, context
 from ratlib.runner import ResourceLimits, run
 
 context.log_level = "error"
+# pwntools' default log_console is sys.stdout -- its internal log.error()
+# calls (e.g. Corefile address-not-mapped warnings) would otherwise land
+# in the same stream as this tool's JSON contract and break the parse.
+context.log_console = sys.stderr
 
 
 def sha256(path: str) -> str:

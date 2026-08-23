@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-revq — rev 정적 배치 (RUNNER 아키텍처 §6.1 rev 루프).
+revq — rev 정적 배치 (rev 루프).
 
 `recon`(pwn triage)·`decomp`(함수 덤프)의 **rev 대칭 보완**. 큰 정적 읽기
 (함수 목록·문자열·xref·call graph)를 **컨텍스트 밖으로** 빼서 한 번 추출·캐시하고,
-오케스트레이터/scout 는 슬라이스만 회수한다 (컨텍스트 위생 = 아키텍처 §1.3).
+오케스트레이터/scout 는 슬라이스만 회수한다 (컨텍스트 위생).
 
 킬러 기능: **string↔function xref + interesting-function 휴리스틱**
   → "Correct/flag/license" 문자열을 참조하고 strcmp/memcmp 를 부르는 함수를
@@ -50,7 +50,7 @@ INTERESTING_STR = re.compile(
     re.I,
 )
 FLAG_STR = re.compile(r"flag|\bctf\b|\}$|\{.*\}", re.I)
-# M3-1: oracle success/failure classification (DESIGN_v2 S14.1) — reuses the
+# oracle success/failure classification — reuses the
 # same extracted strings/xrefs, no new analysis.
 ORACLE_SUCCESS_STR = re.compile(
     r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|valid\b",
@@ -510,7 +510,7 @@ def _oracle_candidates(rev, pattern, kind):
 
 
 def compute_oracle(rev):
-    """success/failure 문자열의 xref BB를 symsolve 좌표로 wiring (§14.1).
+    """success/failure 문자열의 xref BB를 symsolve 좌표로 wiring.
 
     단일·명확(문자열 후보 1개 + xref 1개)일 때만 auto_connect=True 로
     resolve 를 채운다. 다수면 ambiguous=True 로 후보만 나열하고 자동
@@ -696,7 +696,7 @@ def render_func(rev, target):
     return "\n".join(L)
 
 
-# ─────────────────────────── M3-2: Function Card v2 (rat.function-card/v2) ───────────────────────────
+# ─────────────────────────── Function Card v2 (rat.function-card/v2) ───────────────────────────
 FUNCTION_CARD_SCHEMA = "rat.function-card/v2"
 INTERESTING_DETECTOR_VERSION = "interesting-score/v1"
 _CAP = 30
@@ -975,7 +975,7 @@ def selftest():
     chk(top.get("score", 0) >= 5, "check 점수 >= 5 (판별문자열+비교함수)")
     chk(all(i["func"] != "helper_noise" for i in inter), "noise 함수 제외")
 
-    # M3-2: Function Card v2
+    # Function Card v2
     check_card = compute_function_card(rev, "check")
     chk(check_card["schema"] == "rat.function-card/v2", "function-card: schema")
     chk(set(check_card) == {"schema", "function", "facts", "heuristics", "unresolved", "next", "provenance"},
@@ -1034,7 +1034,7 @@ def selftest():
     chk("PE/Windows" in render_summary({**_fixture(), "platform": "pe"}), "render_summary: PE 배너")
     chk("PLATFORM" not in render_summary({**_fixture(), "platform": "elf"}), "render_summary: ELF 은 배너 없음")
 
-    # M3-1: oracle→symsolve 자동연결
+    # oracle→symsolve 자동연결
     oracle = compute_oracle(rev)
     chk(oracle["auto_connect"] is True, "oracle: 단일·명확 success/fail → auto_connect")
     chk(oracle["resolved"]["success"]["addr"] == 0x11a0 and oracle["resolved"]["failure"]["addr"] == 0x11b0,
