@@ -17,7 +17,8 @@ class AgentEntrypointTests(unittest.TestCase):
         self.assertLessEqual(len(self.text.encode("utf-8")), 7000)
 
     def test_fast_path_is_the_default(self):
-        self.assertIn("Default solve path: FAST", self.text)
+        # Guard the architecture, not one particular heading spelling.
+        self.assertIn("FAST = route → query → test → verify", self.text)
         self.assertIn("rat route <artifact>", self.text)
         self.assertIn("rat snapshot --root . --budget-bytes 6000", self.text)
         self.assertIn("Do not preload doctrine", self.text)
