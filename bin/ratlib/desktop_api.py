@@ -30,6 +30,20 @@ def _manifest(challenge_root: str) -> dict[str, Any] | None:
         return None
 
 
+def _stream_stat(stream: Stream) -> tuple[int, int]:
+    """Return a cheap append-only stream generation hint.
+
+    Size + mtime is not a source of truth. It is only emitted after a stable
+    validated read and may be echoed by a client to prove that no bytes changed
+    since that read. Any mismatch falls back to the canonical Stream.read().
+    """
+    try:
+        stat = os.stat(stream.path)
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return 0, 0
+
+
 def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, Any]:
     """Return a materialized view, optionally at a historical event sequence."""
     root = os.path.abspath(challenge_root)
@@ -51,24 +65,88 @@ def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, 
     }
 
 
-def event_delta(challenge_root: str, *, after_seq: int = 0, limit: int = 500) -> dict[str, Any]:
-    """Return ordered STATE events after ``after_seq`` with a bounded count."""
+def event_delta(
+    challenge_root: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 500,
+    stream_id: str | None = None,
+    known_size: int | None = None,
+    known_mtime_ns: int | None = None,
+) -> dict[str, Any]:
+    """Return ordered STATE events after ``after_seq`` with a bounded count.
+
+    ``known_size``/``known_mtime_ns`` are optional client-echoed hints from a
+    previous stable response. When both still match, the append-only stream is
+    unchanged and the expensive JSONL re-parse can be skipped. Hints never
+    bypass validation after the file changes.
+    """
     if not isinstance(after_seq, int) or after_seq < 0:
         raise ValueError("after_seq must be a non-negative integer")
     if not isinstance(limit, int) or limit < 1 or limit > 5000:
         raise ValueError("limit must be between 1 and 5000")
-    events = Stream(os.path.abspath(challenge_root)).read()
-    remaining = [event for event in events if event["seq"] > after_seq]
+    if stream_id is not None and (not isinstance(stream_id, str) or not stream_id):
+        raise ValueError("stream_id must be a non-empty string")
+    if (known_size is None) != (known_mtime_ns is None):
+        raise ValueError("known_size and known_mtime_ns must be supplied together")
+    if known_size is not None and (not isinstance(known_size, int) or known_size < 0):
+        raise ValueError("known_size must be a non-negative integer")
+    if known_mtime_ns is not None and (not isinstance(known_mtime_ns, int) or known_mtime_ns < 0):
+        raise ValueError("known_mtime_ns must be a non-negative integer")
+
+    stream = Stream(os.path.abspath(challenge_root))
+    before_size, before_mtime_ns = _stream_stat(stream)
+    if known_size is not None and known_size == before_size and known_mtime_ns == before_mtime_ns:
+        return {
+            "schema": EVENTS_SCHEMA,
+            "stream_id": stream_id,
+            "after_seq": after_seq,
+            "events": [],
+            "cursor": {
+                "stream_id": stream_id,
+                "seq": after_seq,
+                "source_size": before_size,
+                "source_mtime_ns": before_mtime_ns,
+            },
+            "has_more": False,
+            "reset": False,
+            "unchanged": True,
+        }
+
+    # Only advertise a generation hint if the file remained stable around the
+    # validated read. If a writer races us, omit the hint so the next request
+    # must validate again rather than accidentally treating unread bytes as seen.
+    stable = False
+    events: list[dict[str, Any]] = []
+    final_size = before_size
+    final_mtime_ns = before_mtime_ns
+    for _ in range(3):
+        read_size, read_mtime_ns = _stream_stat(stream)
+        events = stream.read()
+        final_size, final_mtime_ns = _stream_stat(stream)
+        if (read_size, read_mtime_ns) == (final_size, final_mtime_ns):
+            stable = True
+            break
+
+    actual_stream_id = events[0]["stream_id"] if events else None
+    reset = stream_id is not None and stream_id != actual_stream_id
+    effective_after = 0 if reset else after_seq
+    remaining = [event for event in events if event["seq"] > effective_after]
     selected = remaining[:limit]
-    stream_id = events[0]["stream_id"] if events else None
-    latest_seq = selected[-1]["seq"] if selected else after_seq
+    latest_seq = selected[-1]["seq"] if selected else effective_after
+    cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
+    if stable:
+        cursor_doc["source_size"] = final_size
+        cursor_doc["source_mtime_ns"] = final_mtime_ns
     return {
         "schema": EVENTS_SCHEMA,
-        "stream_id": stream_id,
-        "after_seq": after_seq,
+        "stream_id": actual_stream_id,
+        "after_seq": effective_after,
         "events": selected,
-        "cursor": {"stream_id": stream_id, "seq": latest_seq},
+        "cursor": cursor_doc,
         "has_more": len(remaining) > len(selected),
+        "reset": reset,
+        "unchanged": False,
     }
 
 
