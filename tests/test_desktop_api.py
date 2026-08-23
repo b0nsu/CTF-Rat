@@ -45,8 +45,7 @@ class DesktopApiTests(unittest.TestCase):
             self.assertTrue(first["has_more"])
             self.assertFalse(first["reset"])
             self.assertFalse(first["unchanged"])
-            self.assertIn("source_size", first["cursor"])
-            self.assertIn("source_mtime_ns", first["cursor"])
+            self.assertIsInstance(first["cursor"].get("source_generation"), str)
             second = event_delta(root, after_seq=first["cursor"]["seq"], limit=2)
             self.assertEqual([event["seq"] for event in second["events"]], [4])
             self.assertFalse(second["has_more"])
@@ -57,13 +56,13 @@ class DesktopApiTests(unittest.TestCase):
             stream.append("hypothesis.recorded", {"hypothesis_id": "H1"})
             first = event_delta(root, after_seq=0, limit=10)
             cursor = first["cursor"]
+            self.assertIsInstance(cursor["source_generation"], str)
             with patch.object(Stream, "read", side_effect=AssertionError("unchanged poll parsed STATE")):
                 unchanged = event_delta(
                     root,
                     after_seq=cursor["seq"],
                     stream_id=cursor["stream_id"],
-                    known_size=cursor["source_size"],
-                    known_mtime_ns=cursor["source_mtime_ns"],
+                    known_generation=cursor["source_generation"],
                     limit=10,
                 )
             self.assertTrue(unchanged["unchanged"])
@@ -92,16 +91,14 @@ class DesktopApiTests(unittest.TestCase):
             self.assertEqual([event["seq"] for event in reset["events"]], [1])
             self.assertNotEqual(reset["stream_id"], old["stream_id"])
 
-    def test_event_delta_rejects_unbounded_or_partial_hint_requests(self):
+    def test_event_delta_rejects_unbounded_or_invalid_hint_requests(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(ValueError):
                 event_delta(root, after_seq=-1)
             with self.assertRaises(ValueError):
                 event_delta(root, limit=5001)
             with self.assertRaises(ValueError):
-                event_delta(root, known_size=0)
-            with self.assertRaises(ValueError):
-                event_delta(root, known_mtime_ns=0)
+                event_delta(root, known_generation="")
 
     def test_artifact_list_and_preview_reuse_canonical_store(self):
         with tempfile.TemporaryDirectory() as root:
