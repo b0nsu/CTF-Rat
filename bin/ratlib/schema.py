@@ -26,18 +26,18 @@ def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str
     if not isinstance(doc, Mapping): raise ValidationError("document must be an object")
     schema = doc.get("schema")
     if expected and schema != expected: raise ValidationError("expected %s" % expected)
-    if not isinstance(schema, str) or not schema.startswith("rat.") or not schema.endswith("/v1"):
+    if not isinstance(schema, str) or not schema.startswith("rat.") or not (schema.endswith("/v1") or schema.endswith("/v2")):
         raise ValidationError("unsupported schema")
     dispatch = {"rat.tool-result/v1": tool_result, "rat.observation/v1": observation,
       "rat.finding/v1": finding, "rat.checkpoint/v1": checkpoint, "rat.primitive/v1": primitive,
       "rat.run/v1": run, "rat.role-contract/v1": role_contract,
       "rat.task-output/v1": task_output, "rat.skeptic-report/v1": skeptic_report,
-      "rat.benchmark-result/v1": benchmark_result}
+      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2}
     try: dispatch[schema](doc)
     except KeyError: raise ValidationError("unknown schema %s" % schema)
     return doc
 def tool_result(d):
-    _need(d,("schema","tool","run_id","invocation_id","status","started_at","finished_at","duration_ms","inputs","parameters","summary","artifacts","findings","diagnostics","exit","provenance")); _strict(d,{"schema","tool","run_id","invocation_id","status","started_at","finished_at","duration_ms","inputs","parameters","summary","artifacts","findings","diagnostics","exit","provenance","extensions"})
+    _need(d,("schema","tool","run_id","invocation_id","status","started_at","finished_at","duration_ms","inputs","parameters","summary","artifacts","findings","diagnostics","exit","provenance")); _strict(d,{"schema","tool","run_id","invocation_id","status","started_at","finished_at","duration_ms","inputs","parameters","summary","artifacts","findings","diagnostics","exit","provenance","extensions","tool_name","params_digest","cache_state"})
     if d["status"] not in {"ok","partial","timeout","error","cancelled"}: raise ValidationError("invalid result status")
     _iso(d["started_at"]); _iso(d["finished_at"])
     if not isinstance(d["duration_ms"],int) or d["duration_ms"] < 0: raise ValidationError("invalid duration")
@@ -47,6 +47,9 @@ def tool_result(d):
     if not isinstance(d["exit"],Mapping) or set(d["exit"]) != {"code","signal","timed_out","cancelled"}: raise ValidationError("invalid exit")
     if not isinstance(d["provenance"],Mapping) or set(d["provenance"]) != {"platform","dependency_versions","policy_digest","cache"}: raise ValidationError("invalid provenance")
     _digest(d["provenance"]["policy_digest"])
+    if "tool_name" in d and not isinstance(d["tool_name"],str): raise ValidationError("invalid tool_name")
+    if "params_digest" in d and not isinstance(d["params_digest"],str): raise ValidationError("invalid params_digest")
+    if "cache_state" in d and d["cache_state"] not in {"hit","miss","bypass"}: raise ValidationError("invalid cache_state")
 def observation(d):
     _need(d,("schema","observation_id","run_id","created_at","producer","subject","kind","value","evidence","quality","validity")); _iso(d["created_at"])
     if not d["evidence"]: raise ValidationError("observation requires evidence")
@@ -83,3 +86,28 @@ def benchmark_result(d):
     if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
     if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
     if d["outcome"] not in {"verified","solve-claimed","failed","censored","unknown","skipped"}: raise ValidationError("invalid benchmark outcome")
+def benchmark_result_v2(d):
+    _need(d,("schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"))
+    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"})
+    if d["ablation_id"] not in {"A0","A1","A2","A3","A4","A5"}: raise ValidationError("invalid ablation")
+    if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
+    if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
+    if d["outcome"] not in {"verified","solve-claimed","failed","censored","unknown","skipped"}: raise ValidationError("invalid benchmark outcome")
+    _iso(d["started_at"]); _iso(d["finished_at"])
+    groups = {
+        "correctness": {"verified_solve","false_solved","oracle_pass"},
+        "latency": {"time_to_first_query_ms","time_to_first_hypothesis_ms","time_to_first_valid_primitive_ms","time_to_verified_solve_ms"},
+        "context": {"input_tokens","output_tokens","peak_context_tokens","tool_output_bytes"},
+        "tools": {"tool_calls","duplicate_tool_calls","ghidra_runs","cfgfast_runs","symbolic_runs","subagent_count"},
+        "cache": {"cache_requests","cache_hits","cache_hit_ratio","bytes_reused","cold_warm"},
+        "reasoning": {"hypotheses_created","hypotheses_refuted","pivot_count","deep_escalations"},
+        "artifacts": {"functions_decompiled","raw_output_size","compressed_output_size","artifact_count"},
+    }
+    metrics = d["metrics"]
+    if not isinstance(metrics,Mapping) or set(metrics) != set(groups): raise ValidationError("benchmark metrics missing required groups")
+    for name, fields in groups.items():
+        group = metrics[name]
+        if not isinstance(group,Mapping) or set(group) != fields: raise ValidationError("invalid metrics.%s fields" % name)
+    if metrics["cache"]["cold_warm"] not in {"cold","warm"}: raise ValidationError("invalid metrics.cache.cold_warm")
+    ratio = metrics["cache"]["cache_hit_ratio"]
+    if ratio is not None and not (isinstance(ratio,(int,float)) and 0 <= ratio <= 1): raise ValidationError("invalid metrics.cache.cache_hit_ratio")
