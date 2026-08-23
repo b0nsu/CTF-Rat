@@ -7,13 +7,11 @@ import {
   EventRecord,
   Session,
   Snapshot,
-  Telemetry,
   getArtifactPreview,
   getArtifacts,
   getEvents,
   getSession,
   getSnapshot,
-  getTelemetry,
   getTerminal,
   sendTerminalInput,
   startSession,
@@ -64,7 +62,6 @@ export default function App() {
   const [terminalInput, setTerminalInput] = useState("");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactPreview | null>(null);
-  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
   const [connection, setConnection] = useState<"connecting" | "live" | "offline">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [replaySeq, setReplaySeq] = useState<number | null>(null);
@@ -81,8 +78,8 @@ export default function App() {
 
     const initial = async () => {
       try {
-        const [snapshot, delta, currentSession, listing, stats, log] = await Promise.all([
-          getSnapshot(), getEvents(null, 1000), getSession(), getArtifacts(), getTelemetry(), getTerminal(0)
+        const [snapshot, delta, currentSession, listing, log] = await Promise.all([
+          getSnapshot(), getEvents(null, 1000), getSession(), getArtifacts(), getTerminal(0)
         ]);
         if (!mounted) return;
         setLiveSnapshot(snapshot);
@@ -92,7 +89,6 @@ export default function App() {
         eventCursor.current = delta.cursor;
         setSession(currentSession);
         setArtifacts(listing.artifacts);
-        setTelemetry(stats);
         setTerminal(log.text);
         terminalCursor.current = log.cursor;
         setConnection("live");
@@ -134,12 +130,11 @@ export default function App() {
         }
         setSession(currentSession);
         if (stateChanged) {
-          const [snapshot, listing, stats] = await Promise.all([getSnapshot(), getArtifacts(), getTelemetry()]);
+          const [snapshot, listing] = await Promise.all([getSnapshot(), getArtifacts()]);
           if (!mounted) return;
           setLiveSnapshot(snapshot);
           if (replaySeqRef.current === null) setDisplaySnapshot(snapshot);
           setArtifacts(listing.artifacts);
-          setTelemetry(stats);
         }
         setConnection("live");
         setError(null);
@@ -254,7 +249,7 @@ export default function App() {
           onChange={(event) => void changeReplay(Number(event.target.value))}
         />
         <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
-        <span className="telemetry-inline">events {telemetry?.event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
+        <span className="telemetry-inline">events {liveSnapshot?.total_event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
       </section>
 
       <main className="workspace">
