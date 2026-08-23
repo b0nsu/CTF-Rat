@@ -2,8 +2,9 @@
 """Deterministic microbenchmark for CTF-Rat Desktop artifact discovery.
 
 This is a measurement harness, not a performance gate. Fixtures are written
-before timing. Listing measures metadata/schema/object-size discovery; preview
-measures the canonical full SHA-256 verification with a bounded retained prefix.
+before timing. Full listing measures metadata/schema/object-size discovery;
+unchanged listing measures the metadata-inventory generation fast path; preview
+measures full SHA-256 verification with only a bounded retained prefix.
 """
 from __future__ import annotations
 
@@ -93,11 +94,19 @@ def _measure(fn, iterations: int) -> dict[str, float]:
 def run_case(count: int, object_bytes: int, preview_bytes: int, iterations: int) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="ctf-rat-desktop-artifact-bench-") as root:
         digests = _write_artifacts(root, count, object_bytes)
+        first = list_artifacts(root, limit=min(2000, count))
+        generation = first["generation"]
         listing = _measure(lambda: list_artifacts(root, limit=min(2000, count)), iterations)
+        unchanged = _measure(
+            lambda: list_artifacts(root, limit=min(2000, count), known_generation=generation),
+            iterations,
+        )
         preview = _measure(
             lambda: artifact_preview(root, digests[-1], max_bytes=min(preview_bytes, 256 * 1024)),
             iterations,
         )
+        wall_ratio = listing["wall_p50_ms"] / unchanged["wall_p50_ms"] if unchanged["wall_p50_ms"] else None
+        cpu_ratio = listing["cpu_p50_ms"] / unchanged["cpu_p50_ms"] if unchanged["cpu_p50_ms"] else None
         return {
             "schema": SCHEMA,
             "artifact_count": count,
@@ -110,10 +119,13 @@ def run_case(count: int, object_bytes: int, preview_bytes: int, iterations: int)
                 "platform": platform.platform(),
             },
             "operations": {
-                "list_artifacts": listing,
+                "list_artifacts_full": listing,
+                "list_artifacts_unchanged_hint": unchanged,
                 "preview_one": preview,
             },
-            "note": "listing is metadata/object-stat discovery; preview performs full SHA-256 verification while retaining only a bounded prefix",
+            "unchanged_hint_wall_speedup_p50": None if wall_ratio is None else round(wall_ratio, 2),
+            "unchanged_hint_cpu_speedup_p50": None if cpu_ratio is None else round(cpu_ratio, 2),
+            "note": "full listing validates metadata/object-size; unchanged hint scans immutable metadata inventory only; preview performs full SHA-256 verification while retaining a bounded prefix",
         }
 
 
