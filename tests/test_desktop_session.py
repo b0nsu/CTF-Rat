@@ -66,6 +66,28 @@ class DesktopSessionTests(unittest.TestCase):
             self.assertIn("second", replay)
             self.assertNotIn("first", replay)
 
+    def test_spawn_failure_preserves_terminal_log_and_cursor(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = SessionManager(root, [sys.executable, "-u", "-c", "print('before-failure')"])
+            manager.start()
+            self.wait_finished(manager)
+            before = manager.log_delta(0, 4096)
+            self.assertIn("before-failure", before["text"])
+
+            manager.solver_argv = [os.path.join(root, "definitely-missing-solver")]
+            with self.assertRaises(OSError):
+                manager.start()
+
+            after = manager.log_delta(0, 4096)
+            self.assertEqual(after["text"], before["text"])
+            self.assertEqual(after["cursor"], before["cursor"])
+
+            manager.solver_argv = [sys.executable, "-u", "-c", "print('after-failure')"]
+            manager.start()
+            self.wait_finished(manager)
+            resumed = manager.log_delta(before["cursor"], 4096)
+            self.assertIn("after-failure", resumed["text"])
+
     def test_stale_cursor_survives_solver_and_daemon_restart(self):
         with tempfile.TemporaryDirectory() as root:
             first_manager = SessionManager(root, [sys.executable, "-u", "-c", "print('A'*512)"])
