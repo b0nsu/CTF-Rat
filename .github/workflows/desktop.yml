@@ -1,0 +1,49 @@
+name: desktop-workbench
+
+on:
+  push:
+    branches: [desktop]
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'bin/ratd'
+      - 'bin/ratlib/desktop_*.py'
+      - 'tests/test_desktop_*.py'
+      - '.github/workflows/desktop.yml'
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Desktop backend tests
+        run: python3 -m unittest tests.test_desktop_api tests.test_desktop_session
+      - name: Syntax check daemon modules
+        run: python3 -m py_compile bin/ratd bin/ratlib/desktop_api.py bin/ratlib/desktop_session.py
+
+  frontend-tauri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package.json
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential curl file libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+      - name: Rust compile check
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
