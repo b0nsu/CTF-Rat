@@ -84,8 +84,23 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="ctf-rat-desktop-bench-") as root:
         stream_bytes = _write_stream(root, count)
         midpoint = count // 2
+
+        # Prime the opaque generation hint using the same validated fallback
+        # path a real first poll uses. Subsequent unchanged polls echo it.
+        primed = event_delta(root, after_seq=count, limit=500)
+        cursor = primed["cursor"]
+        hinted_idle = lambda: event_delta(
+            root,
+            after_seq=count,
+            limit=500,
+            stream_id=cursor["stream_id"],
+            known_size=cursor.get("source_size"),
+            known_mtime_ns=cursor.get("source_mtime_ns"),
+        )
+
         operations = {
-            "event_delta_idle": _measure(lambda: event_delta(root, after_seq=count, limit=500), iterations),
+            "event_delta_idle_full_scan": _measure(lambda: event_delta(root, after_seq=count, limit=500), iterations),
+            "event_delta_idle_unchanged_hint": _measure(hinted_idle, iterations),
             "event_delta_10_new": _measure(lambda: event_delta(root, after_seq=max(0, count - 10), limit=500), iterations),
             "snapshot_live": _measure(lambda: snapshot(root), iterations),
             "snapshot_midpoint": _measure(lambda: snapshot(root, until_seq=midpoint), iterations),
@@ -93,6 +108,10 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             "artifact_listing_empty": _measure(lambda: list_artifacts(root, limit=500), iterations),
         }
         changed_names = ("event_delta_10_new", "snapshot_live", "telemetry", "artifact_listing_empty")
+        idle_full = operations["event_delta_idle_full_scan"]
+        idle_fast = operations["event_delta_idle_unchanged_hint"]
+        wall_speedup = idle_full["wall_p50_ms"] / idle_fast["wall_p50_ms"] if idle_fast["wall_p50_ms"] else None
+        cpu_speedup = idle_full["cpu_p50_ms"] / idle_fast["cpu_p50_ms"] if idle_fast["cpu_p50_ms"] else None
         return {
             "schema": SCHEMA,
             "event_count": count,
@@ -103,8 +122,10 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
                 "platform": platform.platform(),
             },
             "operations": operations,
-            "estimated_idle_poll_wall_ms_p50": operations["event_delta_idle"]["wall_p50_ms"],
-            "estimated_idle_poll_cpu_ms_p50": operations["event_delta_idle"]["cpu_p50_ms"],
+            "unchanged_hint_wall_speedup_p50": None if wall_speedup is None else round(wall_speedup, 2),
+            "unchanged_hint_cpu_speedup_p50": None if cpu_speedup is None else round(cpu_speedup, 2),
+            "estimated_idle_poll_wall_ms_p50": idle_fast["wall_p50_ms"],
+            "estimated_idle_poll_cpu_ms_p50": idle_fast["cpu_p50_ms"],
             "estimated_changed_poll_wall_ms_p50": round(sum(operations[name]["wall_p50_ms"] for name in changed_names), 3),
             "estimated_changed_poll_cpu_ms_p50": round(sum(operations[name]["cpu_p50_ms"] for name in changed_names), 3),
             "note": "changed poll totals are sequential cost estimates; the UI issues refresh requests concurrently",
