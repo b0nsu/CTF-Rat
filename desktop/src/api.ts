@@ -35,8 +35,7 @@ export type Snapshot = {
 export type EventCursor = {
   stream_id: string | null;
   seq: number;
-  source_size?: number;
-  source_mtime_ns?: number;
+  source_generation?: string;
 };
 
 export type Delta = {
@@ -137,10 +136,7 @@ export function getEvents(cursor: EventCursor | null, limit = 500): Promise<Delt
     limit: String(limit)
   });
   if (cursor?.stream_id) params.set("stream_id", cursor.stream_id);
-  if (typeof cursor?.source_size === "number" && typeof cursor?.source_mtime_ns === "number") {
-    params.set("known_size", String(cursor.source_size));
-    params.set("known_mtime_ns", String(cursor.source_mtime_ns));
-  }
+  if (cursor?.source_generation) params.set("known_generation", cursor.source_generation);
   return request(`/api/events?${params.toString()}`);
 }
 
