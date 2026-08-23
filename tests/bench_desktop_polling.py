@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import sys
 import tempfile
 import time
@@ -52,19 +53,30 @@ def _percentile(samples: list[float], q: float) -> float:
     return ordered[index]
 
 
+def _stats(samples: list[float], prefix: str) -> dict[str, float]:
+    return {
+        "%s_p50_ms" % prefix: round(_percentile(samples, 0.50), 3),
+        "%s_p95_ms" % prefix: round(_percentile(samples, 0.95), 3),
+        "%s_max_ms" % prefix: round(max(samples), 3),
+    }
+
+
 def _measure(fn, iterations: int) -> dict[str, float]:
     # Warm filesystem/page cache once; repeated samples then model steady-state
-    # desktop polling rather than first-open disk latency.
+    # desktop polling rather than first-open disk latency. Wall-clock latency
+    # and process CPU time are distinct signals and must not be conflated.
     fn()
-    samples = []
+    wall_samples = []
+    cpu_samples = []
     for _ in range(iterations):
-        started = time.perf_counter_ns()
+        wall_started = time.perf_counter_ns()
+        cpu_started = time.process_time_ns()
         fn()
-        samples.append((time.perf_counter_ns() - started) / 1_000_000.0)
+        cpu_samples.append((time.process_time_ns() - cpu_started) / 1_000_000.0)
+        wall_samples.append((time.perf_counter_ns() - wall_started) / 1_000_000.0)
     return {
-        "p50_ms": round(_percentile(samples, 0.50), 3),
-        "p95_ms": round(_percentile(samples, 0.95), 3),
-        "max_ms": round(max(samples), 3),
+        **_stats(wall_samples, "wall"),
+        **_stats(cpu_samples, "cpu"),
     }
 
 
@@ -80,20 +92,22 @@ def run_case(count: int, iterations: int) -> dict[str, object]:
             "telemetry": _measure(lambda: telemetry(root), iterations),
             "artifact_listing_empty": _measure(lambda: list_artifacts(root, limit=500), iterations),
         }
-        idle_p50 = operations["event_delta_idle"]["p50_ms"]
-        changed_cpu_p50 = sum(
-            operations[name]["p50_ms"]
-            for name in ("event_delta_10_new", "snapshot_live", "telemetry", "artifact_listing_empty")
-        )
+        changed_names = ("event_delta_10_new", "snapshot_live", "telemetry", "artifact_listing_empty")
         return {
             "schema": SCHEMA,
             "event_count": count,
             "stream_bytes": stream_bytes,
             "iterations": iterations,
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+            },
             "operations": operations,
-            "estimated_idle_poll_cpu_ms_p50": round(idle_p50, 3),
-            "estimated_changed_poll_cpu_ms_p50": round(changed_cpu_p50, 3),
-            "note": "changed poll is a sequential CPU-cost estimate; the UI issues refresh requests concurrently",
+            "estimated_idle_poll_wall_ms_p50": operations["event_delta_idle"]["wall_p50_ms"],
+            "estimated_idle_poll_cpu_ms_p50": operations["event_delta_idle"]["cpu_p50_ms"],
+            "estimated_changed_poll_wall_ms_p50": round(sum(operations[name]["wall_p50_ms"] for name in changed_names), 3),
+            "estimated_changed_poll_cpu_ms_p50": round(sum(operations[name]["cpu_p50_ms"] for name in changed_names), 3),
+            "note": "changed poll totals are sequential cost estimates; the UI issues refresh requests concurrently",
         }
 
 
