@@ -119,6 +119,20 @@ def main(argv=None) -> int:
                     stack = core.read(sp, 64)
                 except Exception:
                     stack = b""
+                # The kernel/gdb snapshot of RIP after `ret` jumps to a
+                # non-canonical (controlled) address is not portable: some
+                # kernels record the popped controlled value in RIP, others
+                # record the address of the faulting `ret`. The controlled
+                # value is deterministically preserved in the just-popped
+                # return slot at [sp-8] -- that is program memory, not a
+                # register snapshot, so it reads back identically on every
+                # x86_64 Linux. Recover it as the portable hijack evidence.
+                try:
+                    ret_slot = int.from_bytes(core.read(sp - 8, 8), "little")
+                except Exception:
+                    ret_slot = None
+                pc_offset = cyclic_offset(pc, args.cyclic_width)
+                ret_slot_offset = cyclic_offset(ret_slot, args.cyclic_width)
                 core_doc = {
                     "sha256": sha256(core_path),
                     "size": os.path.getsize(core_path),
@@ -127,7 +141,13 @@ def main(argv=None) -> int:
                     "pc": pc,
                     "sp": sp,
                     "fault_addr": fault,
-                    "pc_cyclic_offset": cyclic_offset(pc, args.cyclic_width),
+                    "pc_cyclic_offset": pc_offset,
+                    "ret_slot": ret_slot,
+                    "ret_slot_cyclic_offset": ret_slot_offset,
+                    # Portable RIP-hijack offset: prefer the RIP snapshot, fall
+                    # back to the popped return slot when the kernel did not
+                    # snapshot the controlled value into RIP.
+                    "control_cyclic_offset": pc_offset if pc_offset is not None else ret_slot_offset,
                     "fault_cyclic_offset": cyclic_offset(fault, args.cyclic_width),
                     "stack_hex": stack.hex(),
                 }

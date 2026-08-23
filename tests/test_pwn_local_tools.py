@@ -106,14 +106,21 @@ class LocalPwnToolTests(unittest.TestCase):
         # as a #GP rather than a #PF. On x86_64 a #GP carries no linear fault
         # address, so the kernel reports siginfo si_addr=0 -- core.fault_addr
         # (and therefore fault_cyclic_offset) is legitimately null for this
-        # crash class on any x86_64 Linux, emulated or native. The correct,
-        # honest RIP-hijack evidence is pc_cyclic_offset (core.pc IS the
-        # corrupted value that faulted).
+        # crash class on any x86_64 Linux, emulated or native.
+        #
+        # Which register holds the controlled value in the core is NOT
+        # portable: some kernels snapshot RIP as the popped controlled value
+        # (pc_cyclic_offset == 72), others snapshot the faulting `ret`
+        # instruction address (pc_cyclic_offset is null). pwncrash therefore
+        # exposes control_cyclic_offset, which falls back to the popped return
+        # slot at [sp-8] -- program memory that reads back the controlled
+        # value identically on every x86_64 Linux. That is the honest,
+        # environment-independent RIP-hijack evidence.
         result = self.tool("pwncrash", str(self.binary), "--pattern-length", "256", "--repetitions", "2", "--json")
         report = json.loads(result.stdout)
         self.assertEqual(report["verdict"], "crash-reproduced")
         self.assertEqual(report["stable_signal"], 11)
-        self.assertEqual(report["core"]["pc_cyclic_offset"], 72)
+        self.assertEqual(report["core"]["control_cyclic_offset"], 72)
         self.assertEqual(report["core"]["fault_addr"], 0)
         self.assertEqual(report["promotion"], "candidate-evidence-only")
 
