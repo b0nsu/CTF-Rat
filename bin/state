@@ -271,12 +271,15 @@ def main():
         app({"t":"hypothesis","text":" ".join(rest)}, fpath); print("[state] hypothesis")
     elif c in ("primitive", "prim"):
         if len(rest) < 2:
-            print("usage: state primitive <name> <pass|fail|blocked> [evidence...]", file=sys.stderr); raise SystemExit(2)
+            print("usage: state primitive <name> <candidate|fail|blocked> [evidence...]", file=sys.stderr); raise SystemExit(2)
         status = rest[1].lower(); evidence = " ".join(rest[2:]).strip()
-        if status not in ("pass", "fail", "blocked"):
-            print("[state:err] primitive status must be pass, fail, or blocked", file=sys.stderr); raise SystemExit(2)
-        if status == "pass" and not evidence:
-            print("[state:err] primitive PASS requires concrete evidence", file=sys.stderr); raise SystemExit(2)
+        if status == "pass":
+            print("[state:err] legacy 'state primitive <name> pass <evidence>' is rejected -- "
+                  "PASS requires the typed STATE v2 gate (>=3 active direct SELF observations). "
+                  "Use: state primitive pass <rat.primitive/v1 doc.json>", file=sys.stderr)
+            raise SystemExit(2)
+        if status not in ("candidate", "fail", "blocked"):
+            print("[state:err] primitive status must be candidate, fail, or blocked", file=sys.stderr); raise SystemExit(2)
         app({"t":"primitive","name":rest[0],"status":status,"evidence":evidence}, fpath)
         print("[state] primitive %s=%s" % (rest[0], status))
     elif c in ("no","ruleout"):

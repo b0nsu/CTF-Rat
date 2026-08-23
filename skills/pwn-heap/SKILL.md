@@ -19,5 +19,5 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/heap-techniques.
 - Multiple plausible corruption targets (vtable vs GOT vs tcache key) → DEEP, gate on `doctrine/SOLVABILITY.md` before committing.
 
 ## VERIFY
-- `state primitive <name> pass <evidence>` only after the minimal heap manipulation demonstrably corrupts a controlled marker in a plain local run.
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`) only after the minimal heap manipulation demonstrably corrupts a controlled marker in a plain local run.
 - SOLVED requires the exploit to reproduce against the actual libc/loader in play (local Docker/loopback matching the challenge's libc, or the user's designated remote).

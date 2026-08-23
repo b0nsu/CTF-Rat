@@ -20,7 +20,7 @@ from ratlib.governor import check_progress
 from ratlib.route import route as route_fn
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
-from ratlib.state_v2 import Stream
+from ratlib.state_v2 import Stream, cursor as event_cursor
 
 DEFAULT_BUDGET_BYTES = 16384
 
@@ -28,9 +28,71 @@ def _canonical_digest(value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
+def _brief(value, limit=6):
+    if isinstance(value, list):
+        shown = ", ".join(str(v) for v in value[:limit])
+        more = " (+%d more)" % (len(value) - limit) if len(value) > limit else ""
+        return "[%d] %s%s" % (len(value), shown, more)
+    if isinstance(value, dict):
+        return "{%d keys: %s}" % (len(value), ", ".join(list(value)[:limit]))
+    return str(value)
+
+def _render_next(items):
+    lines = []
+    for n in items:
+        if isinstance(n, dict):
+            lines.append("  %s %s" % (n.get("query", ""), n.get("target", "")))
+        else:
+            lines.append("  %s" % n)
+    return lines
+
+def _render_route_text(doc):
+    if doc.get("error"):
+        return "ROUTE       error (%s)" % doc["error"].get("message")
+    lines = ["ROUTE       %s" % doc.get("subroute"),
+              "CONFIDENCE  %.2f" % (doc.get("confidence") or 0.0),
+              "SKILL       %s" % (doc.get("skill") or "-")]
+    if doc.get("conflict"):
+        lines.append("CONFLICT    yes")
+    signals = doc.get("signals") or []
+    if signals:
+        lines += ["", "SIGNALS"] + ["  %s: %s" % (s.get("kind"), _brief(s.get("value"))) for s in signals]
+    alternatives = doc.get("alternatives") or []
+    if alternatives:
+        lines += ["", "ALTERNATIVES"] + ["  %s (confidence=%.2f)" % (a.get("subroute"), a.get("confidence") or 0.0)
+                                          for a in alternatives]
+    nxt = doc.get("next") or []
+    if nxt:
+        lines += ["", "NEXT"] + _render_next(nxt)
+    if doc.get("governor", {}).get("stuck"):
+        lines += ["", "GOVERNOR    stuck (%s)" % doc["governor"].get("action")]
+    return "\n".join(lines)
+
+def _render_query_text(doc):
+    lines = ["QUERY       %s" % doc.get("query"), "STATUS      %s" % doc.get("status")]
+    facts = doc.get("facts") or {}
+    if facts:
+        lines += ["", "FACTS"] + ["  %s: %s" % (k, _brief(v)) for k, v in facts.items()]
+    heuristics = doc.get("heuristics") or {}
+    nxt = heuristics.get("next") or []
+    if nxt:
+        lines += ["", "NEXT"] + _render_next(nxt)
+    diagnostics = doc.get("diagnostics") or []
+    if diagnostics:
+        lines += ["", "DIAGNOSTICS"] + ["  [%s] %s" % (d.get("code"), d.get("message")) for d in diagnostics]
+    if doc.get("governor", {}).get("stuck"):
+        lines += ["", "GOVERNOR    stuck (%s)" % doc["governor"].get("action")]
+    return "\n".join(lines)
+
 def _print(doc, fmt):
     if fmt == "json":
         print(json.dumps(doc, sort_keys=True, ensure_ascii=False))
+        return
+    schema = doc.get("schema")
+    if schema == "rat.route-result/v1":
+        print(_render_route_text(doc))
+    elif schema == "rat.query-result/v1":
+        print(_render_query_text(doc))
     else:
         label = doc.get("query") or doc.get("subroute") or doc.get("schema")
         status = doc.get("status") or ("stuck" if doc.get("governor", {}).get("stuck") else "ok")
@@ -59,13 +121,13 @@ def _load_revq_module():
         _REVQ_MODULE = mod
     return _REVQ_MODULE
 
-def _gather_revq(binary, fast):
+def _gather_revq(binary, fast, store):
     mod = _load_revq_module()
     # revq's extract_* helpers call die()/sys.exit() on missing angr / wrong
     # format when used as a standalone CLI -- reinterpret as a catchable
     # error when loaded in-process so one binary's degradation can't kill rat.
     try:
-        rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False)
+        rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False, index_root=store)
     except SystemExit as exc:
         raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
     return mod, rev
@@ -100,13 +162,23 @@ def _gather_profile(binary, store):
     except Exception:
         return None
 
-# ---- Progress Novelty Governor wiring -- route/query only ----
+# ---- Progress Novelty Governor wiring -- route/query plus STATE progress ----
+# Events that represent real solving progress (new observation, finding/primitive
+# revision, ruled-out route, ...) as opposed to this governor's own bookkeeping
+# (`governor.checked`, which must not count as progress against itself).
+_STATE_PROGRESS_EVENT_TYPES = {
+    "observation.recorded", "finding.revised", "primitive.revised", "primitive.consumed",
+    "evidence.invalidated", "hypothesis.recorded", "unknown.recorded", "route.ruled_out", "next.recorded",
+}
 def _governor_wrap(store, action, novelty_key, doc):
-    digest = _canonical_digest(novelty_key)
     stream = Stream(os.path.dirname(store))
-    events = [e for e in stream.read() if e["type"] == "governor.checked"]
-    novel = digest not in {e["payload"]["digest"] for e in events}
-    history = [e["payload"]["novel"] for e in events] + [novel]
+    events = stream.read()
+    progress = [e for e in events if e["type"] in _STATE_PROGRESS_EVENT_TYPES]
+    state_cursor = event_cursor(progress[-1]) if progress else None
+    digest = _canonical_digest({**novelty_key, "state_cursor": state_cursor})
+    checked = [e for e in events if e["type"] == "governor.checked"]
+    novel = digest not in {e["payload"]["digest"] for e in checked}
+    history = [e["payload"]["novel"] for e in checked] + [novel]
     stream.append("governor.checked", {"action": action, "novel": novel, "digest": digest})
     check = check_progress(history)
     if check["stuck"]:
@@ -134,18 +206,19 @@ def cmd_route(args):
     binary = args.binary
     bad = _check_binary(binary)
     if bad:
-        if args.format == "json":
-            print(json.dumps({"schema": "rat.route-result/v1", "error": bad}, ensure_ascii=False))
-        else:
-            print("route: error (%s)" % bad["message"])
-        return EXIT_INPUT
+        # Still a fully schema-conformant rat.route-result/v1 document -- the
+        # "error" field carries the diagnostic without leaving the required
+        # track/subroute/confidence/signals/capabilities/skill/next fields out.
+        result = route_fn()
+        result["error"] = bad
+        return _emit(result, EXIT_INPUT, args.format)
     store = resolve_index_root(binary, override=args.store)
     caps = _doctor_capabilities(binary)
     profile = _gather_profile(binary, store)
     fast = args.fast or not caps.get("angr", False)
     rev, interesting = None, None
     try:
-        mod, rev = _gather_revq(binary, fast)
+        mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
     except Exception:
         rev, interesting = None, None
@@ -164,7 +237,7 @@ def cmd_query_func(args):
         return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
     try:
-        mod, rev = _gather_revq(binary, args.fast)
+        mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
         return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     card = mod.compute_function_card(rev, name)
@@ -202,7 +275,7 @@ def cmd_query_oracle(args):
         return _emit(*_query_error("oracle", bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
     try:
-        mod, rev = _gather_revq(binary, args.fast)
+        mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)

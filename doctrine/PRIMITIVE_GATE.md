@@ -7,8 +7,12 @@
 ## 상태 타입
 
 - `state hypothesis <text>`: 아직 검증 전인 풀이 가설. 체이닝 근거로 사용 금지.
-- `state primitive <name> pass <evidence>`: 최소 입력으로 검증된 primitive. 로컬 PoC의 근거로 사용 가능.
-- `state primitive <name> fail|blocked <evidence>`: primitive 실패/보류. 같은 경로로 체이닝 금지.
+- `state primitive <name> candidate <evidence>`: 후보 등록(legacy 텍스트 로그). PASS 근거로는 사용 불가.
+- **PASS 기록(typed STATE v2 전용, 필수)**: `state primitive <name> pass <evidence>` 형태의 legacy 명령은 `bin/state`가 거부한다. PASS는 아래 3단계로 typed v2 스트림에 기록해야 한다.
+  1. SELF로 직접 확인한 관찰 3개 이상을 `rat.observation/v1` 문서로 각각 기록: `state event append obs_N.json` (각 문서는 `quality.level:"direct"`, `validity.state:"active"`).
+  2. `rat.primitive/v1` 문서를 작성: `status:"pass"`, `self_evidence:[관찰 3개 이상의 observation_id]`, 나머지 필수 필드(`primitive_id`,`name`,`class`,`input_digest`,`environment_digest`,`constraints`,`side_effects`,`remote_equivalent`,`producer`,`revision`).
+  3. `state primitive pass primitive.json` 로 typed v2 스트림에 append — `bin/state`/`ratlib.state_v2.revise_primitive`가 "3개의 active+direct SELF observation" invariant를 실제로 검증한다.
+- `state primitive <name> fail|blocked <evidence>`: primitive 실패/보류(legacy 텍스트 로그로 허용). 같은 경로로 체이닝 금지.
 - `state no <text> -- <reason>`: 재시도 금지 dead-end.
 
 ## Primitive PASS 조건
@@ -36,18 +40,25 @@ Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
 ```sh
 state hypothesis "saved EBP low-byte overwrite may pivot main epilogue into attacker-controlled stack data"
 
-# 최소 입력 실행 후 core/gdb에서:
-#   ESP=0xfffc00bf
-#   [ESP]=0x41424344 (입력의 marker)
-#   next ret target=0x80000000
-state primitive stack_pivot pass "core: ESP=0xfffc00bf, [ESP]=0x41424344 attacker marker, next ret=0x80000000"
+# 최소 입력 실행 후 core/gdb에서 SELF로 직접 확인한 관찰을 3개 이상 기록:
+#   obs_esp.json:   {"schema":"rat.observation/v1", ..., "value":"ESP=0xfffc00bf",
+#                    "quality":{"level":"direct"}, "validity":{"state":"active"}, ...}
+#   obs_marker.json:{"schema":"rat.observation/v1", ..., "value":"[ESP]=0x41424344 attacker marker", ...}
+#   obs_ret.json:   {"schema":"rat.observation/v1", ..., "value":"next ret target=0x80000000", ...}
+state event append obs_esp.json
+state event append obs_marker.json
+state event append obs_ret.json
+
+# primitive.json: {"schema":"rat.primitive/v1", "status":"pass",
+#                   "self_evidence":["<obs_esp id>","<obs_marker id>","<obs_ret id>"], ...}
+state primitive pass primitive.json
 ```
 
 ## 금지 규칙
 
 아래 중 하나라도 해당하면 로컬 PoC 조립 금지:
 
-- `state hypothesis`만 있고 `state primitive ... pass`가 없다.
+- `state hypothesis`만 있고 typed v2 `state primitive pass <doc.json>` 기록이 없다.
 - pivot 주소가 readable일 뿐 attacker-controlled marker가 없다.
 - gdb에서는 되지만 일반 실행 core에서 깨진다.
 - terminator/NUL/newline이 다음 byte 또는 chain을 훼손하는지 확인하지 않았다.

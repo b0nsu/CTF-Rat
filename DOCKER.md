@@ -113,7 +113,7 @@ if the challenge image itself is pinned.
 - `libcgate .` shows the expected Dockerfile and does not point the loader at
   the host `/lib` path.
 - Exploit succeeds against the loopback Docker service, not only `./prob.local`.
-- `state primitive ... pass` records the remote-equivalent evidence.
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>`, see [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)) records the remote-equivalent evidence.
 - Heap exploits record allocator evidence before blaming libc: tcache count,
   head, returned chunks, and safe-linking `target ^ (chunk >> 12)` when relevant.
 - Do not claim "remote libc mismatch" unless Docker-loopback verification fails

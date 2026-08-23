@@ -18,5 +18,5 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/rop-and-shellcod
 - Stack alignment (`movaps` faults) or bad-byte constraints keep breaking the chain → DEEP, `pwnpayload` + `pwnropcheck` full recheck rather than trial-and-error resending.
 
 ## VERIFY
-- `state primitive <name> pass <evidence>` only after a minimal chain demonstrably redirects control flow (e.g. to a marker function) in a plain local run.
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`) only after a minimal chain demonstrably redirects control flow (e.g. to a marker function) in a plain local run.
 - SOLVED requires the full chain to execute against the local process/Docker (matching libc) or the user's designated remote, with the real flag/shell as evidence.

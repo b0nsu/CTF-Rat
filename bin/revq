@@ -53,7 +53,7 @@ FLAG_STR = re.compile(r"flag|\bctf\b|\}$|\{.*\}", re.I)
 # oracle success/failure classification — reuses the
 # same extracted strings/xrefs, no new analysis.
 ORACLE_SUCCESS_STR = re.compile(
-    r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|valid\b",
+    r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b",
     re.I,
 )
 ORACLE_FAILURE_STR = re.compile(
@@ -793,16 +793,21 @@ def render_xrefs(rev, target):
 
 
 # ─────────────────────────── 오케스트레이션 ───────────────────────────
-def _canonical_index(binpath, want_engine, cur_sha):
+def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
     """Best-effort registration in the M2 canonical cache index (bin/ratlib/cache.py).
 
     revq's own sidecar-file validity check above remains the source of truth
     for hit/miss; this only makes that decision observable to other tools
     (rat-metrics, a future `rat` dispatcher) through one shared index.
+
+    `index_root`, when given, overrides the default dirname(binpath)/.rat
+    resolution -- callers that resolved a custom --store must pass it through
+    so this registration lands in the same canonical index as their other
+    tool calls instead of silently diverging.
     """
     try:
         from ratlib.cache import Cache, canonical_key, resolve_index_root
-        idx_root = resolve_index_root(binpath)
+        idx_root = resolve_index_root(binpath, override=index_root)
         ck = canonical_key(binary_sha256="sha256:" + cur_sha, tool_name="revq", tool_version=str(SCHEMA),
                             params={"engine": want_engine}, dep_versions={})
         return Cache(idx_root), ck
@@ -810,10 +815,10 @@ def _canonical_index(binpath, want_engine, cur_sha):
         return None, None
 
 
-def load_or_extract(binpath, want_engine, refresh):
+def load_or_extract(binpath, want_engine, refresh, index_root=None):
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
-    idx, ck = _canonical_index(binpath, want_engine, cur_sha)
+    idx, ck = _canonical_index(binpath, want_engine, cur_sha, index_root)
     if not refresh and os.path.isfile(cp):
         try:
             with open(cp) as f:
@@ -1039,6 +1044,8 @@ def selftest():
     chk(oracle["auto_connect"] is True, "oracle: 단일·명확 success/fail → auto_connect")
     chk(oracle["resolved"]["success"]["addr"] == 0x11a0 and oracle["resolved"]["failure"]["addr"] == 0x11b0,
         "oracle: xref BB 주소 정확 (angr 로드베이스와 일치, symsolve 그대로 투입 가능)")
+    chk(not ORACLE_SUCCESS_STR.search("invalid") and bool(ORACLE_FAILURE_STR.search("invalid")),
+        "oracle: 'invalid' 는 실패 후보만 매칭 (valid 부분 문자열 오매칭 방지)")
     s = render_summary(rev)
     chk("ORACLE  success@0x11a0" in s and "fail@0x11b0" in s, "render_summary: ORACLE 라인")
     chk("SUGGEST symsolve.py" in s and "--find 0x11a0" in s and "--avoid 0x11b0" in s,
