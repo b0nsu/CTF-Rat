@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""rat - bounded FAST-path front door for CTF-Rat.
+
+This command does not replace recon/revq/state. It gives Codex a small,
+deterministic first response and promotes the existing tools only when needed.
+All default operations are local and read-only.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+
+from ratlib.runner import run
+from ratlib.state_v2 import Stream
+
+VERSION = "rat-fast/v1"
+MAX_TOOL_PREVIEW = 64 * 1024
+COMPARE_IMPORTS = {
+    "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "bcmp",
+    "wcscmp", "wcsncmp", "strstr",
+}
+PWN_IMPORTS = {
+    "gets", "strcpy", "strcat", "sprintf", "vsprintf", "scanf", "__isoc99_scanf",
+    "read", "recv", "memcpy", "strncpy", "fgets", "getline",
+}
+INPUT_IMPORTS = {
+    "read", "recv", "scanf", "__isoc99_scanf", "fgets", "gets", "getline", "fread",
+}
+SUCCESS_RE = re.compile(
+    r"correct|success|congrat|accepted|valid|granted|flag|license|serial|wrong|invalid|denied|try again",
+    re.I,
+)
+CRYPTO_RE = re.compile(
+    r"\b(?:aes|des|rc4|md5|sha(?:1|224|256|384|512)|crc|base64|rsa|hmac|xor)\b",
+    re.I,
+)
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tool(argv: list[str], timeout: int = 8) -> tuple[int, str, str]:
+    try:
+        result = run(argv, timeout_seconds=timeout, tool_version=VERSION)
+    except Exception as exc:
+        return 70, "", f"{type(exc).__name__}: {exc}"
+    out = result.stdout.preview[:MAX_TOOL_PREVIEW].decode("utf-8", errors="replace")
+    err = result.stderr.preview[:MAX_TOOL_PREVIEW].decode("utf-8", errors="replace")
+    return result.exit_code, out, err
+
+
+def _file_type(binary: str) -> str:
+    rc, out, _ = _tool(["file", "-b", "--", binary], 5)
+    return out.strip() if rc == 0 else "unknown"
+
+
+def _imports(binary: str, file_type: str) -> list[str]:
+    if "ELF" not in file_type:
+        return []
+    rc, out, _ = _tool(["readelf", "-W", "--dyn-syms", binary], 8)
+    if rc != 0:
+        return []
+    names = set()
+    for line in out.splitlines():
+        if " UND " not in line:
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[-1].split("@")[0]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.$]*$", name):
+            names.add(name)
+    return sorted(names)
+
+
+def _interesting_strings(binary: str) -> list[str]:
+    rc, out, _ = _tool(["strings", "-n", "4", "--", binary], 8)
+    if rc != 0:
+        return []
+    hits = []
+    for line in out.splitlines():
+        if SUCCESS_RE.search(line) or CRYPTO_RE.search(line):
+            line = line.strip()
+            if line and line not in hits:
+                hits.append(line[:160])
+            if len(hits) >= 16:
+                break
+    return hits
+
+
+def _route(file_type: str, imports: list[str], strings: list[str], category: str = "auto") -> dict:
+    platform = "unknown"
+    if "ELF" in file_type:
+        platform = "elf"
+    elif "PE32" in file_type or "MS Windows" in file_type:
+        platform = "pe"
+    elif "Mach-O" in file_type:
+        platform = "macho"
+
+    imp = set(imports)
+    rev_reasons = []
+    pwn_reasons = []
+    rev_score = 0
+    pwn_score = 0
+    cmp_hits = sorted(imp & COMPARE_IMPORTS)
+    input_hits = sorted(imp & INPUT_IMPORTS)
+    unsafe_hits = sorted(imp & PWN_IMPORTS)
+    if cmp_hits:
+        rev_score += 3
+        rev_reasons.append("compare imports: " + ", ".join(cmp_hits[:6]))
+    if strings:
+        rev_score += min(4, 1 + len(strings) // 3)
+        rev_reasons.append("checker/crypto strings present")
+    if unsafe_hits:
+        pwn_score += 2
+        pwn_reasons.append("memory/input imports: " + ", ".join(unsafe_hits[:8]))
+    if input_hits and not cmp_hits:
+        pwn_score += 1
+    if platform in {"pe", "macho"}:
+        rev_score += 4
+        rev_reasons.append(platform + " defaults to reversing route")
+
+    if category in {"rev", "pwn"}:
+        route = category + "-fast"
+        confidence = 1.0
+        reasons = rev_reasons if category == "rev" else pwn_reasons
+        if not reasons:
+            reasons = ["operator category override"]
+    elif rev_score >= pwn_score + 2:
+        route = "rev-fast"
+        confidence = min(0.95, 0.55 + 0.07 * (rev_score - pwn_score))
+        reasons = rev_reasons
+    elif pwn_score >= rev_score + 2 and platform == "elf":
+        route = "pwn-fast"
+        confidence = min(0.9, 0.55 + 0.07 * (pwn_score - rev_score))
+        reasons = pwn_reasons
+    else:
+        route = "mixed-fast"
+        confidence = 0.5
+        reasons = (rev_reasons + pwn_reasons)[:6] or ["no decisive static signal"]
+
+    return {
+        "route": route,
+        "confidence": round(confidence, 2),
+        "platform": platform,
+        "rev_score": rev_score,
+        "pwn_score": pwn_score,
+        "reasons": reasons,
+        "compare_imports": cmp_hits,
+        "input_imports": input_hits,
+        "pwn_imports": unsafe_hits,
+    }
+
+
+def _cache_status(binary: str, root: str | None = None) -> dict:
+    digest = _sha256(binary)
+    revq_path = binary + ".revq.json"
+    revq = {"state": "miss", "path": revq_path}
+    try:
+        data = json.load(open(revq_path, encoding="utf-8"))
+        revq["state"] = "hit" if data.get("sha256") == digest else "stale"
+        revq["engine"] = data.get("engine")
+    except (OSError, ValueError, TypeError):
+        pass
+
+    decomp_dir = binary + ".decomp"
+    decomp_meta = os.path.join(decomp_dir, ".rat-cache.json")
+    decomp = {"state": "miss", "path": decomp_dir}
+    try:
+        data = json.load(open(decomp_meta, encoding="utf-8"))
+        cached = str(data.get("provenance", {}).get("binary_sha256", "")).removeprefix("sha256:")
+        if cached and cached != digest:
+            decomp["state"] = "stale"
+        elif data.get("status") == "complete":
+            decomp["state"] = "hit"
+        else:
+            decomp["state"] = "partial"
+        decomp["functions_exported"] = data.get("functions_exported")
+    except (OSError, ValueError, TypeError):
+        pass
+
+    root = os.path.abspath(root or os.path.dirname(os.path.abspath(binary)))
+    sqlite_path = os.path.join(root, ".rat", "indexes", "cache.sqlite3")
+    structured = {"state": "absent", "path": sqlite_path, "entries": 0}
+    if os.path.isfile(sqlite_path):
+        try:
+            db = sqlite3.connect("file:%s?mode=ro" % sqlite_path, uri=True)
+            row = db.execute("SELECT COUNT(*) FROM cache").fetchone()
+            structured = {
+                "state": "present",
+                "path": sqlite_path,
+                "entries": int(row[0] if row else 0),
+            }
+            db.close()
+        except sqlite3.Error:
+            structured["state"] = "unreadable"
+    return {"revq": revq, "decomp": decomp, "structured": structured}
+
+
+def _next_steps(route: str, binary: str) -> list[str]:
+    q = json.dumps(binary)
+    if route == "rev-fast":
+        return [f"revq {q} --fast", f"revq {q} --interesting", f"rat func {q} <candidate>"]
+    if route == "pwn-fast":
+        return [
+            f"recon {q}",
+            f"rat-doctor {q} --format json",
+            "enter DEEP only after a concrete exploit primitive is needed",
+        ]
+    return [
+        f"revq {q} --fast",
+        f"recon {q}",
+        "choose rev-fast or pwn-fast from the first bounded result",
+    ]
+
+
+def command_route(args: argparse.Namespace) -> int:
+    binary = os.path.realpath(args.binary)
+    if not os.path.isfile(binary):
+        print("[rat:err] binary not found: " + args.binary, file=sys.stderr)
+        return 2
+    ftype = _file_type(binary)
+    imports = _imports(binary, ftype)
+    strings = _interesting_strings(binary)
+    route = _route(ftype, imports, strings, args.category)
+    doc = {
+        "schema": "rat.fast-route/v1",
+        "binary": binary,
+        "binary_sha256": _sha256(binary),
+        "file_type": ftype,
+        "route": route,
+        "signals": {"interesting_strings": strings[:8], "import_count": len(imports)},
+        "cache": _cache_status(binary, args.root),
+        "next": _next_steps(route["route"], binary),
+        "deep_triggers": [
+            "FAST signals conflict or remain ambiguous",
+            "dynamic-only/packed/anti-debug behavior invalidates static assumptions",
+            "a pwn primitive must be proven before chaining",
+            "local/remote runtime equivalence matters",
+        ],
+    }
+    if args.json:
+        print(json.dumps(doc, indent=2, ensure_ascii=False))
+        return 0
+    print("ROUTE  %s  confidence=%.2f" % (route["route"], route["confidence"]))
+    print("TYPE   " + ftype)
+    print("SHA256 " + doc["binary_sha256"])
+    if route["reasons"]:
+        print("WHY")
+        for reason in route["reasons"][:6]:
+            print("  - " + reason)
+    if strings:
+        print("SIGNAL")
+        for s in strings[:6]:
+            print("  - " + s)
+    print("CACHE")
+    for name in ("revq", "decomp", "structured"):
+        rec = doc["cache"][name]
+        extra = " entries=%s" % rec.get("entries") if name == "structured" else ""
+        print("  %-10s %-9s%s" % (name, rec.get("state", "?"), extra))
+    print("NEXT")
+    for step in doc["next"]:
+        print("  " + step)
+    print("DEEP only on ambiguity, primitive chaining, or runtime-equivalence risk.")
+    return 0
+
+
+def command_func(args: argparse.Namespace) -> int:
+    binary = os.path.realpath(args.binary)
+    if not os.path.isfile(binary):
+        print("[rat:err] binary not found: " + args.binary, file=sys.stderr)
+        return 2
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "revq")
+    argv = [tool, binary]
+    if args.fast:
+        argv.append("--fast")
+    argv += ["--func", args.target]
+    rc, out, err = _tool(argv, args.timeout)
+    if args.json:
+        print(json.dumps({
+            "schema": "rat.function-card/v1",
+            "binary": binary,
+            "target": args.target,
+            "status": "ok" if rc == 0 else "error",
+            "content": out.strip(),
+            "diagnostic": err.strip()[:2000],
+            "cache": _cache_status(binary, args.root),
+        }, ensure_ascii=False, indent=2))
+    else:
+        if err.strip():
+            for line in err.strip().splitlines()[:4]:
+                print(line, file=sys.stderr)
+        print(out.strip())
+    return rc
+
+
+def _iter_records(value):
+    if isinstance(value, dict):
+        return list(value.values())
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _snapshot_doc(root: str) -> dict:
+    view = Stream(root).view()
+    facts = []
+    for item in _iter_records(view.get("findings", {})):
+        state = item.get("state", "unknown")
+        if state in {"confirmed", "supported"}:
+            facts.append({
+                "state": state,
+                "text": item.get("text", item.get("finding_id", "?")),
+            })
+    primitives = [
+        {
+            "status": item.get("status", "unknown"),
+            "id": item.get("primitive_id", item.get("name", "primitive")),
+        }
+        for item in _iter_records(view.get("primitives", {}))
+    ]
+    hypotheses = [
+        item.get("text", item.get("hypothesis_id", "?"))
+        for item in _iter_records(view.get("hypotheses", {}))
+    ]
+    ruled = [
+        item.get("text", item.get("fingerprint", str(item))) if isinstance(item, dict) else str(item)
+        for item in _iter_records(view.get("ruled_out", {}))
+    ]
+    unknowns = [
+        item.get("text", item.get("unknown_id", str(item))) if isinstance(item, dict) else str(item)
+        for item in _iter_records(view.get("unknowns", {}))
+    ]
+    next_probes = [
+        item.get("text", item.get("probe", str(item))) if isinstance(item, dict) else str(item)
+        for item in _iter_records(view.get("next_probes", {}))
+    ]
+    return {
+        "schema": "rat.context-snapshot/v1",
+        "root": os.path.abspath(root),
+        "facts": facts,
+        "primitives": primitives,
+        "hypotheses": hypotheses,
+        "ruled_out": ruled,
+        "unknowns": unknowns,
+        "next": next_probes,
+    }
+
+
+def _bounded_text(doc: dict, budget: int) -> str:
+    sections = [
+        ("FACTS", ["[%s] %s" % (x["state"].upper(), x["text"]) for x in doc["facts"]]),
+        ("PRIMITIVES", ["[%s] %s" % (x["status"].upper(), x["id"]) for x in doc["primitives"]]),
+        ("HYPOTHESES", ["[?] " + x for x in doc["hypotheses"]]),
+        ("RULED OUT", ["[-] " + x for x in doc["ruled_out"]]),
+        ("UNKNOWN", ["[?] " + x for x in doc["unknowns"]]),
+        ("NEXT", ["[>] " + x for x in doc["next"]]),
+    ]
+    out = ["== RAT CONTEXT SNAPSHOT =="]
+    used = len((out[0] + "\n").encode())
+    truncated = False
+    for title, rows in sections:
+        if not rows:
+            continue
+        header = title + ":"
+        hb = len((header + "\n").encode())
+        if used + hb > budget:
+            truncated = True
+            break
+        out.append(header)
+        used += hb
+        for row in rows:
+            line = "  " + row
+            lb = len((line + "\n").encode())
+            if used + lb > budget:
+                truncated = True
+                break
+            out.append(line)
+            used += lb
+        if truncated:
+            break
+    if truncated:
+        marker = "... [TRUNCATED: raise --budget-bytes only if necessary]"
+        if used + len((marker + "\n").encode()) <= budget:
+            out.append(marker)
+    if len(out) == 1:
+        out.append("(no typed state yet)")
+    return "\n".join(out)
+
+
+def command_snapshot(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    try:
+        doc = _snapshot_doc(root)
+    except Exception as exc:
+        print("[rat:err] cannot read typed state: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        if len(raw.encode()) > args.budget_bytes:
+            print(json.dumps({
+                "schema": doc["schema"],
+                "root": doc["root"],
+                "truncated": True,
+                "hint": "use text snapshot or raise --budget-bytes",
+            }, ensure_ascii=False))
+        else:
+            print(raw)
+        return 0
+    print(_bounded_text(doc, args.budget_bytes))
+    return 0
+
+
+def selftest() -> int:
+    fails = []
+
+    def check(cond, name):
+        if cond:
+            print("  PASS " + name)
+        else:
+            print("  FAIL " + name)
+            fails.append(name)
+
+    r = _route("ELF 64-bit LSB pie executable", ["memcmp", "strlen"], ["Correct!"], "auto")
+    check(r["route"] == "rev-fast", "rev checker route")
+    r = _route("ELF 64-bit LSB executable", ["gets", "read"], [], "auto")
+    check(r["route"] == "pwn-fast", "pwn import route")
+    r = _route("PE32+ executable for MS Windows", [], [], "auto")
+    check(r["route"] == "rev-fast", "PE defaults to rev")
+    r = _route("ELF 64-bit LSB executable", [], [], "auto")
+    check(r["route"] == "mixed-fast", "ambiguous route remains mixed")
+    doc = {
+        "facts": [{"state": "confirmed", "text": "A" * 200}],
+        "primitives": [], "hypotheses": [], "ruled_out": [], "unknowns": [], "next": [],
+    }
+    txt = _bounded_text(doc, 120)
+    check(len(txt.encode()) <= 120, "snapshot obeys byte budget")
+    print("ALL GREEN" if not fails else "FAILURES: " + ", ".join(fails))
+    return 0 if not fails else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="rat", description="CTF-Rat bounded FAST-path front door")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("route", help="cheap deterministic artifact routing")
+    q.add_argument("binary")
+    q.add_argument("--category", choices=["auto", "rev", "pwn"], default="auto")
+    q.add_argument("--root", help="challenge root for structured cache status")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=command_route)
+
+    q = sub.add_parser("func", help="bounded revq function card")
+    q.add_argument("binary")
+    q.add_argument("target")
+    q.add_argument("--fast", action="store_true", help="force binutils-tier revq")
+    q.add_argument("--timeout", type=int, default=60)
+    q.add_argument("--root", help="challenge root for structured cache status")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=command_func)
+
+    q = sub.add_parser("snapshot", help="small typed-state projection for model context")
+    q.add_argument("--root", default=os.getcwd())
+    q.add_argument("--budget-bytes", type=int, default=6000)
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=command_snapshot)
+
+    q = sub.add_parser("selftest", help=argparse.SUPPRESS)
+    q.set_defaults(func=lambda _args: selftest())
+    return p
+
+
+def main(argv=None) -> int:
+    p = build_parser()
+    args = p.parse_args(argv)
+    if getattr(args, "budget_bytes", 1) <= 0:
+        p.error("--budget-bytes must be positive")
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
