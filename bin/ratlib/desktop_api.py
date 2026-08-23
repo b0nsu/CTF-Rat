@@ -31,17 +31,22 @@ def _manifest(challenge_root: str) -> dict[str, Any] | None:
 
 
 def _stream_stat(stream: Stream) -> tuple[int, int]:
-    """Return a cheap append-only stream generation hint.
-
-    Size + mtime is not a source of truth. It is only emitted after a stable
-    validated read and may be echoed by a client to prove that no bytes changed
-    since that read. Any mismatch falls back to the canonical Stream.read().
-    """
+    """Return the local size/mtime tuple used only as a change hint."""
     try:
         stat = os.stat(stream.path)
         return stat.st_size, stat.st_mtime_ns
     except OSError:
         return 0, 0
+
+
+def _generation(stat: tuple[int, int]) -> str:
+    """Encode file stat values as an opaque JS-safe string.
+
+    ``st_mtime_ns`` commonly exceeds JavaScript's safe integer range. Keeping
+    the generation opaque avoids precision loss when a Tauri/JS client echoes
+    it back. This is only a performance hint, never canonical STATE evidence.
+    """
+    return "%d:%d" % stat
 
 
 def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, Any]:
@@ -71,15 +76,14 @@ def event_delta(
     after_seq: int = 0,
     limit: int = 500,
     stream_id: str | None = None,
-    known_size: int | None = None,
-    known_mtime_ns: int | None = None,
+    known_generation: str | None = None,
 ) -> dict[str, Any]:
     """Return ordered STATE events after ``after_seq`` with a bounded count.
 
-    ``known_size``/``known_mtime_ns`` are optional client-echoed hints from a
-    previous stable response. When both still match, the append-only stream is
-    unchanged and the expensive JSONL re-parse can be skipped. Hints never
-    bypass validation after the file changes.
+    ``known_generation`` is an optional opaque client-echoed hint from a
+    previous stable response. If it still matches, the append-only stream is
+    unchanged and the expensive JSONL re-parse can be skipped. Any mismatch
+    falls back to canonical ``Stream.read()`` validation.
     """
     if not isinstance(after_seq, int) or after_seq < 0:
         raise ValueError("after_seq must be a non-negative integer")
@@ -87,16 +91,13 @@ def event_delta(
         raise ValueError("limit must be between 1 and 5000")
     if stream_id is not None and (not isinstance(stream_id, str) or not stream_id):
         raise ValueError("stream_id must be a non-empty string")
-    if (known_size is None) != (known_mtime_ns is None):
-        raise ValueError("known_size and known_mtime_ns must be supplied together")
-    if known_size is not None and (not isinstance(known_size, int) or known_size < 0):
-        raise ValueError("known_size must be a non-negative integer")
-    if known_mtime_ns is not None and (not isinstance(known_mtime_ns, int) or known_mtime_ns < 0):
-        raise ValueError("known_mtime_ns must be a non-negative integer")
+    if known_generation is not None and (not isinstance(known_generation, str) or not known_generation):
+        raise ValueError("known_generation must be a non-empty string")
 
     stream = Stream(os.path.abspath(challenge_root))
-    before_size, before_mtime_ns = _stream_stat(stream)
-    if known_size is not None and known_size == before_size and known_mtime_ns == before_mtime_ns:
+    before_stat = _stream_stat(stream)
+    before_generation = _generation(before_stat)
+    if known_generation is not None and known_generation == before_generation:
         return {
             "schema": EVENTS_SCHEMA,
             "stream_id": stream_id,
@@ -105,8 +106,7 @@ def event_delta(
             "cursor": {
                 "stream_id": stream_id,
                 "seq": after_seq,
-                "source_size": before_size,
-                "source_mtime_ns": before_mtime_ns,
+                "source_generation": before_generation,
             },
             "has_more": False,
             "reset": False,
@@ -118,13 +118,12 @@ def event_delta(
     # must validate again rather than accidentally treating unread bytes as seen.
     stable = False
     events: list[dict[str, Any]] = []
-    final_size = before_size
-    final_mtime_ns = before_mtime_ns
+    final_stat = before_stat
     for _ in range(3):
-        read_size, read_mtime_ns = _stream_stat(stream)
+        read_stat = _stream_stat(stream)
         events = stream.read()
-        final_size, final_mtime_ns = _stream_stat(stream)
-        if (read_size, read_mtime_ns) == (final_size, final_mtime_ns):
+        final_stat = _stream_stat(stream)
+        if read_stat == final_stat:
             stable = True
             break
 
@@ -136,8 +135,7 @@ def event_delta(
     latest_seq = selected[-1]["seq"] if selected else effective_after
     cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
     if stable:
-        cursor_doc["source_size"] = final_size
-        cursor_doc["source_mtime_ns"] = final_mtime_ns
+        cursor_doc["source_generation"] = _generation(final_stat)
     return {
         "schema": EVENTS_SCHEMA,
         "stream_id": actual_stream_id,
