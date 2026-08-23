@@ -13,11 +13,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb
       - run: python3 -m pip install --disable-pip-version-check pwntools pyelftools
+      # tool selftests (pure logic, no angr — see bin/revq "Mac selftest 격리")
+      - run: python3 bin/rat selftest
+      - run: python3 bin/revq selftest
+      - run: python3 solve/_template/rev/symsolve.py selftest
+      - run: python3 solve/_template/rev/vmlift.py selftest
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 tests/e2e_artifact_handoff.py
       - run: python3 tests/e2e_analysis.py --category core
       - run: python3 tests/e2e_orchestration.py --scenario converge
       - run: python3 tests/e2e_orchestration.py --scenario invalidate-cancel
+      - run: python3 tests/e2e_orchestration.py --scenario verified-only-exploit
+      - run: python3 tests/e2e_orchestration.py --scenario skeptic-refute
       - run: bin/pkselftest --format json
