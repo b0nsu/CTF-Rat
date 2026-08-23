@@ -49,6 +49,25 @@ def _strings_blob(revq):
 def _sig(kind, value, quality):
     return {"kind": kind, "value": value, "quality": quality}
 
+def _pwn_candidate(imports, profile):
+    """Score the pwn-track signal from imports alone, without returning --
+    the caller decides whether this competes with a rev-track candidate."""
+    if imports & HEAP_IMPORTS:
+        hit = sorted(imports & HEAP_IMPORTS)
+        return "pwn-heap", 0.55, [_sig("heap-imports", hit, "fact")]
+    if (imports & FORMAT_IMPORTS) and (imports & INPUT_IMPORTS):
+        hit = sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS))
+        return "pwn-format", 0.55, [_sig("format-input-imports", hit, "fact")]
+    if imports & OVERFLOW_IMPORTS:
+        hit = sorted(imports & OVERFLOW_IMPORTS)
+        sigs = [_sig("overflow-imports", hit, "fact")]
+        nx = _fact(profile, "elf.nx")
+        if nx is True:
+            sigs.append(_sig("elf-nx", True, "fact"))
+            return "pwn-rop", 0.6, sigs
+        return "pwn-stack", 0.6, sigs
+    return None
+
 def route(*, profile=None, revq=None, interesting=None):
     """Judge a route from existing profile/revq artifacts.
 
@@ -68,37 +87,43 @@ def route(*, profile=None, revq=None, interesting=None):
         signals.append(_sig("kernel-imports", hit, "fact"))
         return _result("pwn", "pwn-kernel", 0.8, signals, capabilities)
 
+    pwn = _pwn_candidate(imports, profile)
     top = (interesting or [None])[0] if interesting else None
     if top:
         score = top.get("score", 0)
         why = top.get("why", [])
         calls_cmp = any("비교함수 호출" in w for w in why)
-        signals.append(_sig("revq-interesting", {"func": top.get("func"), "score": score}, "heuristic"))
+        rev_signals = [_sig("revq-interesting", {"func": top.get("func"), "score": score}, "heuristic")]
         if calls_cmp:
-            confidence = min(0.5 + score / 20.0, 0.9)
-            return _result("rev", "rev-checker", confidence, signals, capabilities, next_target=top.get("func"))
-        if any(h in _strings_blob(revq).lower() for h in CRYPTO_HINTS):
-            signals.append(_sig("crypto-hint", [h for h in CRYPTO_HINTS if h in _strings_blob(revq).lower()], "heuristic"))
-        return _result("rev", "rev-symbolic", 0.5, signals, capabilities)
+            rev_subroute, rev_confidence, rev_target = "rev-checker", min(0.5 + score / 20.0, 0.9), top.get("func")
+        else:
+            rev_subroute, rev_confidence, rev_target = "rev-symbolic", 0.5, None
+            hints = [h for h in CRYPTO_HINTS if h in _strings_blob(revq).lower()]
+            if hints:
+                rev_signals.append(_sig("crypto-hint", hints, "heuristic"))
+        if pwn is None:
+            signals.extend(rev_signals)
+            return _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
+        pwn_subroute, pwn_confidence, pwn_signals = pwn
+        # An explicit compare-call is a strong, mechanical checker signal and keeps
+        # priority even when a pwn import signal also exists; a generic "interesting"
+        # hit with no compare call is weaker and does not outrank a real pwn signal.
+        if calls_cmp or rev_confidence >= pwn_confidence:
+            signals.extend(rev_signals)
+            result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
+            result["conflict"] = True
+            result["alternatives"] = [{"track": "pwn", "subroute": pwn_subroute, "confidence": pwn_confidence}]
+        else:
+            signals.extend(pwn_signals)
+            result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
+            result["conflict"] = True
+            result["alternatives"] = [{"track": "rev", "subroute": rev_subroute, "confidence": rev_confidence}]
+        return result
 
-    if imports & HEAP_IMPORTS:
-        hit = sorted(imports & HEAP_IMPORTS)
-        signals.append(_sig("heap-imports", hit, "fact"))
-        return _result("pwn", "pwn-heap", 0.55, signals, capabilities)
-
-    if (imports & FORMAT_IMPORTS) and (imports & INPUT_IMPORTS):
-        hit = sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS))
-        signals.append(_sig("format-input-imports", hit, "fact"))
-        return _result("pwn", "pwn-format", 0.55, signals, capabilities)
-
-    if imports & OVERFLOW_IMPORTS:
-        hit = sorted(imports & OVERFLOW_IMPORTS)
-        signals.append(_sig("overflow-imports", hit, "fact"))
-        nx = _fact(profile, "elf.nx")
-        if nx is True:
-            signals.append(_sig("elf-nx", True, "fact"))
-            return _result("pwn", "pwn-rop", 0.6, signals, capabilities)
-        return _result("pwn", "pwn-stack", 0.6, signals, capabilities)
+    if pwn is not None:
+        pwn_subroute, pwn_confidence, pwn_signals = pwn
+        signals.extend(pwn_signals)
+        return _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
 
     functions = (revq or {}).get("functions") or []
     fn_names = " ".join(f.get("name", "") for f in functions).lower()

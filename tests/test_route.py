@@ -53,6 +53,30 @@ class RouteFixtures(unittest.TestCase):
         self.assertEqual(r["confidence"], 0.0)
         self.assertIsNone(r["skill"])
 
+class RouteMixedSignal(unittest.TestCase):
+    def test_heap_plus_generic_interesting_routes_pwn_heap_not_rev(self):
+        r = route(profile=profile(imports=["malloc", "free"]),
+                  revq=revq(imports=["malloc", "free", "memcmp"]),
+                  interesting=[{"func": "wrong", "score": 3, "why": ["문자열 상수 비교 대상"]}])
+        self.assertEqual(r["subroute"], "pwn-heap")
+        self.assertTrue(r["conflict"])
+        self.assertEqual(r["alternatives"][0]["subroute"], "rev-symbolic")
+
+    def test_gets_plus_generic_interesting_routes_pwn_stack_not_rev(self):
+        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]),
+                  revq=revq(imports=["gets", "memcmp"]),
+                  interesting=[{"func": "success", "score": 2, "why": ["문자열 상수 비교 대상"]}])
+        self.assertEqual(r["subroute"], "pwn-stack")
+        self.assertTrue(r["conflict"])
+
+    def test_printf_read_plus_explicit_compare_call_still_routes_rev_checker(self):
+        r = route(profile=profile(imports=["printf", "read"]),
+                  revq=revq(imports=["printf", "read", "memcmp"]),
+                  interesting=[{"func": "check_flag", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        self.assertEqual(r["subroute"], "rev-checker")
+        self.assertTrue(r["conflict"])
+        self.assertEqual(r["alternatives"][0]["subroute"], "pwn-format")
+
 class RouteDeterminism(unittest.TestCase):
     def test_identical_inputs_produce_identical_route(self):
         p, rv, inter = profile(imports=["gets"], facts=[("elf.nx", True)]), None, None
