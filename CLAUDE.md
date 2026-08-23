@@ -12,7 +12,7 @@
 4. **skill 1개만**: route에 해당하는 `skills/<route>/SKILL.md`(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY) 또는 `knowledge/GROUNDING_INDEX.md` 라우팅표에서 **하나**만 로드.
 5. **bounded query**: raw dump 금지. `revq --func`/`decomp <func>`/`state compact --budget-tokens N` 같은 범위 제한된 조회만.
 6. **DEEP 승격 조건(아래 하나라도)**: 결과 모호·env-민감(패킹/anti-debug/커널)·같은 실패 반복·evidence 충돌·Progress Novelty Governor stuck(최근 5회 tool/query에 새 artifact digest·finding 개정·ruled-out route·primitive 상태변화 전무, `ratlib.governor.check_progress` 훅) → 강제 re-route 또는 DEEP.
-7. **SOLVED/PASS 금지 조건**: `state primitive <name> pass <evidence>`(SELF 확인 통과) 없이 체이닝 금지, `rat-verify`/`symsolve --find-str`(concrete-verify) 등 deterministic verify 없이 완료 선언 금지.
+7. **SOLVED/PASS 금지 조건**: typed STATE v2 PASS(`state primitive pass <rat.primitive/v1 doc.json>`, `>=3`개의 active+direct SELF observation 필요 — [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)) 없이 체이닝 금지, `rat-verify`/`symsolve --find-str`(concrete-verify) 등 deterministic verify 없이 완료 선언 금지. legacy `state primitive <name> pass <evidence>` 문법은 이 invariant를 우회하므로 `bin/state`가 거부한다.
 
 ## FAST 기본 비활성 (DEEP 조건 충족 시에만)
 

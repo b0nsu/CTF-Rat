@@ -559,13 +559,19 @@ class PrimitiveGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state_path = os.path.join(temp, "STATE.jsonl")
             self.assertNotEqual(self.run_state(state_path, "primitive", "rip", "maybe", "x").returncode, 0)
-            self.assertNotEqual(self.run_state(state_path, "primitive", "rip", "pass").returncode, 0)
             self.assertEqual(self.run_state(state_path, "hypothesis", "saved RIP control").returncode, 0)
-            passed = self.run_state(state_path, "primitive", "rip", "pass",
-                                    "core:rip=0x41414141 marker=SELF")
-            self.assertEqual(passed.returncode, 0, passed.stderr)
+            # Legacy PASS is rejected outright, evidence or not: PASS is a typed
+            # STATE v2 gate (>=3 active direct SELF observations), not a legacy
+            # non-empty-string check.
+            rejected = self.run_state(state_path, "primitive", "rip", "pass",
+                                      "core:rip=0x41414141 marker=SELF")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("typed STATE v2 gate", rejected.stderr)
+            candidate = self.run_state(state_path, "primitive", "rip", "candidate",
+                                       "core:rip=0x41414141 marker=SELF")
+            self.assertEqual(candidate.returncode, 0, candidate.stderr)
             with open(state_path) as f: events = [json.loads(line) for line in f]
-            self.assertEqual(events[-1]["status"], "pass")
+            self.assertEqual(events[-1]["status"], "candidate")
             self.assertTrue(events[-1]["evidence"])
 
 
