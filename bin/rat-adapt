@@ -59,9 +59,10 @@ def main(argv=None):
         "decomp": os.path.join(home, "decomp"),
     }
     tool_path = paths[a.tool]
+    # symsolve.py is executable and has a python3 shebang. Execute it directly so
+    # ratlib.contracts fingerprints the solver script itself rather than the
+    # Python interpreter; solver edits must invalidate cached symbolic results.
     tool_argv = [tool_path, *a.args]
-    if a.tool == "symsolve":
-        tool_argv = [sys.executable, *tool_argv]
 
     root = _rat_root(a.root)
     inputs = _existing_inputs(a.args, a.input)
