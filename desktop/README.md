@@ -97,7 +97,7 @@ With a configured solver command:
 ./desktop/dev.sh /path/to/challenge "<your existing local CTF-Rat agent command>"
 ```
 
-`ratd` listens on `127.0.0.1:8765` by default. The frontend endpoint can be supplied at build/dev time with `VITE_RATD_URL`; packaged v0.2 builds use the default loopback endpoint unless rebuilt with another allowed endpoint.
+`ratd` listens on `127.0.0.1:8765` by default. In browser/Vite development, `VITE_RATD_URL` may point the frontend at another explicitly chosen loopback `ratd` port. Packaged Tauri v0.2 builds are intentionally narrower: the committed CSP permits only `http://127.0.0.1:8765` and `http://localhost:8765`. A packaged custom endpoint therefore requires a corresponding `app.security.csp` `connect-src` change at build time while preserving the loopback-only policy.
 
 ## Linux packages
 
