@@ -1,88 +1,84 @@
-# ctf-rat — Codex FAST-path entry
+# ctf-rat — Codex FAST path
 
-CTF-Rat is a local-first pwn/rev solving kit. The default goal is **time-to-first-action with bounded context** while keeping strict evidence gates for any SOLVED claim.
+CTF-Rat is a local-first pwn/rev kit. Optimize for **time-to-first-action and bounded context**, but never weaken the evidence required for a SOLVED claim.
 
-## Scope and hard invariants
+## Hard invariants
 
-- Work on the provided challenge artifacts, local process/Docker/loopback, and only a **single remote host:port explicitly supplied by the user**.
-- Never discover or scan additional targets, brute-force accounts, collect real credentials, persist, evade detection, exfiltrate unrelated data, or DoS infrastructure.
-- Do not claim a flag, exploit, primitive, offset, or remote success without concrete reproducible evidence.
-- A pwn hypothesis is not a primitive. Do not chain an unverified primitive into an exploit.
-- Remote-sensitive assumptions (libc/loader/seccomp/kernel/allocator/protocol state) require explicit validation before a remote success claim.
-- Repository writes/pushes happen only when the user explicitly asks for repository changes.
+- Work only on supplied challenge artifacts, local process/Docker/loopback, and a single remote host:port explicitly supplied by the user.
+- Do not discover/scan extra targets, brute-force accounts, collect real credentials, persist, evade detection, exfiltrate unrelated data, or DoS infrastructure.
+- Never claim a flag, exploit, primitive, offset, or remote success without reproducible evidence.
+- A pwn hypothesis is not a primitive. Do not chain an unverified primitive.
+- Validate remote-sensitive libc/loader/seccomp/kernel/allocator/protocol assumptions before a remote success claim.
+- Modify/push the repository only when explicitly requested.
 
-## Default solve path: FAST
+## Default: FAST
 
-**Do not preload doctrine or the knowledge tree. Do not read broad reference files at startup.** Start acting on the artifact.
+**Do not preload doctrine, knowledge, or broad references. Touch the artifact first.**
 
-1. If this is a new challenge, acquire the single-challenge guard once: `ctfguard begin <name>`.
-2. Route cheaply: `rat route <artifact>`.
-3. Follow **one** bounded next query:
-   - rev: `revq <bin> --interesting`, then `rat func <bin> <candidate>`; decompile only a named function when needed.
-   - pwn: `recon <bin>` or the specific small pwn helper suggested by the evidence.
-   - when a deterministic query is expensive or likely to repeat, use `rat-adapt --root . --emit stdout <tool> ...` so the structured cache can replay the result without re-running the tool.
+1. New challenge: acquire the single-challenge guard once with `ctfguard begin <name>`.
+2. Route: `rat route <artifact>`.
+3. Run one bounded query:
+   - rev: `revq <bin> --interesting` → `rat-func-v2 <bin> <candidate>`.
+   - if the card exposes success/failure signals: `rat-oracle <bin> --command ...` to produce a cache-aware `symsolve` find/avoid command.
+   - decompile only one named function when the remaining question requires code.
+   - pwn: `recon <bin>` or one evidence-driven helper.
+   - expensive/repeatable deterministic query: use `rat-adapt --root . --emit stdout ...` so structured cache can replay it.
 4. Form the smallest testable hypothesis and run a concrete test/oracle.
-5. Repeat bounded queries. Prefer deterministic tool output over prose summaries.
-6. Before re-reading accumulated state, use `rat snapshot --root . --budget-bytes 6000` rather than loading full history.
-7. Claim SOLVED only after executable/concrete verification. For rev, recovered input must be rerun against the real binary. For pwn, the required primitive and final behavior must be demonstrated in the relevant environment.
+5. Repeat bounded queries; prefer deterministic facts over prose summaries.
+6. Re-read state through `rat snapshot --root . --budget-bytes 6000`, not full history.
+7. Claim SOLVED only after concrete verification. Re-run recovered rev input against the real binary; for pwn, demonstrate the primitive and final behavior in the relevant environment.
 
-FAST is intentionally shallow: route → query → test → verify. No mandatory P0-P5 ceremony, fan-out, skeptic, full Ghidra dump, or broad knowledge loading occurs on this path.
+FAST = route → query → test → verify. No mandatory P0-P5 ceremony, fan-out, skeptic, full decompiler dump, or broad knowledge load.
 
 ## Escalate to DEEP only when needed
 
-Enter the existing strict orchestration when any of these is materially true:
+Escalate when FAST remains ambiguous, anti-analysis/packing/VM/dynamic behavior invalidates static assumptions, a pwn primitive must be proven, local/remote equivalence matters, or repeated failed hypotheses make explicit evidence bookkeeping cheaper.
 
-- FAST signals conflict or remain ambiguous after bounded tests.
-- Packed, anti-debug, dynamic-only, VM/obfuscation, or environment-sensitive behavior invalidates static assumptions.
-- A pwn primitive must be proven before chaining.
-- Local/remote equivalence matters.
-- Repeated failed hypotheses make explicit evidence/state bookkeeping cheaper than continuing ad hoc.
+Use the existing `rat-phase` / `rat-task` / `state` / verifier flow. Load only the doctrine needed now:
 
-On escalation, use the existing `rat-phase` / `rat-task` / `state` / verifier flow. Then load only the doctrine needed for the current gate:
-
-- solving mechanics: `doctrine/SOLVING.md`
-- primitive proof: `doctrine/PRIMITIVE_GATE.md`
-- solvability/stop decision: `doctrine/SOLVABILITY.md`
-- topic knowledge: use `knowledge/GROUNDING_INDEX.md` to select **one relevant knowledge file**, not the whole tree
-- writeup/handoff only after solving: `doctrine/WRITEUP_FORMAT.md`
+- `doctrine/SOLVING.md` — solving mechanics
+- `doctrine/PRIMITIVE_GATE.md` — primitive proof
+- `doctrine/SOLVABILITY.md` — stop/solvability decision
+- `knowledge/GROUNDING_INDEX.md` — choose one relevant knowledge file
+- `doctrine/WRITEUP_FORMAT.md` — only for final handoff/writeup
 
 Do not create a second DEEP engine.
 
 ## Context discipline
 
-- Keep a normal tool result below roughly 2k model-visible tokens when possible; narrow the query instead of dumping more output.
-- Use `rat func`/`revq --func` before a full decompile. Decompile one named function at a time unless evidence requires more.
-- Never `cat` large binaries, logs, decompiler exports, state history, or reference trees into context.
-- FAST uses the main agent. Do not fan out by default. A scout is justified only when a necessary raw read cannot be reduced to a bounded deterministic query; return conclusions plus evidence locators, not the raw dump.
-- Avoid repeating a deterministic tool call with the same effective inputs. Check structured cache, legacy sidecar, and state first.
-- Keep facts, hypotheses, and verified primitives distinct. Store only durable findings that prevent re-derivation.
+- Keep normal model-visible tool output around <=2k tokens; narrow the query instead of dumping more.
+- Prefer `rat-func-v2` before decompilation. Decompile one named function at a time.
+- Never dump large binaries, logs, decompiler exports, state history, or reference trees into context.
+- FAST stays in the main agent. No default fan-out. Use a scout only when a necessary raw read cannot be reduced to a bounded deterministic query.
+- Do not repeat deterministic calls with the same effective inputs. Check structured cache/state first.
+- Keep facts, hypotheses, oracle candidates, and verified primitives distinct.
 
 ## Minimal command surface
 
 ```text
 rat route <artifact>                     cheap deterministic routing
-rat func <bin> <func|addr>               bounded function card
+rat-func-v2 <bin> <func|addr>           structured Function Card v2
+rat-oracle <bin> --command ...           success/failure xref → symsolve wiring
 rat snapshot --root . --budget-bytes N   bounded typed-state projection
-rat-adapt --root . --emit stdout ...     structured-cache wrapper for repeatable queries
+rat-adapt --root . --emit stdout ...     structured-cache wrapper
 revq <bin> --interesting                 rev candidate selection
 recon <bin>                              pwn triage
 decomp <bin> <func>                      named-function decompile
-state ...                                durable evidence/hypothesis/primitive state
+state ...                                durable evidence state
 ```
 
-Use other `bin/` tools only when the current evidence calls for them; do not enumerate or probe the whole toolkit first.
+Other tools are lazy-loaded only when current evidence calls for them.
 
-## Verification policy
+## Verification boundary
 
-Speed optimizations stop at the verification boundary.
-
-- Heuristics and FAST routing signals never auto-promote to facts or primitive PASS.
-- A deterministic executable oracle can replace an LLM skeptic when it directly proves the claimed rev result.
-- Remote/environment-sensitive pwn remains strict: validate primitive, environment assumptions, and observed final behavior before claiming success.
+- FAST routing, role labels, oracle strings, and xref anchors are candidates, not proof.
+- `rat-oracle` may wire deterministic xref anchors into `symsolve`, but the recovered solution must still pass concrete execution.
+- A deterministic executable oracle can replace an LLM skeptic for a directly proven rev result.
+- Remote/environment-sensitive pwn remains strict.
 - Actual output/log/flag bytes are evidence; inferred success is not.
 
 ## Benchmark mode
 
-When measuring an ablation, wrap top-level agent tool calls with `rat-metrics` as documented in `docs/MEASUREMENT.md`. Do not enable telemetry for ordinary solving unless measurement is requested.
+For ablations, use `rat-metrics` per `docs/MEASUREMENT.md`. Telemetry is opt-in for benchmark runs, not normal solving.
 
-The architecture rationale and escalation details live in `docs/CODEX_FAST_PATH.md`; they are reference material, not mandatory startup reading.
+Architecture details live in `docs/CODEX_FAST_PATH.md`; they are not startup reading.
