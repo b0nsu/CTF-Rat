@@ -1,4 +1,4 @@
-"""Small VEX backward slice for branch guards leading to a target block.
+"""Small VEX backward slice for branch guards controlling a target block.
 
 This is intentionally not a whole-program taint engine. It resolves temporary
 and register definitions inside each predecessor block and reports unresolved
@@ -33,30 +33,47 @@ def _children(expr) -> list[Any]:
         return out
 
 
-def _stack_slot(expr, arch) -> str | None:
-    """Recognize direct sp/bp +/- constant addresses without symbolic guessing."""
+def _stack_addr(expr, arch) -> tuple[str, int] | None:
+    """Return (sp/bp register, displacement) for direct constant arithmetic.
+
+    Only Add/Sub chains with one stack base and constants are accepted. This is
+    deliberately narrower than general address simplification: ambiguous or
+    symbolic addressing is left unresolved rather than guessed.
+    """
     tag = type(expr).__name__
     if tag == "Get":
         name = _reg_name(arch, int(expr.offset))
         if name in {"rsp", "rbp", "esp", "ebp", "sp", "x29"}:
-            return "%s+0" % name
+            return name, 0
         return None
+
     args = list(getattr(expr, "args", []) or [])
     if len(args) != 2:
         return None
     left, right = args
-    base = _stack_slot(left, arch)
-    const = _const_value(right)
-    if base is None or const is None:
-        base = _stack_slot(right, arch)
-        const = _const_value(left)
-    if base is None or const is None:
+    left_stack, right_stack = _stack_addr(left, arch), _stack_addr(right, arch)
+    left_const, right_const = _const_value(left), _const_value(right)
+    op = str(getattr(expr, "op", ""))
+
+    if "Add" in op:
+        if left_stack is not None and right_const is not None:
+            return left_stack[0], left_stack[1] + right_const
+        if right_stack is not None and left_const is not None:
+            return right_stack[0], right_stack[1] + left_const
         return None
-    opname = str(getattr(expr, "op", ""))
-    sign = -1 if "Sub" in opname and _stack_slot(left, arch) is not None else 1
-    root = base.split("+", 1)[0]
-    disp = sign * const
-    return "%s%+d" % (root, disp)
+    if "Sub" in op:
+        if left_stack is not None and right_const is not None:
+            return left_stack[0], left_stack[1] - right_const
+        return None
+    return None
+
+
+def _stack_slot(expr, arch) -> str | None:
+    resolved = _stack_addr(expr, arch)
+    if resolved is None:
+        return None
+    base, displacement = resolved
+    return "%s%+d" % (base, displacement)
 
 
 def _expr_uses(expr, arch, tmp_defs, seen_tmps=None) -> tuple[set[str], set[str], list[dict[str, Any]]]:
@@ -151,6 +168,11 @@ def _block_guard_slices(project, node) -> list[dict[str, Any]]:
     return out
 
 
+def _anchor_relation(taken_target: int | None, anchor_block: int) -> str:
+    """Describe how this Exit guard participates in reaching the anchor block."""
+    return "taken" if taken_target == anchor_block else "must-not-take"
+
+
 def _resolve_function(cfg, target: str):
     try:
         addr = int(target, 0)
@@ -195,6 +217,11 @@ def slice_to_anchor(binary: str, function: str, anchor: int, *, max_predecessors
         for item in _block_guard_slices(project, pred):
             item["predecessor_block"] = pred.addr
             item["target_block"] = node.addr
+            item["anchor_relation"] = _anchor_relation(item.get("taken_target"), node.addr)
+            # This means the predecessor CFG edge reaches the anchor block and
+            # this Exit guard constrains that reachability. For must-not-take,
+            # the guard must be false; it does NOT mean the Exit's taken edge
+            # itself targets the anchor.
             item["reaches_anchor_block"] = True
             branches.append(item)
 
@@ -206,12 +233,12 @@ def slice_to_anchor(binary: str, function: str, anchor: int, *, max_predecessors
         "anchor_block": node.addr,
         "branches": branches,
         "coverage": {
-            "scope": "predecessor-block branch guards",
+            "scope": "predecessor-block branch guards controlling anchor-block reachability",
             "tmp_def_use": True,
             "same_block_register_defs": True,
             "direct_stack_slots": True,
             "inter_block_value_flow": False,
             "memory_aliasing": False,
         },
-        "note": "reported dependencies are bounded static evidence; unresolved inter-block values are not guessed",
+        "note": "bounded static evidence only; taken means guard=true reaches anchor, must-not-take means guard=false is required; unresolved inter-block values are not guessed",
     }
