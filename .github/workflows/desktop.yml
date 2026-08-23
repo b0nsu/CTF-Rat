@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -51,11 +55,13 @@ jobs:
       - name: Rust compile check
         run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
       - name: Build Linux bundles
+        if: github.event_name == 'pull_request'
         working-directory: desktop
         run: npm run tauri -- build --bundles deb,appimage
       - name: Verify lockfiles unchanged
         run: git diff --exit-code -- desktop/package-lock.json desktop/src-tauri/Cargo.lock
       - name: Upload Linux bundles
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: ctf-rat-desktop-linux-${{ github.sha }}
