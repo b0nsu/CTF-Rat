@@ -12,7 +12,7 @@ on:
       - '.github/workflows/desktop.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   backend:
@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: desktop/package.json
+          cache-dependency-path: desktop/package-lock.json
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
@@ -44,30 +44,11 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
       - name: Install frontend dependencies
         working-directory: desktop
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Build frontend
         working-directory: desktop
         run: npm run build
       - name: Rust compile check
-        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
-      - name: Capture generated lockfiles
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-lockfiles
-          path: |
-            desktop/package-lock.json
-            desktop/src-tauri/Cargo.lock
-          if-no-files-found: error
-          retention-days: 3
-      - name: Sync generated lockfiles to desktop branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/desktop' && success()
-        run: |
-          if [[ -z "$(git status --porcelain -- desktop/package-lock.json desktop/src-tauri/Cargo.lock)" ]]; then
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add desktop/package-lock.json desktop/src-tauri/Cargo.lock
-          git commit -m 'desktop: lock npm and Cargo dependencies'
-          git push origin HEAD:desktop
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Verify lockfiles unchanged
+        run: git diff --exit-code -- desktop/package-lock.json desktop/src-tauri/Cargo.lock
