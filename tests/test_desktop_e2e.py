@@ -1,5 +1,6 @@
 import importlib.machinery, importlib.util, json, os, sys, tempfile, threading, time, unittest
 from http.server import ThreadingHTTPServer
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
@@ -81,13 +82,22 @@ print('desktop-e2e-terminal', flush=True)
             terminal = self.read_json(base + "/api/terminal?after=0&limit=4096")
             self.assertIn("desktop-e2e-terminal", terminal["text"])
 
-            live = self.read_json(base + "/api/snapshot")
-            self.assertEqual(live["cursor"]["seq"], 2)
-            self.assertIn("H1", live["view"]["hypotheses"])
-            self.assertEqual(live["view"]["next_probes"][-1]["probe"], "desktop e2e probe")
+            live = self.read_json(base + "/api/live?after_seq=0&limit=10")
+            self.assertEqual([event["seq"] for event in live["delta"]["events"]], [1, 2])
+            self.assertEqual(live["snapshot"]["cursor"]["seq"], 2)
+            self.assertIn("H1", live["snapshot"]["view"]["hypotheses"])
+            self.assertEqual(live["snapshot"]["view"]["next_probes"][-1]["probe"], "desktop e2e probe")
 
-            events = self.read_json(base + "/api/events?after_seq=0&limit=10")
-            self.assertEqual([event["seq"] for event in events["events"]], [1, 2])
+            cursor = live["delta"]["cursor"]
+            params = urlencode({
+                "after_seq": cursor["seq"],
+                "limit": 10,
+                "stream_id": cursor["stream_id"],
+                "known_generation": cursor["source_generation"],
+            })
+            idle = self.read_json(base + "/api/live?" + params)
+            self.assertTrue(idle["delta"]["unchanged"])
+            self.assertIsNone(idle["snapshot"])
 
             replay = self.read_json(base + "/api/snapshot?until_seq=1")
             self.assertTrue(replay["historical"])
