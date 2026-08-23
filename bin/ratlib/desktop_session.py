@@ -90,11 +90,14 @@ class SessionManager:
             if self._running():
                 raise ValueError("solver session is already running")
             os.makedirs(self.base, mode=0o700, exist_ok=True)
-            open(self.log_path, "wb").close()
+            # The previous PTY reader must finish before the shared log is
+            # truncated, otherwise a final old-session write can leak into the
+            # next session's replay stream.
             if self._reader is not None and self._reader.is_alive():
                 self._reader.join(timeout=0.5)
                 if self._reader.is_alive():
                     raise ValueError("previous solver session is still cleaning up")
+            open(self.log_path, "wb").close()
             master_fd, slave_fd = pty.openpty()
             env = dict(os.environ)
             env["CTF_RAT_DESKTOP"] = "1"
