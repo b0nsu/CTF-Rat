@@ -45,6 +45,10 @@ class SessionManager:
         self._session_id: str | None = None
         self._exit_code: int | None = None
         self._stopped_at: str | None = None
+        # Terminal cursors are opaque and monotonically increase across solver
+        # restarts. This lets a client safely use a cursor from the previous
+        # session even though terminal.log itself is truncated on start.
+        self._log_base = 0
 
     def _running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -119,6 +123,13 @@ class SessionManager:
             if self._running():
                 raise ValueError("solver session is already running")
             os.makedirs(self.base, mode=0o700, exist_ok=True)
+            try:
+                previous_log_size = os.path.getsize(self.log_path)
+            except OSError:
+                previous_log_size = 0
+            # Advance by one separator as well as the previous byte length so
+            # every cursor from an older session is strictly below this base.
+            self._log_base += previous_log_size + 1
             open(self.log_path, "wb").close()
             master_fd, slave_fd = pty.openpty()
             env = dict(os.environ)
@@ -213,22 +224,30 @@ class SessionManager:
             raise ValueError("after must be non-negative")
         if limit < 1 or limit > MAX_LOG_READ:
             raise ValueError("limit must be between 1 and %d" % MAX_LOG_READ)
-        try:
-            size = os.path.getsize(self.log_path)
-        except OSError:
-            size = 0
-        if after > size:
-            after = size
-        data = b""
-        if size:
-            with open(self.log_path, "rb") as source:
-                source.seek(after)
-                data = source.read(limit)
-        end = after + len(data)
-        return {
-            "schema": LOG_SCHEMA,
-            "after": after,
-            "cursor": end,
-            "has_more": end < size,
-            "text": data.decode("utf-8", "replace"),
-        }
+        # Keep session restart/truncate atomic with respect to cursor mapping.
+        # The PTY writer does not require this lock; bytes appended after the
+        # size snapshot are naturally collected by the next poll.
+        with self._lock:
+            base = self._log_base
+            try:
+                size = os.path.getsize(self.log_path)
+            except OSError:
+                size = 0
+            offset = 0 if after < base else after - base
+            if offset > size:
+                offset = size
+            data = b""
+            if size:
+                with open(self.log_path, "rb") as source:
+                    source.seek(offset)
+                    data = source.read(limit)
+            end_offset = offset + len(data)
+            start_cursor = base + offset
+            end_cursor = base + end_offset
+            return {
+                "schema": LOG_SCHEMA,
+                "after": start_cursor,
+                "cursor": end_cursor,
+                "has_more": end_offset < size,
+                "text": data.decode("utf-8", "replace"),
+            }
