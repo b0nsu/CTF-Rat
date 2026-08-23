@@ -1,7 +1,7 @@
 [package]
 name = "ctf-rat-desktop"
-version = "0.1.0"
-description = "Desktop observer for the CTF-Rat solver runtime"
+version = "0.2.0"
+description = "Desktop workbench for the CTF-Rat solver runtime"
 authors = ["CTF-Rat contributors"]
 edition = "2021"
 
