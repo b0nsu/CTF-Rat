@@ -32,34 +32,44 @@ class OracleTests(unittest.TestCase):
         self.assertIsNone(classify("valid but wrong"))
         self.assertIsNone(classify("hello"))
 
-    def test_xrefs_become_find_avoid_targets(self):
+    def test_xrefs_remain_locators_while_strings_are_solver_targets(self):
         doc = detect(self.fixture(), binary="/tmp/chall", cache={"hit": True})
         self.assertTrue(doc["ready"])
         self.assertEqual(doc["targets"]["find"], [0x401234])
         self.assertEqual(doc["targets"]["avoid"], [0x401280])
-        self.assertEqual(doc["targets"]["find_str"], [])
+        self.assertEqual(doc["targets"]["find_str"], ["Correct!"])
+        self.assertEqual(doc["targets"]["avoid_str"], ["Wrong password"])
         self.assertTrue(doc["cache"]["hit"])
+        self.assertIn("evidence locators only", doc["note"])
 
-    def test_string_fallback_when_xrefs_are_missing(self):
+    def test_string_oracle_remains_ready_when_xrefs_are_missing(self):
         rev = self.fixture()
         rev["strings"][0]["xrefs"] = []
         rev["strings"][1]["xrefs"] = []
         doc = detect(rev, binary="/tmp/chall")
+        self.assertTrue(doc["ready"])
+        self.assertEqual(doc["targets"]["find"], [])
+        self.assertEqual(doc["targets"]["avoid"], [])
         self.assertEqual(doc["targets"]["find_str"], ["Correct!"])
         self.assertEqual(doc["targets"]["avoid_str"], ["Wrong password"])
 
-    def test_symsolve_wiring_preserves_constraints(self):
+    def test_symsolve_wiring_prefers_strings_and_preserves_constraints(self):
         doc = detect(self.fixture(), binary="/tmp/chall")
         argv = symsolve_argv(doc, stdin=16, printable=True, timeout=45)
         self.assertEqual(argv[0], "/tmp/chall")
-        self.assertIn("--find", argv)
-        self.assertIn("0x401234", argv)
-        self.assertIn("--avoid", argv)
-        self.assertIn("0x401280", argv)
+        self.assertIn("--find-str", argv)
+        self.assertIn("Correct!", argv)
+        self.assertIn("--avoid-str", argv)
+        self.assertIn("Wrong password", argv)
+        self.assertNotIn("--find", argv)
+        self.assertNotIn("0x401234", argv)
+        self.assertNotIn("--avoid", argv)
+        self.assertNotIn("0x401280", argv)
         self.assertIn("--stdin", argv)
         self.assertIn("--printable", argv)
         cmd = shell_command(doc, stdin=16, printable=True)
         self.assertTrue(cmd.startswith("rat-adapt --root . --emit stdout symsolve "))
+        self.assertIn("--find-str", cmd)
 
 
 if __name__ == "__main__":
