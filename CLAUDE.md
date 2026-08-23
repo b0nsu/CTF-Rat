@@ -20,6 +20,7 @@ CTF-Rat is a local-first pwn/rev solving kit. The default goal is **time-to-firs
 3. Follow **one** bounded next query:
    - rev: `revq <bin> --interesting`, then `rat func <bin> <candidate>`; decompile only a named function when needed.
    - pwn: `recon <bin>` or the specific small pwn helper suggested by the evidence.
+   - when a deterministic query is expensive or likely to repeat, use `rat-adapt --root . --emit stdout <tool> ...` so the structured cache can replay the result without re-running the tool.
 4. Form the smallest testable hypothesis and run a concrete test/oracle.
 5. Repeat bounded queries. Prefer deterministic tool output over prose summaries.
 6. Before re-reading accumulated state, use `rat snapshot --root . --budget-bytes 6000` rather than loading full history.
@@ -53,7 +54,7 @@ Do not create a second DEEP engine.
 - Use `rat func`/`revq --func` before a full decompile. Decompile one named function at a time unless evidence requires more.
 - Never `cat` large binaries, logs, decompiler exports, state history, or reference trees into context.
 - FAST uses the main agent. Do not fan out by default. A scout is justified only when a necessary raw read cannot be reduced to a bounded deterministic query; return conclusions plus evidence locators, not the raw dump.
-- Avoid repeating a deterministic tool call with the same effective inputs. Check existing result/cache/state first.
+- Avoid repeating a deterministic tool call with the same effective inputs. Check structured cache, legacy sidecar, and state first.
 - Keep facts, hypotheses, and verified primitives distinct. Store only durable findings that prevent re-derivation.
 
 ## Minimal command surface
@@ -62,6 +63,7 @@ Do not create a second DEEP engine.
 rat route <artifact>                     cheap deterministic routing
 rat func <bin> <func|addr>               bounded function card
 rat snapshot --root . --budget-bytes N   bounded typed-state projection
+rat-adapt --root . --emit stdout ...     structured-cache wrapper for repeatable queries
 revq <bin> --interesting                 rev candidate selection
 recon <bin>                              pwn triage
 decomp <bin> <func>                      named-function decompile
