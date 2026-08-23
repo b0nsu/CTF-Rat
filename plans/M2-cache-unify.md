@@ -52,11 +52,20 @@ key = sha256(canonical_json({
 - **작업**: M0 baseline과 동일 fixture 재실행 → `rat-metrics`로 `duplicate_tool_calls`·`cache_hit_ratio` 비교, `tests/telemetry/ab_M2.jsonl` 기록.
 - **Acceptance**: duplicate_tool_calls가 M0 대비 감소, cache_hit_ratio 상승 증거.
 
+## 설계서 반영 (DESIGN_v2.md — PR3)
+- **C3 key v2 필드 확장**: canonical key에 `artifact_inputs[{role,digest,size}]`, `output_schema`, `analysis_schema_version`까지 포함(설계서 §9.1). 내 원안 key에 이 3개 추가.
+- **C3 hit envelope fix(§9.3) — 핵심**: cache hit 시 저장된 옛 envelope를 그대로 반환하지 말고 **새 invocation envelope 생성**: `{invocation_id: new, status: ok, artifacts:[reused immutable refs], provenance.cache:{key, hit:true, source_invocation: old}}`. 이래야 M0의 cache_hit/duplicate 계측이 정확. → `contracts.py:30-35` hit 브랜치를 이 형태로 재작성.
+- **C4 자동 재사용 게이트(§9.4)**: profile/symbols/strings/xrefs/CFG/decompile/ROP/Function Card facts = YES. dynamic trace = scenario+env digest가 key에 있을 때만. **LLM semantic = NO(v2.0)**. partial/truncated/stale 제외.
+- **Migration dual-read/single-write(§22)**: `.revq.json`/`.decomp/`는 한 release간 legacy **read adapter** 유지, 새 **write는 canonical index로만**. immutable artifact 삭제 금지, feature flag로 rollback. legacy CLI output shape 유지.
+- **Error taxonomy(§17.3)**: `stale_cache`(provenance 불일치→recompute), `timeout`(동일결과 cache 금지) 등 코드로 구분.
+
 ## 완료 게이트
-- [ ] canonical_key + 인덱스 스키마 + `tests/test_cache.py`
-- [ ] revq/decomp/rat-profile 3도구 read-through 연결
+- [ ] canonical_key v2(artifact_inputs/output_schema/analysis_schema_version 포함) + `tests/test_cache.py`(ordering/normalization/version 변화 시 key 변화)
+- [ ] **hit envelope fix**: 새 invocation_id + hit=true + source_invocation, artifact digest 동일 (unit test)
+- [ ] revq/decomp/rat-profile 3도구 read-through 연결 (dual-read/single-write)
 - [ ] cache_state가 tool-result envelope에 정확 기록(M0-1 필드 채움)
-- [ ] M2-5에서 duplicate↓ 증명
+- [ ] stale/tool-version/partial/truncated 미재사용 테스트 (§19.1)
+- [ ] M2-5에서 duplicate↓ 증명 (release gate: warm cache hit ratio ≥70%, duplicate ≤25% of v1 추적)
 
 ## 롤백
 - 인덱스 스키마 변경은 마이그레이션 함수로 원복 가능. 도구별 조회는 hit 실패 시 항상 재실행 fallback이라 **캐시 손상이 정답성에 영향 주지 않음**(안전).

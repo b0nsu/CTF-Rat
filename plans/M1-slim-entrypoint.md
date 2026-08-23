@@ -60,12 +60,22 @@
 - **작업**: slim+Terra vs 기존+Terra 를 동일 fixture 3개로 실행, `rat-metrics`로 비교, `tests/telemetry/ab_M1.jsonl` 기록.
 - **Acceptance**: `context_peak`(또는 tokens/solve) 유의미 감소 증거. 감소 없으면 M2 착수 보류 후 원인 분석.
 
+## 설계서 반영 (DESIGN_v2.md — PR2/PR4)
+- **7개 규칙 확정(§8.1)**: root contract는 ①CTF/local ROE+금지 ②목표=verifier/flag+증거 ③첫 동작 `rat route` ④선택된 operator skill 1개만 ⑤raw dump보다 bounded query ⑥불확실/env민감/repeated failure/evidence conflict면 DEEP ⑦SOLVED/PASS는 deterministic verify 없이는 금지.
+- **FAST 기본 비활성 표(§8.2)**: full doctrine preload/full STATE/raw Ghidra/fan-out/skeptic/full CFG·symbolic/scout subagent = 전부 OFF. 각 DEEP 조건 명시.
+- **C10 Progress Novelty Governor 추가**: 시간 기반 stuck 대신 최근 5회 tool/query에서 새 artifact digest·finding revision·ruled-out route·primitive status change가 없으면 강제 re-route 또는 DEEP escalation reason 기록. → `bin/rat`(M4) 또는 governor 헬퍼에 구현, M1에선 규칙 명문화 + hook 지점 확보.
+- **operator skill 포맷(§12)**: `skills/<route>/SKILL.md`는 **SIGNALS·FIRST ACTION·PIVOT·ESCALATE·VERIFY** 섹션만. knowledge/는 reference로 유지, 복제 금지.
+- **C5 state compact 우선순위(§10.1)**: `--budget-tokens`는 우선순위(invalidating>confirmed>PASS primitive>active hyp>next>recent ruled-out>notes)로 절삭하고 `truncated/omitted_counts/cursor` 출력. 동일 cursor+policy+budget → deterministic.
+- **재조정**: 독립 `bin/rat-route`를 만들지 않고 **M4의 `rat route` 서브커맨드로 흡수**(§11, ADR-007 single front door). M1에선 route 판정 로직만 라이브러리(`ratlib`)로 구현하고 CLI 노출은 M4에서.
+
 ## 완료 게이트
-- [ ] CLAUDE.md ≤1.5K토큰, 7줄 hot-path
+- [ ] CLAUDE.md ≤1.5K토큰, 7줄 hot-path(§8.1) + FAST 비활성 표
 - [ ] doctrine lazy, FAST 경로 doctrine 0로드
-- [ ] `rat-route` fixture 정확 + `tests/test_route.py`
-- [ ] `state compact --budget-tokens` 동작
-- [ ] M1-5 A/B에서 context↓ 증명
+- [ ] route 판정 로직(ratlib) + `tests/test_route.py` (동일 profile/signals→동일 subroute, missing capability degradation)
+- [ ] `state compact --budget-tokens` 우선순위 projection + deterministic 테스트
+- [ ] operator skill 9종 스캐폴드(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY)
+- [ ] Progress Novelty Governor 규칙 명문화 + hook 지점
+- [ ] M1-5 A/B에서 context↓ 증명 (release gate: peak context ≤55%, easy-REV unnecessary-DEEP ≤10% 추적 시작)
 
 ## 롤백
 - CLAUDE.md는 git 원복. `rat-route`는 신규 파일(제거로 원복). state 플래그는 기존 동작 미변경(추가만).

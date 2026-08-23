@@ -40,11 +40,18 @@
 - **fixture**: `tests/fixtures/` + `tests/e2e_rev.sh` 활용. angr 미설치 환경이면 최소 2개라도.
 - **Acceptance**: `baseline_M0.jsonl`에 fixture별 지표 3줄(또는 가용 개수) 존재. 이 숫자가 이후 A/B의 기준선.
 
+## 설계서 반영 (DESIGN_v2.md — PR1)
+- **C1 채택**: `duplicate_tool_calls`는 command 문자열이 아니라 **operation_fingerprint**(tool build+inputs digests+normalized params+deps+policy+output_schema의 sha256) 중복으로 집계. **cache hit은 중복 실행으로 세지 않고 `cache_requests`에만 포함.** M0-2를 이 정의로 고정.
+- **C2 채택**: benchmark result v2 필수 필드를 그룹별로 전부 emit — correctness/latency/context/tools/cache/reasoning/artifacts. 단위(ms/bytes/tokens/count) schema 고정. `benchmarks/schemas/rat.benchmark-result.v2.json` 신설(기존 v1은 legacy reference로 보존).
+- **C3 예고**: envelope `cache.hit` 필드는 M0-1에서 뚫되, 실제 hit=true 세팅은 M2(hit envelope fix)와 동일 산식으로. M0-1에선 miss 경로 정확 기록 + hit 경로 placeholder 금지(hit 브랜치도 True 반영).
+- Acceptance에 "timeout/partial/truncated run은 성공 cache hit로 계산 안 됨"(§7.4) 추가.
+
 ## 완료 게이트
-- [ ] M0-1 필드 추가 + 기존 테스트 GREEN
-- [ ] M0-2 `rat-metrics`가 duplicate/cache/ttf 출력
-- [ ] M0-3 baseline jsonl 확보
-- [ ] 새 unittest: `tests/test_metrics.py` (집계 로직 최소 커버)
+- [ ] M0-1 필드 추가(+ hit 브랜치 `cache.hit=true` 보정) + 기존 테스트 GREEN
+- [ ] M0-2 `rat-metrics`가 operation_fingerprint 기반 duplicate/cache/ttf 출력
+- [ ] `rat.benchmark-result.v2.json` 스키마 + validation 테스트 통과
+- [ ] M0-3 baseline jsonl 확보 (컨테이너 `docker/dev`에서, cold/warm 분리)
+- [ ] 새 unittest: `tests/test_telemetry.py` (duplicate fingerprint·cold/warm·timeout/partial/truncated accounting)
 
 ## 롤백
 - 전부 옵셔널 필드 + 신규 파일이라 기존 경로 영향 없음. 브랜치 폐기로 즉시 원복.
