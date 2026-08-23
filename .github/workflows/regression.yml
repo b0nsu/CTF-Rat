@@ -13,7 +13,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb
       - run: python3 -m pip install --disable-pip-version-check pwntools pyelftools
       # tool selftests (pure logic, no angr — see bin/revq "Mac selftest 격리")
