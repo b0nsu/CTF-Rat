@@ -10,6 +10,7 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - live Activity Timeline from append-only STATE v2
 - materialized current/historical STATE view
 - replay slider: inspect what the solver knew at event `#N`
+- serialized polling and latest-request-wins replay updates
 - bounded PTY session manager with process-group shutdown
 - Start/Stop controls for one daemon-configured solver command
 - live terminal output + bounded terminal input
@@ -18,6 +19,8 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - event telemetry and session status
 - loopback-only HTTP API with restricted browser origins
 - POST controls require `X-CTF-Rat-Desktop: 1`
+- locked npm/Cargo dependency resolution
+- CI-built Linux `.deb` and AppImage bundles
 - no second state DB, cache, solver, or verification path
 
 ## Architecture
@@ -38,13 +41,13 @@ solver cmd     CTF-Rat truth
 
 `ratd` never accepts arbitrary argv from HTTP. The operator configures a solver command once at daemon startup; the UI can only start/stop that command and send PTY input to the running process.
 
-## Run
+## Run from source
 
-Install frontend dependencies once:
+Install the locked frontend dependencies:
 
 ```bash
 cd desktop
-npm install
+npm ci
 cd ..
 ```
 
@@ -89,11 +92,28 @@ With a configured solver command:
 ./desktop/dev.sh /path/to/challenge "<your existing local CTF-Rat agent command>"
 ```
 
-`ratd` listens on `127.0.0.1:8765` by default. Override only the frontend endpoint when needed:
+`ratd` listens on `127.0.0.1:8765` by default. The frontend endpoint can be supplied at build/dev time with `VITE_RATD_URL`; packaged v0.2 builds use the default loopback endpoint unless rebuilt with another allowed endpoint.
+
+## Linux packages
+
+Build the same bundle targets used by CI:
 
 ```bash
-VITE_RATD_URL=http://127.0.0.1:8765 npm run tauri dev
+cd desktop
+npm ci
+npm run tauri -- build --bundles deb,appimage
 ```
+
+Outputs are written below:
+
+```text
+desktop/src-tauri/target/release/bundle/deb/
+desktop/src-tauri/target/release/bundle/appimage/
+```
+
+The `desktop-workbench` GitHub Actions workflow uploads both bundle types as a `ctf-rat-desktop-linux-<sha>` artifact on pull-request validation runs.
+
+The installer contains the Tauri workbench, not a second copy of the CTF-Rat solver runtime. `ratd` and the existing repository/runtime remain the canonical backend and must be available separately.
 
 ## API
 
@@ -130,11 +150,17 @@ The daemon only accepts loopback bind addresses and only permits the development
 
 ## Test
 
-Backend desktop tests:
+Desktop backend and end-to-end tests:
 
 ```bash
-python3 -m unittest tests.test_desktop_api tests.test_desktop_session
+python3 -m unittest \
+  tests.test_desktop_api \
+  tests.test_desktop_session \
+  tests.test_desktop_http \
+  tests.test_desktop_e2e
 ```
+
+The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store.
 
 All repository Python tests still include these through normal discovery:
 
@@ -146,17 +172,17 @@ Frontend build check:
 
 ```bash
 cd desktop
-npm install
+npm ci
 npm run build
 ```
 
 Tauri compile check:
 
 ```bash
-cargo check --manifest-path desktop/src-tauri/Cargo.toml
+cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-The `desktop` GitHub Actions workflow performs the backend tests, frontend build, and Rust compile check on pushes to the branch and on desktop-related pull-request changes.
+The desktop CI also verifies that `package-lock.json` and `Cargo.lock` remain unchanged by the build.
 
 ## Current boundaries
 
@@ -164,14 +190,17 @@ The `desktop` GitHub Actions workflow performs the backend tests, frontend build
 - Windows desktop use should host the solver runtime in WSL2; macOS should use the existing Linux VM/container path where required.
 - Desktop does not submit flags, mutate evidence directly, create findings, or bypass `rat`/verification gates.
 - Arbitrary command execution is not exposed through the HTTP API.
-- Bundle/installers are intentionally not enabled until CI proves the frontend and Tauri crate are stable on the desktop branch.
+- Linux installer bundles package the UI shell only; they do not make the Linux CTF-Rat analysis runtime cross-platform.
 
-## Next release gate
+## Verified release gates
 
-Enable packaged installers only after:
+The desktop branch CI verifies:
 
-1. desktop backend tests pass in CI,
-2. `npm run build` passes,
-3. `cargo check` passes with Tauri system dependencies,
-4. session restart/stop tests are stable,
-5. a local CTF fixture is replayed end-to-end without changing canonical STATE semantics.
+1. desktop API/session/HTTP/E2E tests,
+2. Python syntax checks for daemon modules,
+3. `npm ci` against the committed lockfile,
+4. TypeScript/Vite production build,
+5. `cargo check --locked`,
+6. `.deb` and AppImage bundle generation on PR validation runs,
+7. unchanged npm/Cargo lockfiles after the build,
+8. upload of both installer artifacts.
