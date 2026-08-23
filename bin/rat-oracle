@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Detect deterministic rev oracle candidates and wire them to symsolve."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.function_card import load_revmap
+from ratlib.oracle import detect, render_text, shell_command
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="rat-oracle", description="revq oracle detector -> symsolve wiring")
+    p.add_argument("binary")
+    p.add_argument("--root", default=os.getcwd())
+    p.add_argument("--fast", action="store_true", help="use revq binutils tier; usually lacks xrefs")
+    p.add_argument("--timeout", type=float, default=90)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--command", action="store_true", help="print a cache-aware symsolve command")
+    p.add_argument("--stdin", type=int)
+    p.add_argument("--arg", type=int)
+    p.add_argument("--printable", action="store_true")
+    p.add_argument("--charset")
+    p.add_argument("--no-null", action="store_true")
+    p.add_argument("--solve-timeout", type=float)
+    a = p.parse_args(argv)
+
+    binary = os.path.realpath(a.binary)
+    if not os.path.isfile(binary):
+        print("[rat-oracle:err] binary not found: %s" % a.binary, file=sys.stderr)
+        return 2
+    try:
+        rev, cache = load_revmap(binary, root=a.root, fast=a.fast, timeout=a.timeout)
+        doc = detect(rev, binary=binary, cache=cache)
+    except ValueError as exc:
+        print("[rat-oracle:err] %s" % exc, file=sys.stderr)
+        return 2
+
+    if a.json:
+        print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_text(doc))
+
+    if a.command:
+        if not doc.get("ready"):
+            print("[rat-oracle] no safe symsolve command: usable success target missing", file=sys.stderr)
+            return 1
+        print(shell_command(doc, stdin=a.stdin, arg=a.arg, printable=a.printable,
+                            charset=a.charset, no_null=a.no_null, timeout=a.solve_timeout))
+    return 0 if doc.get("ready") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
