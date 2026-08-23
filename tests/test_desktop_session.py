@@ -66,23 +66,25 @@ class DesktopSessionTests(unittest.TestCase):
             self.assertIn("second", replay)
             self.assertNotIn("first", replay)
 
-    def test_stale_cursor_from_previous_session_replays_new_log_from_start(self):
+    def test_stale_cursor_survives_solver_and_daemon_restart(self):
         with tempfile.TemporaryDirectory() as root:
-            manager = SessionManager(root, [sys.executable, "-u", "-c", "print('A'*512)"])
-            manager.start()
-            self.wait_finished(manager)
-            first = manager.log_delta(0, 4096)
+            first_manager = SessionManager(root, [sys.executable, "-u", "-c", "print('A'*512)"])
+            first_manager.start()
+            self.wait_finished(first_manager)
+            first = first_manager.log_delta(0, 4096)
             old_cursor = first["cursor"]
             self.assertGreater(old_cursor, 0)
 
+            # Reconstruct the manager to model ratd itself restarting. The
+            # cursor generation must be recovered from existing session.json.
             second_payload = "BEGIN-SECOND-" + ("B" * (old_cursor + 64))
-            manager.solver_argv = [sys.executable, "-u", "-c", "print(%r)" % second_payload]
-            manager.start()
-            self.wait_finished(manager)
+            second_manager = SessionManager(root, [sys.executable, "-u", "-c", "print(%r)" % second_payload])
+            second_manager.start()
+            self.wait_finished(second_manager)
 
-            # A byte-only cursor would seek into the new, longer file and lose
-            # its prefix. Session-safe cursors must map an old cursor to offset 0.
-            second = manager.log_delta(old_cursor, 4096)
+            # A byte-only or non-persistent cursor would seek into this longer
+            # new log and lose the prefix. Old cursors must map to offset 0.
+            second = second_manager.log_delta(old_cursor, 4096)
             self.assertTrue(second["text"].startswith("BEGIN-SECOND-"))
             self.assertGreater(second["cursor"], old_cursor)
 
