@@ -4,7 +4,7 @@ STATE v2 and the existing content-addressed artifact store remain canonical.
 This module adds bounded projections only; it never creates a second database.
 """
 from __future__ import annotations
-import base64, json, os
+import base64, copy, json, os
 from collections import Counter
 from typing import Any
 
@@ -13,11 +13,29 @@ from .state_v2 import Stream, cursor
 
 SNAPSHOT_SCHEMA = "rat.desktop.snapshot/v1"
 EVENTS_SCHEMA = "rat.desktop.events/v1"
+LIVE_SCHEMA = "rat.desktop.live/v1"
 ARTIFACTS_SCHEMA = "rat.desktop.artifacts/v1"
 PREVIEW_SCHEMA = "rat.desktop.artifact-preview/v1"
 TELEMETRY_SCHEMA = "rat.desktop.telemetry/v1"
 MAX_ARTIFACTS = 2000
 MAX_PREVIEW = 256 * 1024
+
+
+class _EventBackedStream(Stream):
+    """Feed already-validated events through the canonical Stream.view().
+
+    ``Stream.view`` mutates some projected payload dictionaries while applying
+    invalidation/consumption state, so live_update supplies a deep copy. This
+    adapter owns no state semantics; it only prevents a second JSONL parse while
+    reusing the canonical materializer unchanged.
+    """
+
+    def __init__(self, challenge_root: str, events: list[dict[str, Any]]):
+        super().__init__(challenge_root)
+        self._validated_events = events
+
+    def read(self):
+        return self._validated_events
 
 
 def _manifest(challenge_root: str) -> dict[str, Any] | None:
@@ -40,23 +58,12 @@ def _stream_stat(stream: Stream) -> tuple[int, int]:
 
 
 def _generation(stat: tuple[int, int]) -> str:
-    """Encode file stat values as an opaque JS-safe string.
-
-    ``st_mtime_ns`` commonly exceeds JavaScript's safe integer range. Keeping
-    the generation opaque avoids precision loss when a Tauri/JS client echoes
-    it back. This is only a performance hint, never canonical STATE evidence.
-    """
+    """Encode file stat values as an opaque JS-safe string."""
     return "%d:%d" % stat
 
 
 def _stream_tail_summary(stream: Stream) -> tuple[dict[str, Any], int]:
-    """Summarize a stream already validated by ``Stream.view()``.
-
-    This does not materialize STATE semantics. It only counts complete JSONL
-    records and decodes the final complete event for its canonical cursor. A
-    crash-truncated final record is ignored exactly as ``Stream.read()`` does.
-    Callers must compare stream stat before/after the validating view + summary.
-    """
+    """Summarize a stream already validated by ``Stream.view()``."""
     try:
         with open(stream.path, "rb") as source:
             data = source.read()
@@ -75,6 +82,77 @@ def _stream_tail_summary(stream: Stream) -> tuple[dict[str, Any], int]:
     return cursor(event), count
 
 
+def _validate_delta_request(after_seq: int, limit: int, stream_id: str | None, known_generation: str | None) -> None:
+    if not isinstance(after_seq, int) or after_seq < 0:
+        raise ValueError("after_seq must be a non-negative integer")
+    if not isinstance(limit, int) or limit < 1 or limit > 5000:
+        raise ValueError("limit must be between 1 and 5000")
+    if stream_id is not None and (not isinstance(stream_id, str) or not stream_id):
+        raise ValueError("stream_id must be a non-empty string")
+    if known_generation is not None and (not isinstance(known_generation, str) or not known_generation):
+        raise ValueError("known_generation must be a non-empty string")
+
+
+def _delta_document(
+    events: list[dict[str, Any]],
+    *,
+    after_seq: int,
+    limit: int,
+    stream_id: str | None,
+    source_generation: str | None,
+) -> dict[str, Any]:
+    actual_stream_id = events[0]["stream_id"] if events else None
+    reset = stream_id is not None and stream_id != actual_stream_id
+    effective_after = 0 if reset else after_seq
+    remaining = [event for event in events if event["seq"] > effective_after]
+    selected = remaining[:limit]
+    latest_seq = selected[-1]["seq"] if selected else effective_after
+    cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
+    if source_generation is not None:
+        cursor_doc["source_generation"] = source_generation
+    return {
+        "schema": EVENTS_SCHEMA,
+        "stream_id": actual_stream_id,
+        "after_seq": effective_after,
+        "events": selected,
+        "cursor": cursor_doc,
+        "has_more": len(remaining) > len(selected),
+        "reset": reset,
+        "unchanged": False,
+    }
+
+
+def _unchanged_delta(after_seq: int, stream_id: str | None, generation: str) -> dict[str, Any]:
+    return {
+        "schema": EVENTS_SCHEMA,
+        "stream_id": stream_id,
+        "after_seq": after_seq,
+        "events": [],
+        "cursor": {
+            "stream_id": stream_id,
+            "seq": after_seq,
+            "source_generation": generation,
+        },
+        "has_more": False,
+        "reset": False,
+        "unchanged": True,
+    }
+
+
+def _snapshot_from_events(challenge_root: str, events: list[dict[str, Any]], view: dict[str, Any]) -> dict[str, Any]:
+    latest = cursor(events[-1]) if events else {"stream_id": None, "seq": 0}
+    return {
+        "schema": SNAPSHOT_SCHEMA,
+        "challenge_root": os.path.abspath(challenge_root),
+        "run": _manifest(challenge_root),
+        "cursor": latest,
+        "event_count": len(events),
+        "total_event_count": len(events),
+        "historical": False,
+        "view": view,
+    }
+
+
 def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, Any]:
     """Return a materialized view, optionally at a historical event sequence."""
     root = os.path.abspath(challenge_root)
@@ -83,10 +161,6 @@ def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, 
         raise ValueError("until_seq must be a non-negative integer")
 
     if until_seq is None:
-        # Live refresh is latency-sensitive. Stream.view() is the canonical
-        # materializer and already performs one strict Stream.read(). Reuse that
-        # validation and derive only cursor/count from raw JSONL bytes, avoiding
-        # the previous second full JSON parse. Retry if a writer races the read.
         for _ in range(3):
             before_stat = _stream_stat(stream)
             view = stream.view()
@@ -104,9 +178,6 @@ def snapshot(challenge_root: str, *, until_seq: int | None = None) -> dict[str, 
                     "view": view,
                 }
 
-    # Historical replay is interactive rather than a 500 ms polling path, and
-    # this fallback also preserves correctness if a live stream changes during
-    # all retry attempts.
     events = stream.read()
     visible = events if until_seq is None else [event for event in events if event["seq"] <= until_seq]
     latest = cursor(visible[-1]) if visible else {"stream_id": events[0]["stream_id"] if events else None, "seq": 0}
@@ -130,47 +201,16 @@ def event_delta(
     stream_id: str | None = None,
     known_generation: str | None = None,
 ) -> dict[str, Any]:
-    """Return ordered STATE events after ``after_seq`` with a bounded count.
-
-    ``known_generation`` is an optional opaque client-echoed hint from a
-    previous stable response. If it still matches, the append-only stream is
-    unchanged and the expensive JSONL re-parse can be skipped. Any mismatch
-    falls back to canonical ``Stream.read()`` validation.
-    """
-    if not isinstance(after_seq, int) or after_seq < 0:
-        raise ValueError("after_seq must be a non-negative integer")
-    if not isinstance(limit, int) or limit < 1 or limit > 5000:
-        raise ValueError("limit must be between 1 and 5000")
-    if stream_id is not None and (not isinstance(stream_id, str) or not stream_id):
-        raise ValueError("stream_id must be a non-empty string")
-    if known_generation is not None and (not isinstance(known_generation, str) or not known_generation):
-        raise ValueError("known_generation must be a non-empty string")
-
+    """Return ordered STATE events after ``after_seq`` with a bounded count."""
+    _validate_delta_request(after_seq, limit, stream_id, known_generation)
     stream = Stream(os.path.abspath(challenge_root))
-    before_stat = _stream_stat(stream)
-    before_generation = _generation(before_stat)
+    before_generation = _generation(_stream_stat(stream))
     if known_generation is not None and known_generation == before_generation:
-        return {
-            "schema": EVENTS_SCHEMA,
-            "stream_id": stream_id,
-            "after_seq": after_seq,
-            "events": [],
-            "cursor": {
-                "stream_id": stream_id,
-                "seq": after_seq,
-                "source_generation": before_generation,
-            },
-            "has_more": False,
-            "reset": False,
-            "unchanged": True,
-        }
+        return _unchanged_delta(after_seq, stream_id, before_generation)
 
-    # Only advertise a generation hint if the file remained stable around the
-    # validated read. If a writer races us, omit the hint so the next request
-    # must validate again rather than accidentally treating unread bytes as seen.
     stable = False
     events: list[dict[str, Any]] = []
-    final_stat = before_stat
+    final_stat = _stream_stat(stream)
     for _ in range(3):
         read_stat = _stream_stat(stream)
         events = stream.read()
@@ -178,25 +218,64 @@ def event_delta(
         if read_stat == final_stat:
             stable = True
             break
+    return _delta_document(
+        events,
+        after_seq=after_seq,
+        limit=limit,
+        stream_id=stream_id,
+        source_generation=_generation(final_stat) if stable else None,
+    )
 
-    actual_stream_id = events[0]["stream_id"] if events else None
-    reset = stream_id is not None and stream_id != actual_stream_id
-    effective_after = 0 if reset else after_seq
-    remaining = [event for event in events if event["seq"] > effective_after]
-    selected = remaining[:limit]
-    latest_seq = selected[-1]["seq"] if selected else effective_after
-    cursor_doc: dict[str, Any] = {"stream_id": actual_stream_id, "seq": latest_seq}
-    if stable:
-        cursor_doc["source_generation"] = _generation(final_stat)
+
+def live_update(
+    challenge_root: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 500,
+    stream_id: str | None = None,
+    known_generation: str | None = None,
+) -> dict[str, Any]:
+    """Return delta + current snapshot from one validated STATE read on change.
+
+    Unchanged polls preserve the generation fast path and return ``snapshot`` as
+    ``None``. Changed polls parse/validate JSONL once, then reuse the canonical
+    ``Stream.view`` materializer over a deep copy of those validated events.
+    """
+    _validate_delta_request(after_seq, limit, stream_id, known_generation)
+    root = os.path.abspath(challenge_root)
+    stream = Stream(root)
+    before_generation = _generation(_stream_stat(stream))
+    if known_generation is not None and known_generation == before_generation:
+        return {
+            "schema": LIVE_SCHEMA,
+            "delta": _unchanged_delta(after_seq, stream_id, before_generation),
+            "snapshot": None,
+        }
+
+    stable = False
+    events: list[dict[str, Any]] = []
+    final_stat = _stream_stat(stream)
+    for _ in range(3):
+        read_stat = _stream_stat(stream)
+        events = stream.read()
+        final_stat = _stream_stat(stream)
+        if read_stat == final_stat:
+            stable = True
+            break
+    source_generation = _generation(final_stat) if stable else None
+    delta = _delta_document(
+        events,
+        after_seq=after_seq,
+        limit=limit,
+        stream_id=stream_id,
+        source_generation=source_generation,
+    )
+    view_events = copy.deepcopy(events)
+    view = _EventBackedStream(root, view_events).view()
     return {
-        "schema": EVENTS_SCHEMA,
-        "stream_id": actual_stream_id,
-        "after_seq": effective_after,
-        "events": selected,
-        "cursor": cursor_doc,
-        "has_more": len(remaining) > len(selected),
-        "reset": reset,
-        "unchanged": False,
+        "schema": LIVE_SCHEMA,
+        "delta": delta,
+        "snapshot": _snapshot_from_events(root, events, view),
     }
 
 
@@ -215,12 +294,7 @@ def telemetry(challenge_root: str) -> dict[str, Any]:
 
 
 def list_artifacts(challenge_root: str, *, limit: int = 500) -> dict[str, Any]:
-    """List artifact metadata without hashing every object in the store.
-
-    Listing is a discovery operation: schema/digest/object existence/size are
-    checked through ``artifact.describe``. Any byte-consuming path such as
-    preview/get/verify still performs the full SHA-256 verification.
-    """
+    """List artifact metadata without hashing every object in the store."""
     if not isinstance(limit, int) or limit < 1 or limit > MAX_ARTIFACTS:
         raise ValueError("artifact limit must be between 1 and %d" % MAX_ARTIFACTS)
     store = Stream(os.path.abspath(challenge_root)).root
