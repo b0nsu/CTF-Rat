@@ -128,14 +128,11 @@ class SessionManager:
             if self._running():
                 raise ValueError("solver session is already running")
             os.makedirs(self.base, mode=0o700, exist_ok=True)
-            try:
-                previous_log_size = os.path.getsize(self.log_path)
-            except OSError:
-                previous_log_size = 0
-            # Advance by one separator as well as the previous byte length so
-            # every cursor from an older session is strictly below this base.
-            self._log_base += previous_log_size + 1
-            open(self.log_path, "wb").close()
+
+            # Spawn first. A missing executable or other Popen failure must not
+            # truncate the previous terminal log or advance its opaque cursor.
+            # PTYs buffer early child output until the reader starts, so it is
+            # safe to commit the new terminal generation after Popen succeeds.
             master_fd, slave_fd = pty.openpty()
             env = dict(os.environ)
             env["CTF_RAT_DESKTOP"] = "1"
@@ -150,8 +147,23 @@ class SessionManager:
                     start_new_session=True,
                     close_fds=True,
                 )
+            except Exception:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+                raise
             finally:
                 os.close(slave_fd)
+
+            try:
+                previous_log_size = os.path.getsize(self.log_path)
+            except OSError:
+                previous_log_size = 0
+            # Advance by one separator as well as the previous byte length so
+            # every cursor from an older session is strictly below this base.
+            self._log_base += previous_log_size + 1
+            open(self.log_path, "wb").close()
             self._proc = proc
             self._master_fd = master_fd
             self._started_at = time.monotonic()
