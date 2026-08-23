@@ -98,15 +98,17 @@ def execute_binary(binary, sc, timeout):
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
     return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
-def _profile_cache_keys(bdig):
+def _profile_cache_keys(bdig, environment):
     from .cache import canonical_key
-    return {k: canonical_key(binary_sha256=bdig,tool_name="rat-profile",tool_version=VERSION,params={"artifact":k},dep_versions={})
+    return {k: canonical_key(binary_sha256=bdig,tool_name="rat-profile",tool_version=VERSION,
+                              params={"artifact":k,"libc":environment.get("libc"),"loader":environment.get("loader")},
+                              dep_versions={})
             for k in ("profile","string-index")}
-def _profile_cache_lookup(r, bdig):
+def _profile_cache_lookup(r, bdig, environment):
     """Read-through the shared canonical index; miss on any inconsistency."""
     try:
         from .cache import Cache
-        idx=Cache(r); keys=_profile_cache_keys(bdig)
+        idx=Cache(r); keys=_profile_cache_keys(bdig,environment)
         pe,se=idx.get_entry(keys["profile"]),idx.get_entry(keys["string-index"])
         if not (pe and se): return idx,keys,None,None,None
         profile_doc=json.loads(get(pe["path"],root=r))
@@ -118,8 +120,17 @@ def _profile_cache_lookup(r, bdig):
         return None,None,None,None,None
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
-    r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary)
-    idx,keys,cached_doc,cached_arts,src_inv=_profile_cache_lookup(r,bdig)
+    r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary); environment=profile_environment(a)
+    if getattr(a,"no_cache",False):
+        keys=_profile_cache_keys(bdig,environment)
+        try:
+            from .cache import Cache
+            idx=Cache(r)
+        except Exception:
+            idx=None
+        cached_doc,cached_arts,src_inv=None,None,None
+    else:
+        idx,keys,cached_doc,cached_arts,src_inv=_profile_cache_lookup(r,bdig,environment)
     if cached_doc and cached_arts:
         cache_state="hit"; facts,signals,routes=cached_doc["facts"],cached_doc["signals"],cached_doc["routes"]
         arts=list(cached_arts)
@@ -136,7 +147,7 @@ def profile(a):
         for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
             if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
         if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
-        arts=[artifact({"binary_digest":bdig,"environment":profile_environment(a),"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+        arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
     is_elf=next((f["value"] for f in facts if f["kind"]=="format"),"").startswith("ELF ")
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
