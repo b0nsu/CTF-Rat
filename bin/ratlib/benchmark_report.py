@@ -6,7 +6,7 @@ import os
 import statistics
 from typing import Any, Optional
 
-from .telemetry import summarize
+from .telemetry import active, summarize
 
 ABLATIONS = ("A0", "A1", "A2", "A3", "A4", "A5")
 
@@ -37,9 +37,14 @@ def aggregate(root: str, *, challenge_id: Optional[str] = None,
     if min_runs < 1:
         raise ValueError("min_runs must be >= 1")
 
+    active_doc = active(root)
+    active_id = str(active_doc["run_id"]) if active_doc else None
     docs = []
     ignored = []
     for run_id in _run_ids(root):
+        if run_id == active_id:
+            ignored.append({"run_id": run_id, "reason": "active run excluded from aggregate"})
+            continue
         try:
             doc = summarize(root, run_id)
         except ValueError as exc:
