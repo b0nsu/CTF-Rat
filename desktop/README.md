@@ -14,6 +14,7 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - bounded PTY session manager with process-group shutdown
 - Start/Stop controls for one daemon-configured solver command
 - live terminal output + bounded terminal input
+- session-safe terminal cursors across solver and `ratd` restarts
 - artifact browser backed by the existing content-addressed store
 - text/JSON artifact preview and bounded base64 preview for binary artifacts
 - event telemetry and session status
@@ -126,10 +127,12 @@ GET /api/snapshot?until_seq=<n>
 GET /api/events?after_seq=<n>&limit=<n>
 GET /api/telemetry
 GET /api/session
-GET /api/terminal?after=<byte-offset>&limit=<n>
+GET /api/terminal?after=<cursor>&limit=<n>
 GET /api/artifacts?limit=<n>
 GET /api/artifacts/<sha256:digest>?max_bytes=<n>
 ```
+
+The terminal `cursor` is an opaque, monotonically increasing value returned by the previous `/api/terminal` response. Clients must pass that returned value back as `after`; it is not a raw byte offset. Cursor generation is persisted in the existing `.rat/desktop/session.json`, so a cursor from an older solver session or a restarted `ratd` safely maps to the beginning of the current truncated terminal log rather than skipping its prefix.
 
 Bounded controls:
 
@@ -160,7 +163,7 @@ python3 -m unittest \
   tests.test_desktop_e2e
 ```
 
-The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store.
+The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store. Session tests additionally verify rapid solver restart and stale terminal cursor recovery across a reconstructed `SessionManager`, modeling a `ratd` restart.
 
 All repository Python tests still include these through normal discovery:
 
@@ -202,5 +205,6 @@ The desktop branch CI verifies:
 4. TypeScript/Vite production build,
 5. `cargo check --locked`,
 6. `.deb` and AppImage bundle generation on PR validation runs,
-7. unchanged npm/Cargo lockfiles after the build,
-8. upload of both installer artifacts.
+7. Debian metadata and AppImage internal executable validation,
+8. unchanged npm/Cargo lockfiles after the build,
+9. upload of both installer artifacts.
