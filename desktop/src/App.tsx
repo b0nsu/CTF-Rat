@@ -89,6 +89,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [replaySeq, setReplaySeq] = useState<number | null>(null);
   const eventCursor = useRef<EventCursor | null>(null);
+  const artifactGeneration = useRef<string | null>(null);
   const terminalCursor = useRef(0);
   const replaySeqRef = useRef<number | null>(null);
   const replayRequest = useRef(0);
@@ -114,6 +115,7 @@ export default function App() {
         setSelectedEvent(delta.events.at(-1) ?? null);
         eventCursor.current = delta.cursor;
         setSession(currentSession);
+        artifactGeneration.current = listing.generation;
         setArtifacts(listing.artifacts);
         setTerminal(log.text);
         terminalCursor.current = log.cursor;
@@ -158,11 +160,12 @@ export default function App() {
         setSession(currentSession);
         if (stateChanged) {
           if (!live.snapshot) throw new Error("changed live projection omitted snapshot");
-          const listing = await getArtifacts();
+          const listing = await getArtifacts(artifactGeneration.current);
           if (!mounted) return;
           setLiveSnapshot(live.snapshot);
           if (replaySeqRef.current === null) setDisplaySnapshot(live.snapshot);
-          setArtifacts(listing.artifacts);
+          artifactGeneration.current = listing.generation;
+          if (!listing.unchanged) setArtifacts(listing.artifacts);
         }
         setConnection("live");
         setError(null);
