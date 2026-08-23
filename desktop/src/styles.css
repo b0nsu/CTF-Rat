@@ -44,6 +44,16 @@ button { color: inherit; }
 .replay-bar input { width: 100%; accent-color: #58a6ff; }
 .replay-bar code { color: #71b7ff; }
 .telemetry-inline { justify-self: end; letter-spacing: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.focus-bar {
+  min-height: 42px; display: grid; grid-template-columns: minmax(320px, 1fr) minmax(190px, auto) minmax(190px, auto); gap: 18px; align-items: center;
+  padding: 6px 18px; border-bottom: 1px solid #1d2530; background: #0b1118;
+}
+.focus-bar.historical { background: #12100a; }
+.focus-main, .focus-stat { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.focus-main span, .focus-stat span { flex: 0 0 auto; color: #677687; font-size: 9px; font-weight: 750; letter-spacing: .1em; }
+.focus-main strong { overflow: hidden; color: #c9d7e4; font-size: 11px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.focus-stat { justify-content: flex-end; }
+.focus-stat code { overflow: hidden; color: #8ca9c2; font: 9.5px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 
 .workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(560px, 1fr) 360px; }
 .panel { min-height: 0; background: #090e14; }
