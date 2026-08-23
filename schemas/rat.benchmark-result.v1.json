@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rat.benchmark-result/v1",
+  "type": "object",
+  "required": ["schema", "run_id", "variant", "status", "verified_solve", "flag_found", "time_to_flag_ms", "time_to_verified_ms", "wall_time_ms", "peak_context_tokens", "tokens", "tools", "cache", "model", "deep_escalations"],
+  "properties": {
+    "schema": {"const": "rat.benchmark-result/v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "variant": {"type": "string", "minLength": 1},
+    "status": {"type": "string"},
+    "verified_solve": {"type": "boolean"},
+    "flag_found": {"type": "boolean"},
+    "time_to_flag_ms": {"type": ["integer", "null"], "minimum": 0},
+    "time_to_verified_ms": {"type": ["integer", "null"], "minimum": 0},
+    "wall_time_ms": {"type": "integer", "minimum": 0},
+    "peak_context_tokens": {"type": ["integer", "null"], "minimum": 0},
+    "tokens": {
+      "type": "object",
+      "required": ["input", "output", "cache_read", "cache_creation"],
+      "properties": {
+        "input": {"type": "integer", "minimum": 0},
+        "output": {"type": "integer", "minimum": 0},
+        "cache_read": {"type": "integer", "minimum": 0},
+        "cache_creation": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "tools": {
+      "type": "object",
+      "required": ["calls", "duplicate_calls", "counts", "top_duplicates", "wall_ms"],
+      "properties": {
+        "calls": {"type": "integer", "minimum": 0},
+        "duplicate_calls": {"type": "integer", "minimum": 0},
+        "counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "top_duplicates": {"type": "array"},
+        "wall_ms": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "cache": {
+      "type": "object",
+      "required": ["reads", "hits", "misses", "writes", "hit_ratio"],
+      "properties": {
+        "reads": {"type": "integer", "minimum": 0},
+        "hits": {"type": "integer", "minimum": 0},
+        "misses": {"type": "integer", "minimum": 0},
+        "writes": {"type": "integer", "minimum": 0},
+        "hit_ratio": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "required": ["name", "events", "wall_ms"],
+      "properties": {
+        "name": {"type": ["string", "null"]},
+        "events": {"type": "integer", "minimum": 0},
+        "wall_ms": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "deep_escalations": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false
+}

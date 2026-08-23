@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Opt-in benchmark telemetry and top-level tool-call wrapper."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.runner import run
+from ratlib.telemetry import begin, finish, record, record_model, record_tool, summarize
+
+
+def _captured_bytes(stream):
+    if stream.spool_path:
+        with open(stream.spool_path, "rb") as f:
+            return f.read()
+    return stream.preview
+
+
+def command_begin(a):
+    print(json.dumps(begin(a.root, run_id=a.run_id, variant=a.variant, model=a.model, force=a.force), ensure_ascii=False))
+    return 0
+
+
+def command_exec(a):
+    argv = list(a.argv)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        print("[rat-metrics:err] command required after --", file=sys.stderr)
+        return 2
+    spool = os.path.join(os.path.abspath(a.root), ".rat", "telemetry", "tmp")
+    result = run(argv, cwd=a.cwd, timeout_seconds=a.timeout, spool_dir=spool,
+                 env={"RAT_TELEMETRY_ROOT": os.path.abspath(a.root)})
+    out, err = _captured_bytes(result.stdout), _captured_bytes(result.stderr)
+    if out:
+        sys.stdout.buffer.write(out); sys.stdout.buffer.flush()
+    if err:
+        sys.stderr.buffer.write(err); sys.stderr.buffer.flush()
+    record_tool(argv, duration_ms=result.duration_ms, exit_code=result.exit_code,
+                stdout_bytes=result.stdout.total_bytes, stderr_bytes=result.stderr.total_bytes,
+                cwd=a.cwd, root=a.root)
+    return result.exit_code
+
+
+def command_model(a):
+    ok = record_model(input_tokens=a.input_tokens, output_tokens=a.output_tokens,
+                      cache_read_tokens=a.cache_read_tokens,
+                      cache_creation_tokens=a.cache_creation_tokens,
+                      context_tokens=a.context_tokens, duration_ms=a.duration_ms,
+                      model=a.model, root=a.root)
+    if not ok:
+        print("[rat-metrics:err] no active telemetry run", file=sys.stderr)
+        return 2
+    return 0
+
+
+def command_deep(a):
+    if not record("deep", {"reason": a.reason}, root=a.root):
+        print("[rat-metrics:err] no active telemetry run", file=sys.stderr); return 2
+    return 0
+
+
+def command_verify(a):
+    if not record("verify", {"verified": a.verified, "flag_found": a.flag_found}, root=a.root):
+        print("[rat-metrics:err] no active telemetry run", file=sys.stderr); return 2
+    return 0
+
+
+def command_finish(a):
+    print(json.dumps(finish(a.root, status=a.status, verified=a.verified, flag_found=a.flag_found), ensure_ascii=False))
+    return 0
+
+
+def command_summary(a):
+    doc = summarize(a.root, a.run_id)
+    if a.json:
+        print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("RUN      %s  variant=%s status=%s" % (doc["run_id"], doc["variant"], doc["status"]))
+        print("SOLVE    verified=%s flag=%s ttf=%s verify=%s wall=%sms" %
+              (doc["verified_solve"], doc["flag_found"], doc["time_to_flag_ms"],
+               doc["time_to_verified_ms"], doc["wall_time_ms"]))
+        print("CONTEXT  peak_tokens=%s" % doc["peak_context_tokens"])
+        print("TOOLS    calls=%d duplicate=%d wall=%dms" %
+              (doc["tools"]["calls"], doc["tools"]["duplicate_calls"], doc["tools"]["wall_ms"]))
+        ratio = doc["cache"]["hit_ratio"]
+        print("CACHE    %d/%d hit  ratio=%s  writes=%d" %
+              (doc["cache"]["hits"], doc["cache"]["reads"],
+               "n/a" if ratio is None else "%.3f" % ratio, doc["cache"]["writes"]))
+        print("TOKENS   in=%d out=%d cache_read=%d cache_create=%d" %
+              (doc["tokens"]["input"], doc["tokens"]["output"],
+               doc["tokens"]["cache_read"], doc["tokens"]["cache_creation"]))
+        if doc["tools"]["top_duplicates"]:
+            print("DUPLICATES")
+            for item in doc["tools"]["top_duplicates"][:5]:
+                print("  x%d %s" % (item["count"], " ".join(item["argv"])))
+    return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="rat-metrics", description="CTF-Rat opt-in benchmark telemetry")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    q = sub.add_parser("begin"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--run-id"); q.add_argument("--variant", default="manual"); q.add_argument("--model"); q.add_argument("--force", action="store_true"); q.set_defaults(func=command_begin)
+    q = sub.add_parser("exec"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--cwd"); q.add_argument("--timeout", type=float, default=120); q.add_argument("argv", nargs=argparse.REMAINDER); q.set_defaults(func=command_exec)
+    q = sub.add_parser("model"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--input-tokens", type=int, default=0); q.add_argument("--output-tokens", type=int, default=0); q.add_argument("--cache-read-tokens", type=int, default=0); q.add_argument("--cache-creation-tokens", type=int, default=0); q.add_argument("--context-tokens", type=int); q.add_argument("--duration-ms", type=int, default=0); q.add_argument("--model"); q.set_defaults(func=command_model)
+    q = sub.add_parser("deep"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--reason", required=True); q.set_defaults(func=command_deep)
+    q = sub.add_parser("verify"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--verified", action="store_true"); q.add_argument("--flag-found", action="store_true"); q.set_defaults(func=command_verify)
+    q = sub.add_parser("finish"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--status", choices=["solved", "failed", "abandoned", "timeout"], required=True); q.add_argument("--verified", action="store_true"); q.add_argument("--flag-found", action="store_true"); q.set_defaults(func=command_finish)
+    q = sub.add_parser("summary"); q.add_argument("--root", default=os.getcwd()); q.add_argument("--run-id"); q.add_argument("--json", action="store_true"); q.set_defaults(func=command_summary)
+    return p
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    try:
+        return a.func(a)
+    except ValueError as exc:
+        print("[rat-metrics:err] %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
