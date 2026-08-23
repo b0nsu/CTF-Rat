@@ -12,15 +12,19 @@ The desktop layer is intentionally **not** a second solver implementation. `rat`
 - live solver focus strip for the latest recorded next probe plus current primitive/finding status counts
 - replay slider: inspect what the solver knew at event `#N`
 - serialized polling and latest-request-wins replay updates
+- combined `/api/live` projection: changed STATE delta + current snapshot from one validated JSONL read
 - opaque generation-token fast path for unchanged STATE polling
+- generation tokens are issued only at fully caught-up cursors, never while `has_more=true`
 - automatic workbench reset when the canonical STATE stream ID changes
-- single-parse live snapshot projection; historical replay keeps the conservative canonical path
+- historical replay keeps the conservative canonical path
 - bounded PTY session manager with process-group shutdown
 - Start/Stop controls for one daemon-configured solver command
 - live terminal output + bounded terminal input
 - session-safe terminal cursors across solver and `ratd` restarts
 - failed solver spawn preserves the previous terminal log/cursor generation
 - artifact browser backed by the existing content-addressed store
+- artifact discovery validates metadata/object presence/size without hashing every object
+- artifact inventory generation fast path skips unchanged metadata reloads
 - text/JSON artifact preview and bounded base64 preview for binary artifacts
 - artifact preview uses the canonical store's single-pass streaming verifier and retains only the requested bounded prefix
 - event telemetry API without duplicate telemetry polling in the UI
@@ -128,60 +132,73 @@ Read-only projections:
 
 ```text
 GET /api/health
+GET /api/live?after_seq=<n>&limit=<n>&stream_id=<id>&known_generation=<opaque>
 GET /api/snapshot
 GET /api/snapshot?until_seq=<n>
 GET /api/events?after_seq=<n>&limit=<n>
 GET /api/telemetry
 GET /api/session
 GET /api/terminal?after=<cursor>&limit=<n>
-GET /api/artifacts?limit=<n>
+GET /api/artifacts?limit=<n>&known_generation=<opaque>
 GET /api/artifacts/<sha256:digest>?max_bytes=<n>
 ```
 
-`/api/events` returns an event cursor containing `stream_id`, `seq`, and, after a stable validated read, an opaque `source_generation` string. The workbench echoes that generation as `known_generation` on its next poll. If the append-only STATE file is unchanged, `ratd` can answer without reparsing JSONL. Any generation mismatch falls back to canonical `Stream.read()` validation. Clients must treat the generation as opaque; it intentionally encodes filesystem timing data as a string because nanosecond timestamps exceed JavaScript's safe integer range.
+The workbench uses `/api/live` for the hot path. On a changed STATE generation, `ratd` performs one canonical `Stream.read()` validation, derives the bounded event delta, and feeds shallow payload facades of those already-validated events through the existing `Stream.view()` materializer. The adapter does not own STATE semantics and cannot replace canonical validation. Historical replay continues to use `/api/snapshot?until_seq=`.
 
-If the canonical STATE `stream_id` changes, `/api/events` returns `reset: true` and restarts the sequence cursor from zero. The workbench then resets timeline/replay/terminal presentation and reloads the current snapshot/artifacts rather than mixing two runs.
+`/api/live` and compatibility `/api/events` return an event cursor containing `stream_id`, `seq`, and, only when the cursor has consumed the complete stable generation, an opaque `source_generation` string. The client echoes that value as `known_generation`. If the append-only STATE file is unchanged, `ratd` can answer without reparsing JSONL. A paginated response with `has_more=true` deliberately omits `source_generation`; otherwise a client could skip unread pages by taking the unchanged fast path too early.
+
+If the canonical STATE `stream_id` changes, the delta returns `reset: true` and restarts the sequence cursor from zero. The workbench resets timeline/replay/terminal presentation rather than mixing two streams.
 
 The terminal `cursor` is an opaque, monotonically increasing value returned by the previous `/api/terminal` response. Clients must pass that returned value back as `after`; it is not a raw byte offset. Cursor generation is persisted in the existing `.rat/desktop/session.json`, so a cursor from an older solver session or a restarted `ratd` safely maps to the beginning of the current truncated terminal log rather than skipping its prefix.
 
-Artifact previews retain at most the requested `max_bytes` prefix while hashing the complete immutable object once. The returned `total_bytes` is the verified object size, so a large artifact no longer needs to be materialized in full by the Desktop projection just to display a small preview.
+### Artifact discovery vs verification
 
-Bounded controls:
+Artifact listing and artifact byte consumption intentionally have different contracts:
 
-```text
-POST /api/session/start
-POST /api/session/stop
-POST /api/session/input    {"data":"..."}
-```
+- `artifact.describe()` / `/api/artifacts` validate immutable metadata schema/digest, object existence, and recorded object size. They do **not** claim that object bytes were SHA-256 verified.
+- `/api/artifacts` returns an opaque metadata-inventory `generation`. If the same generation is echoed back, the daemon can return `unchanged: true` without reopening/parsing every metadata document.
+- `artifact.metadata()`, `artifact.preview()`, `artifact.get()`, and `artifact.verify()` retain content-integrity verification.
+- Desktop preview hashes the complete immutable object once while retaining only the requested `max_bytes` prefix in memory. `total_bytes` is the verified object size.
 
-POST requests must include:
+The artifact inventory generation is only a performance hint over an immutable metadata tree; it is not evidence and does not weaken byte-consuming verification paths.
 
-```text
-X-CTF-Rat-Desktop: 1
-Content-Type: application/json
-```
+## Measurement harnesses
 
-The daemon only accepts loopback bind addresses and only permits the development/Tauri origins declared in `bin/ratd`.
+The benchmarks are deterministic, non-gating evidence for ablation decisions. Absolute values depend on runner load.
 
-## Polling benchmark
-
-The repository contains a deterministic, non-gating microbenchmark for the read-only Desktop projections:
+### STATE polling
 
 ```bash
 python3 tests/bench_desktop_polling.py --events 100,1000,5000 --iterations 7
 ```
 
-It writes a valid synthetic STATE v2 JSONL fixture directly, warms the filesystem cache, and records wall-clock and process-CPU p50/p95/max. CI runs a shorter three-iteration sample and uploads the JSONL result as `ctf-rat-desktop-poll-benchmark-<sha>`. These numbers are evidence for ablation comparisons, not fixed performance thresholds; absolute values vary with runner load.
+GitHub Actions run `32674768350` on source commit `61d9055e0e35afc15b7bf665a282bfe50309be59` measured:
 
-GitHub Actions run `32657156715` on source commit `4fb12d406f800c4ae9e11efedc97399d582c44b3` measured:
+| STATE events | unchanged live p50 | legacy changed refresh p50 | combined changed refresh p50 | changed speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.012 ms | 1.114 ms | 0.621 ms | 1.79x |
+| 1,000 | 0.011 ms | 10.062 ms | 5.234 ms | 1.92x |
+| 5,000 | 0.011 ms | 56.019 ms | 28.459 ms | 1.97x |
 
-| STATE events | idle full scan p50 | unchanged fast path p50 | fast-path ratio | live snapshot p50 | UI changed-refresh estimate p50 |
+The first combined implementation deep-copied all events and benchmarked slower than the legacy sequence, so it was not accepted as-is. The retained implementation instead gives `Stream.view()` minimal event facades with shallow payload copies; tests prove that projection-side status changes do not mutate the delta payloads.
+
+### Artifact discovery
+
+```bash
+python3 tests/bench_desktop_artifacts.py --artifacts 10,100,500 --object-bytes 65536 --iterations 7
+```
+
+The same CI run measured:
+
+| Artifacts | Total object bytes | full listing p50 | unchanged inventory p50 | speedup | one preview p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100 | 0.572 ms | 0.016 ms | 35.75x | 0.640 ms | 1.214 ms |
-| 1,000 | 9.872 ms | 0.023 ms | 429.22x | 5.898 ms | 15.659 ms |
-| 5,000 | 28.762 ms | 0.013 ms | 2,212.46x | 29.862 ms | 57.606 ms |
+| 10 | 640 KiB | 0.584 ms | 0.169 ms | 3.46x | 0.226 ms |
+| 100 | 6.25 MiB | 5.014 ms | 1.370 ms | 3.66x | 0.291 ms |
+| 500 | 31.25 MiB | 22.860 ms | 4.775 ms | 4.79x | 0.219 ms |
 
-The live snapshot path uses the canonical `Stream.view()` materializer once, then derives only cursor/count from the same stable validated JSONL generation. It does not introduce a second STATE model. Historical replay remains on the conservative full canonical path because it is interactive rather than part of the 500 ms live polling loop. The workbench also no longer requests `/api/telemetry` on every state change because `Snapshot.total_event_count` already supplies the only telemetry value displayed by the UI; the telemetry endpoint remains available for external inspection.
+Listing cost is now metadata/inventory work rather than hashing every object. Preview cost for this fixture remains nearly independent of artifact count because it verifies one selected object.
+
+CI uploads both JSONL files together as `ctf-rat-desktop-benchmarks-<sha>`.
 
 ## Test
 
@@ -189,15 +206,16 @@ Desktop backend and end-to-end tests:
 
 ```bash
 python3 -m unittest \
+  tests.test_artifact_describe \
   tests.test_desktop_api \
   tests.test_desktop_session \
   tests.test_desktop_http \
   tests.test_desktop_e2e
 ```
 
-The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, STATE v2 live projection, historical replay, and the canonical artifact store. Session tests additionally verify rapid solver restart, failed-spawn preservation, and stale terminal cursor recovery across a reconstructed `SessionManager`, modeling a `ratd` restart. API/HTTP tests verify stream-reset behavior, opaque generation round-tripping, and that unchanged generation polling does not call `Stream.read()`.
+The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, the combined live STATE projection, unchanged generation round-tripping, historical replay, and the canonical artifact store. API/HTTP tests also lock the caught-up-only STATE generation invariant and artifact-inventory generation behavior.
 
-All repository Python tests still include these through normal discovery:
+All repository Python tests include these through normal discovery:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
@@ -231,9 +249,9 @@ The desktop CI also verifies that `package-lock.json` and `Cargo.lock` remain un
 
 The desktop branch CI verifies:
 
-1. desktop API/session/HTTP/E2E tests,
-2. Python syntax checks for daemon modules and the polling benchmark,
-3. reproducible polling benchmark artifact generation,
+1. artifact/desktop API/session/HTTP/E2E tests,
+2. Python syntax checks for daemon modules and both benchmark harnesses,
+3. reproducible STATE polling and artifact-discovery benchmark artifacts,
 4. `npm ci` against the committed lockfile,
 5. TypeScript/Vite production build,
 6. `cargo check --locked`,
