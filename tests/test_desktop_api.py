@@ -1,4 +1,5 @@
 import os, sys, tempfile, unittest
+from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib.artifact import put_bytes
@@ -42,16 +43,65 @@ class DesktopApiTests(unittest.TestCase):
             first = event_delta(root, after_seq=1, limit=2)
             self.assertEqual([event["seq"] for event in first["events"]], [2, 3])
             self.assertTrue(first["has_more"])
+            self.assertFalse(first["reset"])
+            self.assertFalse(first["unchanged"])
+            self.assertIn("source_size", first["cursor"])
+            self.assertIn("source_mtime_ns", first["cursor"])
             second = event_delta(root, after_seq=first["cursor"]["seq"], limit=2)
             self.assertEqual([event["seq"] for event in second["events"]], [4])
             self.assertFalse(second["has_more"])
 
-    def test_event_delta_rejects_unbounded_requests(self):
+    def test_event_delta_unchanged_hint_skips_state_parse(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            stream.append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            first = event_delta(root, after_seq=0, limit=10)
+            cursor = first["cursor"]
+            with patch.object(Stream, "read", side_effect=AssertionError("unchanged poll parsed STATE")):
+                unchanged = event_delta(
+                    root,
+                    after_seq=cursor["seq"],
+                    stream_id=cursor["stream_id"],
+                    known_size=cursor["source_size"],
+                    known_mtime_ns=cursor["source_mtime_ns"],
+                    limit=10,
+                )
+            self.assertTrue(unchanged["unchanged"])
+            self.assertFalse(unchanged["reset"])
+            self.assertEqual(unchanged["events"], [])
+            self.assertEqual(unchanged["cursor"], cursor)
+
+    def test_event_delta_stream_change_resets_sequence_cursor(self):
+        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+            first_stream = Stream(first_root)
+            for index in range(3):
+                first_stream.append("hypothesis.recorded", {"hypothesis_id": "OLD%d" % index})
+            old = event_delta(first_root, after_seq=0, limit=10)
+
+            second_stream = Stream(second_root)
+            second_stream.append("hypothesis.recorded", {"hypothesis_id": "NEW"})
+            reset = event_delta(
+                second_root,
+                after_seq=old["cursor"]["seq"],
+                stream_id=old["cursor"]["stream_id"],
+                limit=10,
+            )
+            self.assertTrue(reset["reset"])
+            self.assertFalse(reset["unchanged"])
+            self.assertEqual(reset["after_seq"], 0)
+            self.assertEqual([event["seq"] for event in reset["events"]], [1])
+            self.assertNotEqual(reset["stream_id"], old["stream_id"])
+
+    def test_event_delta_rejects_unbounded_or_partial_hint_requests(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(ValueError):
                 event_delta(root, after_seq=-1)
             with self.assertRaises(ValueError):
                 event_delta(root, limit=5001)
+            with self.assertRaises(ValueError):
+                event_delta(root, known_size=0)
+            with self.assertRaises(ValueError):
+                event_delta(root, known_mtime_ns=0)
 
     def test_artifact_list_and_preview_reuse_canonical_store(self):
         with tempfile.TemporaryDirectory() as root:
