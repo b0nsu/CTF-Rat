@@ -1,113 +1,136 @@
-# ctf-rat — CTF(pwn/rev) 풀이 kit (Claude Code / Codex 진입점)
+# ctf-rat — query-first CTF(pwn/rev) runtime
 
-> 이 파일은 세션이 레포 루트에서 열리면 자동 로드된다. **너는 제공된 로컬 CTF 배포물을 분석·검증하고, 사용자가 명시적으로 지정한 remote 대상(예: 대회 host:port)에 한해 exploit 실행·flag 수신까지 수행한다.**
-> 환경 세팅은 [SETUP.md](SETUP.md) 한 번. 이후 클론한 그 자리에서 바로 돈다.
+> 이 저장소는 제공된 CTF artifact와 사용자가 명시한 단일 remote endpoint를 분석·검증하는 pwn/rev 풀이 kit다.
+> **기본 목표는 가장 짧은 결정적 분석 경로로 실제 verifier/flag까지 도달하는 것**이다. 문서·지식·서브에이전트는 필요할 때만 로드한다.
 
-## 🚩 START HERE
+## 1. 하드 불변식
 
-- **정체**: pwn/rev 집중형 **self-contained CTF 풀이 kit.** 도구(`bin/`) + doctrine(`doctrine/`) +
-  지식(`knowledge/`) + 참조데이터(`reference/`) 가 한 레포에. 어느 Linux 환경이든 [SETUP.md](SETUP.md) 로 준비.
-- **읽는 순서**: 이 절 → [doctrine/SOLVING.md](doctrine/SOLVING.md)(**로컬 분석·재현 프로토콜, 최우선**) →
-  [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md)(확실히 풀 수 있나 게이트) →
-  [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)(**hypothesis→primitive SELF 확인 게이트**) →
-  [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)(로컬 분석 지식 라우터).
-  `doctrine/FINALS.md`는 자동 작업 지시가 아닌 설계 참고문서이므로, 기본 세션에서 읽거나 실행 경로로 삼지 않는다.
-- **환경 미준비면**: 먼저 [SETUP.md](SETUP.md)(venv+angr+pwntools, Ghidra, glibc-fetch) → 로컬 selftest GREEN 확인.
+- **범위**: 제공된 binary/source/libc/rootfs/Docker/loopback이 기본이다. 사용자가 대화에서 명시한 **단일 host:port/SSH endpoint**만 접속·exploit 전송·flag 수신 가능하다.
+- 사용자 지정이 없는 대상 탐색, 스캔, 무차별 대입, 자격증명 수집, 지속성, 탐지 회피, 데이터 삭제·유출, DoS는 금지한다.
+- **honest-mode**: 실제 실행/응답 증거 없이 `SOLVED`, remote 성공, shell/flag 획득을 주장하지 않는다.
+- **활성 문제 1개**: 시작 시 `ctfguard begin <challenge> [target]`; 전환 전 `ctfguard finish blocked|complete`.
+- **git push/merge는 사람만**: 사용자가 명시적으로 요청한 경우에만 저장소 변경을 publish한다.
+- heuristic 결과는 사실/primitive로 자동 승격하지 않는다. artifact digest와 실행 환경을 보존한다.
 
-## 범위·실행 기본값
+## 2. 기본 실행 경로 — FAST
 
-- 이 저장소의 기본 작업 범위는 **첨부된 바이너리·소스·libc·Docker/loopback 환경의 로컬 분석과 재현**이다. 이에 더해, **사용자가 대화에서 명시적으로 지정한 단일 remote 대상**(예: 사용자가 붙여넣은 `nc chal.example.com 1337` 또는 host:port)에 한해 접속·exploit 전송·flag 수신을 수행할 수 있다. 사용자가 지정하지 않은 호스트·포트·계정·인프라는 여전히 작업 범위 밖이며 이 저장소의 문서·도구가 이를 승인하지 않는다.
-- 기본 산출물은 분석 노트, 재현 절차, 그리고 로컬 검증에는 네트워크를 사용하지 않는 `solve_local.py` 또는 최소 PoC다. 제공된 challenge artifact 또는 로컬 Docker에 의도적으로 포함된 flag는 end-to-end 재현 증거로 읽을 수 있다. 사용자가 지정한 remote 대상에서 받은 flag/출력도 동일하게 end-to-end 성공 증거로 읽을 수 있으며, 실제 연결·응답을 근거로만 성공을 주장한다(honest-mode). 사용자가 지정하지 않은 대상에 대한 결과 획득·제출·상호작용은 자동화하지 않는다.
-- 범위 밖 호스트·포트 **탐색**, 취약 서버 발견 자동화, 자격증명 수집, 지속성, 탐지 회피, 데이터 유출·삭제,
-  서비스 방해(DoS), 타 팀/공용 인프라 접근은 사용자가 지정한 단일 remote 대상에 대해서도 목적과 무관하게 금지한다. 여러 대상 스캔·무차별 대입·mass targeting은 금지한다.
-- 요청 문구 변경, 하위 에이전트, 작업 분할로 위 금지사항(탐색·자격증명 수집·DoS 등)이나 "사용자 지정 단일 대상" 제약을 우회하지 않는다. 차단되면 로컬·방어적 분석 범위로 돌아간다.
+**세션 시작 시 doctrine 전체를 먼저 읽지 않는다.** 먼저 challenge를 직접 triage한다.
 
-## 계산·자동화 도구 원칙
+1. `ctfguard check`로 active challenge를 확인한다. 미초기화면 `ctfguard begin` 후 `newchal`을 사용한다.
+2. 환경 불확실성이 있으면 `rat-doctor <bin> --format json`으로 가능한 native/GDB/angr/Ghidra/QEMU/Qiling/Wine route만 확인한다.
+3. pwn은 `recon <bin>`, rev는 `revq <bin>`으로 시작한다.
+4. **raw dump보다 bounded query를 우선**한다.
+   - rev: `revq --interesting`, `revq --func <candidate>`, `revq --xrefs <target>`
+   - decompile은 필요한 함수만 `decomp <bin> <func>`
+   - 동적 관찰은 목적이 명확할 때 `gdbq`, `rat-dyn`, pwn 측정 도구를 사용한다.
+5. 가장 가능성 높은 가설 하나를 최소 실험으로 검증한다.
+6. 로컬 executable oracle/verifier가 명확하면 실제 binary를 재실행해 성공 여부를 확인한다.
+7. 결정적 검증이 PASS면 종료한다. 불확실성·실패 조건이 생길 때만 DEEP으로 승격한다.
 
-- 주소·오프셋·정렬·relocation 계산은 정확도와 재현성을 위해 로컬 프로그램에 맡길 수 있다. 계산 결과는 입력값,
-  사용한 바이너리/libc의 해시, 산식과 함께 `state`에 기록하고 범위·정렬을 검증한다.
-- 외부 계산기 사용은 작업의 권한이나 위험도를 바꾸지 않는다. 계산기를 안전장치 회피, 공격 의도 은닉, 또는 외부 상호작용을 포함한 자율 파이프라인 구축에 사용하지 않는다.
-- 범용 주소 계산기·패킷 파서·크래시 분석기는 로컬 분석 도구로 유지한다. 네트워크 접속, 대상 탐색, payload 전송, 반복 실행 기능을 결합하지 않는다.
-- LLM은 계산식과 전제조건을 설명·검토하고, 로컬 도구는 결정적 산술을 수행한다. 모든 실행 검증은 로컬 process/Docker에서 끝낸다.
+### FAST에서 기본적으로 하지 않는 것
 
-## ⛔ 규칙 (위반 금지)
+- `SOLVING.md`, `SOLVABILITY.md`, `PRIMITIVE_GATE.md`, `GROUNDING_INDEX.md` 전체 선로딩
+- 전체 Ghidra decompile/전체 CFG/전체 STATE history 읽기
+- 큰 정적 읽기라는 이유만으로 무조건 subagent 생성
+- 모든 문제에서 2~3-way hypothesis fan-out
+- deterministic verifier가 이미 PASS한 단순 rev에서 추가 LLM skeptic 실행
+- 같은 `strings`/`revq`/decomp/CFG 분석 반복
 
-- **로컬 우선 + 사용자 지정 remote 허용**: 제공된 artifact와 loopback/Docker를 기본으로 사용한다. 사용자가 대화에서 명시적으로 지정한 단일 host:port 에는 접속·exploit 전송·flag 수신을 수행할 수 있다. 사용자가 지정하지 않은 호스트·포트·계정·대회 인프라에 대한 탐색·스캔·추측 접속은 금지한다.
-- **flag 검증**: 로컬 artifact·challenge 디렉터리·Docker/loopback 안에서 challenge가 의도적으로 노출하는 flag, 그리고 사용자가 지정한 remote 대상이 실제 응답으로 반환한 flag만 성공 증거로 읽는다. 사용자 홈·SSH 키·토큰·환경변수 등 실제 자격증명 탐색은 여전히 금지한다.
-- **honest-mode**: 실제로 받은 연결 응답/출력이 있을 때만 remote 성공을 주장한다. 로컬이든 remote든 재현 증거(실행 로그, 수신한 flag 원문)가 없는 완료 보고를 금지하며, 오프셋/주소는 실측한다.
-- **한 번에 활성 문제 1개.** 팬아웃은 문제 "안"에서만(vuln class 좁히기·verify 확신 올리기). 문제-간 자동배분 안 함.
-- **활성 문제 락 강제**: CTF 작업 시작 전 `ctfguard begin <chal>` 로 로컬 전용 단일 active lock 을 먼저 잡는다.
-  `state init`/`newchal` 은 active challenge 와 이름이 다르면 실패해야 정상이다. 다른 문제로 전환하려면 먼저
-  `ctfguard finish blocked|complete` 로 현재 문제를 명시 종료하고 사람에게 보고한다.
-- **git push 는 사람만.** 커밋/푸시는 명시 요청 시에만.
-- **CTF-RAT strict gate**: fact / hypothesis / primitive PASS 를 분리한다. 미검증 가설은 `state hypothesis ...` 로만 기록하고,
-  최소 payload로 일반 실행 core에서 EIP/ESP/register/controlled marker/terminator 부작용을 확인하기 전까지
-  로컬 PoC 조립 금지. 통과 시에만 `state primitive <name> pass <evidence>` 로 승격한다.
+## 3. DEEP 승격 조건
 
-## 풀이 워크플로 (로컬 우선 단계; 상세=doctrine/SOLVING.md)
+다음 중 하나면 필요한 문서·지식만 lazy-load하고 DEEP으로 전환한다.
 
-0. **Guard** — `ctfguard begin <name>` 로 로컬 전용 active lock을 만든다. 제공되지 않은 대상을 추측하거나 추가하지 않는다.
-   시작 전 `ctfguard check` 가 GREEN 이어야 한다. 새 문제 전환은 `ctfguard finish blocked|complete` 없이는 금지.
-1. **Triage** — 제공된 artifact에 `newchal <name> <bin> [libc]`로 스캐폴드.
-   pwn 이면 `recon <bin>`, rev 이면 `revq <bin>`. `doctrine/SOLVABILITY.md` 로 확신도 게이트.
-2. **RE/정찰** — 큰 정적 읽기는 **scout Task 로 위임하고 요약만 회수**(컨텍스트 위생). rev: `revq --func`/`decomp`.
-3. **Vuln 가설** — 불확실하면 가설별 병렬(상한 3). `knowledge/GROUNDING_INDEX.md` 로 유형별 지식 1개만 로드.
-4. **Primitive** — leak/AAW/control 확보(순차). 후보는 `state hypothesis ...`; SELF 확인 통과 후 `state primitive <name> pass <evidence>`.
-5. **PoC 검증** — primitive PASS 이후에만 로컬 프로세스/Docker(기본) 또는 사용자가 지정한 remote 대상(명시된 경우)에 조립한다.
-   hypothesis만으로 체이닝하지 않는다. 로컬 검증이 기본 산출물(`solve_local.py`, 네트워크 미사용)이며, 사용자가 remote 대상을 지정한 경우 동일한 exploit을 그 대상에 실행해 실제 flag 수신까지 시도한다. 의도된 로컬 flag를 읽었거나 remote에서 flag를 수신했다면 대상·실행 조건·환경 digest(remote는 host:port·수신 원문 포함)를 검증 증거로 기록한다.
-6. **Adversarial verify** — SOLVE 선언 전 skeptic 으로 **반증 시도**(leak 위양성·libc mismatch·환경 차이, remote는 offset/leak이 remote 환경에 그대로 유효한지).
-   rev 는 `symsolve --find-str …`(복원 입력을 **실 바이너리 재실행**으로 concrete-verify)로 executable oracle 검증.
-7. **인계·지식화**(선택, 로컬 검증 후) — 기본 `HANDOFF.md`에 분석·primitive 증거·운영자 인계 조건을 남기고 `writeupcheck --strict`로 검사한다.
-   typed STATE v2가 legacy PASS보다 우선한다. [doctrine/WRITEUP_FORMAT.md](doctrine/WRITEUP_FORMAT.md)가 canonical 양식이며, 증거 digest가 연결된 operator attestation 전에는 `WRITEUP.md`/`SUBMISSION.md`로 승격하지 않는다. 일반화한 교훈은 `knowledge/learned/`에 candidate부터 기록한다.
-   rev grounding 은 `knowledge/ctf-reverse/`, pwn 은 `knowledge/ctf-skills/` — 라우팅은 `knowledge/GROUNDING_INDEX.md`.
+- 서로 독립적인 유효 가설이 2개 이상 남음
+- FAST probe가 반복 실패하거나 새 사실/배제/primitive 진전이 없음
+- remote/local 환경 차이가 exploit 안정성에 영향
+- heap/kernel/complex ROP/format-string chain 등 primitive 증명이 핵심
+- VM/packing/anti-debug/heavy obfuscation 때문에 정적 결과 신뢰가 낮음
+- symbolic path explosion, indirect control flow, aliasing 등으로 bounded 분석이 불충분
+- 증거끼리 충돌하거나 SOLVED 주장을 반증할 필요가 있음
 
-## 도구 (bin/) — 전부 `CTF_HOME`(레포루트) 자동 해석
+DEEP에서만 필요에 따라 읽는다:
 
-```
-GUARD    ctfguard          active 문제 로컬 락
-INGEST   newchal            제공된 artifact의 로컬 스캐폴드
-스캐폴드  newchal            solve 디렉토리 스캐폴딩 (+run.json)
-triage   recon              pwn 정적 프로파일 + 보수적 triage
-         revq               rev 정적 배치 — 함수/문자열/xref/interesting/evasion (angr 주 엔진)
-         analyze            그래프+1-hop 전파 vuln localizer (prior only)
-RE       decomp             Ghidra headless 디컴파일 캐시(함수별 조회)
-         gdbq               GDB batch (노이즈 제거)
-symbolic solve/_template/rev/symsolve.py   angr 하니스(+concrete-verify, PE면 wine)
-         solve/_template/rev/vmlift.py     custom-VM 리프터 스캐폴드
-         solve/_template/rev/qiling_trace.py  Windows PE 동적 에뮬(Qiling, Wine 불필요)
-pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 조립
-         pwncalc            로컬 주소·심볼·문자열 계산 + ELF 해시·정렬 검증
-         pwnscope           solve.py ↔ run.json 단일-target/로컬 우선 정적 검사
-         pwnleak            출력/바이트의 pointer 후보 추출·marker/canonical 검사
-         pwnpayload         payload bad byte·transport·terminator·qword layout 검사
-         pwnropcheck        로컬 ELF mapping·code segment·SysV stack alignment 검사
-         pwncrash           로컬 cyclic crash 재현 + GDB core 증거 수집(자동 PASS 승격 안 함)
-버스     state              STATE.jsonl (확정/배제/다음 기록 — 재도출 방지)
-검증     pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate
+- `doctrine/SOLVING.md` — 전체 solve/reproduction 규약
+- `doctrine/SOLVABILITY.md` — route가 실제로 성립하는지 점검
+- `doctrine/PRIMITIVE_GATE.md` — pwn primitive 승격 계약
+- `knowledge/GROUNDING_INDEX.md` — 유형별 지식 하나를 선택하는 router
+- `doctrine/WRITEUP_FORMAT.md` — 검증 완료 후 문서화 시
+
+## 4. pwn primitive / correctness gate
+
+pwn에서 exploit chain은 검증된 primitive를 기반으로 한다.
+
+```text
+observation/fact
+  → hypothesis
+  → minimal SELF experiment
+  → primitive PASS
+  → exploit composition
+  → deterministic/local or authorized-remote verification
 ```
 
-rev 시너지: `revq` 주소 = angr 로드베이스(PIE 0x400000) → `symsolve --find <그 주소>` 그대로 투입.
+- 후보는 `state hypothesis ...` 또는 typed STATE finding으로 기록한다.
+- RIP/EIP/control marker/leak/AAW 등 주장한 primitive를 실제 최소 payload로 확인하기 전 최종 chain의 근거로 쓰지 않는다.
+- `state primitive ... pass ...`/typed primitive PASS는 관련 evidence가 active일 때만 유효하다.
+- libc/loader/runtime mismatch가 있으면 remote-equivalent로 간주하지 않는다.
 
-## 레이아웃
+단순 rev checker처럼 exploit primitive 개념이 없는 문제는 **candidate input → 실제 binary 실행 → success oracle**이 더 강한 검증이다. 이 경우 불필요한 pwn primitive 절차를 억지로 적용하지 않는다.
 
+## 5. 컨텍스트 정책
+
+- 모델 context에는 **현재 판단에 필요한 projection만** 둔다.
+- `STATE.jsonl`/STATE v2는 영구 evidence bus이지 대화 context가 아니다. 기본은 `state show`, `state compact`, `state delta`의 bounded view를 사용한다.
+- 큰 raw output은 artifact/cache에 남기고, 필요한 함수/주소/범위만 다시 질의한다.
+- 동일 입력·도구·파라미터의 결정적 분석은 cache 결과를 우선 재사용한다. stale/partial/truncated 결과는 재사용하지 않는다.
+- 한 도구를 다시 실행하기 전 **새 정보가 생겼는지** 확인한다. 같은 fingerprint의 반복 호출은 원칙적으로 피한다.
+
+## 6. Subagent 정책
+
+서브에이전트는 context 자체가 아니라 **독립적인 추론/읽기 작업**이 실제 병목일 때만 사용한다.
+
+- bounded query/결과가 대략 2k tokens 이하 → main agent가 직접 처리
+- 대형 decompile/raw 자료를 반드시 읽어야 함 → scout 1개로 요약
+- 유효한 상충 가설이 2개 이상 → hypothesis fan-out 기본 2, 최대 3
+- pwn remote/environment-sensitive 최종 검증 → skeptic 1개 권장
+- executable oracle이 명확히 PASS한 단순 rev → skeptic 생략 가능
+
+서브에이전트 결과도 미검증 해석은 hypothesis이며 사실로 자동 승격하지 않는다.
+
+## 7. 기존 도구 hot path
+
+```text
+GUARD     ctfguard
+INGEST    newchal / ctfpull
+CAP       rat-doctor
+PWN       recon → pwncrash/pwnleak/pwncalc/pwnpayload/pwnropcheck → rat-verify
+REV       revq → decomp(필요 함수만) → symsolve(concrete verify) / rat-dyn
+STATE     state (STATE v2 우선)
+ARTIFACT  rat-* structured analysis + content-addressed store
+HANDOFF   pkshare / writeupcheck
 ```
-CLAUDE.md / AGENTS.md      이 진입점 (AGENTS.md→CLAUDE.md 심볼릭, Codex 호환)
-SETUP.md                   환경무관 초기 세팅
-doctrine/                  SOLVING(로컬 재현) · SOLVABILITY · calibration · FINALS(참고)
-knowledge/                 GROUNDING_INDEX + ctf-skills/(pwn) + ctf-reverse/(rev) + ctf-writeup/
-reference/                 libc-offsets/ · glibc/(list·SOURCES·glibc-fetch)
-bin/                       도구 전체 (+ghidra_scripts/)
-solve/_template/rev/       symsolve · vmlift (챌린지 dir 로 복사해 사용)
-tests/                     e2e_rev.sh(rev 루프) 등 로컬 회귀검증
-```
 
-## 테스트 (도구 수정 후 회귀검증 — 전부 ALL GREEN)
+`revq`는 큰 함수/문자열/xref 분석을 컨텍스트 밖에서 캐시하고 `--func` 등으로 필요한 카드만 회수하는 것이 기본 사용법이다.
 
-```sh
-python3 bin/revq selftest
-python3 solve/_template/rev/symsolve.py selftest
-python3 solve/_template/rev/vmlift.py selftest
-python3 -m unittest tests.test_writeup_pipeline
-```
+## 8. 정체/재계획 규칙
 
-angr 설치 환경이면 `bash tests/e2e_rev.sh`(실 crackme e2e)까지.
+연속된 probe에서 다음이 하나도 바뀌지 않으면 현재 route를 반복하지 말고 재계획한다.
+
+- 새 direct observation/fact
+- hypothesis refute/confirm
+- primitive 상태 변화
+- 새 oracle/target address 발견
+- 환경 불확실성 해소
+
+그때만 더 깊은 decompile, symbolic solve, 동적 tracing, knowledge lookup 또는 subagent를 사용한다.
+
+## 9. 완료 조건
+
+`SOLVED`는 다음 중 실제 증거가 있을 때만 선언한다.
+
+- rev: candidate가 실제 challenge binary의 success oracle을 통과
+- pwn local: 의도된 효과/flag가 동일 binary+libc/loader/runtime에서 재현
+- authorized remote: 사용자가 지정한 endpoint에서 실제 응답으로 의도된 효과/flag 수신
+
+flag 문자열 추측, heuristic score, decompiler 해석, symbolic candidate만으로는 완료가 아니다.
+
+검증 후에만 필요하면 `pkshare`/`writeupcheck`로 인계·문서화한다.
