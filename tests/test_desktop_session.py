@@ -52,6 +52,19 @@ class DesktopSessionTests(unittest.TestCase):
             self.assertEqual(stopped["status"], "finished")
             self.assertIsNotNone(stopped["exit_code"])
 
+    def test_rapid_restart_starts_with_fresh_terminal_log(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = SessionManager(root, [sys.executable, "-u", "-c", "print('first')"])
+            manager.start()
+            self.wait_finished(manager)
+            self.assertIn("first", manager.log_delta(0, 4096)["text"])
+            manager.solver_argv = [sys.executable, "-u", "-c", "print('second')"]
+            manager.start()
+            self.wait_finished(manager)
+            replay = manager.log_delta(0, 4096)["text"]
+            self.assertIn("second", replay)
+            self.assertNotIn("first", replay)
+
 
 if __name__ == "__main__":
     unittest.main()
