@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-slice a branch leading to an oracle/xref anchor."""
+"""Backward-slice branch guards controlling an oracle/xref anchor block."""
 from __future__ import annotations
 
 import argparse
@@ -42,8 +42,10 @@ def main(argv=None):
     if not doc["branches"]:
         print("BRANCH none found in in-function predecessors")
     for item in doc["branches"]:
-        print("BRANCH %#x  pred=%#x -> target-block=%#x" %
-              (item["branch_insn"], item["predecessor_block"], item["target_block"]))
+        print("BRANCH %#x  pred=%#x -> anchor-block=%#x  relation=%s" %
+              (item["branch_insn"], item["predecessor_block"], item["target_block"], item["anchor_relation"]))
+        if item.get("taken_target") is not None:
+            print("  taken: %#x" % item["taken_target"])
         print("  regs : %s" % (", ".join(item["register_dependencies"]) or "-"))
         print("  stack: %s" % (", ".join(item["stack_dependencies"]) or "-"))
     print("SCOPE  same-block tmp/register def-use + direct stack slots; no inter-block value-flow claim")
