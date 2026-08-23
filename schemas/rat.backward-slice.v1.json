@@ -23,7 +23,7 @@
       "maxItems": 64,
       "items": {
         "type": "object",
-        "required": ["branch_insn", "taken_target", "register_dependencies", "stack_dependencies", "trace", "predecessor_block", "target_block", "reaches_anchor_block"],
+        "required": ["branch_insn", "taken_target", "register_dependencies", "stack_dependencies", "trace", "predecessor_block", "target_block", "anchor_relation", "reaches_anchor_block"],
         "properties": {
           "branch_insn": {"type": "integer", "minimum": 1},
           "taken_target": {"type": ["integer", "null"]},
@@ -32,6 +32,7 @@
           "trace": {"type": "array", "maxItems": 64},
           "predecessor_block": {"type": "integer", "minimum": 1},
           "target_block": {"type": "integer", "minimum": 1},
+          "anchor_relation": {"enum": ["taken", "must-not-take"]},
           "reaches_anchor_block": {"const": true}
         },
         "additionalProperties": false
