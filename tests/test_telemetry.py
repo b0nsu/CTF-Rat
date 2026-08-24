@@ -2,7 +2,8 @@ import json, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 from ratlib.contracts import execute
-from ratlib.metrics import aggregate, operation_fingerprint
+from ratlib.metrics import aggregate, operation_fingerprint, first_primitive_pass_ts
+from ratlib.state_v2 import Stream
 
 D = "sha256:" + "a" * 64
 
@@ -114,6 +115,27 @@ class Aggregate(unittest.TestCase):
     def test_time_to_flag_sec_is_elapsed_seconds_between_guard_begin_and_verify_pass(self):
         m = aggregate([envelope()], guard_started_at=1000, verify_pass_at=1090)
         self.assertEqual(m["time_to_flag_sec"], 90)
+
+class FirstPrimitivePassTs(unittest.TestCase):
+    """Once a v2 stream exists it is authoritative: a legacy PASS must never
+    leak into v2 time-to-flag telemetry (the legacy `state primitive ... pass`
+    command is itself rejected by bin/state, so trusting it here would let a
+    rejected write resurface as a solved timestamp)."""
+
+    def _write_legacy_pass(self, state_dir, ts):
+        with open(os.path.join(state_dir, "STATE.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"t": "primitive", "status": "pass", "ts": ts}) + "\n")
+
+    def test_legacy_pass_used_when_no_v2_stream(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_legacy_pass(d, 4242)
+            self.assertEqual(first_primitive_pass_ts(d), 4242)
+
+    def test_v2_stream_without_typed_pass_suppresses_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_legacy_pass(d, 4242)
+            Stream(d).append("hypothesis.recorded", {"hypothesis_id": "h1"})
+            self.assertIsNone(first_primitive_pass_ts(d))
 
 if __name__ == "__main__":
     unittest.main()

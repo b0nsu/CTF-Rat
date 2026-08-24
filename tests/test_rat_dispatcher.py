@@ -227,5 +227,41 @@ class FullEngineDependent(unittest.TestCase):
         self.assertIn("revq_json", rows)
         self.assertIn("profile_artifact", rows)
 
+    def test_governor_reads_challenge_state_not_custom_store(self):
+        # `--store` overrides only the cache/index location; the solving STATE
+        # namespace the governor reads progress from must stay anchored to the
+        # binary. A store whose parent is NOT the challenge dir would, under the
+        # old `Stream(dirname(store))` wiring, make the governor read/write a
+        # stray STATE and go blind to real progress.
+        far = tempfile.TemporaryDirectory(); self.addCleanup(far.cleanup)
+        store = str(pathlib.Path(far.name) / "cache" / "store")
+        code, out, err = run_rat("route", str(self.exe), "--store", store, "--format", "json")
+        self.assertEqual(code, 0, err)
+        chal_stream = self.exe.parent / ".rat" / "events" / "STATE.v2.jsonl"
+        self.assertTrue(chal_stream.exists(), "governor must write STATE next to the binary")
+        types = [json.loads(l)["type"] for l in chal_stream.read_text().splitlines() if l.strip()]
+        self.assertIn("governor.checked", types)
+        stray = pathlib.Path(store).parent / ".rat" / "events" / "STATE.v2.jsonl"
+        self.assertFalse(stray.exists(), "custom --store must not relocate the STATE namespace")
+
+    def test_query_oracle_bounds_projection_but_keeps_exact_counts(self):
+        # Query-First v2: a single oracle query must not blow up context even on
+        # a binary with many success/failure-like strings. The projection is
+        # budget-bounded while the counts (which drive auto_connect) stay exact.
+        code, out, err = run_rat("query", "oracle", str(self.exe), "--store", self.store,
+                                  "--budget-bytes", "1", "--format", "json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        validate(doc, "rat.query-result/v1")
+        facts = doc["facts"]
+        self.assertIn("success_candidate_count", facts)
+        self.assertIn("failure_candidate_count", facts)
+        self.assertLessEqual(len(facts.get("success_candidates", [])), facts["success_candidate_count"])
+        self.assertLessEqual(len(facts.get("failure_candidates", [])), facts["failure_candidate_count"])
+        if facts["success_candidate_count"] or facts["failure_candidate_count"]:
+            # budget_bytes=1 forces truncation whenever any candidate exists
+            self.assertEqual(doc["status"], "partial")
+            self.assertIn("truncated_counts", doc["coverage"]["omitted"])
+
 if __name__ == "__main__":
     unittest.main()

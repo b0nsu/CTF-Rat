@@ -170,8 +170,17 @@ _STATE_PROGRESS_EVENT_TYPES = {
     "observation.recorded", "finding.revised", "primitive.revised", "primitive.consumed",
     "evidence.invalidated", "hypothesis.recorded", "unknown.recorded", "route.ruled_out", "next.recorded",
 }
-def _governor_wrap(store, action, novelty_key, doc):
-    stream = Stream(os.path.dirname(store))
+# The solving STATE lives next to the challenge binary (dirname(binary)/.rat),
+# NOT under the cache/index store. Those coincide by default because the default
+# index root is dirname(binary)/.rat, but `--store /elsewhere` overrides only the
+# cache/artifact location and must not relocate the STATE namespace the governor
+# reads progress from -- otherwise a custom store makes the governor blind to
+# real solving progress and report false-stuck. Anchor on the binary directly.
+def _state_dir(binary):
+    return os.path.dirname(os.path.realpath(binary))
+
+def _governor_wrap(state_dir, action, novelty_key, doc):
+    stream = Stream(state_dir)
     events = stream.read()
     progress = [e for e in events if e["type"] in _STATE_PROGRESS_EVENT_TYPES]
     state_cursor = event_cursor(progress[-1]) if progress else None
@@ -226,7 +235,7 @@ def cmd_route(args):
     result["capabilities"] = {**result["capabilities"], **caps}
     novelty_key = {"track": result["track"], "subroute": result["subroute"],
                    "signals": [s["value"] for s in result["signals"]]}
-    result = _governor_wrap(store, "route", novelty_key, result)
+    result = _governor_wrap(_state_dir(binary), "route", novelty_key, result)
     return _emit(result, EXIT_OK, args.format)
 
 def cmd_query_func(args):
@@ -265,7 +274,7 @@ def cmd_query_func(args):
                            diagnostics=diagnostics,
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
-    doc = _governor_wrap(store, "query:func", {"query": query, "facts": facts}, doc)
+    doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_oracle(args):
@@ -279,24 +288,38 @@ def cmd_query_oracle(args):
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
-    facts = {"success_candidates": oracle["success_candidates"], "failure_candidates": oracle["failure_candidates"]}
+    # auto_connect / ambiguity are decided by compute_oracle over the FULL
+    # candidate set -- we only bound the *projection* returned to the model, so
+    # a binary with many "success"/"failure"-like strings can't blow up a single
+    # oracle query's context. Truncation never changes the resolve decision.
+    succ_full, fail_full = oracle["success_candidates"], oracle["failure_candidates"]
+    budget = args.budget_bytes
+    kept, truncated, omit = truncate_lists_sharing_budget(
+        [("success_candidates", succ_full), ("failure_candidates", fail_full)], budget)
+    facts = {**kept, "success_candidate_count": len(succ_full), "failure_candidate_count": len(fail_full)}
     heuristics = {"resolved": oracle["resolved"], "auto_connect": oracle["auto_connect"]}
     diagnostics = []
     if oracle["ambiguous"]:
         diagnostics.append({"code": "ambiguous", "severity": "warning",
                              "message": "multiple success/failure candidates; auto-connect withheld"})
-    elif not oracle["success_candidates"] and not oracle["failure_candidates"]:
+    elif not succ_full and not fail_full:
         diagnostics.append({"code": "partial", "severity": "warning", "message": "no success/failure string candidates found"})
+    if truncated:
+        diagnostics.append({"code": "partial", "severity": "warning",
+                             "message": "candidates truncated at item boundary (budget_bytes=%d); counts are exact" % budget})
     if oracle["auto_connect"]:
         r = oracle["resolved"]
         heuristics["next"] = [{"query": "symsolve.py --find %#x --avoid %#x" % (r["success"]["addr"], r["failure"]["addr"]), "target": binary}]
-    status = "ok" if oracle["auto_connect"] else "partial"
+    status = "ok" if oracle["auto_connect"] and not truncated else "partial"
     doc = _query_envelope("oracle", status=status, facts=facts, heuristics=heuristics, artifacts=[],
-                           coverage={"complete": oracle["auto_connect"], "scope": "binary-strings+xrefs",
-                                     "omitted": None if oracle["auto_connect"] else "unresolved-candidates"},
+                           coverage={"complete": oracle["auto_connect"] and not truncated, "scope": "binary-strings+xrefs",
+                                     "omitted": (None if oracle["auto_connect"] else "unresolved-candidates") if not truncated
+                                                else {"truncated_counts": {"success_candidates": omit["success_candidates"],
+                                                                            "failure_candidates": omit["failure_candidates"]}}},
                            diagnostics=diagnostics,
-                           provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}})
-    doc = _governor_wrap(store, "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
+                           provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}},
+                           budget_bytes=budget)
+    doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_slice(args):
@@ -345,7 +368,7 @@ def cmd_query_slice(args):
                            diagnostics=diagnostics,
                            provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
                                        "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
-    doc = _governor_wrap(store, "query:slice", {"facts": facts, "heuristics": heuristics}, doc)
+    doc = _governor_wrap(_state_dir(binary), "query:slice", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_dyn(rest):
@@ -407,6 +430,7 @@ def build_parser():
     pf.add_argument("--format", choices=("text", "json"), default="text")
     po = qsub.add_parser("oracle")
     po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
+    po.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     po.add_argument("--format", choices=("text", "json"), default="text")
     ps = qsub.add_parser("slice")
     ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)

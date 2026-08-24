@@ -46,12 +46,26 @@ class RouteResultSchema(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(route_result(next=[{"query": "x"}]))
 
-    def test_alternatives_field_allowed_when_a_list(self):
-        d = route_result(); d["alternatives"] = ["rev-symbolic"]
+    def test_alternatives_field_allowed_with_valid_shape(self):
+        d = route_result(); d["conflict"] = True
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
         validate(d)
 
     def test_alternatives_field_rejected_when_not_a_list(self):
         d = route_result(); d["alternatives"] = "rev-symbolic"
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_element_missing_field_raises(self):
+        d = route_result(); d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack"}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_element_confidence_out_of_range_raises(self):
+        d = route_result()
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 1.5}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_conflict_must_be_bool(self):
+        d = route_result(); d["conflict"] = "yes"
         with self.assertRaises(ValidationError): validate(d)
 
 class QueryResultSchema(unittest.TestCase):

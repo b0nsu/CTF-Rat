@@ -125,7 +125,14 @@ def route_result(d):
     if d["skill"] is not None and not isinstance(d["skill"],str): raise ValidationError("invalid skill")
     if not isinstance(d["next"],list) or any(
         not isinstance(n,Mapping) or {"query","target"} - set(n) for n in d["next"]): raise ValidationError("invalid next")
-    if "alternatives" in d and not isinstance(d["alternatives"],list): raise ValidationError("invalid alternatives")
+    if "conflict" in d and not isinstance(d["conflict"],bool): raise ValidationError("invalid conflict")
+    if "alternatives" in d:
+        if not isinstance(d["alternatives"],list): raise ValidationError("invalid alternatives")
+        for alt in d["alternatives"]:
+            if not isinstance(alt,Mapping) or {"track","subroute","confidence"} - set(alt):
+                raise ValidationError("invalid alternative shape")
+            if not isinstance(alt["confidence"],(int,float)) or not 0 <= alt["confidence"] <= 1:
+                raise ValidationError("invalid alternative confidence")
 
 _QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
 def query_result(d):
