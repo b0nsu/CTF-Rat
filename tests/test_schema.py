@@ -68,6 +68,27 @@ class RouteResultSchema(unittest.TestCase):
         d = route_result(); d["conflict"] = "yes"
         with self.assertRaises(ValidationError): validate(d)
 
+    def test_conflict_true_without_alternatives_raises(self):
+        d = route_result(); d["conflict"] = True
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_conflict_true_with_empty_alternatives_raises(self):
+        d = route_result(); d["conflict"] = True; d["alternatives"] = []
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_without_conflict_raises(self):
+        d = route_result()
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_with_conflict_false_raises(self):
+        d = route_result(); d["conflict"] = False
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_no_conflict_no_alternatives_passes(self):
+        validate(route_result(conflict=False))
+
 class QueryResultSchema(unittest.TestCase):
     def test_valid_doc_passes_for_each_status(self):
         for status in ("ok", "partial", "error"):

@@ -133,6 +133,14 @@ def route_result(d):
                 raise ValidationError("invalid alternative shape")
             if not isinstance(alt["confidence"],(int,float)) or not 0 <= alt["confidence"] <= 1:
                 raise ValidationError("invalid alternative confidence")
+    # conflict and alternatives are two halves of one fact: a real conflict must
+    # name at least one alternative, and listing alternatives without flagging a
+    # conflict is incoherent. Enforce the coupling in both directions.
+    has_alts = bool(d.get("alternatives"))
+    if d.get("conflict") is True and not has_alts:
+        raise ValidationError("conflict requires non-empty alternatives")
+    if has_alts and d.get("conflict") is not True:
+        raise ValidationError("alternatives require conflict true")
 
 _QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
 def query_result(d):
