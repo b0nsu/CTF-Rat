@@ -239,6 +239,11 @@ export default function App() {
     }
   };
 
+  const selectTimelineEvent = (event: EventRecord) => {
+    setSelectedEvent(event);
+    setSelectedArtifact(null);
+  };
+
   const changeReplay = async (value: number) => {
     const request = ++replayRequest.current;
     const max = liveSnapshot?.total_event_count ?? 0;
@@ -267,41 +272,45 @@ export default function App() {
       <header className="topbar">
         <div className="brand-block">
           <div className="eyebrow">CTF-RAT WORKBENCH</div>
-          <h1>{challengeName}</h1>
-          <span className="root-inline">{liveSnapshot?.challenge_root ?? API}</span>
+          <div className="brand-line">
+            <h1>{challengeName}</h1>
+            <span className="root-inline" title={liveSnapshot?.challenge_root ?? API}>{liveSnapshot?.challenge_root ?? API}</span>
+          </div>
         </div>
         <div className="top-actions">
-          <div className={`session-pill ${session?.status ?? "idle"}`}>{session?.status?.toUpperCase() ?? "IDLE"}</div>
-          <button className="primary" disabled={!session?.configured || session?.status === "running"} onClick={() => void runControl("start")}>Start Solver</button>
-          <button className="danger" disabled={session?.status !== "running"} onClick={() => void runControl("stop")}>Stop</button>
-          <div className={`connection ${connection}`}><span className="dot" />{connection.toUpperCase()}</div>
+          <div className={`session-pill ${session?.status ?? "idle"}`} aria-label={`Solver session ${session?.status ?? "idle"}`}>{session?.status?.toUpperCase() ?? "IDLE"}</div>
+          <button type="button" className="primary" disabled={!session?.configured || session?.status === "running"} onClick={() => void runControl("start")}>Start Solver</button>
+          <button type="button" className="danger" disabled={session?.status !== "running"} onClick={() => void runControl("stop")}>Stop</button>
+          <div className={`connection ${connection}`} role="status" aria-live="polite" aria-label={`ratd connection ${connection}`}><span className="dot" aria-hidden="true" />{connection.toUpperCase()}</div>
         </div>
       </header>
 
-      {error && <div className="error-banner">{error}</div>}
+      {error && <div className="error-banner" role="alert">{error}</div>}
 
-      <section className="replay-bar">
-        <span>REPLAY</span>
+      <section className="replay-bar" aria-label="STATE replay controls">
+        <span id="replay-label">REPLAY</span>
         <input
           type="range"
           min={0}
           max={liveSnapshot?.total_event_count ?? 0}
           value={replaySeq ?? liveSnapshot?.total_event_count ?? 0}
+          aria-labelledby="replay-label"
+          aria-valuetext={replaySeq === null ? "Live state" : `Historical state at event ${replaySeq}`}
           onChange={(event) => void changeReplay(Number(event.target.value))}
         />
         <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
         <span className="telemetry-inline">events {liveSnapshot?.total_event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
       </section>
 
-      <section className={`focus-bar ${displaySnapshot?.historical ? "historical" : ""}`}>
+      <section className={`focus-bar ${displaySnapshot?.historical ? "historical" : ""}`} aria-label="Solver focus summary">
         <div className="focus-main"><span>NEXT PROBE</span><strong title={focus.nextProbe}>{focus.nextProbe}</strong></div>
         <div className="focus-stat"><span>PRIMITIVES</span><code>{focus.primitives}</code></div>
         <div className="focus-stat"><span>FINDINGS</span><code>{focus.findings}</code></div>
       </section>
 
       <main className="workspace">
-        <aside className="state-panel panel">
-          <div className="panel-title">STATE {displaySnapshot?.historical ? "· HISTORICAL" : "· LIVE"}</div>
+        <aside className="state-panel panel" aria-labelledby="state-title">
+          <div className="panel-title" id="state-title" role="heading" aria-level={2}>STATE {displaySnapshot?.historical ? "· HISTORICAL" : "· LIVE"}</div>
           <div className="counter-grid">
             {counters.map(([label, value]) => <div className="counter" key={label}><span>{label}</span><strong>{value}</strong></div>)}
           </div>
@@ -311,10 +320,16 @@ export default function App() {
             <span>PID</span><strong>{session?.pid ?? "—"}</strong>
             <span>Exit</span><strong>{session?.exit_code ?? "—"}</strong>
           </div>
-          <div className="panel-title subsection">ARTIFACTS · {artifacts.length}</div>
-          <div className="artifact-list">
+          <div className="panel-title subsection" id="artifacts-title" role="heading" aria-level={3}>ARTIFACTS · {artifacts.length}</div>
+          <div className="artifact-list" aria-labelledby="artifacts-title">
             {artifacts.slice(0, 80).map((artifact) => (
-              <button key={artifact.digest} className="artifact-row" onClick={() => void selectArtifact(artifact)}>
+              <button
+                type="button"
+                key={artifact.digest}
+                className="artifact-row"
+                aria-pressed={selectedArtifact?.metadata.digest === artifact.digest}
+                onClick={() => void selectArtifact(artifact)}
+              >
                 <strong>{artifact.logical_name}</strong>
                 <span>{artifact.kind}</span>
                 <code>{artifact.digest.slice(0, 19)}…</code>
@@ -325,47 +340,60 @@ export default function App() {
         </aside>
 
         <section className="center-stack">
-          <section className="timeline panel">
-            <div className="panel-title">ACTIVITY TIMELINE</div>
+          <section className="timeline panel" aria-labelledby="timeline-title">
+            <div className="panel-title" id="timeline-title" role="heading" aria-level={2}>ACTIVITY TIMELINE</div>
             <div className="event-list">
               {!events.length && <div className="empty">Waiting for STATE v2 events…</div>}
               {events.map((event) => {
                 const future = replaySeq !== null && event.seq > replaySeq;
+                const selected = selectedEvent?.event_id === event.event_id && !selectedArtifact;
                 return (
-                  <button className={`event-row ${selectedEvent?.event_id === event.event_id ? "selected" : ""} ${future ? "future" : ""}`} key={event.event_id} onClick={() => setSelectedEvent(event)}>
+                  <button
+                    type="button"
+                    className={`event-row ${selected ? "selected" : ""} ${future ? "future" : ""}`}
+                    key={event.event_id}
+                    aria-pressed={selected}
+                    onClick={() => selectTimelineEvent(event)}
+                  >
                     <span className="seq">#{event.seq}</span>
                     <span className="kind">{group(event.type)}</span>
                     <span className="event-main"><strong>{event.type}</strong><small>{eventLabel(event)}</small></span>
-                    <time>{new Date(event.at).toLocaleTimeString()}</time>
+                    <time dateTime={event.at} title={new Date(event.at).toLocaleString()}>{new Date(event.at).toLocaleTimeString()}</time>
                   </button>
                 );
               })}
             </div>
           </section>
 
-          <section className="terminal-panel panel">
-            <div className="terminal-head"><span className="panel-title">LIVE TERMINAL</span><code>{session?.argv?.join(" ") || "ratd started without --solver-command"}</code></div>
-            <pre className="terminal" ref={terminalRef}>{terminal || "No terminal output yet."}</pre>
-            <form className="terminal-input" onSubmit={submitTerminal}>
-              <span>›</span>
-              <input disabled={session?.status !== "running"} value={terminalInput} onChange={(event) => setTerminalInput(event.target.value)} placeholder={session?.status === "running" ? "send input to solver PTY" : "solver is not running"} />
+          <section className="terminal-panel panel" aria-labelledby="terminal-title">
+            <div className="terminal-head"><span className="panel-title" id="terminal-title" role="heading" aria-level={2}>LIVE TERMINAL</span><code title={session?.argv?.join(" ")}>{session?.argv?.join(" ") || "ratd started without --solver-command"}</code></div>
+            <pre className="terminal" ref={terminalRef} tabIndex={0} aria-label="Solver terminal output">{terminal || "No terminal output yet."}</pre>
+            <form className="terminal-input" onSubmit={submitTerminal} aria-label="Solver terminal input">
+              <span aria-hidden="true">›</span>
+              <input
+                aria-label="Send input to solver PTY"
+                disabled={session?.status !== "running"}
+                value={terminalInput}
+                onChange={(event) => setTerminalInput(event.target.value)}
+                placeholder={session?.status === "running" ? "send input to solver PTY" : "solver is not running"}
+              />
             </form>
           </section>
         </section>
 
-        <aside className="inspector panel">
-          <div className="panel-title">INSPECTOR</div>
+        <aside className="inspector panel" aria-labelledby="inspector-title">
+          <div className="panel-title" id="inspector-title" role="heading" aria-level={2}>INSPECTOR</div>
           {selectedArtifact ? (
             <>
               <div className="inspector-head"><span>ARTIFACT</span><strong>{selectedArtifact.metadata.kind}</strong></div>
               <h2>{selectedArtifact.metadata.logical_name}</h2>
               <div className="inspector-meta">
-                <span>digest</span><code>{selectedArtifact.metadata.digest}</code>
+                <span>digest</span><code title={selectedArtifact.metadata.digest}>{selectedArtifact.metadata.digest}</code>
                 <span>media</span><code>{selectedArtifact.metadata.media_type}</code>
                 <span>size</span><code>{selectedArtifact.total_bytes} B</code>
               </div>
-              <button className="link-button" onClick={() => setSelectedArtifact(null)}>Show selected event</button>
-              <pre>{selectedArtifact.encoding === "utf-8" ? selectedArtifact.content : `[base64 preview]\n${selectedArtifact.content}`}</pre>
+              <button type="button" className="link-button" onClick={() => setSelectedArtifact(null)}>Show selected event</button>
+              <pre tabIndex={0}>{selectedArtifact.encoding === "utf-8" ? selectedArtifact.content : `[base64 preview]\n${selectedArtifact.content}`}</pre>
             </>
           ) : selectedEvent ? (
             <>
@@ -374,9 +402,9 @@ export default function App() {
               <div className="inspector-meta">
                 <span>actor</span><code>{selectedEvent.actor}</code>
                 <span>task</span><code>{selectedEvent.task_id}</code>
-                <span>event</span><code>{selectedEvent.event_id}</code>
+                <span>event</span><code title={selectedEvent.event_id}>{selectedEvent.event_id}</code>
               </div>
-              <pre>{JSON.stringify(selectedEvent.payload, null, 2)}</pre>
+              <pre tabIndex={0}>{JSON.stringify(selectedEvent.payload, null, 2)}</pre>
             </>
           ) : <div className="empty">Select an event or artifact.</div>}
         </aside>
