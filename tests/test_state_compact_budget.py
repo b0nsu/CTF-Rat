@@ -3,13 +3,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.artifact import put_bytes
 from ratlib.compact import budget_compact, estimate_tokens
 from ratlib.state_v2 import Stream, revise_finding, revise_primitive
+from tests.direct_evidence_helper import direct_evidence_envelope, CANONICAL_SUBJECT, CANONICAL_ENVIRONMENT
 
 D = "sha256:" + "a" * 64
 
 def observation(stream, oid):
-    rec = put_bytes(oid.encode(), kind="test-evidence", media_type="text/plain", logical_name=oid,
-                     root=stream.root, provenance={"evidence_policy": {"level": "direct", "promotion_allowed": True}})
-    return {"observation_id": oid, "quality": {"level": "direct"}, "validity": {"state": "active"}, "evidence": [rec["digest"]]}
+    digest = direct_evidence_envelope(root=stream.root, producer="gdbq", measurement=b"measurement:" + oid.encode(), summary=oid)
+    return {"observation_id": oid, "quality": {"level": "direct"}, "validity": {"state": "active"}, "evidence": [digest]}
 
 def seeded_stream(d):
     s = Stream(d)
@@ -19,9 +19,9 @@ def seeded_stream(d):
     revise_finding(s, {"finding_id": "f1", "state": "supported", "evidence_observation_ids": ["o1"]})
     revise_finding(s, {"finding_id": "f1", "state": "confirmed", "evidence_observation_ids": ["o1"]})
     revise_primitive(s, {"primitive_id": "p1", "status": "candidate", "self_evidence": [],
-                          "input_digest": D, "environment_digest": D})
+                          "input_digest": CANONICAL_SUBJECT, "environment_digest": CANONICAL_ENVIRONMENT})
     revise_primitive(s, {"primitive_id": "p1", "status": "pass", "self_evidence": ["o1", "o2", "o3"],
-                          "input_digest": D, "environment_digest": D})
+                          "input_digest": CANONICAL_SUBJECT, "environment_digest": CANONICAL_ENVIRONMENT})
     for i in range(5):
         s.append("hypothesis.recorded", {"hypothesis_id": "h%d" % i, "text": "hypothesis number %d" % i})
     for i in range(5):
@@ -53,6 +53,8 @@ class BudgetCompactUnit(unittest.TestCase):
         self.assertEqual(out["hypotheses"], {})
         self.assertTrue(out["truncated"])
         self.assertEqual(out["omitted_counts"]["hypotheses"], 20)
+        self.assertTrue(out["budget_exceeded_by_critical_tiers"])
+        self.assertGreater(out["estimated_tokens"], out["budget_tokens"])
 
     def test_droppable_tiers_keep_newest_first(self):
         view = {"findings": {}, "primitives": {},
@@ -91,6 +93,7 @@ class BudgetCompactAgainstRealStream(unittest.TestCase):
             self.assertEqual(len(out["next_probes"]), 5)
             self.assertEqual(len(out["ruled_out"]), 5)
             self.assertFalse(out["truncated"])
+            self.assertFalse(out["budget_exceeded_by_critical_tiers"])
 
 if __name__ == "__main__":
     unittest.main()

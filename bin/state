@@ -1,12 +1,33 @@
 #!/usr/bin/env python3
-# 챌린지별 STATE.jsonl (append-only, flock 병렬안전, 사망 내성). LLM이 읽기 좋은 digest.
-import sys, os, json, fcntl, time
+# 챌린지별 STATE v2 (append-only, flock 병렬안전, 사망 내성). LLM이 읽기 좋은 digest.
+import sys, os, json, fcntl, time, uuid
 from ratlib.runner import run
-from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive, cursor as event_cursor
+from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive, cursor as event_cursor, trusted_offset_inputs, project_trusted_offsets, FAILURE_CLASSES
 from ratlib.compact import budget_compact
 from ratlib.schema import validate, ValidationError
 STATE = "STATE.jsonl"
 CTF_HOME = os.environ.get("CTF_HOME", os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")))
+SCHEMAS_DIR = os.path.join(CTF_HOME, "schemas")
+# Minimal scaffolds so a model can `state primitive --example` (or
+# `state event --example`), fill in real measured evidence, and append. The
+# primitive starts as candidate because PASS must be a second revision after
+# three active+direct SELF observations exist.
+OBSERVATION_EXAMPLE = {
+    "schema": "rat.observation/v1", "observation_id": "obs_rsp", "run_id": "run_1",
+    "created_at": "2026-01-01T00:00:00Z", "producer": {"tool": "gdbq", "version": "1"},
+    "subject": {"binary": "./chal"}, "kind": "pwn.reg", "value": "RSP=0x7fffffffde80",
+    "evidence": ["sha256:" + "0" * 64],
+    "quality": {"level": "direct"}, "validity": {"state": "active"},
+}
+PRIMITIVE_EXAMPLE = {
+    "schema": "rat.primitive/v1", "primitive_id": "prim_ret_control", "name": "ret-address-control",
+    "class": "control-flow", "status": "candidate",
+    "input_digest": "sha256:" + "0" * 64, "environment_digest": "sha256:" + "0" * 64,
+    "self_evidence": [],
+    "constraints": ["promote to pass only after obs_rsp/obs_marker/obs_ret exist as active direct SELF observations"],
+    "side_effects": [],
+    "remote_equivalent": True, "producer": {"tool": "pwnstage", "version": "1"}, "revision": 1,
+}
 def active_chal():
     try:
         with open(os.path.join(CTF_HOME, "ACTIVE.json"), "r") as f:
@@ -53,20 +74,29 @@ def path_arg(arg):
         or os.path.isdir(arg)
     )
 def guard_check(chal):
+    # Side effect: runs the ctfguard binary as a subprocess (5s timeout). A
+    # non-zero policy exit code raises SystemExit with that code, so `state init`
+    # can abort here when the active-challenge lock rejects `chal`.
     guard = os.path.join(CTF_HOME, "bin", "ctfguard")
     if os.path.exists(guard):
         checked = run([guard, "check-newchal", chal], timeout_seconds=5,
                       tool_version="ctfguard-p0-v1")
         if checked.exit_code != 0:
             raise SystemExit(checked.exit_code)
-def app(ev, fpath=None):
-    ev["ts"] = int(time.time())
-    fpath = fpath or state_file()
-    os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
-    with open(fpath, "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        fh.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        fcntl.flock(fh, fcntl.LOCK_UN)
+def _new_id(prefix):
+    return prefix + "_" + uuid.uuid4().hex
+def challenge_root(fpath=None):
+    return os.path.dirname(os.path.abspath(fpath or state_file()))
+def stream_for(fpath=None):
+    return Stream(challenge_root(fpath))
+def refuse_legacy_write(command):
+    examples = {
+        "offset": "Use: state event append <rat.observation/v1 doc.json> with kind=pwn.offset",
+        "ok": "Use: state finding propose|support|confirm <rat.finding/v1 doc.json>",
+        "primitive": "Use: state primitive candidate|pass|fail|block <rat.primitive/v1 doc.json>",
+    }
+    print("[state:err] legacy '%s' writes are disabled for STATE v2. %s" % (command, examples.get(command, examples["primitive"])), file=sys.stderr)
+    raise SystemExit(2)
 def show_v2(fpath):
     """Render the materialized v2 view while keeping the legacy text shape."""
     view = Stream(os.path.dirname(os.path.abspath(fpath))).view()
@@ -76,8 +106,17 @@ def show_v2(fpath):
     for observation in view["observations"].values():
         legacy=observation.get("legacy", {})
         if legacy.get("t") == "offset": offsets.append((legacy.get("k"),legacy.get("v"),legacy.get("src", "")))
+    offset_status = False
+    try:
+        canonical=project_trusted_offsets(*trusted_offset_inputs(os.path.dirname(os.path.abspath(fpath))))
+    except ValueError as exc:
+        canonical=None; offset_status=True; o.append("OFFSETS (typed/direct): CONFLICT/CORRUPT — %s" % exc)
+    if canonical:
+        offset_status = True
+        o.append("OFFSETS (typed/direct):")
+        for key,value in sorted(canonical.items()): o.append("  %s = %#x" % (key,value))
     if offsets:
-        o.append("OFFSETS (legacy-derived; re-measure before promotion):")
+        o.append("OFFSETS (LEGACY/DERIVED/UNVERIFIED; re-measure before promotion):")
         for key,value,source in offsets: o.append("  %s = %s%s" % (key,value,"  [%s]" % source if source else ""))
     if view["findings"]:
         o.append("FINDINGS:")
@@ -85,10 +124,32 @@ def show_v2(fpath):
     if view["hypotheses"]:
         o.append("HYPOTHESES:")
         for hypothesis in view["hypotheses"].values(): o.append("  [?] " + hypothesis.get("text",hypothesis.get("hypothesis_id")))
+    if view.get("ruled_out"):
+        o.append("RULED OUT:")
+        for route in view["ruled_out"].values():
+            text=route.get("text",route.get("fingerprint"))
+            reason=route.get("reason","")
+            o.append("  [-] %s%s" % (text,"  <= %s" % reason if reason else ""))
+    if view.get("next_probes"):
+        o.append("NEXT:")
+        for probe in view["next_probes"]:
+            o.append("  [>] " + probe.get("text",probe.get("probe","")))
+    if view.get("alerts"):
+        o.append("ALERTS (advisory; use invalidate-evidence for trust changes):")
+        for alert in view["alerts"]: o.append("  [!] " + alert.get("text",alert.get("alert_id")))
+    if view.get("notes"):
+        o.append("NOTES:")
+        for note in view["notes"]: o.append("  [.] " + note.get("text",note.get("note_id")))
+    if view.get("failures"):
+        o.append("FAILURES (classified):")
+        for failure in view["failures"]:
+            note=failure.get("note","")
+            o.append("  [x] %s%s" % (failure.get("class","other")," — %s" % note if note else ""))
     if view["primitives"]:
         o.append("PRIMITIVE GATE:")
         for primitive in view["primitives"].values(): o.append("  [%s] %s" % (primitive.get("status","unknown").upper(),primitive.get("primitive_id")))
-    if not (offsets or view["findings"] or view["hypotheses"] or view["primitives"]): o.append("(no v2 facts yet)")
+    if not (offset_status or offsets or view["findings"] or view["hypotheses"] or view["primitives"] or view.get("ruled_out") or view.get("next_probes") or view.get("notes") or view.get("alerts") or view.get("failures")):
+        o.append("(no v2 facts yet)")
     print("\n".join(o))
 def show(fpath=None, legacy=False):
     fpath = fpath or state_file()
@@ -115,13 +176,13 @@ def show(fpath=None, legacy=False):
         elif t == "primitive":  prims.append(e)
     o = ["== STATE: %s ==" % chal]
     if alerts:
-        o.append("!! ALERTS (invalidating — RE-PLAN before acting):")
+        o.append("!! ALERTS (LEGACY/UNVERIFIED advisory; not invalidating):")
         for x in alerts: o.append("  [!] " + x)
     if offs:
-        o.append("OFFSETS (verified, live-measured):")
+        o.append("OFFSETS (LEGACY/UNVERIFIED):")
         for k,(v,s) in offs.items(): o.append("  %s = %s%s" % (k, v, "  [%s]"%s if s else ""))
     if ok:
-        o.append("WORKING (verified primitives/steps):")
+        o.append("WORKING (LEGACY/UNVERIFIED):")
         for x in ok: o.append("  [+] " + x)
     if hyps:
         o.append("HYPOTHESES (not evidence; cannot be used for chaining until primitive PASS):")
@@ -136,7 +197,7 @@ def show(fpath=None, legacy=False):
     elif hyps:
         o.append("PRIMITIVE GATE: BLOCKED — hypothesis exists but no primitive PASS recorded")
     if no:
-        o.append("RULED OUT (do NOT retry):")
+        o.append("RULED OUT (LEGACY/UNVERIFIED):")
         for x,r in no: o.append("  [-] %s%s" % (x, "  <= %s"%r if r else ""))
     if nxt:
         o.append("NEXT:")
@@ -153,17 +214,31 @@ def main():
         fpath = state_file(a[1]); a = a[2:]
     if not a:
         show(fpath); return
-    # P1 typed-state commands.  Legacy commands below deliberately retain their
-    # old JSONL format until an explicit migration is requested.
+    # STATE v2 is canonical. Legacy v1 is explicit inspection/import only.
     if a[0] == "migrate":
         if a[1:] not in (["--to-v2"], ["--to-v2", "--dry-run"]):
             print("usage: state migrate --to-v2 [--dry-run]", file=sys.stderr); raise SystemExit(2)
         try: print(json.dumps(migrate_v1(os.path.dirname(fpath or state_file()), "--dry-run" in a)))
         except ValueError as e: print("[state:err] %s" % e, file=sys.stderr); raise SystemExit(2)
         return
+    if a[0] in ("primitive", "prim") and a[1:2] == ["--example"]:
+        print(json.dumps(PRIMITIVE_EXAMPLE, indent=2, ensure_ascii=False)); return
+    if a[0] == "event" and a[1:2] == ["--example"]:
+        print(json.dumps(OBSERVATION_EXAMPLE, indent=2, ensure_ascii=False)); return
+    if a[0] == "schema":
+        if len(a) != 2:
+            print("usage: state schema <name>  (e.g. rat.primitive/v1, rat.observation/v1, rat.finding/v1)", file=sys.stderr); raise SystemExit(2)
+        fname = a[1].replace("/", ".") + ".json" if "/" in a[1] else a[1] if a[1].endswith(".json") else a[1] + ".json"
+        path = os.path.join(SCHEMAS_DIR, fname)
+        try:
+            print(open(path, encoding="utf-8").read(), end="")
+        except OSError:
+            avail = sorted(f[:-5].replace(".v", "/v") for f in os.listdir(SCHEMAS_DIR) if f.endswith(".json"))
+            print("[state:err] no schema %r; available: %s" % (a[1], ", ".join(avail)), file=sys.stderr); raise SystemExit(2)
+        return
     if a[0] == "event" and len(a) == 3 and a[1] == "append":
         try:
-            doc=json.load(open(a[2],encoding="utf-8")); stream=Stream(os.path.dirname(fpath or state_file()))
+            doc=json.load(open(a[2],encoding="utf-8")); stream=stream_for(fpath)
             if doc.get("schema") == "rat.observation/v1": validate(doc); ev=stream.append("observation.recorded",doc)
             elif doc.get("schema") == "rat.finding/v1": validate(doc); ev=revise_finding(stream,doc)
             elif doc.get("schema") == "rat.primitive/v1": validate(doc); ev=revise_primitive(stream,doc)
@@ -171,7 +246,10 @@ def main():
             print(json.dumps({"cursor":{"stream_id":ev["stream_id"],"seq":ev["seq"]},"event_id":ev["event_id"]}))
         except (OSError,ValueError,ValidationError,json.JSONDecodeError) as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
         return
-    if a[0] in ("finding", "primitive") and len(a) == 3:
+    if a[0] in ("finding", "primitive") and len(a) == 3 and (
+        (a[0] == "finding" and a[1] in {"propose","support","confirm","refute","invalidate"})
+        or (a[0] == "primitive" and a[1] in {"candidate","pass","fail","block"})
+    ):
         expected = "rat.finding/v1" if a[0] == "finding" else "rat.primitive/v1"
         allowed = ({"propose":"proposed", "support":"supported", "confirm":"confirmed", "refute":"refuted", "invalidate":"invalidated"}
                    if a[0] == "finding" else {"candidate":"candidate", "pass":"pass", "fail":"fail", "block":"blocked"})
@@ -179,23 +257,23 @@ def main():
             if a[1] not in allowed: raise ValueError("unsupported %s action" % a[0])
             doc=json.load(open(a[2],encoding="utf-8")); validate(doc, expected)
             if doc.get("state" if a[0] == "finding" else "status") != allowed[a[1]]: raise ValueError("document state does not match action")
-            stream=Stream(os.path.dirname(fpath or state_file()))
+            stream=stream_for(fpath)
             ev=revise_finding(stream,doc) if a[0] == "finding" else revise_primitive(stream,doc)
             print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]}))
         except (OSError,ValueError,ValidationError,json.JSONDecodeError) as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
         return
     if a[0] == "invalidate-evidence" and len(a) >= 2:
-        ev=Stream(os.path.dirname(fpath or state_file())).append("evidence.invalidated", {"observation_ids":a[1:], "reason":"manual invalidation"})
+        ev=stream_for(fpath).append("evidence.invalidated", {"observation_ids":a[1:], "reason":"manual invalidation"})
         print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]})); return
     if a[0] in ("unknown", "route", "probe") and len(a) >= 2:
-        stream=Stream(os.path.dirname(fpath or state_file())); text=" ".join(a[1:])
+        stream=stream_for(fpath); text=" ".join(a[1:])
         typ={"unknown":"unknown.recorded", "route":"route.ruled_out", "probe":"next.recorded"}[a[0]]
         field={"unknown":"unknown_id", "route":"fingerprint", "probe":"probe"}[a[0]]
         ev=stream.append(typ,{field:a[1],"text":text})
         print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]})); return
     if a[0] == "primitive" and len(a) == 5 and a[1] == "consume":
         try:
-            ev=consume_primitive(Stream(os.path.dirname(fpath or state_file())),a[2],input_digest=a[3],environment_digest=a[4])
+            ev=consume_primitive(stream_for(fpath),a[2],input_digest=a[3],environment_digest=a[4])
             print(json.dumps({"event_id":ev["event_id"],"seq":ev["seq"]}))
         except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
         return
@@ -204,7 +282,7 @@ def main():
         p=argparse.ArgumentParser(prog="state delta"); p.add_argument("--after"); p.add_argument("--until"); p.add_argument("--max-bytes",type=int,default=32768); ns=p.parse_args(a[1:])
         def cur(v): return json.loads(v) if v else None
         try:
-            ev=Stream(os.path.dirname(fpath or state_file())).delta(cur(ns.after),cur(ns.until)); raw=json.dumps(ev,ensure_ascii=False).encode()
+            ev=stream_for(fpath).delta(cur(ns.after),cur(ns.until)); raw=json.dumps(ev,ensure_ascii=False).encode()
             if len(raw)>ns.max_bytes: raw=json.dumps({"events":ev[-10:],"truncated":True},ensure_ascii=False).encode()
             print(raw.decode())
         except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
@@ -212,7 +290,7 @@ def main():
     if a[0] == "compact":
         import argparse
         p=argparse.ArgumentParser(prog="state compact"); p.add_argument("--budget-tokens",type=int,default=None); ns=p.parse_args(a[1:])
-        stream=Stream(os.path.dirname(fpath or state_file())); view=stream.view()
+        stream=stream_for(fpath); view=stream.view()
         if ns.budget_tokens is None:
             print(json.dumps({"observations":view["observations"],"findings":view["findings"],"primitives":view["primitives"],"hypotheses":view["hypotheses"],"ruled_out":view["ruled_out"],"unknowns":view["unknowns"],"next_probes":view["next_probes"]},ensure_ascii=False)); return
         events=stream.read(); cur=event_cursor(events[-1]) if events else None
@@ -221,7 +299,7 @@ def main():
         if a[1] == "create":
             import argparse
             p=argparse.ArgumentParser(); p.add_argument("--phase",required=True); p.add_argument("--task",required=True); p.add_argument("--role",default="local"); p.add_argument("--reason",required=True); ns=p.parse_args(a[2:])
-            print(json.dumps(Stream(os.path.dirname(fpath or state_file())).checkpoint(phase=ns.phase,task_id=ns.task,role=ns.role,reason=ns.reason)))
+            print(json.dumps(stream_for(fpath).checkpoint(phase=ns.phase,task_id=ns.task,role=ns.role,reason=ns.reason)))
             return
         if a[1] in ("show","materialize") and len(a)==3:
             path=os.path.join(os.path.dirname(fpath or state_file()),".rat","checkpoints",a[2]+".json")
@@ -239,53 +317,82 @@ def main():
     if c == "init":
         chal = rest[0] if rest else os.path.basename(os.path.abspath(os.getcwd()))
         guard_check(chal)
-        app({"t":"init","chal": chal}, fpath)
+        stream_for(fpath).append("run.initialized", {"challenge":chal})
         print("[state] init"); show(fpath)
     elif c == "offset":
-        if len(rest) < 2: print("usage: state offset <k> <v> [src]"); return
-        app({"t":"offset","k":rest[0],"v":rest[1],"src":" ".join(rest[2:])}, fpath)
-        print("[state] offset %s=%s" % (rest[0], rest[1]))
+        refuse_legacy_write("offset")
     elif c == "get":
         if not rest: return
         if len(rest) > 1 and path_arg(rest[-1]):
             fpath = state_file(rest[-1]); rest = rest[:-1]
-        val=""
-        sf = fpath or state_file()
-        stream = Stream(os.path.dirname(os.path.abspath(sf)))
-        if os.path.exists(stream.path):
-            for observation in stream.view()["observations"].values():
-                legacy=observation.get("legacy", {})
-                if legacy.get("t")=="offset" and legacy.get("k")==rest[0]: val=legacy.get("v","")
-            print(val); return
-        if os.path.exists(sf):
-            for ln in open(sf):
-                try: e=json.loads(ln)
-                except: continue
-                if e.get("t")=="offset" and e.get("k")==rest[0]: val=e.get("v","")
-        print(val)
-    elif c in ("ok","next","note","alert"):
-        app({"t":c,"text":" ".join(rest)}, fpath); print("[state] %s" % c)
+        try:
+            offsets=project_trusted_offsets(*trusted_offset_inputs(challenge_root(fpath)))
+        except ValueError as e:
+            print("[state:err] %s" % e, file=sys.stderr); raise SystemExit(2)
+        val=offsets.get(rest[0])
+        print("" if val is None else hex(val))
+    elif c == "ok":
+        refuse_legacy_write("ok")
+    elif c == "next":
+        text=" ".join(rest).strip()
+        if not text: print("usage: state next <probe>", file=sys.stderr); raise SystemExit(2)
+        stream_for(fpath).append("next.recorded", {"probe":text}); print("[state] next")
+    elif c == "note":
+        text=" ".join(rest).strip()
+        if not text: print("usage: state note <text>", file=sys.stderr); raise SystemExit(2)
+        stream_for(fpath).append("note.recorded", {"note_id":_new_id("note"),"text":text}); print("[state] note")
+    elif c == "alert":
+        text=" ".join(rest).strip()
+        if not text: print("usage: state alert <text>", file=sys.stderr); raise SystemExit(2)
+        stream_for(fpath).append("alert.recorded", {"alert_id":_new_id("alert"),"text":text}); print("[state] alert advisory")
     elif c in ("hypothesis", "hyp"):
         if not rest or not " ".join(rest).strip():
             print("usage: state hypothesis <text>", file=sys.stderr); raise SystemExit(2)
-        app({"t":"hypothesis","text":" ".join(rest)}, fpath); print("[state] hypothesis")
+        stream_for(fpath).append("hypothesis.recorded", {"hypothesis_id":_new_id("hyp"),"text":" ".join(rest)}); print("[state] hypothesis")
+    elif c == "failclass":
+        if len(rest) < 1:
+            print("usage: state failclass <class> [note]  (class: %s)" % "|".join(sorted(FAILURE_CLASSES)), file=sys.stderr); raise SystemExit(2)
+        cls = rest[0]; note = " ".join(rest[1:]).strip()
+        if cls not in FAILURE_CLASSES:
+            print("[state:err] unknown failure class %r (allowed: %s)" % (cls, ", ".join(sorted(FAILURE_CLASSES))), file=sys.stderr); raise SystemExit(2)
+        stream_for(fpath).append("failure.classified", {"failure_id":_new_id("fail"),"class":cls,"note":note}); print("[state] failure classified: %s" % cls)
     elif c in ("primitive", "prim"):
-        if len(rest) < 2:
-            print("usage: state primitive <name> <candidate|fail|blocked> [evidence...]", file=sys.stderr); raise SystemExit(2)
-        status = rest[1].lower(); evidence = " ".join(rest[2:]).strip()
-        if status == "pass":
-            print("[state:err] legacy 'state primitive <name> pass <evidence>' is rejected -- "
-                  "PASS requires the typed STATE v2 gate (>=3 active direct SELF observations). "
-                  "Use: state primitive pass <rat.primitive/v1 doc.json>", file=sys.stderr)
-            raise SystemExit(2)
-        if status not in ("candidate", "fail", "blocked"):
-            print("[state:err] primitive status must be candidate, fail, or blocked", file=sys.stderr); raise SystemExit(2)
-        app({"t":"primitive","name":rest[0],"status":status,"evidence":evidence}, fpath)
-        print("[state] primitive %s=%s" % (rest[0], status))
+        refuse_legacy_write("primitive")
     elif c in ("no","ruleout"):
         txt = " ".join(rest); reason = ""
         if " -- " in txt: txt, reason = txt.split(" -- ", 1)
-        app({"t":"no","text":txt.strip(),"reason":reason.strip()}, fpath); print("[state] ruled out")
+        text=txt.strip()
+        if not text: print("usage: state no <route> [-- reason]", file=sys.stderr); raise SystemExit(2)
+        stream_for(fpath).append("route.ruled_out", {"fingerprint":_new_id("route"),"text":text,"reason":reason.strip()}); print("[state] ruled out")
     else:
-        print("cmds: init | offset <k> <v> [src] | ok <t> | hypothesis <t> | primitive <name> <pass|fail|blocked> [evidence] | no <t> -- <reason> | next <t> | note <t> | alert <t> | show")
+        usage()
+def usage():
+    print("""state — STATE v2 bus (append-only, typed). [--dir|--state <path>] prefix targets another challenge.
+
+typed writes (canonical):
+  event append <rat.observation/v1 doc.json>     record a measured observation (SELF evidence)
+  finding <action> <rat.finding/v1 doc.json>     action: propose|support|confirm|refute|invalidate
+  primitive <action> <rat.primitive/v1 doc.json> action: candidate|pass|fail|block
+                                                 (pass needs >=3 active+direct SELF observations)
+  primitive consume <name> <input_digest> <env_digest>
+  invalidate-evidence <observation_id>...        advisory -> hard trust removal
+
+scaffolds / inspection:
+  primitive --example                            print a schema-valid rat.primitive/v1 skeleton
+  event --example                                print a schema-valid rat.observation/v1 skeleton
+  schema <name>                                  print a JSON schema (e.g. rat.primitive/v1)
+  show [--legacy] [path]                         materialized digest view (default when no args)
+  compact [--budget-tokens N]                    token-bounded view for handoff
+  delta [--after <cursor>] [--until <cursor>]    event delta since a cursor
+  get <key>                                      resolved trusted offset (hex) or empty
+
+lightweight notes (untyped, non-chaining):
+  init [chal] | hypothesis <t> | next <t> | note <t> | alert <t>
+  no <route> [-- reason] | failclass <class> [note]
+
+checkpoints / migration:
+  checkpoint create --phase P --task T --reason R | checkpoint show|materialize <id>
+  migrate --to-v2 [--dry-run]
+
+legacy direct writes (offset|ok|primitive <name> ...) are REFUSED -- use the typed forms above.""", file=sys.stderr)
 main()

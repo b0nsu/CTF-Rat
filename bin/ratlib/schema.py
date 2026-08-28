@@ -34,7 +34,8 @@ def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str
       "rat.task-output/v1": task_output, "rat.skeptic-report/v1": skeptic_report,
       "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2,
       "rat.route-result/v1": route_result, "rat.query-result/v1": query_result,
-      "rat.cache-stats/v1": cache_stats}
+      "rat.cache-stats/v1": cache_stats, "rat.brief-card/v1": brief_card,
+      "rat.bench-result/v1": bench_result}
     try: dispatch[schema](doc)
     except KeyError: raise ValidationError("unknown schema %s" % schema)
     return doc
@@ -53,22 +54,24 @@ def tool_result(d):
     if "params_digest" in d and not isinstance(d["params_digest"],str): raise ValidationError("invalid params_digest")
     if "cache_state" in d and d["cache_state"] not in {"hit","miss","bypass"}: raise ValidationError("invalid cache_state")
 def observation(d):
-    _need(d,("schema","observation_id","run_id","created_at","producer","subject","kind","value","evidence","quality","validity")); _iso(d["created_at"])
+    _need(d,("schema","observation_id","run_id","created_at","producer","subject","kind","value","evidence","quality","validity")); _strict(d,{"schema","observation_id","run_id","created_at","producer","subject","kind","value","evidence","quality","validity","extensions"}); _iso(d["created_at"])
     if not d["evidence"]: raise ValidationError("observation requires evidence")
     if d["quality"].get("level") not in {"direct","derived","heuristic"}: raise ValidationError("invalid quality")
     if d["validity"].get("state") not in {"active","invalidated"}: raise ValidationError("invalid validity")
 def finding(d):
-    _need(d,("schema","finding_id","revision","run_id","created_at","updated_at","title","class","state","confidence","impact","subject","evidence_observation_ids","assumptions","contradictions","related_findings","producer_role","owner_task_id")); _iso(d["created_at"]); _iso(d["updated_at"])
+    _need(d,("schema","finding_id","revision","run_id","created_at","updated_at","title","class","state","confidence","impact","subject","evidence_observation_ids","assumptions","contradictions","related_findings","producer_role","owner_task_id")); _strict(d,{"schema","finding_id","revision","run_id","created_at","updated_at","title","class","state","confidence","impact","subject","evidence_observation_ids","assumptions","contradictions","related_findings","producer_role","owner_task_id","invalidation","extensions"}); _iso(d["created_at"]); _iso(d["updated_at"])
     if d["state"] not in STATES or not 0 <= d["confidence"] <= 1: raise ValidationError("invalid finding state/confidence")
     if d["state"] != "proposed" and not d["evidence_observation_ids"]: raise ValidationError("finding requires evidence")
+    if not isinstance(d["revision"], int) or isinstance(d["revision"], bool) or d["revision"] < 1: raise ValidationError("invalid finding revision")
 def checkpoint(d):
     _need(d,("schema","checkpoint_id","run_id","created_at","reason","phase","task_id","role","event_cursor","active","invalidation_cursor","context_artifact","budgets","status")); _iso(d["created_at"])
     if d["status"] not in {"open","handoff","converged","cancelled","terminal"}: raise ValidationError("invalid checkpoint status")
 def primitive(d):
-    _need(d,("schema","primitive_id","name","class","status","input_digest","environment_digest","self_evidence","constraints","side_effects","remote_equivalent","producer","revision"))
+    _need(d,("schema","primitive_id","name","class","status","input_digest","environment_digest","self_evidence","constraints","side_effects","remote_equivalent","producer","revision")); _strict(d,{"schema","primitive_id","name","class","status","input_digest","environment_digest","self_evidence","constraints","side_effects","remote_equivalent","producer","revision","extensions"})
     if d["status"] not in {"candidate","pass","fail","blocked","stale"}: raise ValidationError("invalid primitive status")
     _digest(d["input_digest"]); _digest(d["environment_digest"])
     if d["status"] == "pass" and len(d["self_evidence"]) < 3: raise ValidationError("PASS requires SELF evidence")
+    if not isinstance(d["revision"], int) or isinstance(d["revision"], bool) or d["revision"] < 1: raise ValidationError("invalid primitive revision")
 def run(d):
     _need(d,("schema","run_id","created_at","updated_at","challenge","status","inputs","target_policy","environment","toolchain","policy"))
 def role_contract(d):
@@ -153,6 +156,26 @@ def query_result(d):
     if any(x["code"] not in _QUERY_DIAGNOSTIC_CODES for x in d["diagnostics"]): raise ValidationError("unknown diagnostic code")
     if not isinstance(d["provenance"],Mapping) or "cache" not in d["provenance"]: raise ValidationError("invalid provenance")
     if not isinstance(d["artifacts"],list): raise ValidationError("invalid artifacts")
+    if not isinstance(d["facts"],Mapping): raise ValidationError("invalid facts")
+    if not isinstance(d["heuristics"],Mapping): raise ValidationError("invalid heuristics")
+
+def brief_card(d):
+    _need(d,("schema","binary","capabilities","route","track_summary","libc","truncated","side_effects"))
+    if not isinstance(d["capabilities"],Mapping): raise ValidationError("invalid capabilities")
+    if not isinstance(d["route"],Mapping): raise ValidationError("invalid route")
+    if not isinstance(d["track_summary"],Mapping): raise ValidationError("invalid track_summary")
+    if not isinstance(d["libc"],Mapping): raise ValidationError("invalid libc")
+    if not isinstance(d["truncated"],list): raise ValidationError("invalid truncated")
+    if not isinstance(d["side_effects"],list): raise ValidationError("invalid side_effects")
+
+_BENCH_OUTCOMES = {"route-miss","solved","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
+def bench_result(d):
+    # Mode A and Mode B rows share a small required core; extra per-mode fields are
+    # intentionally open (no _strict) so the two shapes validate under one contract.
+    _need(d,("schema","mode","run_id","id","track","outcome","wall_ms"))
+    if d["mode"] not in {"A","B"}: raise ValidationError("invalid bench mode")
+    if d["outcome"] not in _BENCH_OUTCOMES: raise ValidationError("invalid bench outcome")
+    if not isinstance(d["wall_ms"],int) or d["wall_ms"] < 0: raise ValidationError("invalid wall_ms")
 
 def cache_stats(d):
     _need(d,("schema","store","total_entries","by_backend","oldest_produced_at","newest_produced_at"))

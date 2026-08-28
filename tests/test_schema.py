@@ -1,4 +1,4 @@
-import os, sys, unittest
+import json, os, pathlib, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 
@@ -118,6 +118,15 @@ class QueryResultSchema(unittest.TestCase):
         # results; the validator is deliberately _need-only, not _strict.
         d = query_result(); d["governor"] = {"stuck": True, "action": "re-route-or-deep-escalate", "reason": "x"}
         validate(d)
+
+    def test_reference_schema_matches_runtime_object_shape(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        schema = json.loads((repo / "schemas" / "rat.query-result.v1.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["facts"]["type"], "object")
+        self.assertEqual(schema["properties"]["heuristics"]["type"], "object")
+        validate(query_result(facts={"key": "value"}, heuristics={"next": []}), "rat.query-result/v1")
+        with self.assertRaises(ValidationError):
+            validate(query_result(facts=[], heuristics={}), "rat.query-result/v1")
 
 class CacheStatsSchema(unittest.TestCase):
     def test_valid_doc_passes(self):

@@ -3,9 +3,14 @@
 import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib.contracts import execute
-p=argparse.ArgumentParser(); p.add_argument("--root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60); p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
+p=argparse.ArgumentParser(); p.add_argument("--root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60)
+p.add_argument("--direct-subject",help="path (must be one of --input) this invocation measures; "
+    "opts the run into direct-evidence issuance when it is a real measurement mode of a trusted "
+    "verifier build (see ratlib.state_v2.direct_measurement_policy). Cite the printed "
+    "extensions.envelope_digest as an observation's evidence to mint 'direct' quality (PRIMITIVE_GATE.md).")
+p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
 a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
 paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"..","solve","_template","rev","symsolve.py")}
 argv=[paths[a.tool],*a.args]
 if a.tool=="symsolve": argv=[sys.executable,*argv]
-print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout),ensure_ascii=False))
+print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout,direct_subject=a.direct_subject),ensure_ascii=False))
