@@ -192,10 +192,10 @@ def _result(track, subroute, confidence, signals, capabilities, next_target=None
     }
 
 _NEXT_QUERY = {
-    "rev-checker": "revq --func",
+    "rev-checker": "rat query func",
     "rev-vm": "solve/_template/rev/vmlift.py --disasm",
     "rev-packed": "gdbq",
-    "rev-symbolic": "solve/_template/rev/symsolve.py --find-str",
+    "rev-symbolic": "rat query oracle",
     "pwn-stack": "pwncalc + pwnropcheck",
     "pwn-format": "pwnleak",
     "pwn-heap": "gdbq",
@@ -205,6 +205,7 @@ _NEXT_QUERY = {
 }
 
 _NEXT_TARGET = {
+    "rev-symbolic": "success-failure-oracle-before-symbolic",
     "rev-packed": "dynamic-unpack-trace-before-static-re-analysis",
     "pwn-stack": "no-nx-shellcode-path",
     "pwn-format": "format-string-output",
