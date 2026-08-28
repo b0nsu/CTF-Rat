@@ -12,16 +12,17 @@ from .artifact import put_bytes, put_file, digest_bytes, get, metadata
 from .runner import run, EXIT_DEPENDENCY, EXIT_INPUT, EXIT_POLICY, EXIT_TIMEOUT
 
 VERSION="p2-mvp/1"; POLICY="sha256:"+hashlib.sha256(b"p2-local-executable-only").hexdigest()
+PROFILE_ANALYSIS_SCHEMA="rat-profile/v2"
 def _module_digest():
- # Content-addressed identity of the verdict logic itself (this file), so a
- # verification-report producer can be resolved by CONTENT the same way
- # state_v2 resolves SELF-evidence verifiers -- not by a fixed policy label
- # that any tool can copy into its own report.
+ # Content-addressed identity of the analysis/verdict logic itself (this file),
+ # so tool provenance and verification-report trust bind to code, not to the
+ # challenge binary being analyzed.
  h=hashlib.sha256()
  with open(os.path.realpath(__file__),"rb") as f:
   for b in iter(lambda:f.read(65536),b""): h.update(b)
  return "sha256:"+h.hexdigest()
-VERIFY_BUILD_DIGEST=_module_digest()
+ANALYSIS_BUILD_DIGEST=_module_digest()
+VERIFY_BUILD_DIGEST=ANALYSIS_BUILD_DIGEST
 P2_LIMITATIONS={
  "rat-profile":["format signals are not vulnerability proof"],
  "rat-slice":["call-path reachability only; no value-flow proof"],
@@ -46,6 +47,17 @@ def fdigest(p):
  with open(p,"rb") as f:
   for b in iter(lambda:f.read(65536),b""): h.update(b)
  return "sha256:"+h.hexdigest()
+def _executable_identity(name):
+ path=shutil.which(name)
+ if not path: return "missing"
+ try: return fdigest(os.path.realpath(path))
+ except OSError: return "unreadable"
+def _profile_dependency_identity():
+ """Deterministic identities of code/executables that shape profile artifacts."""
+ return {"ratlib.analysis":ANALYSIS_BUILD_DIGEST,
+         "file":_executable_identity("file"),
+         "readelf":_executable_identity("readelf"),
+         "strings":_executable_identity("strings")}
 def canonical_digest(value):
  raw=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
  return "sha256:"+hashlib.sha256(raw).hexdigest()
@@ -75,8 +87,8 @@ def require_profile(a, r):
         raise ValueError("profile binary digest does not match current binary")
     return profile
 def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=(), code=0, started=None):
-    started=started or iso(); finished=iso(); bdig=fdigest(binary) if binary and os.path.isfile(binary) else "sha256:"+"0"*64
-    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":bdig},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":bdig,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
+    started=started or iso(); finished=iso(); input_digest=fdigest(binary) if binary and os.path.isfile(binary) else "sha256:"+"0"*64
+    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":ANALYSIS_BUILD_DIGEST},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":input_digest,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
     if name in P2_LIMITATIONS:
         # Analysis output is deliberately non-promotable.  Only STATE's
         # evidence/primitive lifecycle may promote independently verified
@@ -106,17 +118,19 @@ def execute_binary(binary, sc, timeout):
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
     return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
-def _profile_cache_keys(bdig, environment):
+def _profile_cache_keys(bdig, environment, dependencies=None):
     from .cache import canonical_key
+    deps=dependencies or _profile_dependency_identity()
     return {k: canonical_key(binary_sha256=bdig,tool_name="rat-profile",tool_version=VERSION,
                               params={"artifact":k,"libc":environment.get("libc"),"loader":environment.get("loader")},
-                              dep_versions={})
+                              dep_versions=deps,output_schema="rat.tool-result/v1",
+                              analysis_schema_version=PROFILE_ANALYSIS_SCHEMA)
             for k in ("profile","string-index")}
-def _profile_cache_lookup(r, bdig, environment):
+def _profile_cache_lookup(r, bdig, environment, dependencies=None):
     """Read-through the shared canonical index; miss on any inconsistency."""
     try:
         from .cache import Cache
-        idx=Cache(r); keys=_profile_cache_keys(bdig,environment)
+        idx=Cache(r); keys=_profile_cache_keys(bdig,environment,dependencies)
         pe,se=idx.get_entry(keys["profile"]),idx.get_entry(keys["string-index"])
         if not (pe and se): return idx,keys,None,None,None
         profile_doc=json.loads(get(pe["path"],root=r))
@@ -128,9 +142,9 @@ def _profile_cache_lookup(r, bdig, environment):
         return None,None,None,None,None
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
-    r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary); environment=profile_environment(a)
+    r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary); environment=profile_environment(a); dependencies=_profile_dependency_identity()
     if getattr(a,"no_cache",False):
-        keys=_profile_cache_keys(bdig,environment)
+        keys=_profile_cache_keys(bdig,environment,dependencies)
         try:
             from .cache import Cache
             idx=Cache(r)
@@ -138,7 +152,7 @@ def profile(a):
             idx=None
         cached_doc,cached_arts,src_inv=None,None,None
     else:
-        idx,keys,cached_doc,cached_arts,src_inv=_profile_cache_lookup(r,bdig,environment)
+        idx,keys,cached_doc,cached_arts,src_inv=_profile_cache_lookup(r,bdig,environment,dependencies)
     if cached_doc and cached_arts:
         cache_state="hit"; facts,signals,routes=cached_doc["facts"],cached_doc["signals"],cached_doc["routes"]
         arts=list(cached_arts)
@@ -160,6 +174,7 @@ def profile(a):
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
     doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state
+    doc["provenance"]["dependency_versions"]=dependencies
     # Register on miss AFTER the envelope exists so this run's invocation_id is
     # recorded as the source of any later hit.
     if cache_state=="miss" and idx and keys:
