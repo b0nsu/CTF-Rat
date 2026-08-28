@@ -10,7 +10,6 @@ p.add_argument("--direct-subject",help="path (must be one of --input) this invoc
     "extensions.envelope_digest as an observation's evidence to mint 'direct' quality (PRIMITIVE_GATE.md).")
 p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
 a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
-paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"..","solve","_template","rev","symsolve.py")}
+paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"symsolve")}
 argv=[paths[a.tool],*a.args]
-if a.tool=="symsolve": argv=[sys.executable,*argv]
 print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout,direct_subject=a.direct_subject),ensure_ascii=False))
