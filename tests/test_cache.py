@@ -104,6 +104,24 @@ class DecompCacheIndexRegistration(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertEqual(entry["backend"], "decomp_dir")
             self.assertEqual(entry["path"], cache)
+            # content anchor pins the export listing so the row survives path deletion
+            import hashlib as _h
+            with open(os.path.join(cache, "_index.txt"), "rb") as f:
+                want = "sha256:" + _h.sha256(f.read()).hexdigest()
+            self.assertEqual(entry["envelope_digest"], want)
+
+    def test_lineage_survives_cache_dir_deletion(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temp:
+            binary, scripts, ghidra, cache = self._fixture(temp)
+            write_decomp_meta(cache, binary, ghidra, scripts, "complete")
+            prov = decomp_provenance(binary, ghidra, scripts)
+            idx_root = resolve_index_root(binary)
+            shutil.rmtree(cache)  # mutable artifact gone
+            entry = Cache(idx_root).get_entry("sha256:" + decomp_cache_key(prov))
+            # the row is now dangling on `path`, but the content anchor persists
+            self.assertFalse(os.path.exists(entry["path"]))
+            self.assertTrue(entry["envelope_digest"].startswith("sha256:"))
 
     def test_partial_cache_is_not_registered(self):
         with tempfile.TemporaryDirectory() as temp:

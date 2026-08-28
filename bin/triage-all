@@ -12,14 +12,24 @@ done
 printf '%-28s %-14s %-8s %s\n' "BINARY" "TIER" "확신" "기법"
 printf '%s\n' "--------------------------------------------------------------------------------"
 tmp=$(mktemp)
+# Consume recon's machine-facing JSON view (no Korean text to grep/sed).
 for b in "${bins[@]}"; do
-  out="$("$CTF/bin/recon" "$b" 2>/dev/null)"
-  t="$(echo "$out" | grep -m1 'TRIAGE:' | sed 's/TRIAGE: //')"
-  tech="$(echo "$out" | grep -m1 '추정 기법:' | sed 's/.*추정 기법: //' | cut -c1-40)"
-  tier="$(echo "$t" | awk '{print $1" "$2}')"; conf="$(echo "$t" | grep -oE '확신도: [^ ]+' | cut -d' ' -f2)"
-  # 정렬 키: 🟢0 🟡1 🟠2
-  k=2; case "$tier" in *FAST*) k=0;; *STANDARD*) k=1;; esac
-  printf '%d\t%-28s %-14s %-8s %s\n' "$k" "$(basename "$b")" "$tier" "$conf" "$tech" >> "$tmp"
+  "$CTF/bin/recon" "$b" --format json 2>/dev/null | python3 -c '
+import sys, os, json
+b = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("2\t%-28s %-14s %-8s %s" % (os.path.basename(b), "?", "?", "recon 실패")); sys.exit()
+tr = d.get("triage", {})
+key = {"fast": 0, "standard": 1, "hard": 2}.get(tr.get("tier"), 2)
+label = {"fast": "🟢 FAST", "standard": "🟡 STANDARD", "hard": "🟠 HARD"}.get(tr.get("tier"), "🟠 HARD")
+if d.get("status") == "pe": label, tr = "PE(rev)", {"confidence": "-", "techniques": ["rev track"]}
+# An un-parseable binary (status:error, no triage) must not masquerade as a valid HARD row.
+if d.get("status") == "error": key, label, tr = 3, "ERR", {"confidence": "-", "techniques": [(d.get("error") or "parse 실패")[:40]]}
+tech = "; ".join(tr.get("techniques", []))[:40]
+print("%d\t%-28s %-14s %-8s %s" % (key, os.path.basename(b), label, tr.get("confidence", "-"), tech))
+' "$b" >> "$tmp"
 done
 sort -n "$tmp" | cut -f2-
 rm -f "$tmp"

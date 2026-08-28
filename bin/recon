@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# recon <binary> [libc.so.6] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
-import sys, os, re, glob
+# recon <binary> [libc.so.6] [--format text|json] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
+import sys, os, re, glob, json
 from pwn import ELF, context
 from ratlib.runner import run
 context.log_level = 'error'
@@ -9,18 +9,31 @@ def sh(argv):
     return result.stdout.preview.decode("utf-8", errors="replace")
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: recon <binary> [libc.so.6]"); return 1
-    path = sys.argv[1]; libc_path = sys.argv[2] if len(sys.argv) > 2 else None
+    argv = sys.argv[1:]
+    fmt = "text"
+    if "--format" in argv:
+        i = argv.index("--format")
+        if i + 1 >= len(argv) or argv[i + 1] not in ("text", "json"):
+            print("usage: recon <binary> [libc.so.6] [--format text|json]", file=sys.stderr); return 1
+        fmt = argv[i + 1]; del argv[i:i + 2]
+    if not argv:
+        print("usage: recon <binary> [libc.so.6] [--format text|json]", file=sys.stderr); return 1
+    path = argv[0]; libc_path = argv[1] if len(argv) > 1 else None
     # The bounded runner accepts argv only; a shell-shaped string would make
     # it try to execute the first character and leave PE routing inoperative.
     ft0 = sh(["file", "--", path])
     if "PE32" in ft0 or "MS Windows" in ft0:
+        if fmt == "json":
+            print(json.dumps({"schema": "rat.recon/v1", "status": "pe", "binary": path,
+                              "hint": "rev track: revq/decomp/qiling"}, ensure_ascii=False)); return 0
         print("[recon] PE/Windows 바이너리 감지 — recon(pwn/ELF triage) 대상 아님.")
         print("  → rev 로 처리: revq %s  |  decomp %s <fn>  |  동적=Qiling/Frida" % (path, path))
         return 0
     try: e = ELF(path, checksec=False)
     except Exception as ex:
+        if fmt == "json":
+            print(json.dumps({"schema": "rat.recon/v1", "status": "error", "binary": path,
+                              "error": str(ex)}, ensure_ascii=False)); return 1
         print("[!] ELF 파싱 실패:", ex); print(sh(["file", "--", path])); return 1
     ftype = sh(["file", "--", path]).strip()
     syms = set(e.symbols.keys()); plt = set(e.plt.keys()); universe = plt | syms
@@ -54,21 +67,22 @@ def main():
              or re.search(r'glibc[ -](\d+\.\d+)', s, re.I))
         if m: libc_ver = m.group(1)
 
-    print("="*60)
-    print("[FACT] 직접 ELF/문자열 파싱 관측 (취약점 확정 아님)")
-    print("BIN   :", path)
-    print("FILE  :", ftype[:120])
-    print("PROT  : PIE=%s Canary=%s NX=%s RELRO=%s | stripped=%s funcs=%d" % (
-        e.pie, e.canary, e.nx, e.relro, stripped, nfunc))
-    print("libc  :", libc_ver or (lp or "미제공"))
-    if winsyms: print("SIGNAL win? :", ", ".join(winsyms[:8]))
-    print("SIGNAL sink :", ", ".join(dangerous) or "-", "| fmt계열:", ", ".join(fmtfns) or "-")
-    print("EXEC  : system=%s execve=%s syscall=%s /bin/sh=%s seccomp=%s" % (
-        has_system, has_execve, has_syscall, binsh, seccomp))
-    if heapfns: print("SIGNAL heap :", ", ".join(heapfns))
-    if catflag: print("SIGNAL flag : flag 문자열/경로 감지")
-    if vmish:   print("SIGNAL VM?  : interpreter/opcode 문자열 감지")
-    if stripped: print("[!] stripped — 심볼기반 신호(win/함수명) 신뢰 불가, triage 확신도 하향")
+    if fmt == "text":
+        print("="*60)
+        print("[FACT] 직접 ELF/문자열 파싱 관측 (취약점 확정 아님)")
+        print("BIN   :", path)
+        print("FILE  :", ftype[:120])
+        print("PROT  : PIE=%s Canary=%s NX=%s RELRO=%s | stripped=%s funcs=%d" % (
+            e.pie, e.canary, e.nx, e.relro, stripped, nfunc))
+        print("libc  :", libc_ver or (lp or "미제공"))
+        if winsyms: print("SIGNAL win? :", ", ".join(winsyms[:8]))
+        print("SIGNAL sink :", ", ".join(dangerous) or "-", "| fmt계열:", ", ".join(fmtfns) or "-")
+        print("EXEC  : system=%s execve=%s syscall=%s /bin/sh=%s seccomp=%s" % (
+            has_system, has_execve, has_syscall, binsh, seccomp))
+        if heapfns: print("SIGNAL heap :", ", ".join(heapfns))
+        if catflag: print("SIGNAL flag : flag 문자열/경로 감지")
+        if vmish:   print("SIGNAL VM?  : interpreter/opcode 문자열 감지")
+        if stripped: print("[!] stripped — 심볼기반 신호(win/함수명) 신뢰 불가, triage 확신도 하향")
 
     # ---------- 보수적 triage: 확실할 때만 🟢 ----------
     tier="🟠 HARD"; techs=[]; why=[]; conf="낮음"
@@ -97,12 +111,35 @@ def main():
 
     rec = {"🟢 FAST":"SOLVE (확신 — 먼저)", "🟡 STANDARD":"SOLVE (작업 필요)",
            "🟠 HARD":"후순위 (확신 낮음)"}[tier]
-    if stripped and tier=="🟢 FAST": tier="🟡 STANDARD"; rec="SOLVE (stripped라 확신 하향)"
+    if stripped and tier=="🟢 FAST":
+        tier="🟡 STANDARD"; conf="중간"; rec="SOLVE (stripped라 확신 하향)"
+    techs=list(dict.fromkeys(techs))
+    if fmt == "json":
+        # machine-facing view: same facts/triage, no Korean text to grep/sed.
+        # tier_key is the language-agnostic sort key (fast<standard<hard).
+        tier_key = {"🟢 FAST":"fast", "🟡 STANDARD":"standard", "🟠 HARD":"hard"}.get(tier, "hard")
+        # Language-agnostic keys so a machine consumer never has to branch on the Korean
+        # display strings (mirrors the tier/tier_key split). Display strings stay for humans.
+        confidence_key = {"낮음":"low", "중간":"mid", "높음":"high"}.get(conf, "low")
+        recommendation_key = "solve" if tier_key in ("fast", "standard") else "deprioritize"
+        print(json.dumps({
+            "schema": "rat.recon/v1", "status": "ok", "binary": path, "file": ftype[:200],
+            "protections": {"pie": bool(e.pie), "canary": bool(e.canary), "nx": bool(e.nx),
+                            "relro": str(e.relro), "stripped": stripped, "functions": nfunc},
+            "libc_version": libc_ver, "libc_path": lp,
+            "signals": {"win_symbols": winsyms[:8], "sinks": dangerous, "fmt_funcs": fmtfns,
+                        "heap_funcs": heapfns, "system": has_system, "execve": has_execve,
+                        "syscall": has_syscall, "binsh": binsh, "seccomp": seccomp,
+                        "catflag": catflag, "vmish": vmish},
+            "triage": {"tier": tier_key, "confidence": conf, "confidence_key": confidence_key,
+                       "recommendation": rec, "recommendation_key": recommendation_key,
+                       "techniques": techs, "why": list(dict.fromkeys(why))},
+        }, ensure_ascii=False)); return 0
     print("-"*60)
     print("[ROUTE] TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
     print("  추정 기법:", "; ".join(dict.fromkeys(techs)) or "미상 — decomp 로 vuln 확인")
     print("  근거    :", "; ".join(why) or "정적 신호 부족")
-    print("  다음    : decomp %s <func> → vuln 확정 → state.md" % path)
+    print("  다음    : decomp %s <func> → vuln 확정 → state show/compact에 typed v2 증거 기록" % path)
     print("="*60)
     return 0
 sys.exit(main())
