@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
 from ratlib.orchestration import DEFAULT_BUDGET, GateError, converge, enter, finish_phase, finish_task, plan_fanout, rollback, start_task, invalidate
 from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
+from tests.direct_evidence_helper import direct_evidence_envelope
 def contract(role, phase, required=()):
  return {"schema":"rat.role-contract/v1","role":role,"phase":phase,"objective":"x","allowed_inputs":[],"required_outputs":list(required),"forbidden_actions":[],"state_write_scope":[],"capabilities":{"network_write":False,"repository_write":False,"evidence_promote":False},"budgets":dict(DEFAULT_BUDGET),"stop_conditions":["budget"]}
 def _start_parallel(root, checkpoint_id, index, queue):
@@ -13,8 +14,8 @@ def _start_parallel(root, checkpoint_id, index, queue):
   queue.put(("blocked",str(exc)))
 def output(task, outputs=None): return {"schema":"rat.task-output/v1","task_id":task["task_id"],"status":"completed","outputs":outputs or {},"evidence_ids":["e0"]}
 def observation(stream, oid):
- rec=put_bytes(oid.encode(),kind="test-evidence",media_type="text/plain",logical_name=oid,root=stream.root,provenance={"evidence_policy":{"level":"direct","promotion_allowed":True}})
- return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[rec["digest"]]}
+ digest=direct_evidence_envelope(root=stream.root,producer="gdbq",measurement=b"measurement:"+oid.encode(),summary=oid)
+ return {"observation_id":oid,"quality":{"level":"direct"},"validity":{"state":"active"},"evidence":[digest]}
 def to_p2(d):
  for p in ("solve-P0","solve-P1"):
   enter(d,p); finish_phase(d,p)

@@ -12,6 +12,16 @@ from .artifact import put_bytes, put_file, digest_bytes, get, metadata
 from .runner import run, EXIT_DEPENDENCY, EXIT_INPUT, EXIT_POLICY, EXIT_TIMEOUT
 
 VERSION="p2-mvp/1"; POLICY="sha256:"+hashlib.sha256(b"p2-local-executable-only").hexdigest()
+def _module_digest():
+ # Content-addressed identity of the verdict logic itself (this file), so a
+ # verification-report producer can be resolved by CONTENT the same way
+ # state_v2 resolves SELF-evidence verifiers -- not by a fixed policy label
+ # that any tool can copy into its own report.
+ h=hashlib.sha256()
+ with open(os.path.realpath(__file__),"rb") as f:
+  for b in iter(lambda:f.read(65536),b""): h.update(b)
+ return "sha256:"+h.hexdigest()
+VERIFY_BUILD_DIGEST=_module_digest()
 P2_LIMITATIONS={
  "rat-profile":["format signals are not vulnerability proof"],
  "rat-slice":["call-path reachability only; no value-flow proof"],
@@ -24,8 +34,6 @@ P2_LIMITATIONS={
  "rat-verify":["local verification does not establish remote equivalence"],
 }
 def iso(): return datetime.now(timezone.utc).isoformat()
-# Artifacts belong to the active challenge/CWD unless the caller explicitly
-# selects a store.  Never attempt to create ``<system-binary-dir>/.rat``.
 def root(a, binary=None):
     # M2 rework: the canonical index + artifact store resolve through the one
     # shared resolver so rat-profile lands in the same sqlite as revq/decomp.
@@ -378,7 +386,7 @@ def verify(a):
         results.append({"exit":p.exit_code,"timed_out":p.timed_out,"conditions_met":ok,"oracle":oracle_result})
     verdict="pass" if environment_match and all(x["conditions_met"] for x in results) else ("inconclusive" if not environment_match or any(x["timed_out"] for x in results) else "fail")
     status="ok" if verdict=="pass" else ("timeout" if verdict=="inconclusive" else "partial")
-    report={"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","provenance":{"claim_id":a.claim,"primitive_id":a.primitive,"exploit_task_id":a.exploit_task,"trace_digest":a.trace,"environment_digest":execution_environment(profile,sc)},"results":results,"producer":{"tool":"rat-verify","build_digest":POLICY}}
+    report={"schema":"rat.verification-report/v1","verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","provenance":{"claim_id":a.claim,"primitive_id":a.primitive,"exploit_task_id":a.exploit_task,"trace_digest":a.trace,"environment_digest":execution_environment(profile,sc)},"results":results,"producer":{"tool":"rat-verify","build_digest":VERIFY_BUILD_DIGEST}}
     arts=[artifact(report,"verification-report","verification.json",r)]
     diagnostics=[]
     if not environment_match: diagnostics.append("trace environment does not match this verification scenario")
@@ -473,8 +481,19 @@ def vm(a):
     return emit(envelope("rat-vm",a.binary,a,{"dispatcher_confidence":0.0 if not a.dispatch else 0.5,"opcode_count":len(ops),"lifted_count":1 if candidate else 0,"unknown_opcode":unknown,"solve_candidates":candidates},arts,status=status,diagnostics=diagnostics,started=started),a)
 def parser():
     p=argparse.ArgumentParser(); p.add_argument("binary"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--max-output",type=int,default=65536); p.add_argument("--format",choices=("text","json"),default="text"); p.add_argument("--store"); p.add_argument("--no-cache",action="store_true"); return p
+_DIGEST_HANDOFF_EPILOG = (
+    "P2 digest handoff: --profile/--trace take an artifact DIGEST, not a path.\n"
+    "Get the profile digest first, then feed it in:\n"
+    "  PROFILE=$(rat-profile \"$BIN\" --format json | jq -r .artifacts[0].digest)\n"
+    "  rat-dyn \"$BIN\" --profile \"$PROFILE\" --scenario scen.json\n"
+    "rat-verify additionally needs the rat-dyn trace digest:\n"
+    "  TRACE=$(rat-dyn \"$BIN\" --profile \"$PROFILE\" --scenario scen.json --format json | jq -r '.artifacts[]|select(.kind==\"execution-trace\").digest')\n"
+    "  rat-verify \"$BIN\" --profile \"$PROFILE\" --trace \"$TRACE\" --scenario scen.json --oracle scen.json"
+)
 def main(which, argv=None):
     p=parser()
+    if which in ("rat-dyn","rat-verify"):
+        p.epilog=_DIGEST_HANDOFF_EPILOG; p.formatter_class=argparse.RawDescriptionHelpFormatter
     if which=="rat-profile": p.add_argument("--libc"); p.add_argument("--loader"); fn=profile
     elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc"); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); p.add_argument("--mode",choices=["call-path","data"],default="call-path"); p.add_argument("--backward",dest="backward_addr"); p.add_argument("--source",default=None); fn=slice_
     elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); fn=dyn
