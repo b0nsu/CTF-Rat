@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""pwngadget — bounded ROP-gadget search with a cache wrapper (plans/TOOL_ADDITIONS.md T3).
+
+Problem: pwnropcheck only *validates* a chain; finding gadgets meant piping ROPgadget's
+tens-of-thousands-of-lines raw dump straight into the model's context. pwngadget runs
+ROPgadget/ropper under the bounded ratlib.runner, filters to the query, and caches the
+filtered result keyed on (binary sha256, query, arch) via the canonical cache index — so a
+ROP call costs tens of tokens, deterministically.
+
+  pwngadget <bin> "pop rdi ; ret" [--arch x86-64] [--max 20] [--format text|json]
+  pwngadget <bin> --presets                 # standard pwn-rop query set
+  pwngadget selftest
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+
+from ratlib.cache import Cache, canonical_key, resolve_index_root  # noqa: E402
+from ratlib import runner  # noqa: E402
+
+TOOL_VERSION = "1"
+PRESETS = [
+    "pop rdi ; ret", "pop rsi ; ret", "pop rdx ; ret", "pop rax ; ret",
+    "pop rsi ; pop r15 ; ret", "ret", "syscall", "leave ; ret", "pop rsp ; ret",
+]
+# ROPgadget line: "0x0000000000401234 : pop rdi ; ret"
+_LINE = re.compile(r"^(0x[0-9a-fA-F]+)\s*:\s*(.+?)\s*$")
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def _sha256_text(text):
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+def _norm(insn):
+    """Normalize gadget text so 'pop rdi ; ret' matches 'pop  rdi ;  ret'."""
+    return re.sub(r"\s*;\s*", " ; ", re.sub(r"\s+", " ", insn.strip())).lower()
+
+
+def parse_gadgets(raw):
+    """Parse ROPgadget/ropper stdout into [{addr, insn}] (deterministic, order-preserving)."""
+    out = []
+    for line in raw.splitlines():
+        m = _LINE.match(line.strip())
+        if not m:
+            continue
+        insn = m.group(2)
+        if insn.lower().startswith(("gadgets information", "unique gadgets")):
+            continue
+        out.append({"addr": m.group(1), "insn": insn})
+    return out
+
+
+def filter_gadgets(gadgets, query, limit):
+    """Exact-normalized match first, then substring fallback; cap at limit; dedup by insn."""
+    q = _norm(query)
+    seen = set()
+    exact, partial = [], []
+    for g in gadgets:
+        n = _norm(g["insn"])
+        if n in seen:
+            continue
+        if n == q:
+            seen.add(n); exact.append(g)
+        elif q in n:
+            # Register substring hits in `seen` too, otherwise two whitespace/format
+            # variants of the same partial gadget both survive (the dedup only ever
+            # caught partials that duplicated an exact hit).
+            seen.add(n); partial.append(g)
+    # exact-normalized (n==q) and substring (n!=q) sets are disjoint by construction,
+    # and `seen` already removed intra-set duplicates, so a plain concat is dedup-clean.
+    return (exact + partial)[:limit]
+
+
+def _result_status(truncated, gadgets):
+    return "partial" if truncated else "ok"
+
+
+def _which(name):
+    from shutil import which
+    return which(name)
+
+
+def _captured(stream):
+    """Full bounded capture, preferring the runner's spool file over the preview slice."""
+    if stream.spool_path:
+        try:
+            with open(stream.spool_path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            pass
+    return bytes(stream.preview)
+
+
+_ELF_MACHINE = {0x03: "x86", 0x3E: "x86-64", 0x28: "arm", 0xB7: "aarch64", 0x08: "mips"}
+
+
+def _detect_arch(binary):
+    """Best-effort ELF e_machine -> canonical arch name; None if not a readable ELF."""
+    try:
+        with open(binary, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return None
+    endian = "<" if head[5] == 1 else ">"
+    import struct
+    (e_machine,) = struct.unpack(endian + "H", head[18:20])
+    return _ELF_MACHINE.get(e_machine)
+
+
+def _select_engine():
+    """Which gadget engine will actually run, chosen the SAME way _run_gadget_engine
+    chooses it -- callers must not re-derive this independently or a cache key built
+    from one choice could be paired with a run using the other."""
+    if _which("ROPgadget"):
+        return "ROPgadget"
+    if _which("ropper"):
+        return "ropper"
+    return None
+
+
+def _engine_version(tool):
+    """Best-effort engine version string for the cache key (never network, bounded)."""
+    try:
+        res = runner.run([tool, "--version"], timeout_seconds=10, tool_version=TOOL_VERSION)
+        out = _captured(res.stdout).decode(errors="replace").strip().splitlines()
+        return out[0][:80] if out else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _run_gadget_engine(binary, engine):
+    """Run the given engine (as chosen by _select_engine) under the bounded runner.
+
+    Returns (raw, tool, error): error is None on a clean, complete run; "dependency"
+    when the engine is no longer available; "timeout"/"engine-error" for a failed run
+    (raw is None — a partial/empty dump from a killed run must NOT be parsed or
+    cached); "truncated" when the engine succeeded but its output exceeded the
+    capture cap (raw is the partial dump, to be surfaced but not cached).
+    """
+    if engine == "ROPgadget":
+        argv = ["ROPgadget", "--binary", binary]
+    elif engine == "ropper":
+        argv = ["ropper", "--file", binary]
+    else:
+        return None, None, "dependency"
+    tool = engine
+    res = runner.run(argv, timeout_seconds=120, tool_version=TOOL_VERSION)
+    if res.exit_code == runner.EXIT_DEPENDENCY:
+        return None, None, "dependency"
+    if res.timed_out:
+        return None, tool, "timeout"
+    if res.exit_code != runner.EXIT_OK:
+        return None, tool, "engine-error"
+    return _captured(res.stdout).decode(errors="replace"), tool, ("truncated" if res.stdout.truncated else None)
+
+
+def _envelope(*, binary, sha, query, arch, limit, gadgets, status, tool_used, cache_state, started, finished, duration_ms, diagnostics=None):
+    # invocation_id identifies THIS process run, distinct from the cache key
+    # (sha, query, arch, limit): the cache key is intentionally input-derived so
+    # repeat calls hit, but invocation_id must be unique per run or two runs of
+    # the same query would look like the same invocation to metrics/provenance.
+    cache_key_digest = _sha256_text("%s|%s|%s|%s" % (sha, query, arch, limit))
+    invocation_id = "invoke_" + uuid.uuid4().hex
+    # `_envelope` is only ever called on paths that return runner.EXIT_OK (0) to
+    # the shell -- a "partial" (truncated/empty) result is still a successful
+    # process run, so its exit.code must say 0 too, not an unrelated nonzero
+    # constant that happens to collide with EXIT_DEPENDENCY's meaning.
+    return {
+        "schema": "rat.tool-result/v1",
+        "tool": {"name": "pwngadget", "version": TOOL_VERSION, "build_digest": _sha256_file(os.path.realpath(__file__))},
+        "run_id": invocation_id,
+        "invocation_id": invocation_id,
+        "status": status,
+        "started_at": started, "finished_at": finished, "duration_ms": duration_ms,
+        "inputs": [{"role": "binary", "digest": sha}] if sha else [],
+        "parameters": {"query": query, "arch": arch, "max": limit},
+        "summary": {"query": query, "count": len(gadgets), "gadgets": gadgets, "engine": tool_used},
+        "artifacts": [], "findings": [], "diagnostics": diagnostics or [],
+        "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
+        "provenance": {"platform": sys.platform, "dependency_versions": {tool_used or "none": "n/a"},
+                       "policy_digest": _sha256_text("network-free;bounded-runner"),
+                       "cache": {"state": cache_state, "key": cache_key_digest}},
+        "cache_state": cache_state,
+    }
+
+
+def _cached_path(binary, sha, query, arch, limit, engine, engine_version):
+    root = resolve_index_root(binary)
+    # dep_versions used to be the literal string "any" -- a cache entry produced by
+    # ROPgadget and one that would be produced by ropper collided on the same key, so
+    # whichever engine ran FIRST silently served every later query regardless of which
+    # engine was actually installed. Bind the key to the real chosen engine + its
+    # version so a different engine (or a different build of the same one) misses.
+    k = canonical_key(binary_sha256=sha, tool_name="pwngadget", tool_version=TOOL_VERSION,
+                      params={"query": _norm(query), "arch": arch, "max": limit},
+                      dep_versions={"engine": engine or "none", "engine_version": engine_version})
+    return root, k
+
+
+def query_binary(binary, query, arch, limit, fmt):
+    if not os.path.isfile(binary):
+        print("[pwngadget:err] binary not found: %s" % binary, file=sys.stderr); return runner.EXIT_INPUT
+    sha = _sha256_file(binary)
+    # --arch used to be accepted, stamped into the envelope/cache key, and then never
+    # actually passed to the engine or used to filter gadgets -- so a caller could
+    # request --arch arm against an x86-64 binary and silently get x86-64 gadgets
+    # mislabeled arm. Neither engine here supports cross-arch gadget search, so
+    # validate the claim against the binary's real e_machine instead of accepting it.
+    detected = _detect_arch(binary)
+    if detected and arch and arch != detected:
+        print("[pwngadget:err] --arch %s does not match binary's detected arch %s "
+              "(cross-arch gadget search is not supported)" % (arch, detected), file=sys.stderr)
+        return runner.EXIT_INPUT
+    engine = _select_engine()
+    engine_version = _engine_version(engine) if engine else "none"
+    root, k = _cached_path(binary, sha, query, arch, limit, engine, engine_version)
+    cache = Cache(root)
+    entry = cache.get_entry(k)
+    cache_state = "miss"
+    now = datetime.now(timezone.utc).isoformat()
+    if entry and entry.get("path") and os.path.isfile(entry["path"]):
+        stored = None
+        try:
+            with open(entry["path"], encoding="utf-8") as fh:
+                stored = json.load(fh)
+            s = stored["summary"]
+            gadgets, status, engine = s["gadgets"], stored["status"], s.get("engine")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            stored = None
+        if stored is not None:
+            # Rebuild the envelope for THIS retrieval rather than mutating two fields of
+            # the stored (miss-time) doc: otherwise a "hit" result would carry the
+            # original run's started_at/duration_ms, misreporting the cache read as if
+            # it took the original compute time. Only the gadgets carry over.
+            env = _envelope(binary=binary, sha=sha, query=query, arch=arch, limit=limit,
+                            gadgets=gadgets, status=status, tool_used=engine,
+                            cache_state="hit", started=now, finished=now, duration_ms=0)
+            _emit(env, fmt)
+            return runner.EXIT_OK
+        # Corrupt/malformed cache entry: fall through and treat as a miss (recompute).
+    t0 = time.monotonic()
+    raw, tool, err = _run_gadget_engine(binary, engine)
+    if err == "dependency":
+        print("[pwngadget:err] no gadget engine (install ROPgadget or ropper)", file=sys.stderr)
+        return runner.EXIT_DEPENDENCY
+    if raw is None:
+        # A timed-out or crashed engine yields evidence, not a reusable analysis result.
+        # Returning here WITHOUT caching prevents a transient failure from poisoning the
+        # cache with a permanent "(none matched)" false negative for this (sha,query,arch).
+        print("[pwngadget:err] gadget engine %s failed (%s); not caching" % (tool, err), file=sys.stderr)
+        return runner.EXIT_TIMEOUT if err == "timeout" else runner.EXIT_INTERNAL
+    truncated = err == "truncated"
+    gadgets = filter_gadgets(parse_gadgets(raw), query, limit)
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    diagnostics = ([{"code": "truncated", "severity": "warning",
+                     "message": "engine output exceeded the capture cap; gadget set may be incomplete"}]
+                   if truncated else None)
+    # A complete engine run with zero matches is a cacheable ok/count=0 result.
+    # Only truncated output is partial because the result set may be incomplete.
+    status = _result_status(truncated, gadgets)
+    env = _envelope(binary=binary, sha=sha, query=query, arch=arch, limit=limit, gadgets=gadgets,
+                    status=status, tool_used=tool, cache_state=cache_state,
+                    started=now, finished=datetime.now(timezone.utc).isoformat(), duration_ms=duration_ms,
+                    diagnostics=diagnostics)
+    if truncated:
+        # Do not cache an incomplete dump: a later, larger-budget run must re-execute.
+        print("[pwngadget:warn] %s output truncated at capture cap; result not cached" % tool, file=sys.stderr)
+        _emit(env, fmt)
+        return runner.EXIT_OK
+    # persist filtered result as the cached artifact
+    cache_dir = os.path.join(root, "pwngadget")
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path = os.path.join(cache_dir, k.replace("sha256:", "") + ".json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(env, fh, sort_keys=True)
+    cache.put_entry(k, backend="pwngadget", path=out_path, envelope_digest=_sha256_text(json.dumps(env, sort_keys=True)))
+    _emit(env, fmt)
+    return runner.EXIT_OK
+
+
+def _emit(env, fmt):
+    if fmt == "json":
+        print(json.dumps(env, sort_keys=True, ensure_ascii=False)); return
+    s = env["summary"]
+    print("GADGETS  query=%r  engine=%s  cache=%s" % (s["query"], s.get("engine"), env.get("cache_state")))
+    if not s["gadgets"]:
+        print("  (none matched)")
+    for g in s["gadgets"]:
+        print("  %s : %s" % (g["addr"], g["insn"]))
+
+
+def cmd_presets(binary, arch, limit, fmt):
+    rc = runner.EXIT_OK
+    for q in PRESETS:
+        r = query_binary(binary, q, arch, limit, fmt)
+        if r not in (runner.EXIT_OK,):
+            rc = r
+    return rc
+
+
+def _selftest():
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    sample = "\n".join([
+        "Gadgets information",
+        "============================================================",
+        "0x0000000000401234 : pop rdi ; ret",
+        "0x0000000000401256 : pop  rdi ;  ret",   # whitespace variant -> dedups to same
+        "0x0000000000401299 : pop rsi ; pop r15 ; ret",
+        "0x00000000004012aa : ret",
+        "0x00000000004012bb : mov rax, rbx ; ret",
+        "",
+        "Unique gadgets found: 5",
+    ])
+    g = parse_gadgets(sample)
+    chk(len(g) == 5, "parse: 5 gadget lines (headers/blank skipped)")
+    pr = filter_gadgets(g, "pop rdi ; ret", 20)
+    chk(len(pr) == 1 and pr[0]["addr"] == "0x0000000000401234", "filter: exact match dedups whitespace variant")
+    chk(filter_gadgets(g, "ret", 20)[0]["insn"] == "ret", "filter: exact 'ret' preferred over substring")
+    chk(len(filter_gadgets(g, "pop", 2)) == 2, "filter: --max cap honored")
+    # substring path must dedup format variants too (regression: seen.add was missing there)
+    chk(len(filter_gadgets(g, "pop rdi", 20)) == 1, "filter: substring dedups whitespace variants")
+    chk(_norm("pop  rdi ;  ret") == "pop rdi ; ret", "norm: whitespace canonicalized")
+    chk(_result_status(False, []) == "ok" and _result_status(True, pr) == "partial", "status: empty complete result is ok; truncated is partial")
+    # cache key determinism (same normalized query -> same key)
+    _, k1 = _cached_path("/bin/ls", "sha256:" + "a" * 64, "pop  rdi ; ret", "x86-64", 20, "ROPgadget", "7.4")
+    _, k2 = _cached_path("/bin/ls", "sha256:" + "a" * 64, "pop rdi ;  ret", "x86-64", 20, "ROPgadget", "7.4")
+    chk(k1 == k2, "cache: normalized query yields stable key")
+    # BLOCK regression: a different engine (or version) must NOT share a cache key --
+    # otherwise whichever engine ran first silently serves every later query.
+    _, k3 = _cached_path("/bin/ls", "sha256:" + "a" * 64, "pop  rdi ; ret", "x86-64", 20, "ropper", "1.13")
+    chk(k1 != k3, "cache: different engine yields a different key")
+    _, k4 = _cached_path("/bin/ls", "sha256:" + "a" * 64, "pop  rdi ; ret", "x86-64", 20, "ROPgadget", "7.5")
+    chk(k1 != k4, "cache: different engine version yields a different key")
+    # --arch is validated against the binary's real e_machine, not accepted uncritically
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".elf") as tf:
+        tf.write(b"\x7fELF\x02\x01" + b"\x00" * 10 + b"\x02\x00" + b"\x3e\x00")  # ET_EXEC, EM_X86_64
+        tf.flush()
+        chk(_detect_arch(tf.name) == "x86-64", "arch: e_machine 0x3e detected as x86-64")
+    chk(_detect_arch("/nonexistent/path") is None, "arch: unreadable path -> None (fail open on detection, not a guess)")
+    # the emitted envelope must satisfy the canonical rat.tool-result/v1 contract
+    # (ratlib.schema is the single source of truth) -- guards silent shape drift.
+    now = datetime.now(timezone.utc).isoformat()
+    env = _envelope(binary="/bin/ls", sha="sha256:" + "a" * 64, query="pop rdi ; ret", arch="x86-64",
+                    limit=20, gadgets=pr, status="ok", tool_used="ROPgadget", cache_state="miss",
+                    started=now, finished=now, duration_ms=7)
+    try:
+        from ratlib.schema import validate
+        validate(env, "rat.tool-result/v1")
+        chk(env["duration_ms"] == 7 and env["run_id"] == env["invocation_id"], "envelope: validates + real duration + invocation-scoped run_id")
+    except Exception as exc:
+        chk(False, "envelope: rat.tool-result/v1 validation (%s)" % exc)
+    if fails:
+        print("pwngadget selftest: FAIL (%d)" % len(fails)); return 1
+    print("pwngadget selftest: OK"); return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "selftest":
+        return _selftest()
+    ap = argparse.ArgumentParser(prog="pwngadget", description="bounded ROP-gadget search + cache")
+    ap.add_argument("binary")
+    ap.add_argument("query", nargs="?")
+    ap.add_argument("--arch", default="x86-64")
+    ap.add_argument("--max", type=int, default=20)
+    ap.add_argument("--presets", action="store_true")
+    ap.add_argument("--format", choices=("text", "json"), default="text")
+    args = ap.parse_args(argv)
+    if args.presets:
+        return cmd_presets(args.binary, args.arch, args.max, args.format)
+    if not args.query:
+        ap.error("provide a gadget query or --presets")
+    return query_binary(args.binary, args.query, args.arch, args.max, args.format)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
