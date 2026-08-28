@@ -593,8 +593,10 @@ def cmd_query_oracle(args):
 
 def _slice_complete(slice_doc):
     s = slice_doc.get("summary", {})
-    unresolved = bool(s.get("unresolved_aliases", 0)) or bool(s.get("unresolved_indirect_calls", 0))
-    return slice_doc.get("status") == "ok" and not unresolved
+    counters = (s.get("unresolved_aliases"), s.get("unresolved_indirect_calls"))
+    return (slice_doc.get("status") == "ok"
+            and all(isinstance(value, int) and not isinstance(value, bool) and value == 0
+                    for value in counters))
 
 def cmd_query_slice(args):
     binary = args.binary

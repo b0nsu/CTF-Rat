@@ -125,6 +125,8 @@ class QueryResultSchema(unittest.TestCase):
         schema = json.loads((repo / "schemas" / "rat.query-result.v1.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["facts"]["type"], "object")
         self.assertEqual(schema["properties"]["heuristics"]["type"], "object")
+        self.assertEqual(schema["properties"]["coverage"]["properties"]["complete"]["type"], "boolean")
+        self.assertTrue(schema["allOf"])
         validate(query_result(facts={"key": "value"}, heuristics={"next": []}), "rat.query-result/v1")
         with self.assertRaises(ValidationError):
             validate(query_result(facts=[], heuristics={}), "rat.query-result/v1")

@@ -29,6 +29,11 @@ class SliceTruthTests(unittest.TestCase):
             ({"status": "ok", "summary": {"unresolved_aliases": 1, "unresolved_indirect_calls": 0}}, False),
             ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 1}}, False),
             ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 2}}, False),
+            ({"status": "ok", "summary": {}}, False),
+            ({"status": "ok", "summary": {"unresolved_aliases": None, "unresolved_indirect_calls": 0}}, False),
+            ({"status": "ok", "summary": {"unresolved_aliases": "0", "unresolved_indirect_calls": 0}}, False),
+            ({"status": "ok", "summary": {"unresolved_aliases": False, "unresolved_indirect_calls": 0}}, False),
+            ({"status": "ok", "summary": {"unresolved_aliases": -1, "unresolved_indirect_calls": 0}}, False),
             ({"status": "partial", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 0}}, False),
             ({"status": "partial", "summary": {}}, False),
         ]
