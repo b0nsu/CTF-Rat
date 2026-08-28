@@ -2,6 +2,7 @@
 """Deterministic P3 lifecycle checks, including a real cancelled child."""
 import argparse, json, os, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__),"..","bin"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__),".."))
 from ratlib.orchestration import (DEFAULT_BUDGET, GateError, converge, enter,
  finish_phase, finish_task, invalidate, plan_fanout, record_verification,
  report_skeptic, start_task)
