@@ -10,15 +10,15 @@ the loop; a "solved" row proves the route+oracle pairing works when handed the a
 that anything discovered the answer. The oracle stage is reported as `skipped` (not failed)
 when its toolchain (gcc / angr) is missing.
 
-Mode B (model-eval) is intentionally NOT automated here; run external agent CLIs by hand
-and drop rat.bench-result/v1 lines into bench/results/ (see the plan). Mode B does NOT
-re-run Mode A's flag-regex/symsolve oracle over the agent's output -- it decides "solved"
-purely from whether a typed STATE v2 primitive PASS is currently active for that fixture
-(ratlib.metrics.first_primitive_pass_ts), the same honest-mode gate used everywhere else in
-the kit. A bare `FLAG{...}` in the agent's stdout is recorded as `flag_claimed` but never
-promoted to `solved` on its own.
+Mode B (model-eval) is intentionally on-demand. Each attempt receives an isolated runtime
+export of CTF-Rat plus only the challenge runtime artifact(s): benchmark source, route fixtures,
+known-good inputs, and ground truth remain outside the agent workspace. A bare `FLAG{...}` in
+agent stdout is only a claim. `solved` requires the canonical completion gate: an active typed
+primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS linked to the
+same completed exploit task.
 
   ratbench run [--id ID] [--suite path] [--run-id ID]
+  ratbench eval --agent '<cli {dir}>' [--id ID] [--run-id ID]
   ratbench report [--suite path]
   ratbench selftest
 """
@@ -136,8 +136,6 @@ def _verify(entry, binpath):
     if kind == "symsolve-restore":
         return _verify_symsolve(entry, binpath)
     if kind == "rat-verify-pass":
-        # Deterministic report-presence check; a real verification report would be produced
-        # by the challenge run. Absent one, this is skipped rather than failed.
         return "skipped", "rat-verify report presence check (not produced in Mode A)"
     return "skipped", "unknown verify kind %s" % kind
 
@@ -157,7 +155,7 @@ def cmd_run(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, run_id + ".jsonl")
-    workdir_ctx = tempfile.TemporaryDirectory()  # auto-cleaned (was mkdtemp -> leaked)
+    workdir_ctx = tempfile.TemporaryDirectory()
     workdir = workdir_ctx.name
     n_fail = 0
     lines = []
@@ -168,7 +166,6 @@ def cmd_run(args):
         binpath = _compile(e, workdir)
         vstatus, vdetail = _verify(e, binpath)
         elapsed_ms = int((time.time() - t0) * 1000)
-        # solve = route correct AND verifier passed; skipped verifier => "partial"
         if not route_ok:
             outcome = "route-miss"
         elif vstatus == "pass":
@@ -194,7 +191,7 @@ def cmd_run(args):
             "" if route_ok else "!=%s" % e["expected_route"],
             vstatus, vdetail if vstatus != "pass" else "ok"))
     for rec in lines:
-        validate(rec, "rat.bench-result/v1")  # catch row-shape drift before persisting
+        validate(rec, "rat.bench-result/v1")
     with open(out_path, "w", encoding="utf-8") as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -204,9 +201,6 @@ def cmd_run(args):
         print("-- %d entr%s FAILED (route-miss/verify-fail)" % (n_fail, "y" if n_fail == 1 else "ies"))
         return 1
     n_skipped = sum(1 for rec in lines if rec["verify"]["status"] == "skipped")
-    # A missing gcc is not the only way a verifier gets skipped (symsolve-restore
-    # needs angr, rat-verify-pass is always skipped in Mode A) -- report what
-    # actually ran, not a proxy check for one dependency.
     if n_skipped:
         print("-- all entries route-correct, %d/%d verifier%s skipped (missing dependency, not failed)" %
               (n_skipped, len(lines), "" if n_skipped == 1 else "s"))
@@ -216,14 +210,107 @@ def cmd_run(args):
 
 
 # ---------------------------------------------------------------------------
+# eval workspace — runtime only; benchmark truth never enters the agent tree
+# ---------------------------------------------------------------------------
+_RUNTIME_DIRS = ("bin", "doctrine", "knowledge", "reference", "schemas", "skills", "kernel")
+_RUNTIME_FILES = ("CLAUDE.md", "AGENTS.md", "FLAG_FORMAT")
+
+
+def _copy_runtime_export(dst_root):
+    import shutil
+    src_root = ctf_home()
+    os.makedirs(dst_root, exist_ok=True)
+    for name in _RUNTIME_FILES:
+        src = os.path.join(src_root, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dst_root, name))
+    for name in _RUNTIME_DIRS:
+        src = os.path.join(src_root, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(dst_root, name), symlinks=False)
+    template = os.path.join(src_root, "solve", "_template")
+    if os.path.isdir(template):
+        os.makedirs(os.path.join(dst_root, "solve"), exist_ok=True)
+        shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
+
+
+def _runtime_fixture_relpath(relpath):
+    if not isinstance(relpath, str) or not relpath or os.path.isabs(relpath):
+        raise ValueError("runtime fixture path must be relative")
+    normalized = os.path.normpath(relpath)
+    if normalized in ("", ".", os.pardir) or normalized.startswith(os.pardir + os.sep):
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if ".rat" in normalized.split(os.sep):
+        raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+    return normalized
+
+
+def _fixture_file(entry, relpath):
+    normalized = _runtime_fixture_relpath(relpath)
+    base = os.path.realpath(os.path.join(ctf_home(), entry["dir"]))
+    candidate = os.path.realpath(os.path.join(base, normalized))
+    if os.path.commonpath((base, candidate)) != base:
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if not os.path.isfile(candidate):
+        raise ValueError("runtime fixture file missing: %s" % relpath)
+    return candidate
+
+
+def _prepare_eval_workspace(entry, sandbox):
+    """Create a CTF-Rat runtime export plus answer-free challenge directory."""
+    import shutil
+    kit_root = os.path.join(sandbox, "ctf-rat")
+    _copy_runtime_export(kit_root)
+    chal_dir = os.path.join(kit_root, "solve", entry["id"])
+    os.makedirs(chal_dir, exist_ok=True)
+
+    binary_rel = entry.get("binary")
+    if binary_rel:
+        binary = _fixture_file(entry, binary_rel)
+        target = os.path.join(chal_dir, os.path.basename(binary_rel))
+        shutil.copy2(binary, target)
+    else:
+        built = _compile(entry, chal_dir)
+        if built is None:
+            raise RuntimeError("cannot materialize runtime binary (gcc/source unavailable)")
+        target = os.path.join(chal_dir, "chall")
+        os.replace(built, target)
+
+    forbidden = {
+        _runtime_fixture_relpath(entry.get("source", "src.c")),
+        _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
+    }
+    for relpath in entry.get("runtime_files", []) or []:
+        normalized = _runtime_fixture_relpath(relpath)
+        if normalized in forbidden:
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        src = _fixture_file(entry, normalized)
+        dst = os.path.realpath(os.path.join(chal_dir, normalized))
+        if os.path.commonpath((os.path.realpath(chal_dir), dst)) != os.path.realpath(chal_dir):
+            raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    # Explicit invariant: the agent export never contains the benchmark tree.
+    if os.path.exists(os.path.join(kit_root, "bench")):
+        raise RuntimeError("Mode B runtime export leaked benchmark data")
+    return kit_root, chal_dir, target
+
+
+def _agent_environment(kit_root):
+    env = os.environ.copy()
+    env["CTF_HOME"] = kit_root
+    env["PATH"] = os.path.join(kit_root, "bin") + os.pathsep + env.get("PATH", "")
+    for key in ("RAT_INDEX_ROOT", "STATE_PATH", "CTF_TEAM", "PYTHONPATH"):
+        env.pop(key, None)
+    return env
+
+
+# ---------------------------------------------------------------------------
 # eval (Mode B — external model CLI, on-demand, human-run, NOT CI)
 # ---------------------------------------------------------------------------
 def cmd_eval(args):
-    """Drive an external agent CLI over each fixture in a fresh sandbox copy, then read the
-    outcome off the SAME honest-mode gate the rest of the kit uses (typed primitive PASS) --
-    NOT Mode A's flag-regex/symsolve oracle, which is never invoked here. Deliberately
-    on-demand: results are written but git-ignored, never committed (only the leaderboard
-    is). Degrades to EXIT_DEPENDENCY if the CLI is absent."""
+    """Run an external agent against an answer-free CTF-Rat runtime export."""
     import shutil
     import tempfile
     if not args.agent:
@@ -231,12 +318,14 @@ def cmd_eval(args):
     agent_bin = args.agent.split()[0]
     if not _have(agent_bin):
         print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
-        return 3  # EXIT_DEPENDENCY
+        return 3
     suite = _load_suite(_suite_path(args.suite))
     entries = suite["entries"]
     if args.id:
         entries = [e for e in entries if e["id"] == args.id]
-    run_id = args.run_id or ("B-%s-%d" % (agent_bin, int(time.time())))
+        if not entries:
+            print("[ratbench:err] no entry %s" % args.id, file=sys.stderr); return 4
+    run_id = args.run_id or ("B-%s-%d" % (os.path.basename(agent_bin), int(time.time())))
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, run_id + ".jsonl")
@@ -245,52 +334,52 @@ def cmd_eval(args):
     for e in entries:
         sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
         try:
-            # Never copy run state into the sandbox: a fixture that accidentally
-            # carries .rat/ with a typed primitive PASS would satisfy the honest-mode
-            # gate without the agent solving anything.
-            shutil.copytree(os.path.join(ctf_home(), e["dir"]), os.path.join(sandbox, e["id"]),
-                            ignore=shutil.ignore_patterns(".rat"))
-            chal_dir = os.path.join(sandbox, e["id"])
+            try:
+                kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
+            except (OSError, ValueError, RuntimeError) as exc:
+                print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
+                return 3
             prompt = args.agent.replace("{dir}", chal_dir)
             t0 = time.time()
             try:
                 p = subprocess.run(prompt, shell=True, cwd=chal_dir, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, timeout=args.timeout)
+                                   stderr=subprocess.STDOUT, timeout=args.timeout,
+                                   env=_agent_environment(kit_root))
                 agent_out = p.stdout.decode(errors="replace")
                 agent_rc = p.returncode
             except subprocess.TimeoutExpired:
                 agent_out, agent_rc = "", 124
             wall = int((time.time() - t0) * 1000)
-            # A FLAG{...} in stdout is a *claim*, never proof: an agent can print one
-            # without solving anything. The authoritative honest-mode gate (per AGENTS.md)
-            # is a *typed primitive PASS* -- >=3 active direct SELF observations, enforced
-            # by state_v2.revise_primitive (and, once producer-owned evidence lands, not
-            # forgeable). Reuse the same scan metrics uses. Outcome is decided by the gate:
-            #   solved        -> typed primitive PASS present (real, honest solve)
-            #   solve-claimed  -> flag printed but NO gate (overclaim; must not count as solved)
-            #   fail           -> neither
+
             flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
             from ratlib.metrics import first_primitive_pass_ts
+            from ratlib.completion import completion_gate
             typed_pass = first_primitive_pass_ts(chal_dir) is not None
-            if typed_pass:
+            completion = completion_gate(chal_dir)
+            verified = completion.get("verified") is True
+            if verified:
                 outcome = "solved"
             elif flag_claimed:
                 outcome = "solve-claimed"
             else:
                 outcome = "fail"
-            rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": agent_bin,
+            rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
                    "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
                    "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
-                   "typed_primitive_pass": typed_pass, "wall_ms": wall}
+                   "typed_primitive_pass": typed_pass, "verified_solve": verified,
+                   "completion_reason": completion.get("reason"), "wall_ms": wall}
             lines.append(rec)
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
-            print("  [%s] %-18s rc=%s wall=%dms%s" % (
-                mark, e["id"], agent_rc, wall,
-                "  (flag claimed, gate NOT satisfied)" if outcome == "solve-claimed" else ""))
+            detail = ""
+            if outcome == "solve-claimed":
+                detail = "  (flag claimed, verified completion gate NOT satisfied)"
+            elif typed_pass and not verified:
+                detail = "  (primitive PASS present, deterministic verification missing/stale)"
+            print("  [%s] %-18s rc=%s wall=%dms%s" % (mark, e["id"], agent_rc, wall, detail))
         finally:
             shutil.rmtree(sandbox, ignore_errors=True)
     for rec in lines:
-        validate(rec, "rat.bench-result/v1")  # catch row-shape drift before persisting
+        validate(rec, "rat.bench-result/v1")
     with open(out_path, "w", encoding="utf-8") as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -332,7 +421,6 @@ def _render_leaderboard(rows):
     if not rows:
         L.append("_(no results yet — run `ratbench run`)_")
         return "\n".join(L) + "\n"
-    # per-run aggregate
     runs = {}
     for r in rows:
         runs.setdefault(r.get("run_id", "?"), []).append(r)
@@ -344,18 +432,15 @@ def _render_leaderboard(rows):
         n = len(rs)
         route_ok = sum(1 for x in rs if x.get("route_ok"))
         solved = sum(1 for x in rs if x.get("outcome") == "solved")
-        # Mode B overclaims: a flag was printed but the typed primitive-PASS gate was
-        # never satisfied. Surfaced explicitly so they never masquerade as solves.
         claimed = sum(1 for x in rs if x.get("outcome") == "solve-claimed")
         skipped = sum(1 for x in rs if x.get("outcome") == "route-ok-verify-skipped")
         failed = sum(1 for x in rs if x.get("outcome") in ("route-miss", "verify-fail", "fail"))
         acc = "%.0f%%" % (100.0 * route_ok / n) if n else "n/a"
         mode = rs[0].get("mode", "?")
         L.append("| %s | %s | %d | %d | %d | %d | %d | %d | %s |" % (rid, mode, n, route_ok, solved, claimed, skipped, failed, acc))
-    # per-difficulty matrix (latest run per id wins)
     latest = {}
     for r in rows:
-        latest[r.get("id")] = r  # file order is chronological-ish; last wins
+        latest[r.get("id")] = r
     L.append("")
     L.append("## By difficulty (latest per entry)")
     L.append("")
@@ -386,15 +471,14 @@ def _selftest():
     suite = _load_suite(_suite_path())
     ids = {e["id"] for e in suite["entries"]}
     chk({"stack-basic-01", "fmt-basic-01", "checker-basic-01"} <= ids, "suite: synthetic entries present")
-    # route stage must classify every entry correctly from its fixture
     for e in suite["entries"]:
         ok, got, _track = _check_route(e)
         chk(ok, "route: %s -> %s (expected %s)" % (e["id"], got, e["expected_route"]))
-    # deliberately-wrong expected_route must be detected as a miss
     bad = dict(suite["entries"][0]); bad["expected_route"] = "pwn-heap"
     ok, _got, _t = _check_route(bad)
     chk(not ok, "route: misassignment detected (negative test)")
-    # leaderboard renders from synthetic rows
+    chk("bench" not in _RUNTIME_DIRS and "tests" not in _RUNTIME_DIRS and "fixtures" not in _RUNTIME_DIRS,
+        "eval: runtime export allowlist excludes benchmark/test fixture trees")
     lb = _render_leaderboard([
         {"run_id": "T", "mode": "A", "id": "x", "difficulty": 1, "route_ok": True, "outcome": "solved"},
         {"run_id": "T", "mode": "A", "id": "y", "difficulty": 1, "route_ok": False, "outcome": "route-miss"},
