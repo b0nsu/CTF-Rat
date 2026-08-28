@@ -26,6 +26,21 @@ def _captured_bytes(stream):
  if stream.spool_path:
   with open(stream.spool_path,"rb") as f: return f.read()
  return stream.preview
+def _capture_artifact(stream, kind, root):
+ """Persist one bounded stream, then best-effort remove its staging spool.
+
+ The content-addressed artifact is the durable copy. A spool file is only a
+ transient runner staging object and must not become a second long-term store.
+ Cleanup happens only after ``put_bytes`` succeeds, so a failed artifact write
+ leaves the spool available for diagnosis/retry.
+ """
+ data=_captured_bytes(stream)
+ rec=put_bytes(data,kind=kind,media_type="text/plain; charset=utf-8",
+               logical_name=kind+".txt",root=root)
+ if stream.spool_path:
+  try: os.unlink(stream.spool_path)
+  except OSError: pass
+ return {k:rec[k] for k in ("kind","digest","media_type","size","logical_name")}
 def _validate_direct_target(build, tool_argv, direct_subject):
  """Fail closed when a trusted SELF verifier targets a different subject.
 
@@ -108,10 +123,8 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
   except Exception:
    pass
  started=_iso(); result=run(tool_argv,timeout_seconds=timeout,spool_dir=os.path.join(root,"tmp"))
- artifacts=[]
- for kind,data in (("stdout",_captured_bytes(result.stdout)),("stderr",_captured_bytes(result.stderr))):
-  rec=put_bytes(data,kind=kind,media_type="text/plain; charset=utf-8",logical_name=kind+".txt",root=root)
-  artifacts.append({k:rec[k] for k in ("kind","digest","media_type","size","logical_name")})
+ artifacts=[_capture_artifact(result.stdout,"stdout",root),
+            _capture_artifact(result.stderr,"stderr",root)]
  status="timeout" if result.timed_out else ("ok" if result.exit_code==0 else "error")
  # Direct evidence is minted ONLY when the caller names the measured subject and the
  # invocation is a real measurement mode of a registered verifier (see
