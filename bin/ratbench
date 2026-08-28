@@ -19,8 +19,8 @@ same completed exploit task. When Linux `strace` is usable, Mode B additionally 
 observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts do not depend
 on agent-authored telemetry.
 
-  ratbench run [--id ID] [--suite path] [--run-id ID]
-  ratbench eval --agent '<cli {dir}>' [--id ID] [--run-id ID]
+  ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
+  ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
   ratbench report [--schema legacy|v2]
   ratbench selftest
 """
@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib import route as route_mod  # noqa: E402
+from ratlib.bench_suite import CORPORA, SuiteValidationError, load_suite, project_suite  # noqa: E402
 from ratlib.schema import validate  # noqa: E402
 
 
@@ -51,8 +52,18 @@ def _suite_path(override=None):
 
 
 def _load_suite(path):
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+    return load_suite(path)
+
+
+def _select_entries(args):
+    """Validate once, then project one corpus before any benchmark work begins."""
+    suite = project_suite(_load_suite(_suite_path(args.suite)), corpus=getattr(args, "corpus", None))
+    entries = suite["entries"]
+    if getattr(args, "id", None):
+        entries = [entry for entry in entries if entry["id"] == args.id]
+        if not entries:
+            raise LookupError("no entry %s" % args.id)
+    return entries
 
 
 def _have(cmd):
@@ -176,12 +187,14 @@ def _verify(entry, binpath):
 # ---------------------------------------------------------------------------
 def cmd_run(args):
     import tempfile
-    suite = _load_suite(_suite_path(args.suite))
-    entries = suite["entries"]
-    if args.id:
-        entries = [e for e in entries if e["id"] == args.id]
-        if not entries:
-            print("[ratbench:err] no entry %s" % args.id, file=sys.stderr); return 4
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
     run_id = args.run_id or ("A-%d" % int(time.time()))
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
@@ -210,6 +223,7 @@ def cmd_run(args):
         rec = {
             "schema": "rat.bench-result/v1", "mode": "A", "run_id": run_id,
             "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+            "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
             "expected_route": e["expected_route"], "got_route": got_route, "got_track": got_track,
             "route_ok": route_ok, "verify": {"kind": e["verify"]["kind"], "status": vstatus, "detail": vdetail},
             "outcome": outcome, "wall_ms": elapsed_ms,
@@ -453,7 +467,10 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                    "verification_id": verification_id},
         "ground_truth": {"track": entry.get("track"), "difficulty": entry.get("difficulty"),
                          "expected_route": entry.get("expected_route"),
-                         "verify_kind": (entry.get("verify") or {}).get("kind")},
+                         "verify_kind": (entry.get("verify") or {}).get("kind"),
+                         "corpus": entry.get("corpus"),
+                         "capabilities": entry.get("capabilities", []),
+                         "redistributable": entry.get("redistributable")},
     }
 
 
@@ -470,12 +487,14 @@ def cmd_eval(args):
     if not _have(agent_bin):
         print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
         return 3
-    suite = _load_suite(_suite_path(args.suite))
-    entries = suite["entries"]
-    if args.id:
-        entries = [e for e in entries if e["id"] == args.id]
-        if not entries:
-            print("[ratbench:err] no entry %s" % args.id, file=sys.stderr); return 4
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
     run_id = args.run_id or ("B-%s-%d" % (os.path.basename(agent_bin), int(time.time())))
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
@@ -529,6 +548,7 @@ def cmd_eval(args):
                 outcome = "fail"
             rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
                    "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+                   "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
                    "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
                    "typed_primitive_pass": typed_pass, "verified_solve": verified,
                    "completion_reason": completion.get("reason"), "wall_ms": wall}
@@ -773,9 +793,11 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
     r = sub.add_parser("run", help="Mode A scripted driver over the suite")
     r.add_argument("--id"); r.add_argument("--suite"); r.add_argument("--run-id")
+    r.add_argument("--corpus", choices=sorted(CORPORA))
     ev = sub.add_parser("eval", help="Mode B external agent CLI eval (on-demand, not CI)")
     ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
     ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
+    ev.add_argument("--corpus", choices=sorted(CORPORA))
     ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
     ev.add_argument("--timeout", type=int, default=600)
     rep = sub.add_parser("report", help="render a legacy or benchmark-v2 leaderboard from results")
