@@ -116,6 +116,52 @@ class ModeBV2RecordTests(unittest.TestCase):
             self.assertIn("| T | B | 1 |", leaderboard)
             self.assertNotIn("| ? |", leaderboard)
 
+    def test_v2_report_uses_only_eligible_rows_and_shows_metric_coverage(self):
+        verified = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:06+00:00",
+            agent_rc=0, flag_claimed=True,
+            completion={"verified": True, "reason": "verified", "verification_id": "verify_1"},
+            events=[{"type": "verification.recorded", "at": "2026-08-29T00:00:05+00:00",
+                     "payload": {"verification_id": "verify_1"}}],
+            primitive_pass_at=None, artifact_count=2,
+            process_metrics={"tool_calls": 4, "duplicate_tool_calls": 1,
+                             "ghidra_runs": 1, "symbolic_runs": 0},
+        )
+        failed = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "fixture-02"}, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:08+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=1,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            results = os.path.join(d, "bench", "results")
+            os.makedirs(results)
+            with open(os.path.join(results, "T.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(verified) + "\n")
+                fh.write(json.dumps(failed) + "\n")
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 0)
+            leaderboard = open(os.path.join(d, "bench", "LEADERBOARD.v2.md"), encoding="utf-8").read()
+            self.assertIn("| T | A0 | 2 | 1 | 0 | 1 | 0 | 50.0% |", leaderboard)
+            self.assertIn("5000ms (1/2)", leaderboard)
+            self.assertIn("4 (1/2)", leaderboard)
+            self.assertIn("1 (1/2)", leaderboard)
+            self.assertIn("n/a (0/2)", leaderboard)
+
+    def test_v2_report_rejects_malformed_rows_instead_of_biasing_results(self):
+        with tempfile.TemporaryDirectory() as d:
+            results = os.path.join(d, "bench", "results")
+            os.makedirs(results)
+            with open(os.path.join(results, "bad.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 3)
+            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v2.md")))
+
 
 if __name__ == "__main__":
     unittest.main()
