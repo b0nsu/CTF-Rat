@@ -1,9 +1,11 @@
 import json, os, shutil, subprocess, sys, tempfile, unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib.contracts import execute
 from ratlib.metrics import aggregate, iter_tool_results
+from ratlib.runner import CapturedStream, RunResult
 from ratlib.state_v2 import _file_digest, trusted_producer_for_build
 
 
@@ -84,6 +86,29 @@ class PersistentTelemetryRegression(unittest.TestCase):
             extensions = hit_docs[0].get("extensions") or {}
             self.assertNotIn("evidence_policy", extensions)
             self.assertNotIn("envelope_digest", extensions)
+
+
+class SpoolLifecycleRegression(unittest.TestCase):
+    def test_execute_removes_spool_after_durable_artifact_capture(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
+            spool = os.path.join(root, "tmp", "rat-stdout-fixture")
+            full = b"full bounded capture"
+            with open(spool, "wb") as f:
+                f.write(full)
+            fake = RunResult(
+                argv=["/bin/echo", "ignored"], returncode=0, exit_code=0,
+                timed_out=False, cancelled=False, duration_ms=1,
+                stdout=CapturedStream(preview=b"full", total_bytes=len(full), truncated=False, spool_path=spool),
+                stderr=CapturedStream(preview=b"", total_bytes=0, truncated=False, spool_path=None),
+                network_policy="inherit", signal=None, resource_limited=False, tool_version=None,
+            )
+            with patch("ratlib.contracts.run", return_value=fake):
+                doc = execute(["/bin/echo", "ignored"], root=root, timeout=5)
+            self.assertFalse(os.path.exists(spool))
+            stdout = next(a for a in doc["artifacts"] if a["kind"] == "stdout")
+            self.assertEqual(stdout["size"], len(full))
 
 
 if __name__ == "__main__":
