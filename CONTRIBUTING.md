@@ -39,10 +39,7 @@ knowledge live together so they stay in sync.
 
 ## Reporting issues
 
-Use the issue templates (bug report / feature request). For anything you
-believe touches the ROE/authorization boundaries described in `CLAUDE.md`
-(scope, safety), open a normal issue — there's no separate private disclosure
-process for this project.
+Use the issue templates (bug report / feature request).
 
 ## Code style
 
