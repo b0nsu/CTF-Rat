@@ -227,9 +227,11 @@ class RunnerTests(unittest.TestCase):
             code = "import os,sys;fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);os.write(fd,b'x'*(1<<20))"
             result = run([sys.executable, "-c", code, path],
                          limits=ResourceLimits(file_size_bytes=4096))
+            # A single write that straddles the limit may be truncated to a short
+            # write (POSIX allows this) rather than raising SIGXFSZ -- the kernel
+            # only signals when a write can make *zero* forward progress. The
+            # portable invariant is the file size cap, not the signal.
             self.assertLessEqual(os.path.getsize(path), 4096, result.stderr.preview)
-            if sys.platform.startswith("linux"):
-                self.assertEqual(result.signal, signal.SIGXFSZ, result.stderr.preview)
 
     def test_timeout_has_common_exit_code(self):
         start = time.monotonic()
