@@ -1,4 +1,4 @@
-import os, sys, tempfile, unittest
+import json, os, shutil, subprocess, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
@@ -30,6 +30,31 @@ class DirectEvidenceBindingRegression(unittest.TestCase):
         repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         shim = os.path.join(repo, "bin", "symsolve")
         self.assertEqual(trusted_producer_for_build(_file_digest(shim)), "symsolve")
+
+    @unittest.skipUnless(shutil.which("gcc") and shutil.which("gdb"), "requires gcc and gdb")
+    def test_documented_gdbq_batch_path_mints_subject_bound_direct_evidence(self):
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        adapt = os.path.join(repo, "bin", "rat-adapt")
+        with tempfile.TemporaryDirectory() as d:
+            source = os.path.join(d, "tiny.c")
+            binary = os.path.join(d, "tiny")
+            batch = os.path.join(d, "measure.gdb")
+            with open(source, "w", encoding="utf-8") as f:
+                f.write("int main(void){return 0;}\n")
+            with open(batch, "w", encoding="utf-8") as f:
+                f.write("start\ninfo registers rip\nquit\n")
+            subprocess.run(["gcc", "-g", source, "-o", binary], check=True, capture_output=True)
+            proc = subprocess.run(
+                [sys.executable, adapt, "--root", os.path.join(d, ".rat"),
+                 "--input", binary, "--direct-subject", binary,
+                 "gdbq", "--batch", batch],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+            doc = json.loads(proc.stdout)
+            policy = (doc.get("extensions") or {}).get("evidence_policy") or {}
+            self.assertEqual(policy.get("producer"), "gdbq")
+            self.assertEqual(policy.get("subject_digest"), _file_digest(binary))
+            self.assertEqual(doc["cache_state"], "miss")
 
 
 class PersistentTelemetryRegression(unittest.TestCase):
