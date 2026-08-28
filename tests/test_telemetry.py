@@ -2,7 +2,7 @@ import json, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 from ratlib.contracts import execute
-from ratlib.metrics import aggregate, operation_fingerprint, first_primitive_pass_ts
+from ratlib.metrics import aggregate, operation_fingerprint, first_primitive_pass_ts, process_trace_metrics
 from ratlib.state_v2 import Stream
 
 D = "sha256:" + "a" * 64
@@ -71,6 +71,35 @@ class OperationFingerprint(unittest.TestCase):
 
     def test_different_parameters_change_fingerprint(self):
         self.assertNotEqual(operation_fingerprint(envelope(parameters={"a": 1})), operation_fingerprint(envelope(parameters={"a": 2})))
+
+class ProcessTraceMetrics(unittest.TestCase):
+    def test_counts_process_tools_duplicates_and_heavy_analyzers(self):
+        with tempfile.TemporaryDirectory() as d:
+            kit = os.path.join(d, "kit")
+            chal = os.path.join(kit, "solve", "fixture")
+            trace = os.path.join(d, "execve.log")
+            lines = [
+                f'100 execve("{kit}/bin/rat", ["rat", "route", "{chal}/chall"], 0x0) = 0',
+                f'101 execve("{kit}/bin/rat-profile", ["rat-profile", "{chal}/chall", "--format", "json"], 0x0) = 0',
+                f'102 execve("{kit}/bin/rat", ["rat", "route", "{chal}/chall"], 0x0) = 0',
+                '103 execve("/opt/ghidra/support/analyzeHeadless", ["analyzeHeadless", "/tmp/proj", "p"], 0x0) = 0',
+                f'104 execve("/usr/bin/python3", ["python3", "{kit}/solve/_template/rev/symsolve.py", "{chal}/chall", "--find", "0x401000"], 0x0) = 0',
+                f'105 execve("{kit}/bin/revq", ["revq", "{chal}/chall"], 0x0) = -1 ENOENT (No such file or directory)',
+            ]
+            with open(trace, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            metrics = process_trace_metrics(trace, kit, chal)
+            self.assertEqual(metrics["tool_calls"], 4)
+            self.assertEqual(metrics["duplicate_tool_calls"], 1)
+            self.assertEqual(metrics["ghidra_runs"], 1)
+            self.assertEqual(metrics["symbolic_runs"], 1)
+            self.assertEqual(metrics["tool_name_counts"].get("rat"), 2)
+            self.assertEqual(metrics["tool_name_counts"].get("rat-profile"), 1)
+            self.assertEqual(metrics["tool_name_counts"].get("symsolve.py"), 1)
+
+    def test_missing_trace_is_unknown_not_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(process_trace_metrics(os.path.join(d, "missing.log"), os.path.join(d, "kit")))
 
 class Aggregate(unittest.TestCase):
     def test_direct_subjects_use_distinct_cache_entries(self):

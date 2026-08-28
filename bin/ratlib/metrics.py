@@ -2,10 +2,12 @@
 
 Reads tool-result envelopes from a .rat artifact store plus the authoritative
 typed STATE v2 stream, with legacy STATE.jsonl fallback for pre-v2 sessions,
-and emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
+and emits one rat.session-metrics/v1 jsonl line. It can also parse an externally
+captured execve trace for process-level tool-call metrics. No binary execution,
+no network.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, sys
+import argparse, ast, hashlib, json, os, re, sys
 from datetime import datetime
 from .artifact import get as artifact_get
 from .completion import completion_gate
@@ -50,6 +52,131 @@ def operation_fingerprint(doc):
     }
     raw = json.dumps(key, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+# strace `-e trace=execve -s 4096` output. We intentionally accept only
+# completed, successful execve records; unfinished/resumed or failed lookups are
+# not tool executions and therefore must not inflate process-level telemetry.
+_EXECVE_RE = re.compile(
+    r'^(?:\d+\s+)?execve\("((?:\\.|[^"])*)", (\[.*\]), [^)]*\)\s+=\s+0$'
+)
+_TRACE_TEMPLATE_TOOLS = {"symsolve.py", "vmlift.py", "qiling_trace.py"}
+_TRACE_SYMBOLIC_TOOLS = {"symsolve", "symsolve.py"}
+_TRACE_NON_MEASUREMENT_ARGS = {"selftest", "--selftest", "-h", "--help", "help", "--version", "-V"}
+
+def _decode_trace_path(value):
+    try:
+        decoded = ast.literal_eval('"' + value + '"')
+    except (SyntaxError, ValueError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+def _trace_candidate_path(value, kit_root, challenge_dir=None):
+    if not isinstance(value, str) or not value:
+        return None
+    if os.path.isabs(value):
+        return os.path.realpath(value)
+    # Agent commands normally use absolute $CTF_HOME paths. These two bounded
+    # fallbacks cover `./bin/rat` from the kit root and relative paths from the
+    # challenge directory without trying to reconstruct arbitrary chdir history.
+    bases = [kit_root]
+    if challenge_dir:
+        bases.append(challenge_dir)
+    for base in bases:
+        candidate = os.path.realpath(os.path.join(base, value))
+        if candidate.startswith(os.path.realpath(kit_root) + os.sep):
+            return candidate
+    return os.path.realpath(value)
+
+def _trace_tool_call(exec_path, argv, kit_root, challenge_dir=None):
+    """Return (canonical tool name, tool argv) for one CTF-Rat process exec.
+
+    Only top-level `bin/*` tools and the explicit executable rev templates are
+    counted. Internal helper modules under `bin/ratlib` are implementation detail
+    rather than agent-visible tool calls. Interpreter-mediated invocations such
+    as `python3 $CTF_HOME/bin/revq ...` canonicalize to the same tool/argv shape
+    as direct execution, so duplicate detection is not syntax-dependent.
+    """
+    if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+        return None
+    bin_root = os.path.realpath(os.path.join(kit_root, "bin"))
+    template_root = os.path.realpath(os.path.join(kit_root, "solve", "_template", "rev"))
+    path = _trace_candidate_path(exec_path, kit_root, challenge_dir)
+    if path and os.path.dirname(path) == bin_root:
+        return os.path.basename(path), argv[1:]
+    for index, token in enumerate(argv[1:], 1):
+        candidate = _trace_candidate_path(token, kit_root, challenge_dir)
+        if not candidate:
+            continue
+        if os.path.dirname(candidate) == bin_root:
+            return os.path.basename(candidate), argv[index + 1:]
+        if os.path.dirname(candidate) == template_root and os.path.basename(candidate) in _TRACE_TEMPLATE_TOOLS:
+            return os.path.basename(candidate), argv[index + 1:]
+    return None
+
+def _normalize_trace_arg(value, kit_root, challenge_dir=None):
+    roots = [(os.path.realpath(kit_root), "$CTF_HOME")]
+    if challenge_dir:
+        roots.append((os.path.realpath(challenge_dir), "$CHAL"))
+    for root, label in sorted(roots, key=lambda item: len(item[0]), reverse=True):
+        if value == root:
+            return label
+        if value.startswith(root + os.sep):
+            return label + value[len(root):]
+    return value
+
+def process_trace_metrics(path, kit_root, challenge_dir=None):
+    """Parse observer-owned execve telemetry into benchmark-safe process metrics.
+
+    This deliberately measures *process-level CTF-Rat tool invocations*, not
+    every internal Python function call. Actual Ghidra headless executions are
+    counted separately even though `analyzeHeadless` is outside the kit. If the
+    trace cannot be read, return None so callers preserve the `unknown != 0`
+    invariant instead of fabricating an empty run.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = list(fh)
+    except OSError:
+        return None
+    calls = []
+    ghidra_runs = 0
+    symbolic_runs = 0
+    name_counts = {}
+    fingerprints = {}
+    for raw in lines:
+        match = _EXECVE_RE.match(raw.strip())
+        if not match:
+            continue
+        exec_path = _decode_trace_path(match.group(1))
+        if exec_path is None:
+            continue
+        try:
+            argv = ast.literal_eval(match.group(2))
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+            continue
+        if os.path.basename(exec_path) == "analyzeHeadless":
+            ghidra_runs += 1
+        call = _trace_tool_call(exec_path, argv, kit_root, challenge_dir)
+        if call is None:
+            continue
+        name, tool_argv = call
+        normalized_argv = [_normalize_trace_arg(x, kit_root, challenge_dir) for x in tool_argv]
+        fingerprint = json.dumps([name, normalized_argv], sort_keys=False, separators=(",", ":"), ensure_ascii=False)
+        fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
+        name_counts[name] = name_counts.get(name, 0) + 1
+        calls.append((name, normalized_argv))
+        if name in _TRACE_SYMBOLIC_TOOLS and not (_TRACE_NON_MEASUREMENT_ARGS & set(tool_argv)):
+            symbolic_runs += 1
+    duplicate = sum(count - 1 for count in fingerprints.values() if count > 1)
+    return {
+        "tool_calls": len(calls),
+        "duplicate_tool_calls": duplicate,
+        "ghidra_runs": ghidra_runs,
+        "symbolic_runs": symbolic_runs,
+        "tool_name_counts": name_counts,
+    }
 
 def guard_started_at(ctf_home, chal=None):
     try:
