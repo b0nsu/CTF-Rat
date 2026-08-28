@@ -424,10 +424,26 @@ def _artifact_count(store_root):
     return count
 
 
+def _runtime_input_digest(chal_dir):
+    """Digest the exact answer-free challenge tree before the agent mutates it."""
+    digest = hashlib.sha256()
+    for root, dirs, files in os.walk(chal_dir):
+        dirs[:] = sorted(name for name in dirs if name != ".rat")
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            relpath = os.path.relpath(path, chal_dir).replace(os.sep, "/")
+            digest.update(relpath.encode("utf-8")); digest.update(b"\0")
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(64 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
 def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
                       primitive_pass_at, artifact_count, process_metrics=None,
-                      provenance=None):
+                      provenance=None, runtime_input_digest=None):
     """Build one honest Mode B `rat.benchmark-result/v2` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
@@ -506,7 +522,8 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                          "verify_kind": (entry.get("verify") or {}).get("kind"),
                          "corpus": entry.get("corpus"),
                          "capabilities": entry.get("capabilities", []),
-                         "redistributable": entry.get("redistributable")},
+                         "redistributable": entry.get("redistributable"),
+                         "runtime_input_digest": runtime_input_digest},
     }
     if provenance is not None:
         doc["provenance"] = provenance
@@ -553,6 +570,7 @@ def cmd_eval(args):
         try:
             try:
                 kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
+                runtime_input_digest = _runtime_input_digest(chal_dir)
             except (OSError, ValueError, RuntimeError) as exc:
                 print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
                 return 3
@@ -606,6 +624,7 @@ def cmd_eval(args):
                 primitive_pass_at=primitive_pass_at,
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
                 process_metrics=process_metrics, provenance=run_provenance,
+                runtime_input_digest=runtime_input_digest,
             ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""
