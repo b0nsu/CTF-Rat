@@ -1,16 +1,153 @@
-#!/usr/bin/env bash
-CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
-set -e
-REPO="${CTF_TEAM:-$CTF_HOME/team}"
-N="${1:?usage: teamreg <name> [binary]}"; SRC="${2:-}"
-[ -d "$REPO/.git" ] || { echo "[teamreg] 팀 repo 없음: $REPO — TEAM_SETUP.md 따라 clone 먼저"; exit 1; }
-AUTHOR="$(cat "$REPO/.author" 2>/dev/null || echo unknown)"
-D="$REPO/chals/$N"; mkdir -p "$D"
-SHA=""; [ -n "$SRC" ] && [ -f "$SRC" ] && SHA="$(sha256sum "$SRC" | cut -d' ' -f1)"
-printf '{"name":"%s","sha256":"%s","status":"open","registered_by":"%s","registered_at":"%s"}\n' \
-  "$N" "$SHA" "$AUTHOR" "$(date -u +%FT%TZ)" > "$D/meta.json"
-mkdir -p "$CTF_HOME/solve/$N"
-[ -n "$SRC" ] && [ -f "$SRC" ] && cp "$SRC" "$CTF_HOME/solve/$N/"
-( cd "$REPO" && git add -A >/dev/null 2>&1 && git commit -q -m "reg $N by $AUTHOR" >/dev/null 2>&1 \
-  && { git pull -q --rebase >/dev/null 2>&1; git push -q >/dev/null 2>&1; } || true )
-echo "[teamreg] '$N' 등록 (author=$AUTHOR sha=${SHA:0:12}). 로컬: $CTF_HOME/solve/$N — 이제 teamsync --loop & 후 state로 기록"
+#!/usr/bin/env python3
+"""Register a challenge in the shared team repository."""
+from __future__ import annotations
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+from ratlib import team_state_store as store
+
+CTF_HOME = os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REPO = os.environ.get("CTF_TEAM") or os.path.join(CTF_HOME, "team")
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def die(msg, code=2):
+    print("[teamreg] %s" % msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def safe_slug(value, label):
+    if not SLUG_RE.fullmatch(value or "") or value in {".", ".."}:
+        die("unsafe %s: %r" % (label, value))
+    return value
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as inp:
+        for chunk in iter(lambda: inp.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_author():
+    try:
+        return pathlib.Path(REPO, ".author").read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def init_local_solve(name, src):
+    """Return True iff `state init` actually succeeded.
+
+    A discarded returncode here used to let teamreg print a success message
+    even when local STATE initialization failed (e.g. a ctfguard policy
+    rejecting concurrent active challenges) -- leaving nothing for a later
+    `teamsync` to publish, with no diagnostic pointing at why.
+    """
+    solve_dir = pathlib.Path(CTF_HOME, "solve", name)
+    solve_dir.mkdir(parents=True, exist_ok=True)
+    if src:
+        shutil.copy2(src, solve_dir / pathlib.Path(src).name)
+    env = dict(os.environ, PATH=BIN_DIR + ":" + os.environ.get("PATH", ""), PYTHONPATH=BIN_DIR + (":" + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""))
+    result = subprocess.run([sys.executable, os.path.join(BIN_DIR, "state"), "init", name], cwd=solve_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        print("[teamreg] local `state init %s` failed (rc=%d): %s" % (
+            name, result.returncode, result.stdout.decode(errors="replace").strip()), file=sys.stderr)
+        return False
+    return True
+
+
+def atomic_write_json_no_follow(path, doc):
+    parent = path.parent
+    try:
+        store.require_plain_under(REPO, str(parent), "challenge registration")
+    except ValueError as exc:
+        die(str(exc))
+    if os.path.lexists(path) and os.path.islink(path):
+        die("registration metadata must not be a symlink: %s" % path)
+    try:
+        store.require_plain_under(REPO, str(path), "registration metadata")
+    except ValueError as exc:
+        die(str(exc))
+    data = (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    tmp = parent / (".%s.%s.tmp" % (path.name, os.getpid()))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    try:
+        store.require_plain_under(REPO, str(tmp), "registration metadata temp")
+        fd = os.open(str(tmp), flags, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            fd = None
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        if os.path.lexists(path) and os.path.islink(path):
+            die("registration metadata must not be a symlink: %s" % path)
+        os.replace(str(tmp), str(path))
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp.exists():
+            tmp.unlink()
+
+
+def main(argv=None):
+    argv = argv or sys.argv[1:]
+    if not (1 <= len(argv) <= 2):
+        print("usage: teamreg <name> [binary]", file=sys.stderr)
+        return 2
+    if not os.path.isdir(os.path.join(REPO, ".git")):
+        die("team repo not found: %s" % REPO, 1)
+    name = safe_slug(argv[0], "challenge")
+    src = argv[1] if len(argv) == 2 else ""
+    if src and not os.path.isfile(src):
+        die("binary not found: %s" % src)
+    author = read_author()
+    sha = sha256_file(src) if src else ""
+    chal_dir = pathlib.Path(REPO, "chals", name)
+    meta_path = chal_dir / "meta.json"
+    with store.repo_lock(REPO):
+        conflict = store.conflict_state(REPO)
+        if conflict:
+            print("[teamreg] git conflict: %s" % conflict.stderr, file=sys.stderr)
+            return 1
+        store.require_plain_under(REPO, str(chal_dir), "challenge registration")
+        chal_dir.mkdir(parents=True, exist_ok=True)
+        store.require_plain_dir_under(REPO, str(chal_dir), "challenge registration")
+        doc = {
+            "name": name,
+            "sha256": sha,
+            "status": "open",
+            "registered_by": author,
+            "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        atomic_write_json_no_follow(meta_path, doc)
+        outcome = store.sync_paths(REPO, [str(meta_path)], "reg %s by %s" % (name, author), timeout=30)
+        if outcome.state not in {"unchanged", "committed", "remote-synced"}:
+            detail = ": %s" % outcome.stderr.strip() if outcome.stderr.strip() else ""
+            print("[teamreg] git %s failed%s; registration is local-only" % (outcome.step or outcome.state, detail), file=sys.stderr)
+            rc = 1
+        else:
+            rc = 0
+    if not init_local_solve(name, src):
+        rc = max(rc, 1)
+    print("[teamreg] '%s' registered (author=%s sha=%s). local: %s/solve/%s" % (name, author, sha[:12], CTF_HOME, name))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

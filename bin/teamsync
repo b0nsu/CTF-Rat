@@ -1,19 +1,529 @@
-#!/usr/bin/env bash
-CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
-REPO="${CTF_TEAM:-$CTF_HOME/team}"
-[ -d "$REPO/.git" ] || { echo "[teamsync] 팀 repo 없음: $REPO"; exit 1; }
-AUTHOR="$(cat "$REPO/.author" 2>/dev/null || echo unknown)"
-sync_one(){ local n="$1"; local ls="$CTF_HOME/solve/$n/STATE.jsonl"
-  [ -f "$ls" ] && { mkdir -p "$REPO/chals/$n"; cp "$ls" "$REPO/chals/$n/$AUTHOR.jsonl"; }; }
-push_pull(){ cd "$REPO" || return
-  git add -A >/dev/null 2>&1
-  git diff --cached --quiet 2>/dev/null || git commit -q -m "sync $AUTHOR" >/dev/null 2>&1
-  git pull -q --rebase >/dev/null 2>&1
-  git push -q >/dev/null 2>&1 || true; }
-once(){ if [ -n "$1" ] && [ "$1" != "--loop" ]; then sync_one "$1"
-  else for d in "$HOME"/ctf/solve/*/STATE.jsonl; do [ -f "$d" ] && sync_one "$(basename "$(dirname "$d")")"; done; fi
-  push_pull; }
-if [ "$1" = "--loop" ] || [ "$2" = "--loop" ]; then
-  echo "[teamsync] loop 시작(20s, author=$AUTHOR). 중단=Ctrl-C"
-  while true; do once "${1#--loop}"; sleep 20; done
-else once "$1"; echo "[teamsync] 1회 동기화 완료(author=$AUTHOR)"; fi
+#!/usr/bin/env python3
+"""Publish per-author STATE v2 snapshots into the local team repository."""
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import uuid
+
+from ratlib.state_v2 import validate_history
+from ratlib import team_state_store as store
+
+CTF_HOME = os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REPO = os.environ.get("CTF_TEAM") or os.path.join(CTF_HOME, "team")
+AUTHOR = "unknown"
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def die(msg, code=2):
+    print("[teamsync] %s" % msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def safe_slug(value, label):
+    if not SLUG_RE.fullmatch(value or "") or value in {".", ".."}:
+        die("unsafe %s: %r" % (label, value))
+    return value
+
+
+def require_plain_under(root, path, label):
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except ValueError:
+        die("%s escapes root: %s" % (label, path))
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        die("%s escapes root: %s" % (label, path))
+    cur = root_abs
+    for part in [] if rel == "." else rel.split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.lexists(cur) and os.path.islink(cur):
+            die("%s must not be a symlink: %s" % (label, cur))
+    real_root = os.path.realpath(root_abs)
+    real_path = os.path.realpath(path_abs)
+    if os.path.commonpath((real_root, real_path)) != real_root:
+        die("%s escapes root: %s" % (label, path))
+
+
+def require_plain_dir_under(root, path, label):
+    require_plain_under(root, path, label)
+    if not os.path.isdir(path):
+        die("%s is not a directory: %s" % (label, path))
+
+
+def read_bytes_under(root, path, label):
+    require_plain_under(root, path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        die("%s cannot be safely read: %s" % (label, exc))
+    with os.fdopen(fd, "rb") as source:
+        return source.read()
+
+
+def fsync_if_dir(path):
+    if os.path.isdir(path):
+        fsync_dir(path)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def checked(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as exc:
+        die(str(exc))
+
+
+def valid_prefix(path):
+    source_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(path))))
+    if not os.path.exists(path):
+        die("STATE v2 stream not found: %s" % path)
+    out = []
+    stream_id = None
+    excluded = 0
+    require_plain_dir_under(source_root, os.path.join(source_root, ".rat"), ".rat")
+    require_plain_dir_under(source_root, os.path.join(source_root, ".rat", "events"), "events")
+    require_plain_under(source_root, path, "STATE v2 stream")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        die("STATE v2 stream cannot be safely read: %s" % exc)
+    with os.fdopen(fd, "rb") as source:
+        fcntl.flock(source.fileno(), fcntl.LOCK_SH)
+        lines = source.readlines()
+        for index, line in enumerate(lines, 1):
+            if index == len(lines) and not line.endswith(b"\n"):
+                excluded = len(line)
+                break
+            out.append(line)
+        fcntl.flock(source.fileno(), fcntl.LOCK_UN)
+    events_bytes = b"".join(out)
+    events = checked(store.parse_state_events, events_bytes, allow_partial_tail=False)
+    if excluded:
+        print("[teamsync] excluded unterminated crash tail: %d bytes" % excluded, file=sys.stderr)
+    return events_bytes, events[-1], events
+
+
+def copy_file_checked(src, dst):
+    os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+    shutil.copy2(src, dst)
+    with open(dst, "rb") as copied:
+        os.fsync(copied.fileno())
+
+
+def copy_artifacts(source_rat, dest_rat, digests):
+    for digest in digests:
+        src_obj, src_meta = store.artifact_paths(source_rat, digest)
+        dst_obj, dst_meta = store.artifact_paths(dest_rat, digest)
+        copy_file_checked(src_obj, dst_obj)
+        copy_file_checked(src_meta, dst_meta)
+
+
+def fsync_artifact_dirs(root, digests):
+    fsync_if_dir(os.path.join(root, "events"))
+    for digest in digests:
+        h = digest[7:]
+        fsync_if_dir(os.path.join(root, "objects", "sha256", h[:2]))
+        fsync_if_dir(os.path.join(root, "metadata", "sha256", h[:2]))
+    fsync_if_dir(os.path.join(root, "objects", "sha256"))
+    fsync_if_dir(os.path.join(root, "metadata", "sha256"))
+    fsync_if_dir(os.path.join(root, "objects"))
+    fsync_if_dir(os.path.join(root, "metadata"))
+    fsync_if_dir(root)
+    fsync_if_dir(os.path.dirname(root))
+
+
+def staging_root():
+    git_dir = os.path.join(REPO, ".git")
+    require_plain_dir_under(REPO, git_dir, ".git")
+    base = os.path.join(REPO, ".git", "teamsync-staging")
+    require_plain_under(git_dir, base, "teamsync staging")
+    if os.path.lexists(base):
+        require_plain_dir_under(git_dir, base, "teamsync staging")
+    else:
+        os.mkdir(base, mode=0o700)
+        require_plain_dir_under(git_dir, base, "teamsync staging")
+    return base
+
+
+def parse_snapshot_name(name):
+    if not safe_slug(name, "snapshot cursor") or "-" not in name:
+        die("invalid CURRENT cursor: %r" % name)
+    stream_id, seq_text = name.rsplit("-", 1)
+    try:
+        seq = int(seq_text)
+    except ValueError:
+        die("invalid CURRENT cursor: %r" % name)
+    return stream_id, seq
+
+
+def current_snapshot(author_dir):
+    current = os.path.join(author_dir, "CURRENT")
+    if not os.path.exists(current):
+        return None
+    data = read_bytes_under(REPO, current, "CURRENT").decode("utf-8").strip()
+    stream_id, seq = parse_snapshot_name(data)
+    return {"name": data, "stream_id": stream_id, "seq": seq}
+
+
+def committed_snapshot(author_dir):
+    """Read the authoritative selected cursor from HEAD, if one exists."""
+    current = os.path.join(author_dir, "CURRENT")
+    rel = os.path.relpath(current, REPO)
+    exists = store.run_git(REPO, ["cat-file", "-e", "HEAD:" + rel], capture=True)
+    if exists.returncode:
+        return None
+    shown = store.run_git(REPO, ["show", "HEAD:" + rel], capture=True)
+    if shown.returncode:
+        die("cannot read committed CURRENT: %s" % shown.stderr.strip())
+    data = shown.stdout.strip()
+    stream_id, seq = parse_snapshot_name(data)
+    return {"name": data, "stream_id": stream_id, "seq": seq}
+
+
+def cursor_doc(info):
+    return None if info is None else {"stream_id": info["stream_id"], "seq": info["seq"], "snapshot": info["name"]}
+
+
+def snapshot_info(name):
+    stream_id, seq = parse_snapshot_name(name)
+    return {"name": name, "stream_id": stream_id, "seq": seq}
+
+
+def valid_publication_cursor(value):
+    if not isinstance(value, dict) or set(value) != {"stream_id", "seq", "snapshot"}:
+        return False
+    if not isinstance(value["stream_id"], str) or not value["stream_id"]:
+        return False
+    if not isinstance(value["seq"], int) or value["seq"] < 1:
+        return False
+    return value["snapshot"] == "%s-%d" % (value["stream_id"], value["seq"])
+
+
+def write_publication(snapshot_root, *, author, challenge, stream_id, seq, snapshot_name, supersedes, reason, events_bytes, digests):
+    doc = {
+        "schema": "rat.team-publication/v1",
+        "author": author,
+        "challenge": challenge,
+        "stream_id": stream_id,
+        "seq": seq,
+        "snapshot": snapshot_name,
+        "supersedes": supersedes,
+        "replacement_reason": reason,
+        "frozen_stream_digest": "sha256:" + store._sha(events_bytes),
+        "referenced_artifacts": sorted(digests),
+    }
+    path = os.path.join(snapshot_root, "PUBLICATION.json")
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+    return doc
+
+
+def validate_publication(snapshot_root, expected):
+    path = os.path.join(snapshot_root, "PUBLICATION.json")
+    data = read_bytes_under(snapshot_root, path, "PUBLICATION").decode("utf-8")
+    try:
+        got = json.loads(data)
+    except json.JSONDecodeError as exc:
+        die("invalid PUBLICATION.json: %s" % exc)
+    if got != expected:
+        die("PUBLICATION.json changed before publish")
+
+
+def read_publication(snapshot_root):
+    path = os.path.join(snapshot_root, "PUBLICATION.json")
+    data = read_bytes_under(snapshot_root, path, "PUBLICATION").decode("utf-8")
+    try:
+        doc = json.loads(data)
+    except json.JSONDecodeError as exc:
+        die("invalid PUBLICATION.json: %s" % exc)
+    if not isinstance(doc, dict):
+        die("invalid PUBLICATION.json: metadata must be an object")
+    return doc
+
+
+def validate_existing_publication(snapshot_root, *, author, challenge, stream_id, seq, snapshot_name, current_info, current_path, snapshots_dir, replace_lineage, events_bytes, digests):
+    try:
+        path = store.publication_manifest_state(REPO, snapshot_root)
+    except ValueError as exc:
+        die(str(exc))
+    if not path:
+        if replace_lineage:
+            die("PUBLICATION.json required for --replace-lineage snapshot: %s" % snapshot_name)
+        if current_info and current_info["stream_id"] != stream_id:
+            die("manifest-less compatibility snapshot cannot replace lineage: %s" % snapshot_name)
+        if not current_info or current_info["name"] != snapshot_name:
+            die("manifest-less compatibility snapshot must already be CURRENT: %s" % snapshot_name)
+        try:
+            paths = store.publication_paths(REPO, snapshot_root, current_path, digests, require_manifest=False)
+            store.verify_git_tree_matches(REPO, paths, treeish="HEAD")
+        except ValueError as exc:
+            die("uncommitted compatibility snapshot: %s" % exc)
+        return "compatibility"
+    doc = read_publication(snapshot_root)
+    required = {
+        "schema": "rat.team-publication/v1",
+        "author": author,
+        "challenge": challenge,
+        "stream_id": stream_id,
+        "seq": seq,
+        "snapshot": snapshot_name,
+        "frozen_stream_digest": "sha256:" + store._sha(events_bytes),
+        "referenced_artifacts": sorted(digests),
+    }
+    for key, value in required.items():
+        if doc.get(key) != value:
+            die("PUBLICATION.json %s mismatch for %s" % (key, snapshot_name))
+    supersedes = doc.get("supersedes")
+    reason = doc.get("replacement_reason")
+    try:
+        store.validate_publication_lineage(supersedes, reason, stream_id=stream_id, seq=seq)
+    except ValueError as exc:
+        die("%s for %s" % (exc, snapshot_name))
+    if supersedes is not None:
+        try:
+            store.verify_publication_predecessor(REPO, snapshots_dir, supersedes)
+        except ValueError as exc:
+            die("%s for %s" % (exc, snapshot_name))
+    if current_info is None:
+        if supersedes is not None or reason is not None:
+            die("PUBLICATION.json supersedes mismatch for %s" % snapshot_name)
+    elif current_info["name"] == snapshot_name:
+        if supersedes == cursor_doc(current_info):
+            die("PUBLICATION.json must not supersede itself: %s" % snapshot_name)
+        try:
+            parent_name = store.selection_parent_current(REPO, current_path, snapshot_name)
+        except ValueError as exc:
+            die("%s for %s" % (exc, snapshot_name))
+        parent = snapshot_info(parent_name) if parent_name else None
+        expected_reason = "explicit replace-lineage" if parent and parent["stream_id"] != stream_id else None
+        if supersedes != cursor_doc(parent) or reason != expected_reason:
+            die("PUBLICATION.json does not match committed predecessor for %s" % snapshot_name)
+    elif current_info["stream_id"] != stream_id:
+        if not replace_lineage:
+            die("different stream lineage requires --replace-lineage: current=%s new=%s" % (current_info["name"], snapshot_name))
+        if supersedes != cursor_doc(current_info) or reason != "explicit replace-lineage":
+            die("PUBLICATION.json replacement lineage mismatch for %s" % snapshot_name)
+    elif supersedes != cursor_doc(current_info) or reason is not None:
+        die("PUBLICATION.json advancement lineage mismatch for %s" % snapshot_name)
+    return "manifest"
+
+
+def publish_one(name, *, replace_lineage=False):
+    chal = safe_slug(name, "challenge")
+    author = safe_slug(AUTHOR, "author")
+    source_root = os.path.join(CTF_HOME, "solve", chal)
+    source_rat = os.path.join(source_root, ".rat")
+    events_bytes, last, events = valid_prefix(os.path.join(source_rat, "events", "STATE.v2.jsonl"))
+    stream_id = safe_slug(last["stream_id"], "stream_id")
+    snapshot_name = "%s-%d" % (stream_id, last["seq"])
+    state_root = os.path.join(REPO, "chals", chal, "state-v2")
+    require_plain_under(REPO, state_root, "state-v2")
+    author_dir = os.path.join(REPO, "chals", chal, "state-v2", author)
+    require_plain_under(REPO, author_dir, "author path")
+    snapshots_dir = os.path.join(author_dir, "snapshots")
+    require_plain_under(REPO, snapshots_dir, "snapshots")
+    snap_dir = os.path.join(author_dir, "snapshots", snapshot_name)
+    require_plain_under(snapshots_dir, snap_dir, "snapshot")
+    current = os.path.join(author_dir, "CURRENT")
+    require_plain_under(REPO, current, "CURRENT")
+    try:
+        validate_history(events, source_root)
+    except ValueError as exc:
+        die("invalid source STATE v2 history: %s" % exc)
+    digests = checked(store.collect_event_digests, events)
+    source_closure = checked(store.verify_artifact_closure, source_rat, digests, containment_root=source_root, label="source", exact=False)
+    # source_closure's keys are the recursively-expanded artifact set (event-cited
+    # envelope digests PLUS every artifact those envelopes cite, e.g. SELF-measurement
+    # bytes). Every downstream step that touches the snapshot's physical file set --
+    # copy, fsync, and the git-add path list -- must operate on that full set, or a
+    # nested artifact ends up on disk but untracked/uncommitted.
+    full_digests = sorted(source_closure)
+    tmp = None
+    with store.repo_lock(REPO):
+      with store.author_lock(REPO, chal, author):
+        conflict = store.conflict_state(REPO)
+        if conflict:
+            detail = ": %s" % conflict.stderr.strip() if conflict.stderr.strip() else ""
+            print("[teamsync] git conflict %s failed%s" % (conflict.step or conflict.state, detail), file=sys.stderr)
+            return 1
+        worktree_info = current_snapshot(author_dir)
+        current_info = committed_snapshot(author_dir)
+        if worktree_info and worktree_info != current_info and worktree_info["name"] != snapshot_name:
+            die("worktree CURRENT differs from committed publication: %s" % worktree_info["name"])
+        if current_info and current_info["stream_id"] == stream_id and current_info["seq"] > last["seq"]:
+            die("same stream cursor regression: current=%s new=%s" % (current_info["name"], snapshot_name))
+        if current_info and current_info["stream_id"] != stream_id:
+            if not replace_lineage:
+                die("different stream lineage requires --replace-lineage: current=%s new=%s" % (current_info["name"], snapshot_name))
+        reason = "explicit replace-lineage" if current_info and current_info["stream_id"] != stream_id else None
+        supersedes = cursor_doc(current_info)
+        if os.path.isdir(snap_dir):
+            old = read_bytes_under(REPO, os.path.join(snap_dir, ".rat", "events", "STATE.v2.jsonl"), "snapshot stream")
+            if old != events_bytes:
+                die("same cursor has different stream bytes: %s" % snapshot_name)
+            dest_closure = checked(store.verify_artifact_closure, os.path.join(snap_dir, ".rat"), digests, containment_root=REPO, label="snapshot", exact=True)
+            if dest_closure != source_closure:
+                die("same cursor artifact closure differs: %s" % snapshot_name)
+            try:
+                validate_history(events, snap_dir)
+            except ValueError as exc:
+                die("invalid existing snapshot STATE v2 history: %s" % exc)
+            publication_kind = validate_existing_publication(
+                snap_dir, author=author, challenge=chal, stream_id=stream_id, seq=last["seq"],
+                snapshot_name=snapshot_name, current_info=current_info, current_path=current,
+                snapshots_dir=snapshots_dir, replace_lineage=replace_lineage,
+                events_bytes=events_bytes, digests=full_digests,
+            )
+            event_rel = os.path.relpath(os.path.join(snap_dir, ".rat", "events", "STATE.v2.jsonl"), REPO)
+            tracked = store.run_git(REPO, ["cat-file", "-e", "HEAD:" + event_rel], capture=True)
+            if tracked.returncode == 0:
+                try:
+                    immutable_paths = store.publication_paths(
+                        REPO, snap_dir, current, full_digests,
+                        require_manifest=(publication_kind != "compatibility"),
+                    )
+                    store.verify_git_tree_matches(
+                        REPO, [path for path in immutable_paths if path != current], treeish="HEAD")
+                except ValueError as exc:
+                    die("immutable snapshot differs from HEAD: %s" % exc)
+            print("[teamsync] unchanged author=%s challenge=%s cursor=%s objects=%d publication=%s" % (
+                author, chal, snapshot_name, len(digests), publication_kind))
+        else:
+            if supersedes is not None:
+                try:
+                    store.verify_publication_predecessor(REPO, snapshots_dir, supersedes)
+                except ValueError as exc:
+                    die("%s for %s" % (exc, snapshot_name))
+            os.makedirs(snapshots_dir, mode=0o700, exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix="snapshot-%s-" % uuid.uuid4().hex, dir=staging_root())
+            try:
+                dst_rat = os.path.join(tmp, ".rat")
+                os.makedirs(os.path.join(dst_rat, "events"), mode=0o700, exist_ok=True)
+                with open(os.path.join(dst_rat, "events", "STATE.v2.jsonl"), "wb") as out:
+                    out.write(events_bytes)
+                    out.flush()
+                    os.fsync(out.fileno())
+                copy_artifacts(source_rat, dst_rat, full_digests)
+                staged = read_bytes_under(REPO, os.path.join(dst_rat, "events", "STATE.v2.jsonl"), "staged stream")
+                if staged != events_bytes:
+                    die("staged stream bytes changed before publish: %s" % snapshot_name)
+                try:
+                    validate_history(events, tmp)
+                except ValueError as exc:
+                    die("invalid staged STATE v2 history: %s" % exc)
+                if checked(store.verify_artifact_closure, dst_rat, digests, containment_root=tmp, label="staged", exact=True) != source_closure:
+                    die("staged artifact closure differs: %s" % snapshot_name)
+                expected = write_publication(
+                    tmp, author=author, challenge=chal, stream_id=stream_id, seq=last["seq"],
+                    snapshot_name=snapshot_name, supersedes=supersedes, reason=reason,
+                    events_bytes=events_bytes, digests=full_digests,
+                )
+                validate_publication(tmp, expected)
+                fsync_artifact_dirs(dst_rat, full_digests)
+                fsync_dir(tmp)
+                os.replace(tmp, snap_dir)
+                tmp = None
+                fsync_dir(snapshots_dir)
+                print("[teamsync] published author=%s challenge=%s cursor=%s objects=%d" % (author, chal, snapshot_name, len(digests)))
+            finally:
+                if tmp and os.path.isdir(tmp):
+                    shutil.rmtree(tmp, ignore_errors=True)
+        tmp_current = os.path.join(author_dir, "CURRENT.%s.%s.tmp" % (os.getpid(), uuid.uuid4().hex))
+        try:
+            require_plain_under(REPO, tmp_current, "CURRENT")
+            with open(tmp_current, "w", encoding="utf-8") as out:
+                out.write(snapshot_name + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_current, current)
+            tmp_current = None
+        finally:
+            if tmp_current and os.path.exists(tmp_current):
+                os.unlink(tmp_current)
+        fsync_dir(author_dir)
+        paths_to_stage = checked(
+            store.publication_paths,
+            REPO,
+            snap_dir,
+            current,
+            full_digests,
+            require_manifest=replace_lineage or bool(store.publication_manifest_state(REPO, snap_dir)),
+        )
+        outcome = store.sync_paths(REPO, paths_to_stage, "sync %s" % AUTHOR, timeout=30)
+        if outcome.state in {"failed", "local-only", "local-stale", "conflict"}:
+            detail = ": %s" % outcome.stderr.strip() if outcome.stderr.strip() else ""
+            print("[teamsync] snapshot published locally; git %s failed%s" % (outcome.step or outcome.state, detail), file=sys.stderr)
+            return 1
+        return 0
+
+
+def discover():
+    solve = os.path.join(CTF_HOME, "solve")
+    if not os.path.isdir(solve):
+        return []
+    return sorted(name for name in os.listdir(solve) if os.path.exists(os.path.join(solve, name, ".rat", "events", "STATE.v2.jsonl")))
+
+
+def once(name, *, replace_lineage=False):
+    if name:
+        return publish_one(name, replace_lineage=replace_lineage)
+    rc = 0
+    for challenge in discover():
+        rc = max(rc, publish_one(challenge, replace_lineage=replace_lineage))
+    return rc
+
+
+def main(argv):
+    global AUTHOR
+    if not os.path.isdir(os.path.join(REPO, ".git")):
+        die("team repo not found: %s" % REPO, 1)
+    try:
+        AUTHOR = open(os.path.join(REPO, ".author"), encoding="utf-8").read().strip() or "unknown"
+    except OSError:
+        AUTHOR = "unknown"
+    loop = "--loop" in argv
+    replace_lineage = "--replace-lineage" in argv
+    names = [arg for arg in argv if arg not in ("--loop", "--replace-lineage")]
+    if len(names) > 1:
+        # A single positional silently taking names[0] and dropping the rest let
+        # `teamsync chal1 chal2` exit 0 having only published chal1 -- with the
+        # caller believing chal2 was synced too. Multi-challenge sync isn't
+        # supported (omit the name to sync everything discover() finds instead).
+        die("expected at most one <name> argument, got %d: %s (omit <name> to sync all discovered challenges)" % (len(names), " ".join(names)), 2)
+    name = names[0] if names else None
+    if loop:
+        print("[teamsync] loop start(20s, author=%s)" % AUTHOR)
+        while True:
+            try:
+                once(name, replace_lineage=replace_lineage)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print("[teamsync] %s" % exc, file=sys.stderr)
+            time.sleep(20)
+    try:
+        rc = once(name, replace_lineage=replace_lineage)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print("[teamsync] %s" % exc, file=sys.stderr)
+        return 2
+    print("[teamsync] done(author=%s)" % AUTHOR)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
