@@ -627,9 +627,13 @@ def cmd_query_slice(args):
     s = slice_doc.get("summary", {})
     complete = _slice_complete(slice_doc)
     status = "ok" if complete else "partial"
-    # C9: `claim` is a heuristic label, never a fact -- it must not appear in `facts`.
-    facts = {"target": s.get("target"), "within_function": s.get("within_function"), "interproc": s.get("interproc")}
+    # C9/C10: claims and loop recurrences are heuristic candidates, never facts.
+    within_function = dict(s.get("within_function") or {})
+    loop_analysis = within_function.pop("loop_analysis", None)
+    facts = {"target": s.get("target"), "within_function": within_function, "interproc": s.get("interproc")}
     heuristics = {"claim": s.get("claim")}
+    if loop_analysis is not None:
+        heuristics["loop_analysis"] = loop_analysis
     diagnostics = []
     for d in slice_doc.get("diagnostics", []):
         msg = d.get("message", "")

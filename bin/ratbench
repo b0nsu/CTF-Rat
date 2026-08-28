@@ -15,17 +15,20 @@ export of CTF-Rat plus only the challenge runtime artifact(s): benchmark source,
 known-good inputs, and ground truth remain outside the agent workspace. A bare `FLAG{...}` in
 agent stdout is only a claim. `solved` requires the canonical completion gate: an active typed
 primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS linked to the
-same completed exploit task.
+same completed exploit task. When Linux `strace` is usable, Mode B additionally records an
+observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts do not depend
+on agent-authored telemetry.
 
   ratbench run [--id ID] [--suite path] [--run-id ID]
   ratbench eval --agent '<cli {dir}>' [--id ID] [--run-id ID]
-  ratbench report [--suite path]
+  ratbench report [--schema legacy|v2]
   ratbench selftest
 """
 import argparse
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -64,6 +67,33 @@ def _have_angr():
         return True
     except Exception:
         return False
+
+
+def _strace_usable():
+    """Whether observer-owned execve tracing can run without changing eval semantics."""
+    if os.name != "posix" or not _have("strace"):
+        return False
+    try:
+        p = subprocess.run(
+            ["strace", "-qq", "-e", "trace=execve", "-o", os.devnull,
+             sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
+    if trace_path:
+        # Explicit /bin/sh preserves the previous shell-command contract while
+        # making strace the observer rather than a wrapper inside the agent tree.
+        argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-s", "4096",
+                "-o", trace_path, "/bin/sh", "-c", prompt]
+        return subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout, env=env)
+    return subprocess.run(prompt, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=timeout, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -348,16 +378,17 @@ def _artifact_count(store_root):
 
 def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
-                      primitive_pass_at, artifact_count):
+                      primitive_pass_at, artifact_count, process_metrics=None):
     """Build one honest Mode B `rat.benchmark-result/v2` record.
 
-    Unknown instrumentation is encoded as null, never fabricated as zero.  The
-    first wiring deliberately records only facts that the isolated runtime can
-    prove today; later telemetry patches can replace nulls with measured values.
+    Unknown instrumentation is encoded as null, never fabricated as zero. Process
+    metrics are populated only when an observer-owned execve trace was actually
+    available for the attempt.
     """
     started_epoch = _epoch(started_at)
     verified = completion.get("verified") is True
     verification_id = completion.get("verification_id")
+    process_metrics = process_metrics or {}
     time_to_first_query_ms = _first_event_ms(
         events, started_epoch,
         lambda e: e.get("type") == "governor.checked"
@@ -383,7 +414,8 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
     else:
         outcome = "failed"
     metrics = {
-        "correctness": {"verified_solve": verified, "false_solved": None,
+        "correctness": {"verified_solve": verified,
+                        "false_solved": bool(flag_claimed and not verified),
                         "oracle_pass": True if verified else None},
         "latency": {"time_to_first_query_ms": time_to_first_query_ms,
                     "time_to_first_hypothesis_ms": time_to_first_hypothesis_ms,
@@ -391,9 +423,12 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                     "time_to_verified_solve_ms": time_to_verified_solve_ms},
         "context": {"input_tokens": None, "output_tokens": None,
                     "peak_context_tokens": None, "tool_output_bytes": None},
-        "tools": {"tool_calls": None, "duplicate_tool_calls": None,
-                  "ghidra_runs": None, "cfgfast_runs": None,
-                  "symbolic_runs": None, "subagent_count": None},
+        "tools": {"tool_calls": process_metrics.get("tool_calls"),
+                  "duplicate_tool_calls": process_metrics.get("duplicate_tool_calls"),
+                  "ghidra_runs": process_metrics.get("ghidra_runs"),
+                  "cfgfast_runs": None,
+                  "symbolic_runs": process_metrics.get("symbolic_runs"),
+                  "subagent_count": None},
         "cache": {"cache_requests": None, "cache_hits": None,
                   "cache_hit_ratio": None, "bytes_reused": None, "cold_warm": "cold"},
         "reasoning": {"hypotheses_created": sum(1 for e in events if e.get("type") == "hypothesis.recorded"),
@@ -448,7 +483,12 @@ def cmd_eval(args):
     v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v2.jsonl")
     lines = []
     v2_lines = []
+    trace_enabled = _strace_usable()
     print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
+    if trace_enabled:
+        print("-- process telemetry: observer execve trace enabled")
+    else:
+        print("-- process telemetry: unavailable (process metrics remain null)")
     for e in entries:
         sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
         try:
@@ -458,21 +498,23 @@ def cmd_eval(args):
                 print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
                 return 3
             prompt = args.agent.replace("{dir}", chal_dir)
+            trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
             started_at = datetime.now(timezone.utc).isoformat()
             t0 = time.time()
             try:
-                p = subprocess.run(prompt, shell=True, cwd=chal_dir, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, timeout=args.timeout,
-                                   env=_agent_environment(kit_root))
+                p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
+                               timeout=args.timeout, trace_path=trace_path)
                 agent_out = p.stdout.decode(errors="replace")
                 agent_rc = p.returncode
-            except subprocess.TimeoutExpired:
-                agent_out, agent_rc = "", 124
+            except subprocess.TimeoutExpired as exc:
+                partial = exc.stdout or b""
+                agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
+                agent_rc = 124
             wall = int((time.time() - t0) * 1000)
             finished_at = datetime.now(timezone.utc).isoformat()
 
             flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
-            from ratlib.metrics import first_primitive_pass_ts
+            from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics
             from ratlib.completion import completion_gate
             from ratlib.state_v2 import Stream
             primitive_pass_at = first_primitive_pass_ts(chal_dir)
@@ -495,6 +537,7 @@ def cmd_eval(args):
                 events = Stream(chal_dir).read()
             except (OSError, ValueError):
                 events = []
+            process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
             v2_lines.append(_mode_b_v2_record(
                 e, run_id=run_id, ablation_id=args.ablation,
                 started_at=started_at, finished_at=finished_at,
@@ -502,6 +545,7 @@ def cmd_eval(args):
                 completion=completion, events=events,
                 primitive_pass_at=primitive_pass_at,
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
+                process_metrics=process_metrics,
             ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""
@@ -530,23 +574,70 @@ def cmd_eval(args):
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
+def _read_legacy_results(results_dir):
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v2.jsonl"):
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return rows
+
+
+def _read_v2_results(results_dir):
+    """Read canonical v2 benchmark rows fail-closed.
+
+    Measurement output is an evidence artifact: malformed JSON or a schema-invalid
+    row must stop the report instead of being silently dropped and biasing rates.
+    """
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".benchmark-v2.jsonl"):
+            continue
+        path = os.path.join(results_dir, fn)
+        with open(path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("%s:%d invalid JSON: %s" % (fn, lineno, exc)) from exc
+                try:
+                    validate(row, "rat.benchmark-result/v2")
+                except Exception as exc:
+                    raise ValueError("%s:%d invalid benchmark-v2 row: %s" % (fn, lineno, exc)) from exc
+                rows.append(row)
+    return rows
+
+
 def cmd_report(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
-    rows = []
-    if os.path.isdir(results_dir):
-        for fn in sorted(os.listdir(results_dir)):
-            if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v2.jsonl"):
-                continue
-            with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        try:
-                            rows.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-    lb = _render_leaderboard(rows)
-    out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.md")
+    schema = getattr(args, "schema", "legacy")
+    if schema == "v2":
+        try:
+            rows = _read_v2_results(results_dir)
+        except (OSError, ValueError) as exc:
+            print("[ratbench:err] %s" % exc, file=sys.stderr)
+            return 3
+        lb = _render_v2_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.v2.md")
+    else:
+        rows = _read_legacy_results(results_dir)
+        lb = _render_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.md")
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(lb)
     print(lb)
@@ -597,6 +688,54 @@ def _render_leaderboard(rows):
     return "\n".join(L) + "\n"
 
 
+def _nested_metric(row, group, name):
+    return ((row.get("metrics") or {}).get(group) or {}).get(name)
+
+
+def _metric_median(rows, group, name, *, suffix=""):
+    values = [_nested_metric(row, group, name) for row in rows]
+    values = [value for value in values
+              if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    total = len(rows)
+    if not values:
+        return "n/a (0/%d)" % total
+    value = statistics.median(values)
+    rendered = ("%.1f" % value).rstrip("0").rstrip(".")
+    return "%s%s (%d/%d)" % (rendered, suffix, len(values), total)
+
+
+def _render_v2_leaderboard(rows):
+    L = ["# ratbench benchmark-v2 leaderboard", "",
+         "> Generated by `ratbench report --schema v2` from `bench/results/*.benchmark-v2.jsonl`.",
+         "> Only `eligible=true` attempts enter solve-rate and metric medians. Metric cells include",
+         "> measured coverage `(non-null/eligible)` so unavailable telemetry is never treated as zero.", ""]
+    if not rows:
+        L.append("_(no benchmark-v2 results yet — run `ratbench eval ...`)_")
+        return "\n".join(L) + "\n"
+    runs = {}
+    for row in rows:
+        runs.setdefault((row["benchmark_run_id"], row["ablation_id"]), []).append(row)
+    L += ["## Runs", "",
+          "| Run | Ablation | Eligible | Verified | False solved | Failed | Censored | Verified rate | Median TTVS | Median tools | Median duplicate | Median cache hit |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|"]
+    for (run_id, ablation_id), rs in sorted(runs.items()):
+        eligible = [row for row in rs if row.get("eligible") is True]
+        n = len(eligible)
+        verified = sum(1 for row in eligible if row.get("outcome") == "verified")
+        false_solved = sum(1 for row in eligible if _nested_metric(row, "correctness", "false_solved") is True)
+        failed = sum(1 for row in eligible if row.get("outcome") == "failed")
+        censored = sum(1 for row in eligible if row.get("outcome") == "censored")
+        rate = ("%.1f%%" % (100.0 * verified / n)) if n else "n/a"
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %s | %s | %s | %s | %s |" % (
+            run_id, ablation_id, n, verified, false_solved, failed, censored, rate,
+            _metric_median(eligible, "latency", "time_to_verified_solve_ms", suffix="ms"),
+            _metric_median(eligible, "tools", "tool_calls"),
+            _metric_median(eligible, "tools", "duplicate_tool_calls"),
+            _metric_median(eligible, "cache", "cache_hit_ratio"),
+        ))
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # selftest
 # ---------------------------------------------------------------------------
@@ -639,8 +778,9 @@ def main(argv=None):
     ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
     ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
     ev.add_argument("--timeout", type=int, default=600)
-    rep = sub.add_parser("report", help="render bench/LEADERBOARD.md from results")
+    rep = sub.add_parser("report", help="render a legacy or benchmark-v2 leaderboard from results")
     rep.add_argument("--suite")
+    rep.add_argument("--schema", choices=("legacy", "v2"), default="legacy")
     sub.add_parser("selftest", help="pure-logic regression")
     args = ap.parse_args(argv)
     if args.cmd == "run":

@@ -112,6 +112,36 @@ class SliceTruthTests(unittest.TestCase):
         self.assertEqual(doc["status"], "ok")
         self.assertTrue(doc["coverage"]["complete"])
 
+    def test_loop_candidate_stays_heuristic(self):
+        loop_analysis = {
+            "schema": "rat.loop-summary/v1",
+            "coverage": {"complete": True, "scope": "natural-loops/register-affine", "omitted": []},
+            "loops": [{
+                "header": "0x401010",
+                "recurrences": [{"target": "rax", "kind": "affine-delta", "delta": 8, "quality": "candidate"}],
+                "eligible_for_fast_forward": False,
+            }],
+        }
+        doc = self._project({
+            "status": "ok",
+            "summary": {
+                "target": {"address": "0x401000", "function": "main"},
+                "within_function": {"registers_read": ["rax"], "loop_analysis": loop_analysis},
+                "interproc": {"depth": 2},
+                "claim": "dependency-candidate",
+                "unresolved_aliases": 0,
+                "unresolved_indirect_calls": 0,
+            },
+            "diagnostics": [],
+            "inputs": [{"digest": "sha256:" + "2" * 64}],
+            "artifacts": [{"kind": "loop-summary", "digest": "sha256:" + "3" * 64}],
+            "provenance": {"cache": {"hit": False}},
+        })
+        self.assertNotIn("loop_analysis", doc["facts"]["within_function"])
+        self.assertEqual(doc["facts"]["within_function"]["registers_read"], ["rax"])
+        self.assertEqual(doc["heuristics"]["claim"], "dependency-candidate")
+        self.assertEqual(doc["heuristics"]["loop_analysis"], loop_analysis)
+
 
 if __name__ == "__main__":
     unittest.main()
