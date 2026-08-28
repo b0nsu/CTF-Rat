@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib import route as route_mod  # noqa: E402
@@ -306,6 +307,121 @@ def _agent_environment(kit_root):
     return env
 
 
+def _epoch(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _elapsed_ms(started_epoch, finished_epoch):
+    if not isinstance(started_epoch, (int, float)) or not isinstance(finished_epoch, (int, float)):
+        return None
+    if finished_epoch < started_epoch:
+        return None
+    return int(round((finished_epoch - started_epoch) * 1000))
+
+
+def _first_event_ms(events, started_epoch, predicate):
+    candidates = []
+    for event in events:
+        if not predicate(event):
+            continue
+        event_epoch = _epoch(event.get("at"))
+        latency = _elapsed_ms(started_epoch, event_epoch)
+        if latency is not None:
+            candidates.append(latency)
+    return min(candidates) if candidates else None
+
+
+def _artifact_count(store_root):
+    meta = os.path.join(store_root, "metadata", "sha256")
+    if not os.path.isdir(meta):
+        return 0
+    count = 0
+    for prefix in os.listdir(meta):
+        directory = os.path.join(meta, prefix)
+        if os.path.isdir(directory):
+            count += sum(1 for name in os.listdir(directory) if name.endswith(".json"))
+    return count
+
+
+def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
+                      agent_rc, flag_claimed, completion, events,
+                      primitive_pass_at, artifact_count):
+    """Build one honest Mode B `rat.benchmark-result/v2` record.
+
+    Unknown instrumentation is encoded as null, never fabricated as zero.  The
+    first wiring deliberately records only facts that the isolated runtime can
+    prove today; later telemetry patches can replace nulls with measured values.
+    """
+    started_epoch = _epoch(started_at)
+    verified = completion.get("verified") is True
+    verification_id = completion.get("verification_id")
+    time_to_first_query_ms = _first_event_ms(
+        events, started_epoch,
+        lambda e: e.get("type") == "governor.checked"
+        and str(e.get("payload", {}).get("action", "")).startswith("query:"),
+    )
+    time_to_first_hypothesis_ms = _first_event_ms(
+        events, started_epoch, lambda e: e.get("type") == "hypothesis.recorded"
+    )
+    time_to_verified_solve_ms = None
+    if verified and verification_id:
+        time_to_verified_solve_ms = _first_event_ms(
+            events, started_epoch,
+            lambda e: e.get("type") == "verification.recorded"
+            and e.get("payload", {}).get("verification_id") == verification_id,
+        )
+    time_to_first_valid_primitive_ms = _elapsed_ms(started_epoch, primitive_pass_at)
+    if verified:
+        outcome = "verified"
+    elif flag_claimed:
+        outcome = "solve-claimed"
+    elif agent_rc == 124:
+        outcome = "censored"
+    else:
+        outcome = "failed"
+    metrics = {
+        "correctness": {"verified_solve": verified, "false_solved": None,
+                        "oracle_pass": True if verified else None},
+        "latency": {"time_to_first_query_ms": time_to_first_query_ms,
+                    "time_to_first_hypothesis_ms": time_to_first_hypothesis_ms,
+                    "time_to_first_valid_primitive_ms": time_to_first_valid_primitive_ms,
+                    "time_to_verified_solve_ms": time_to_verified_solve_ms},
+        "context": {"input_tokens": None, "output_tokens": None,
+                    "peak_context_tokens": None, "tool_output_bytes": None},
+        "tools": {"tool_calls": None, "duplicate_tool_calls": None,
+                  "ghidra_runs": None, "cfgfast_runs": None,
+                  "symbolic_runs": None, "subagent_count": None},
+        "cache": {"cache_requests": None, "cache_hits": None,
+                  "cache_hit_ratio": None, "bytes_reused": None, "cold_warm": "cold"},
+        "reasoning": {"hypotheses_created": sum(1 for e in events if e.get("type") == "hypothesis.recorded"),
+                      "hypotheses_refuted": None, "pivot_count": None,
+                      "deep_escalations": None},
+        "artifacts": {"functions_decompiled": None, "raw_output_size": None,
+                      "compressed_output_size": None, "artifact_count": artifact_count},
+    }
+    return {
+        "schema": "rat.benchmark-result/v2",
+        "benchmark_run_id": run_id,
+        "ablation_id": ablation_id,
+        "challenge_id": entry["id"],
+        "attempt": 1,
+        "status": "timeout" if agent_rc == 124 else "completed",
+        "eligible": True,
+        "outcome": outcome,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "metrics": metrics,
+        "oracle": {"kind": "completion-gate", "reason": completion.get("reason"),
+                   "verification_id": verification_id},
+        "ground_truth": {"track": entry.get("track"), "difficulty": entry.get("difficulty"),
+                         "expected_route": entry.get("expected_route"),
+                         "verify_kind": (entry.get("verify") or {}).get("kind")},
+    }
+
+
 # ---------------------------------------------------------------------------
 # eval (Mode B — external model CLI, on-demand, human-run, NOT CI)
 # ---------------------------------------------------------------------------
@@ -329,7 +445,9 @@ def cmd_eval(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, run_id + ".jsonl")
+    v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v2.jsonl")
     lines = []
+    v2_lines = []
     print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
     for e in entries:
         sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
@@ -340,6 +458,7 @@ def cmd_eval(args):
                 print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
                 return 3
             prompt = args.agent.replace("{dir}", chal_dir)
+            started_at = datetime.now(timezone.utc).isoformat()
             t0 = time.time()
             try:
                 p = subprocess.run(prompt, shell=True, cwd=chal_dir, stdout=subprocess.PIPE,
@@ -350,11 +469,14 @@ def cmd_eval(args):
             except subprocess.TimeoutExpired:
                 agent_out, agent_rc = "", 124
             wall = int((time.time() - t0) * 1000)
+            finished_at = datetime.now(timezone.utc).isoformat()
 
             flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
             from ratlib.metrics import first_primitive_pass_ts
             from ratlib.completion import completion_gate
-            typed_pass = first_primitive_pass_ts(chal_dir) is not None
+            from ratlib.state_v2 import Stream
+            primitive_pass_at = first_primitive_pass_ts(chal_dir)
+            typed_pass = primitive_pass_at is not None
             completion = completion_gate(chal_dir)
             verified = completion.get("verified") is True
             if verified:
@@ -369,6 +491,18 @@ def cmd_eval(args):
                    "typed_primitive_pass": typed_pass, "verified_solve": verified,
                    "completion_reason": completion.get("reason"), "wall_ms": wall}
             lines.append(rec)
+            try:
+                events = Stream(chal_dir).read()
+            except (OSError, ValueError):
+                events = []
+            v2_lines.append(_mode_b_v2_record(
+                e, run_id=run_id, ablation_id=args.ablation,
+                started_at=started_at, finished_at=finished_at,
+                agent_rc=agent_rc, flag_claimed=flag_claimed,
+                completion=completion, events=events,
+                primitive_pass_at=primitive_pass_at,
+                artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
+            ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""
             if outcome == "solve-claimed":
@@ -380,10 +514,16 @@ def cmd_eval(args):
             shutil.rmtree(sandbox, ignore_errors=True)
     for rec in lines:
         validate(rec, "rat.bench-result/v1")
+    for rec in v2_lines:
+        validate(rec, "rat.benchmark-result/v2")
     with open(out_path, "w", encoding="utf-8") as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    with open(v2_out_path, "w", encoding="utf-8") as fh:
+        for rec in v2_lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
     print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
+    print("-- benchmark v2 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
     return 0
 
 
@@ -395,7 +535,7 @@ def cmd_report(args):
     rows = []
     if os.path.isdir(results_dir):
         for fn in sorted(os.listdir(results_dir)):
-            if not fn.endswith(".jsonl"):
+            if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v2.jsonl"):
                 continue
             with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
                 for line in fh:
@@ -497,6 +637,7 @@ def main(argv=None):
     ev = sub.add_parser("eval", help="Mode B external agent CLI eval (on-demand, not CI)")
     ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
     ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
+    ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
     ev.add_argument("--timeout", type=int, default=600)
     rep = sub.add_parser("report", help="render bench/LEADERBOARD.md from results")
     rep.add_argument("--suite")
