@@ -177,7 +177,12 @@ def _merge_tree(source: str, destination: str) -> None:
 
 
 def safe_extract_archive(archive_path: str, destination: str, policy: ArchivePolicy = DEFAULT_POLICY) -> int:
-    """Extract one ZIP/TAR archive or raise without touching destination content."""
+    """Extract one ZIP/TAR archive through a staged directory.
+
+    The destination directory may be created. Existing top-level entries are
+    collision-protected before merge, but the final multi-entry merge is not a
+    rollback transaction for arbitrary I/O failures after some entries move.
+    """
     archive_path, destination = os.path.abspath(archive_path), os.path.abspath(destination)
     if not os.path.isfile(archive_path):
         raise ArchiveError("archive does not exist: %s" % archive_path)

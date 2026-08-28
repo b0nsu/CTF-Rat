@@ -5,7 +5,7 @@ on:
   push:
     branches: ['**']
   schedule:
-    - cron: '0 4 * * *'   # nightly deep run
+    - cron: '0 4 * * *'   # nightly workflow; also enables analysis-deep
   workflow_dispatch:
 
 jobs:
@@ -24,6 +24,14 @@ jobs:
       - run: python3 bin/revq selftest
       - run: python3 solve/_template/rev/symsolve.py selftest
       - run: python3 solve/_template/rev/vmlift.py selftest
+      - run: python3 solve/_template/rev/qiling_trace.py selftest
+      - run: python3 bin/k_kallsyms --selftest
+      - run: python3 bin/ratbench selftest
+      - run: python3 bin/pklearn selftest
+      - run: python3 bin/pwngadget selftest
+      - run: python3 bin/pwnlibc selftest
+      # Mode A scripted driver: route accuracy over the synthetic suite (gcc present -> verifiers run too)
+      - run: python3 bin/ratbench run
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 tests/e2e_artifact_handoff.py
       - run: python3 tests/e2e_analysis.py --category core
