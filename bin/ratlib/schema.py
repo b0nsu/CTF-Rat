@@ -96,7 +96,7 @@ def _benchmark_provenance(d):
     _strict(d,{"suite_digest","corpora","agent","execution","environment","toolchain"})
     _need(d,("suite_digest","corpora","agent","execution","environment","toolchain")); _digest(d["suite_digest"])
     corpora=d["corpora"]
-    if not isinstance(corpora,list) or not corpora or len(corpora)!=len(set(corpora)) or any(x not in {"synthetic","integration","real","private"} for x in corpora): raise ValidationError("invalid benchmark provenance corpora")
+    if not isinstance(corpora,list) or not corpora or any(not isinstance(x,str) or x not in {"synthetic","integration","real","private"} for x in corpora) or len(corpora)!=len(set(corpora)): raise ValidationError("invalid benchmark provenance corpora")
     agent=d["agent"]
     if not isinstance(agent,Mapping) or set(agent)!={"executable","command_digest","model_id","reasoning_effort"}: raise ValidationError("invalid benchmark provenance agent")
     if not isinstance(agent["executable"],str) or not agent["executable"]: raise ValidationError("invalid benchmark agent executable")
