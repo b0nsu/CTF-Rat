@@ -21,10 +21,12 @@ on agent-authored telemetry.
 
   ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
   ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
+                [--model-id ID] [--reasoning-effort LABEL]
   ratbench report [--schema legacy|v2]
   ratbench selftest
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -36,7 +38,10 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib import route as route_mod  # noqa: E402
-from ratlib.bench_suite import CORPORA, SuiteValidationError, load_suite, project_suite  # noqa: E402
+from ratlib.bench_suite import (  # noqa: E402
+    CORPORA, SuiteValidationError, load_suite, project_suite, suite_digest,
+)
+from ratlib.run_manifest import environment_identity, toolchain_identity  # noqa: E402
 from ratlib.schema import validate  # noqa: E402
 
 
@@ -64,6 +69,35 @@ def _select_entries(args):
         if not entries:
             raise LookupError("no entry %s" % args.id)
     return entries
+
+
+def _selected_suite_doc(entries):
+    """Canonical identity document for the exact post-filter execution set."""
+    return {"schema": "rat.bench-suite/v1", "entries": list(entries)}
+
+
+def _command_digest(command):
+    return "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _benchmark_provenance(args, agent_bin, entries, trace_enabled):
+    """Observer-owned conditions required to compare Mode B runs honestly."""
+    return {
+        "suite_digest": suite_digest(_selected_suite_doc(entries)),
+        "corpora": sorted({entry["corpus"] for entry in entries}),
+        "agent": {
+            "executable": os.path.basename(agent_bin),
+            "command_digest": _command_digest(args.agent),
+            "model_id": getattr(args, "model_id", None),
+            "reasoning_effort": getattr(args, "reasoning_effort", None),
+        },
+        "execution": {
+            "timeout_seconds": args.timeout,
+            "observer_execve_trace": bool(trace_enabled),
+        },
+        "environment": environment_identity(),
+        "toolchain": toolchain_identity(ctf_home()),
+    }
 
 
 def _have(cmd):
@@ -392,12 +426,14 @@ def _artifact_count(store_root):
 
 def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
-                      primitive_pass_at, artifact_count, process_metrics=None):
+                      primitive_pass_at, artifact_count, process_metrics=None,
+                      provenance=None):
     """Build one honest Mode B `rat.benchmark-result/v2` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
     metrics are populated only when an observer-owned execve trace was actually
-    available for the attempt.
+    available for the attempt. Provenance is optional only to keep old fixtures/
+    result rows readable; the live Mode B producer always supplies it.
     """
     started_epoch = _epoch(started_at)
     verified = completion.get("verified") is True
@@ -451,7 +487,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         "artifacts": {"functions_decompiled": None, "raw_output_size": None,
                       "compressed_output_size": None, "artifact_count": artifact_count},
     }
-    return {
+    doc = {
         "schema": "rat.benchmark-result/v2",
         "benchmark_run_id": run_id,
         "ablation_id": ablation_id,
@@ -472,6 +508,9 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                          "capabilities": entry.get("capabilities", []),
                          "redistributable": entry.get("redistributable")},
     }
+    if provenance is not None:
+        doc["provenance"] = provenance
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +542,7 @@ def cmd_eval(args):
     lines = []
     v2_lines = []
     trace_enabled = _strace_usable()
+    run_provenance = _benchmark_provenance(args, agent_bin, entries, trace_enabled)
     print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
     if trace_enabled:
         print("-- process telemetry: observer execve trace enabled")
@@ -565,7 +605,7 @@ def cmd_eval(args):
                 completion=completion, events=events,
                 primitive_pass_at=primitive_pass_at,
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
-                process_metrics=process_metrics,
+                process_metrics=process_metrics, provenance=run_provenance,
             ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""
@@ -643,12 +683,26 @@ def _read_v2_results(results_dir):
     return rows
 
 
+def _assert_v2_run_provenance(rows):
+    """One run+ablation cannot silently combine different measurement conditions."""
+    groups = {}
+    for row in rows:
+        key = (row["benchmark_run_id"], row["ablation_id"])
+        serialized = json.dumps(row.get("provenance"), sort_keys=True, separators=(",", ":"))
+        groups.setdefault(key, set()).add(serialized)
+    mixed = [key for key, values in groups.items() if len(values) > 1]
+    if mixed:
+        run_id, ablation_id = sorted(mixed)[0]
+        raise ValueError("mixed provenance for benchmark run %s ablation %s" % (run_id, ablation_id))
+
+
 def cmd_report(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
     schema = getattr(args, "schema", "legacy")
     if schema == "v2":
         try:
             rows = _read_v2_results(results_dir)
+            _assert_v2_run_provenance(rows)
         except (OSError, ValueError) as exc:
             print("[ratbench:err] %s" % exc, file=sys.stderr)
             return 3
@@ -798,6 +852,8 @@ def main(argv=None):
     ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
     ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
     ev.add_argument("--corpus", choices=sorted(CORPORA))
+    ev.add_argument("--model-id", help="optional declarative model label recorded in provenance")
+    ev.add_argument("--reasoning-effort", help="optional declarative reasoning-effort label recorded in provenance")
     ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
     ev.add_argument("--timeout", type=int, default=600)
     rep = sub.add_parser("report", help="render a legacy or benchmark-v2 leaderboard from results")
