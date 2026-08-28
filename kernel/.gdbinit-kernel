@@ -41,7 +41,7 @@ define kattach
   target remote :1234
 end
 document kattach
-Attach to the QEMU gdbstub on localhost:1234 (started by run_qemu.sh).
+Attach to the QEMU gdbstub on localhost:1234 (started by k_run_qemu).
 end
 
 # QEMU's gdbstub is flaky with hardware watchpoints; prefer software breakpoints.
