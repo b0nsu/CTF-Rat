@@ -10,7 +10,7 @@ from .orchestration import GateError, _task, _verification_report
 from .state_v2 import Stream
 
 
-def completion_gate(root):
+def completion_gate(root, verification_id=None):
     """Return the authoritative local completion decision for ``root``.
 
     The gate deliberately re-reads immutable verification artifacts instead of
@@ -47,6 +47,8 @@ def completion_gate(root):
     ]
 
     for record in reversed(records):
+        if verification_id is not None and record.get("verification_id") != verification_id:
+            continue
         if record.get("verdict") != "pass" or record.get("environment_match") is not True:
             continue
         primitive_id = record.get("primitive_id")

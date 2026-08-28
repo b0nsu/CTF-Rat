@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse, hashlib, json, os, sys
 from datetime import datetime
 from .artifact import get as artifact_get
+from .completion import completion_gate
 from .state_v2 import Stream
 
 def iter_tool_results(root):
@@ -66,11 +67,10 @@ def _first_primitive_pass_ts_v2(state_dir):
     A raw scan for any "status":"pass" event is not enough: _materialize() stales
     a primitive whose self_evidence was later invalidated (evidence.invalidated),
     and a solved-then-invalidated primitive must not count as a solve for
-    benchmarking/gating (ratbench Mode B reads this to decide the "solved" outcome).
-    Only primitive_ids whose MATERIALIZED status is currently pass/consumed
-    contribute; for those, use the timestamp of their most recent pass transition
-    (an earlier pass that was itself invalidated before this one is not the real
-    solve time).
+    benchmarking/gating. Only primitive_ids whose MATERIALIZED status is
+    currently pass/consumed contribute; for those, use the timestamp of their
+    most recent pass transition (an earlier pass invalidated before this one is
+    not the current valid primitive time).
     """
     try:
         stream = Stream(state_dir)
@@ -126,12 +126,37 @@ def first_primitive_pass_ts(state_dir):
 
     Once a v2 stream exists it is authoritative: a session that wrote typed
     events but has no typed PASS has NOT passed, so we must not silently fall
-    back to a legacy PASS (that would let a rejected legacy write leak into v2
-    time-to-flag telemetry). Legacy is consulted only when no v2 stream ever
-    existed."""
+    back to a legacy PASS. Legacy is consulted only when no v2 stream existed.
+    """
     if os.path.exists(Stream(state_dir).path):
         return _first_primitive_pass_ts_v2(state_dir)
     return _first_primitive_pass_ts_legacy(state_dir)
+
+def first_verified_solve_ts(state_dir):
+    """Timestamp of the authenticated, currently-active verified solve.
+
+    The canonical completion gate re-authenticates the immutable rat-verify
+    report and checks its primitive/exploit-task lineage. Only the matching
+    verification.recorded event is eligible for solve latency; primitive PASS
+    alone deliberately returns None here.
+    """
+    try:
+        events = Stream(state_dir).read()
+    except (OSError, ValueError):
+        return None
+    for event in events:
+        if event.get("type") != "verification.recorded":
+            continue
+        verification_id = event.get("payload", {}).get("verification_id")
+        if not verification_id:
+            continue
+        if completion_gate(state_dir, verification_id=verification_id).get("verified") is not True:
+            continue
+        try:
+            return int(datetime.fromisoformat(event["at"]).timestamp())
+        except (KeyError, ValueError):
+            return None
+    return None
 
 def index_backends(root):
     """Distinct cached artifacts per backend from the canonical cache index.
@@ -150,7 +175,20 @@ def index_backends(root):
     except Exception:
         return {}
 
-def aggregate(docs, *, guard_started_at=None, verify_pass_at=None, index_backend_counts=None):
+def _elapsed_seconds(started_at, finished_at):
+    if isinstance(started_at, int) and isinstance(finished_at, int) and finished_at >= started_at:
+        return finished_at - started_at
+    return None
+
+def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
+              verified_solve_at=None, verify_pass_at=None, index_backend_counts=None):
+    """Aggregate telemetry without conflating primitive proof with solved state.
+
+    ``verify_pass_at`` retains its v1 meaning as a compatibility alias for the
+    primitive-PASS timestamp. New callers should pass ``primitive_pass_at``
+    and ``verified_solve_at`` explicitly. ``time_to_flag_sec`` retains its v1
+    primitive-PASS meaning; verified-solve latency is exposed separately.
+    """
     docs = list(docs)
     seen_fingerprints = {}
     duplicate = 0
@@ -175,9 +213,10 @@ def aggregate(docs, *, guard_started_at=None, verify_pass_at=None, index_backend
         tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
         duration_total += doc.get("duration_ms", 0) or 0
     cache_requests = cache_hits + cache_misses
-    time_to_flag_sec = None
-    if isinstance(guard_started_at, int) and isinstance(verify_pass_at, int) and verify_pass_at >= guard_started_at:
-        time_to_flag_sec = verify_pass_at - guard_started_at
+    if primitive_pass_at is None and verify_pass_at is not None:
+        primitive_pass_at = verify_pass_at
+    time_to_first_valid_primitive_sec = _elapsed_seconds(guard_started_at, primitive_pass_at)
+    time_to_verified_solve_sec = _elapsed_seconds(guard_started_at, verified_solve_at)
     ghidra_runs = sum(n for name, n in tool_name_counts.items() if "ghidra" in name.lower())
     revq_runs = tool_name_counts.get("revq", 0)
     functions_decompiled = tool_name_counts.get("decomp", 0)
@@ -189,7 +228,9 @@ def aggregate(docs, *, guard_started_at=None, verify_pass_at=None, index_backend
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
         "cache_hit_ratio": (cache_hits / cache_requests) if cache_requests else None,
-        "time_to_flag_sec": time_to_flag_sec,
+        "time_to_first_valid_primitive_sec": time_to_first_valid_primitive_sec,
+        "time_to_verified_solve_sec": time_to_verified_solve_sec,
+        "time_to_flag_sec": time_to_first_valid_primitive_sec,
         "functions_decompiled": functions_decompiled,
         "ghidra_runs": ghidra_runs,
         "revq_runs": revq_runs,
@@ -213,7 +254,8 @@ def main(argv=None):
     metrics = aggregate(
         iter_tool_results(root),
         guard_started_at=guard_started_at(ctf_home, ns.chal),
-        verify_pass_at=first_primitive_pass_ts(state_dir),
+        primitive_pass_at=first_primitive_pass_ts(state_dir),
+        verified_solve_at=first_verified_solve_ts(state_dir),
         index_backend_counts=index_backends(root),
     )
     print(json.dumps(metrics, sort_keys=True, ensure_ascii=False))
