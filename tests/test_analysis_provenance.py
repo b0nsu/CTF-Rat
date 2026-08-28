@@ -4,6 +4,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib import analysis
+from ratlib.state_v2 import KNOWN_BUILD_DIGESTS
 
 
 D = "sha256:" + "a" * 64
@@ -27,6 +28,13 @@ class AnalysisEnvelopeIdentity(unittest.TestCase):
 
     def test_verify_report_and_analysis_envelopes_share_code_identity(self):
         self.assertEqual(analysis.VERIFY_BUILD_DIGEST, analysis.ANALYSIS_BUILD_DIGEST)
+
+    def test_live_analyzer_build_is_recorded_for_historical_verification(self):
+        self.assertEqual(
+            KNOWN_BUILD_DIGESTS.get(analysis.ANALYSIS_BUILD_DIGEST),
+            "rat-verify",
+            "missing rat-verify registry entry for %s" % analysis.ANALYSIS_BUILD_DIGEST,
+        )
 
 
 class ProfileCacheIdentity(unittest.TestCase):
