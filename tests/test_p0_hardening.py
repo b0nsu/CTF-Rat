@@ -137,6 +137,28 @@ class RatbenchIsolationTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(chal_dir, "src.c")))
             self.assertFalse(os.path.exists(os.path.join(chal_dir, "route.json")))
 
+    def test_mode_b_rejects_normalized_ground_truth_aliases(self):
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            fixture = os.path.join(root, "bench", "artifacts", "case")
+            os.makedirs(os.path.join(root, "bin"))
+            os.makedirs(fixture)
+            for name in ("src.c", "route.json", "chall"):
+                with open(os.path.join(fixture, name), "wb") as fh:
+                    fh.write(b"fixture")
+            entry = {
+                "id": "case", "dir": "bench/artifacts/case", "binary": "chall",
+                "source": "src.c", "route_fixture": "route.json",
+                "runtime_files": ["sub/../src.c"],
+            }
+            original = ratbench.ctf_home
+            ratbench.ctf_home = lambda: root
+            try:
+                with self.assertRaises(ValueError):
+                    ratbench._prepare_eval_workspace(entry, sandbox)
+            finally:
+                ratbench.ctf_home = original
+
 
 if __name__ == "__main__":
     unittest.main()

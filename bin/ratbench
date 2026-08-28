@@ -234,11 +234,21 @@ def _copy_runtime_export(dst_root):
         shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
 
 
-def _fixture_file(entry, relpath):
+def _runtime_fixture_relpath(relpath):
     if not isinstance(relpath, str) or not relpath or os.path.isabs(relpath):
         raise ValueError("runtime fixture path must be relative")
+    normalized = os.path.normpath(relpath)
+    if normalized in ("", ".", os.pardir) or normalized.startswith(os.pardir + os.sep):
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if ".rat" in normalized.split(os.sep):
+        raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+    return normalized
+
+
+def _fixture_file(entry, relpath):
+    normalized = _runtime_fixture_relpath(relpath)
     base = os.path.realpath(os.path.join(ctf_home(), entry["dir"]))
-    candidate = os.path.realpath(os.path.join(base, relpath))
+    candidate = os.path.realpath(os.path.join(base, normalized))
     if os.path.commonpath((base, candidate)) != base:
         raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
     if not os.path.isfile(candidate):
@@ -266,12 +276,18 @@ def _prepare_eval_workspace(entry, sandbox):
         target = os.path.join(chal_dir, "chall")
         os.replace(built, target)
 
-    forbidden = {entry.get("source", "src.c"), entry.get("route_fixture", "route.json")}
+    forbidden = {
+        _runtime_fixture_relpath(entry.get("source", "src.c")),
+        _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
+    }
     for relpath in entry.get("runtime_files", []) or []:
-        if relpath in forbidden or relpath.startswith(".rat"):
+        normalized = _runtime_fixture_relpath(relpath)
+        if normalized in forbidden:
             raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
-        src = _fixture_file(entry, relpath)
-        dst = os.path.join(chal_dir, relpath)
+        src = _fixture_file(entry, normalized)
+        dst = os.path.realpath(os.path.join(chal_dir, normalized))
+        if os.path.commonpath((os.path.realpath(chal_dir), dst)) != os.path.realpath(chal_dir):
+            raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
 
