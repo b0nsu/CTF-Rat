@@ -21,7 +21,8 @@ def _module_digest():
  with open(os.path.realpath(__file__),"rb") as f:
   for b in iter(lambda:f.read(65536),b""): h.update(b)
  return "sha256:"+h.hexdigest()
-VERIFY_BUILD_DIGEST=_module_digest()
+BUILD_DIGEST=_module_digest()
+VERIFY_BUILD_DIGEST=BUILD_DIGEST
 P2_LIMITATIONS={
  "rat-profile":["format signals are not vulnerability proof"],
  "rat-slice":["call-path reachability only; no value-flow proof"],
@@ -76,7 +77,7 @@ def require_profile(a, r):
     return profile
 def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=(), code=0, started=None):
     started=started or iso(); finished=iso(); bdig=fdigest(binary) if binary and os.path.isfile(binary) else "sha256:"+"0"*64
-    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":bdig},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":bdig,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
+    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":BUILD_DIGEST},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":bdig,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
     if name in P2_LIMITATIONS:
         # Analysis output is deliberately non-promotable.  Only STATE's
         # evidence/primitive lifecycle may promote independently verified
