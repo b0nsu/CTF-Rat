@@ -591,6 +591,13 @@ def cmd_query_oracle(args):
     doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
+def _slice_complete(slice_doc):
+    s = slice_doc.get("summary", {})
+    counters = (s.get("unresolved_aliases"), s.get("unresolved_indirect_calls"))
+    return (slice_doc.get("status") == "ok"
+            and all(isinstance(value, int) and not isinstance(value, bool) and value == 0
+                    for value in counters))
+
 def cmd_query_slice(args):
     binary = args.binary
     bad = _check_binary(binary)
@@ -618,8 +625,8 @@ def cmd_query_slice(args):
         msgs = [d.get("message", "") for d in slice_doc.get("diagnostics", [])] or ["rat-slice reported error"]
         return _emit(*_query_error("slice", "input_invalid", "; ".join(msgs), EXIT_INPUT), args.format)
     s = slice_doc.get("summary", {})
-    unresolved = bool(s.get("unresolved_aliases", 0)) or s.get("unresolved_indirect_calls", 0) == 1
-    status = "partial" if unresolved or slice_doc.get("status") == "partial" else "ok"
+    complete = _slice_complete(slice_doc)
+    status = "ok" if complete else "partial"
     # C9: `claim` is a heuristic label, never a fact -- it must not appear in `facts`.
     facts = {"target": s.get("target"), "within_function": s.get("within_function"), "interproc": s.get("interproc")}
     heuristics = {"claim": s.get("claim")}
@@ -630,7 +637,7 @@ def cmd_query_slice(args):
         diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
     doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
                            artifacts=slice_doc.get("artifacts", []),
-                           coverage={"complete": not unresolved,
+                           coverage={"complete": complete,
                                      "scope": "backward-data-slice depth=%s" % (s.get("interproc") or {}).get("depth"),
                                      "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
                                                  "unresolved_indirect_calls": s.get("unresolved_indirect_calls")}},

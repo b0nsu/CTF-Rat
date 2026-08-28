@@ -92,7 +92,8 @@ class RouteResultSchema(unittest.TestCase):
 class QueryResultSchema(unittest.TestCase):
     def test_valid_doc_passes_for_each_status(self):
         for status in ("ok", "partial", "error"):
-            validate(query_result(status=status))
+            validate(query_result(status=status,
+                                  coverage={"complete": status == "ok", "scope": "x", "omitted": None}))
 
     def test_invalid_status_raises(self):
         with self.assertRaises(ValidationError): validate(query_result(status="pending"))
@@ -124,6 +125,8 @@ class QueryResultSchema(unittest.TestCase):
         schema = json.loads((repo / "schemas" / "rat.query-result.v1.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["facts"]["type"], "object")
         self.assertEqual(schema["properties"]["heuristics"]["type"], "object")
+        self.assertEqual(schema["properties"]["coverage"]["properties"]["complete"]["type"], "boolean")
+        self.assertTrue(schema["allOf"])
         validate(query_result(facts={"key": "value"}, heuristics={"next": []}), "rat.query-result/v1")
         with self.assertRaises(ValidationError):
             validate(query_result(facts=[], heuristics={}), "rat.query-result/v1")

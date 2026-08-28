@@ -597,7 +597,8 @@ class TriageAllTests(unittest.TestCase):
 
     STUB = (
         "#!/bin/sh\n"
-        'case "$1" in\n'
+        'base=$(basename "$1")\n'
+        'case "$base" in\n'
         "  *fast*) echo '{\"status\":\"ok\",\"triage\":{\"tier\":\"fast\",\"confidence\":\"0.90\",\"techniques\":[\"bof\"]}}';;\n"
         "  *hard*) echo '{\"status\":\"ok\",\"triage\":{\"tier\":\"hard\",\"confidence\":\"0.20\",\"techniques\":[\"heap\"]}}';;\n"
         "  *err*)  echo '{\"status\":\"error\",\"error\":\"cannot load\"}';;\n"

@@ -151,6 +151,9 @@ def query_result(d):
     if d["status"] not in {"ok","partial","error"}: raise ValidationError("invalid query status")
     if not isinstance(d["coverage"],Mapping) or {"complete","scope","omitted"} - set(d["coverage"]):
         raise ValidationError("invalid coverage")
+    complete = d["coverage"]["complete"]
+    if not isinstance(complete,bool): raise ValidationError("coverage.complete must be boolean")
+    if complete and d["status"] != "ok": raise ValidationError("complete coverage requires ok query status")
     if not isinstance(d["diagnostics"],list) or any(not isinstance(x,Mapping) or "code" not in x for x in d["diagnostics"]):
         raise ValidationError("invalid diagnostics")
     if any(x["code"] not in _QUERY_DIAGNOSTIC_CODES for x in d["diagnostics"]): raise ValidationError("unknown diagnostic code")
