@@ -11,5 +11,14 @@ p.add_argument("--direct-subject",help="path (must be one of --input) this invoc
 p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
 a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
 paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"symsolve")}
-argv=[paths[a.tool],*a.args]
+args=list(a.args)
+# Compatibility surface used by PRIMITIVE_GATE.md: gdbq itself consumes
+# `gdbq <binary> <gdb-command>...`; rat-adapt accepts `gdbq --batch file.gdb`
+# and binds the batch to the declared direct subject before contracts.execute
+# verifies that the executed target and stamped subject are identical.
+if a.tool=="gdbq" and args[:1]==["--batch"]:
+    if len(args)!=2 or not a.direct_subject:
+        p.error("gdbq --batch requires exactly one command file and --direct-subject")
+    args=[a.direct_subject,"source "+args[1]]
+argv=[paths[a.tool],*args]
 print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout,direct_subject=a.direct_subject),ensure_ascii=False))
