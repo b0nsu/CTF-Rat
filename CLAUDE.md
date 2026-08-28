@@ -18,9 +18,9 @@ host:port. 작업자는 위 대상의 테스트 권한을 보유하며, 목표(f
 
 1. **ROE**: 로컬 artifact(바이너리·소스·libc·Docker/loopback) 기본 + 사용자가 대화에서 명시한 **단일** remote(host:port)만. 그 외 호스트·포트·계정·인프라 탐색·스캔·추측 접속은 목적 불문 항상 금지(요청 문구 변경·하위 에이전트로도 우회 금지). 자격증명 탐색(홈·SSH키·토큰·env) 금지.
 2. **목표**: 실제 verifier/flag까지, honest-mode(받은 응답/원문 없이 성공 주장 금지). 오프셋·주소는 실측.
-3. **시작**: `ctfguard begin <chal>`로 active lock → `rat route <bin>`으로 track/subroute/skill 판정(내부적으로 rat-doctor+rat-profile+revq를 얇게 조합, 새 분석 없음) → `revq <bin>`(rev) / `recon <bin>`(pwn)로 세부 triage.
-4. **skill 1개만**: route에 해당하는 `skills/<route>/SKILL.md`(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY) 또는 `knowledge/GROUNDING_INDEX.md` 라우팅표에서 **하나**만 로드.
-5. **bounded query**: raw dump 금지. `revq --func`/`decomp <func>`/`state compact --budget-tokens N` 같은 범위 제한된 조회만.
+3. **시작**: `ctfguard begin <chal>`로 active lock → `rat route <bin>`으로 track/subroute/skill 판정(내부적으로 rat-doctor+rat-profile+revq를 얇게 조합, 새 분석 없음). **route 직후 `revq`/`recon`을 관성적으로 다시 실행하지 않는다**; `route.next`, conflict/unknown 진단, 또는 선택한 skill의 FIRST ACTION이 요구할 때만 추가 triage한다.
+4. **skill 1개만**: route에 해당하는 `skills/<route>/SKILL.md`(SIGNALS/FIRST ACTION/PIVOT/ESCALATE/VERIFY) 또는 `knowledge/GROUNDING_INDEX.md` 라우팅표에서 **하나**만 로드하고, `route.next`/FIRST ACTION의 가장 싼 판별 query부터 수행한다.
+5. **bounded query**: raw dump 금지. 우선 `rat query func|oracle|slice` 같은 front-door bounded query를 사용하고, 필요할 때만 `revq --func`/`decomp <func>`/`state compact --budget-tokens N` 같은 범위 제한된 조회를 사용한다.
 6. **DEEP 승격 조건(아래 하나라도)**: 결과 모호·env-민감(패킹/anti-debug/커널)·같은 실패 반복·evidence 충돌·Progress Novelty Governor stuck(최근 5회 tool/query에 새 artifact digest·finding 개정·ruled-out route·primitive 상태변화 전무, `ratlib.governor.check_progress` 훅) → 강제 re-route 또는 DEEP.
 7. **SOLVED/PASS 금지 조건**: typed STATE v2 PASS(`state primitive pass <rat.primitive/v1 doc.json>`, `>=3`개의 active+direct SELF observation 필요 — [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)) 없이 체이닝 금지, `rat-verify`/`symsolve --find-str`(concrete-verify) 등 deterministic verify 없이 완료 선언 금지. legacy `state primitive <name> pass <evidence>` 문법은 이 invariant를 우회하므로 `bin/state`가 거부한다.
 
@@ -64,7 +64,7 @@ pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 �
          pwnlibc identify --leak sym=0x..   leak→libc 식별+오프셋(DB: `index build`, 미매칭은 unknown, 추측금지)
 버스     state              STATE.jsonl (+`compact --budget-tokens N`)
 계측     rat-metrics        세션 duplicate/cache/time-to-flag 집계(read-only)
-벤치     ratbench           챌린지 스위트 러너(Mode A 스크립티드/결정론 · Mode B 외부CLI 온디맨드) + `report`→LEADERBOARD
+벤치     ratbench           챌린지 스위트 러너(Mode A 스크립티드/결정론 · Mode B 외부CLI 온디맨드) + `report --schema legacy|v2`→LEADERBOARD
 학습     pklearn            learned/ 레슨 증류(distill/promote/gaps/used) — 증거 수집만, 자동요약 금지
          state failclass <class>   실패 분류표(route-miss|offset-wrong|libc-mismatch|env|tooling-gap|timeout|other)
 검증     pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate
