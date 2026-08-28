@@ -48,18 +48,25 @@ class ModeBV2RecordTests(unittest.TestCase):
             agent_rc=0, flag_claimed=True,
             completion={"verified": True, "reason": "verified", "verification_id": "verify_1"},
             events=events, primitive_pass_at=1787961603, artifact_count=7,
+            process_metrics={"tool_calls": 4, "duplicate_tool_calls": 1,
+                             "ghidra_runs": 1, "symbolic_runs": 1},
         )
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
         self.assertEqual(doc["schema"], "rat.benchmark-result/v2")
         self.assertEqual(doc["outcome"], "verified")
         self.assertTrue(doc["metrics"]["correctness"]["verified_solve"])
+        self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_query_ms"], 1250)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_hypothesis_ms"], 2500)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_valid_primitive_ms"], 3000)
         self.assertEqual(doc["metrics"]["latency"]["time_to_verified_solve_ms"], 5750)
         self.assertEqual(doc["metrics"]["artifacts"]["artifact_count"], 7)
         self.assertIsNone(doc["metrics"]["context"]["input_tokens"])
-        self.assertIsNone(doc["metrics"]["tools"]["tool_calls"])
+        self.assertEqual(doc["metrics"]["tools"]["tool_calls"], 4)
+        self.assertEqual(doc["metrics"]["tools"]["duplicate_tool_calls"], 1)
+        self.assertEqual(doc["metrics"]["tools"]["ghidra_runs"], 1)
+        self.assertEqual(doc["metrics"]["tools"]["symbolic_runs"], 1)
+        self.assertIsNone(doc["metrics"]["tools"]["cfgfast_runs"])
 
     def test_flag_without_completion_is_only_solve_claimed(self):
         doc = RATBENCH._mode_b_v2_record(
@@ -73,8 +80,8 @@ class ModeBV2RecordTests(unittest.TestCase):
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
         self.assertEqual(doc["outcome"], "solve-claimed")
         self.assertFalse(doc["metrics"]["correctness"]["verified_solve"])
+        self.assertTrue(doc["metrics"]["correctness"]["false_solved"])
         self.assertIsNone(doc["metrics"]["latency"]["time_to_verified_solve_ms"])
-        self.assertIsNone(doc["metrics"]["correctness"]["false_solved"])
 
     def test_timeout_without_verified_solve_is_censored(self):
         doc = RATBENCH._mode_b_v2_record(
@@ -88,6 +95,9 @@ class ModeBV2RecordTests(unittest.TestCase):
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
         self.assertEqual(doc["status"], "timeout")
         self.assertEqual(doc["outcome"], "censored")
+        self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
+        self.assertIsNone(doc["metrics"]["tools"]["tool_calls"])
+        self.assertIsNone(doc["metrics"]["tools"]["duplicate_tool_calls"])
 
     def test_legacy_report_ignores_v2_companion(self):
         with tempfile.TemporaryDirectory() as d:
