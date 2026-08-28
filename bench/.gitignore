@@ -1,0 +1,10 @@
+# Mode A/B run outputs are reproducible and per-machine — not committed.
+results/*.jsonl
+LEADERBOARD.md
+# Compiled fixtures + any real-competition binaries dropped under artifacts/.
+artifacts/**/*.bin
+artifacts/**/a.out
+*.o
+# Run state must never live in a fixture: Mode B copytree would inherit a stale
+# typed primitive PASS and report "solved" without the agent doing anything.
+artifacts/**/.rat/

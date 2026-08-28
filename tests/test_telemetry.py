@@ -73,6 +73,32 @@ class OperationFingerprint(unittest.TestCase):
         self.assertNotEqual(operation_fingerprint(envelope(parameters={"a": 1})), operation_fingerprint(envelope(parameters={"a": 2})))
 
 class Aggregate(unittest.TestCase):
+    def test_direct_subjects_use_distinct_cache_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            tool = os.path.join(d, "measure")
+            for path, data in ((tool, b"#!/bin/sh\nprintf measured\n"),
+                               (os.path.join(d, "a"), b"a"),
+                               (os.path.join(d, "b"), b"b")):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            os.chmod(tool, 0o755)
+            a, b = os.path.join(d, "a"), os.path.join(d, "b")
+            first = execute([tool], root=os.path.join(d, ".rat"), input_paths=[a, b], direct_subject=a)
+            second = execute([tool], root=os.path.join(d, ".rat"), input_paths=[a, b], direct_subject=b)
+            self.assertEqual(first["cache_state"], "miss")
+            self.assertEqual(second["cache_state"], "miss")
+
+    def test_command_arguments_use_distinct_cache_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            tool = os.path.join(d, "measure")
+            with open(tool, "wb") as fh:
+                fh.write(b"#!/bin/sh\nprintf '%s' \"$1\"\n")
+            os.chmod(tool, 0o755)
+            first = execute([tool, "first"], root=os.path.join(d, ".rat"))
+            second = execute([tool, "second"], root=os.path.join(d, ".rat"))
+            self.assertEqual(first["cache_state"], "miss")
+            self.assertEqual(second["cache_state"], "miss")
+
     def test_duplicate_tool_calls_counts_repeated_fingerprint_misses(self):
         docs = [envelope(cache_state="miss"), envelope(cache_state="miss")]
         m = aggregate(docs)
@@ -115,6 +141,27 @@ class Aggregate(unittest.TestCase):
     def test_time_to_flag_sec_is_elapsed_seconds_between_guard_begin_and_verify_pass(self):
         m = aggregate([envelope()], guard_started_at=1000, verify_pass_at=1090)
         self.assertEqual(m["time_to_flag_sec"], 90)
+
+    def test_indexed_artifacts_backend_counts_default_empty(self):
+        self.assertEqual(aggregate([envelope()])["indexed_artifacts_by_backend"], {})
+
+    def test_indexed_artifacts_surface_tools_that_bypass_the_tool_result_store(self):
+        # revq/decomp/pwngadget register in the shared cache index, not the
+        # tool-result store metrics scans -- so with zero tool-result docs the
+        # index backends are the only lineage signal they leave.
+        from ratlib.cache import Cache, canonical_key
+        from ratlib.metrics import index_backends
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            c = Cache(root)
+            c.put_entry(canonical_key(binary_sha256="sha256:" + "a" * 64, tool_name="revq",
+                        tool_version="2", params={}, dep_versions={}), backend="revq_json", path="/tmp/x.revq.json")
+            c.put_entry(canonical_key(binary_sha256="sha256:" + "a" * 64, tool_name="pwngadget",
+                        tool_version="1", params={"q": "ret"}, dep_versions={}), backend="pwngadget", path="/tmp/g.json")
+            m = aggregate([], index_backend_counts=index_backends(root))
+            self.assertEqual(m["tool_calls"], 0)  # nothing in the tool-result store
+            self.assertEqual(m["indexed_artifacts_by_backend"].get("revq_json"), 1)
+            self.assertEqual(m["indexed_artifacts_by_backend"].get("pwngadget"), 1)
 
 class FirstPrimitivePassTs(unittest.TestCase):
     """Once a v2 stream exists it is authoritative: a legacy PASS must never

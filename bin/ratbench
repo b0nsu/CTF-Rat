@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""ratbench — challenge-suite runner + leaderboard (plans/BENCHMARK_LEARNING_LOOP.md B1/B2).
+
+Mode A (scripted-driver, deterministic, CI-able) is a route-unit + oracle-smoke check, NOT
+a route-to-exploit E2E run: it (1) checks route judgment against each entry's committed
+`route.json` fixture with zero external dependencies, and (2) feeds each fixture's known-good
+"magic input" (`verify.stdin` / `verify.find_str`) straight to a real oracle (a compiled
+binary's stdout regex, or angr symsolve). No model, agent, or exploit-construction step is in
+the loop; a "solved" row proves the route+oracle pairing works when handed the answer, not
+that anything discovered the answer. The oracle stage is reported as `skipped` (not failed)
+when its toolchain (gcc / angr) is missing.
+
+Mode B (model-eval) is intentionally NOT automated here; run external agent CLIs by hand
+and drop rat.bench-result/v1 lines into bench/results/ (see the plan). Mode B does NOT
+re-run Mode A's flag-regex/symsolve oracle over the agent's output -- it decides "solved"
+purely from whether a typed STATE v2 primitive PASS is currently active for that fixture
+(ratlib.metrics.first_primitive_pass_ts), the same honest-mode gate used everywhere else in
+the kit. A bare `FLAG{...}` in the agent's stdout is recorded as `flag_claimed` but never
+promoted to `solved` on its own.
+
+  ratbench run [--id ID] [--suite path] [--run-id ID]
+  ratbench report [--suite path]
+  ratbench selftest
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib import route as route_mod  # noqa: E402
+from ratlib.schema import validate  # noqa: E402
+
+
+def ctf_home():
+    return os.environ.get(
+        "CTF_HOME",
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")),
+    )
+
+
+def _suite_path(override=None):
+    return override or os.path.join(ctf_home(), "bench", "suite.json")
+
+
+def _load_suite(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _have(cmd):
+    from shutil import which
+    return which(cmd) is not None
+
+
+def _have_angr():
+    try:
+        subprocess.run([sys.executable, "-c", "import angr"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# route stage (always runs — pure python, no deps)
+# ---------------------------------------------------------------------------
+def _check_route(entry):
+    fx_path = os.path.join(ctf_home(), entry["dir"], entry.get("route_fixture", "route.json"))
+    with open(fx_path, encoding="utf-8") as fh:
+        fx = json.load(fh)
+    result = route_mod.route(profile=fx.get("profile"), revq=fx.get("revq"),
+                             interesting=fx.get("interesting"))
+    got = result.get("subroute")
+    return got == entry["expected_route"], got, result.get("track")
+
+
+# ---------------------------------------------------------------------------
+# verify stage (runs the real fixture when toolchain is present)
+# ---------------------------------------------------------------------------
+def _compile(entry, workdir):
+    src = os.path.join(ctf_home(), entry["dir"], entry.get("source", "src.c"))
+    if not os.path.isfile(src) or not _have("gcc"):
+        return None
+    out = os.path.join(workdir, entry["id"])
+    # -no-pie + -fno-stack-protector keep the synthetic fixtures simple/deterministic.
+    cmd = ["gcc", "-w", "-O1", "-fno-stack-protector", "-no-pie", src, "-o", out]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except Exception:
+        return None
+    return out if os.path.isfile(out) else None
+
+
+def _verify_flag_regex(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    stdin = entry["verify"].get("stdin", "").encode()
+    try:
+        p = subprocess.run([binpath], input=stdin, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=30)
+    except Exception as exc:
+        return "error", str(exc)
+    out = p.stdout.decode(errors="replace")
+    if re.search(entry["verify"]["pattern"], out):
+        return "pass", out.strip().splitlines()[-1] if out.strip() else ""
+    return "fail", "pattern %r not in output" % entry["verify"]["pattern"]
+
+
+def _verify_symsolve(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    if not _have_angr():
+        return "skipped", "no angr"
+    v = entry["verify"]
+    sym = os.path.join(ctf_home(), "solve", "_template", "rev", "symsolve.py")
+    cmd = [sys.executable, sym, binpath, "--find-str", v["find_str"],
+           "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)), "--printable"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    except Exception as exc:
+        return "error", str(exc)
+    out = p.stdout.decode(errors="replace")
+    if v["expected"] in out:
+        return "pass", v["expected"]
+    return "fail", "expected %r not recovered" % v["expected"]
+
+
+def _verify(entry, binpath):
+    kind = entry["verify"]["kind"]
+    if kind == "flag-regex":
+        return _verify_flag_regex(entry, binpath)
+    if kind == "symsolve-restore":
+        return _verify_symsolve(entry, binpath)
+    if kind == "rat-verify-pass":
+        # Deterministic report-presence check; a real verification report would be produced
+        # by the challenge run. Absent one, this is skipped rather than failed.
+        return "skipped", "rat-verify report presence check (not produced in Mode A)"
+    return "skipped", "unknown verify kind %s" % kind
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+def cmd_run(args):
+    import tempfile
+    suite = _load_suite(_suite_path(args.suite))
+    entries = suite["entries"]
+    if args.id:
+        entries = [e for e in entries if e["id"] == args.id]
+        if not entries:
+            print("[ratbench:err] no entry %s" % args.id, file=sys.stderr); return 4
+    run_id = args.run_id or ("A-%d" % int(time.time()))
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, run_id + ".jsonl")
+    workdir_ctx = tempfile.TemporaryDirectory()  # auto-cleaned (was mkdtemp -> leaked)
+    workdir = workdir_ctx.name
+    n_fail = 0
+    lines = []
+    print("== ratbench Mode A: %s (%d entries) ==" % (run_id, len(entries)))
+    for e in entries:
+        t0 = time.time()
+        route_ok, got_route, got_track = _check_route(e)
+        binpath = _compile(e, workdir)
+        vstatus, vdetail = _verify(e, binpath)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        # solve = route correct AND verifier passed; skipped verifier => "partial"
+        if not route_ok:
+            outcome = "route-miss"
+        elif vstatus == "pass":
+            outcome = "solved"
+        elif vstatus == "skipped":
+            outcome = "route-ok-verify-skipped"
+        else:
+            outcome = "verify-fail"
+        if outcome in ("route-miss", "verify-fail"):
+            n_fail += 1
+        rec = {
+            "schema": "rat.bench-result/v1", "mode": "A", "run_id": run_id,
+            "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+            "expected_route": e["expected_route"], "got_route": got_route, "got_track": got_track,
+            "route_ok": route_ok, "verify": {"kind": e["verify"]["kind"], "status": vstatus, "detail": vdetail},
+            "outcome": outcome, "wall_ms": elapsed_ms,
+        }
+        lines.append(rec)
+        mark = {"solved": "OK  ", "route-ok-verify-skipped": "~   ",
+                "route-miss": "MISS", "verify-fail": "FAIL"}[outcome]
+        print("  [%s] %-18s route=%s%s verify=%s (%s)" % (
+            mark, e["id"], got_route,
+            "" if route_ok else "!=%s" % e["expected_route"],
+            vstatus, vdetail if vstatus != "pass" else "ok"))
+    for rec in lines:
+        validate(rec, "rat.bench-result/v1")  # catch row-shape drift before persisting
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for rec in lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    print("-- results: %s" % os.path.relpath(out_path, ctf_home()))
+    workdir_ctx.cleanup()
+    if n_fail:
+        print("-- %d entr%s FAILED (route-miss/verify-fail)" % (n_fail, "y" if n_fail == 1 else "ies"))
+        return 1
+    n_skipped = sum(1 for rec in lines if rec["verify"]["status"] == "skipped")
+    # A missing gcc is not the only way a verifier gets skipped (symsolve-restore
+    # needs angr, rat-verify-pass is always skipped in Mode A) -- report what
+    # actually ran, not a proxy check for one dependency.
+    if n_skipped:
+        print("-- all entries route-correct, %d/%d verifier%s skipped (missing dependency, not failed)" %
+              (n_skipped, len(lines), "" if n_skipped == 1 else "s"))
+    else:
+        print("-- all entries route-correct and verified")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# eval (Mode B — external model CLI, on-demand, human-run, NOT CI)
+# ---------------------------------------------------------------------------
+def cmd_eval(args):
+    """Drive an external agent CLI over each fixture in a fresh sandbox copy, then read the
+    outcome off the SAME honest-mode gate the rest of the kit uses (typed primitive PASS) --
+    NOT Mode A's flag-regex/symsolve oracle, which is never invoked here. Deliberately
+    on-demand: results are written but git-ignored, never committed (only the leaderboard
+    is). Degrades to EXIT_DEPENDENCY if the CLI is absent."""
+    import shutil
+    import tempfile
+    if not args.agent:
+        print("[ratbench:err] eval requires --agent \"<cli command template>\" (use {dir} placeholder)", file=sys.stderr); return 2
+    agent_bin = args.agent.split()[0]
+    if not _have(agent_bin):
+        print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
+        return 3  # EXIT_DEPENDENCY
+    suite = _load_suite(_suite_path(args.suite))
+    entries = suite["entries"]
+    if args.id:
+        entries = [e for e in entries if e["id"] == args.id]
+    run_id = args.run_id or ("B-%s-%d" % (agent_bin, int(time.time())))
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, run_id + ".jsonl")
+    lines = []
+    print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
+    for e in entries:
+        sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
+        try:
+            # Never copy run state into the sandbox: a fixture that accidentally
+            # carries .rat/ with a typed primitive PASS would satisfy the honest-mode
+            # gate without the agent solving anything.
+            shutil.copytree(os.path.join(ctf_home(), e["dir"]), os.path.join(sandbox, e["id"]),
+                            ignore=shutil.ignore_patterns(".rat"))
+            chal_dir = os.path.join(sandbox, e["id"])
+            prompt = args.agent.replace("{dir}", chal_dir)
+            t0 = time.time()
+            try:
+                p = subprocess.run(prompt, shell=True, cwd=chal_dir, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=args.timeout)
+                agent_out = p.stdout.decode(errors="replace")
+                agent_rc = p.returncode
+            except subprocess.TimeoutExpired:
+                agent_out, agent_rc = "", 124
+            wall = int((time.time() - t0) * 1000)
+            # A FLAG{...} in stdout is a *claim*, never proof: an agent can print one
+            # without solving anything. The authoritative honest-mode gate (per AGENTS.md)
+            # is a *typed primitive PASS* -- >=3 active direct SELF observations, enforced
+            # by state_v2.revise_primitive (and, once producer-owned evidence lands, not
+            # forgeable). Reuse the same scan metrics uses. Outcome is decided by the gate:
+            #   solved        -> typed primitive PASS present (real, honest solve)
+            #   solve-claimed  -> flag printed but NO gate (overclaim; must not count as solved)
+            #   fail           -> neither
+            flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
+            from ratlib.metrics import first_primitive_pass_ts
+            typed_pass = first_primitive_pass_ts(chal_dir) is not None
+            if typed_pass:
+                outcome = "solved"
+            elif flag_claimed:
+                outcome = "solve-claimed"
+            else:
+                outcome = "fail"
+            rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": agent_bin,
+                   "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+                   "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
+                   "typed_primitive_pass": typed_pass, "wall_ms": wall}
+            lines.append(rec)
+            mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
+            print("  [%s] %-18s rc=%s wall=%dms%s" % (
+                mark, e["id"], agent_rc, wall,
+                "  (flag claimed, gate NOT satisfied)" if outcome == "solve-claimed" else ""))
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    for rec in lines:
+        validate(rec, "rat.bench-result/v1")  # catch row-shape drift before persisting
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for rec in lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+def cmd_report(args):
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    rows = []
+    if os.path.isdir(results_dir):
+        for fn in sorted(os.listdir(results_dir)):
+            if not fn.endswith(".jsonl"):
+                continue
+            with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+    lb = _render_leaderboard(rows)
+    out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.md")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(lb)
+    print(lb)
+    print("-- wrote %s" % os.path.relpath(out_path, ctf_home()))
+    return 0
+
+
+def _render_leaderboard(rows):
+    L = ["# ratbench leaderboard", "",
+         "> Generated by `ratbench report` from `bench/results/*.jsonl`. A/B comparisons are only",
+         "> valid across the SAME suite. Mode A = scripted driver; Mode B = external model eval.", ""]
+    if not rows:
+        L.append("_(no results yet — run `ratbench run`)_")
+        return "\n".join(L) + "\n"
+    # per-run aggregate
+    runs = {}
+    for r in rows:
+        runs.setdefault(r.get("run_id", "?"), []).append(r)
+    L.append("## Runs")
+    L.append("")
+    L.append("| Run | Mode | Entries | Route OK | Solved | Claimed | Verify-skipped | Failed | Route acc |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    for rid, rs in sorted(runs.items()):
+        n = len(rs)
+        route_ok = sum(1 for x in rs if x.get("route_ok"))
+        solved = sum(1 for x in rs if x.get("outcome") == "solved")
+        # Mode B overclaims: a flag was printed but the typed primitive-PASS gate was
+        # never satisfied. Surfaced explicitly so they never masquerade as solves.
+        claimed = sum(1 for x in rs if x.get("outcome") == "solve-claimed")
+        skipped = sum(1 for x in rs if x.get("outcome") == "route-ok-verify-skipped")
+        failed = sum(1 for x in rs if x.get("outcome") in ("route-miss", "verify-fail", "fail"))
+        acc = "%.0f%%" % (100.0 * route_ok / n) if n else "n/a"
+        mode = rs[0].get("mode", "?")
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %d | %s |" % (rid, mode, n, route_ok, solved, claimed, skipped, failed, acc))
+    # per-difficulty matrix (latest run per id wins)
+    latest = {}
+    for r in rows:
+        latest[r.get("id")] = r  # file order is chronological-ish; last wins
+    L.append("")
+    L.append("## By difficulty (latest per entry)")
+    L.append("")
+    L.append("| Difficulty | Entries | Route OK | Solved |")
+    L.append("|---|---|---|---|")
+    by_diff = {}
+    for r in latest.values():
+        by_diff.setdefault(r.get("difficulty"), []).append(r)
+    for d in sorted(by_diff, key=lambda x: (x is None, x)):
+        rs = by_diff[d]
+        L.append("| %s | %d | %d | %d |" % (
+            d, len(rs), sum(1 for x in rs if x.get("route_ok")),
+            sum(1 for x in rs if x.get("outcome") == "solved")))
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def _selftest():
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    suite = _load_suite(_suite_path())
+    ids = {e["id"] for e in suite["entries"]}
+    chk({"stack-basic-01", "fmt-basic-01", "checker-basic-01"} <= ids, "suite: synthetic entries present")
+    # route stage must classify every entry correctly from its fixture
+    for e in suite["entries"]:
+        ok, got, _track = _check_route(e)
+        chk(ok, "route: %s -> %s (expected %s)" % (e["id"], got, e["expected_route"]))
+    # deliberately-wrong expected_route must be detected as a miss
+    bad = dict(suite["entries"][0]); bad["expected_route"] = "pwn-heap"
+    ok, _got, _t = _check_route(bad)
+    chk(not ok, "route: misassignment detected (negative test)")
+    # leaderboard renders from synthetic rows
+    lb = _render_leaderboard([
+        {"run_id": "T", "mode": "A", "id": "x", "difficulty": 1, "route_ok": True, "outcome": "solved"},
+        {"run_id": "T", "mode": "A", "id": "y", "difficulty": 1, "route_ok": False, "outcome": "route-miss"},
+    ])
+    chk("Route acc" in lb and "50%" in lb, "report: leaderboard renders route accuracy")
+    if fails:
+        print("ratbench selftest: FAIL (%d)" % len(fails)); return 1
+    print("ratbench selftest: OK"); return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ratbench", description="challenge-suite runner + leaderboard")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("run", help="Mode A scripted driver over the suite")
+    r.add_argument("--id"); r.add_argument("--suite"); r.add_argument("--run-id")
+    ev = sub.add_parser("eval", help="Mode B external agent CLI eval (on-demand, not CI)")
+    ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
+    ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
+    ev.add_argument("--timeout", type=int, default=600)
+    rep = sub.add_parser("report", help="render bench/LEADERBOARD.md from results")
+    rep.add_argument("--suite")
+    sub.add_parser("selftest", help="pure-logic regression")
+    args = ap.parse_args(argv)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "eval":
+        return cmd_eval(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "selftest":
+        return _selftest()
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

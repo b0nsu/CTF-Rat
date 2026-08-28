@@ -1,0 +1,105 @@
+{
+  "schema": "rat.bench-suite/v1",
+  "note": "Repo-authored synthetic fixtures (license-free). Real-competition binaries go under bench/artifacts/<id>/ and are .gitignored by size/license — add their manifest entries here.",
+  "entries": [
+    {
+      "id": "stack-basic-01",
+      "track": "pwn",
+      "expected_route": "pwn-stack",
+      "difficulty": 1,
+      "dir": "bench/artifacts/stack-basic-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "open-sesame\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "fmt-basic-01",
+      "track": "pwn",
+      "expected_route": "pwn-format",
+      "difficulty": 1,
+      "dir": "bench/artifacts/fmt-basic-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "0x[0-9a-f]+", "stdin": "%p.%p.%p\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "checker-basic-01",
+      "track": "rev",
+      "expected_route": "rev-checker",
+      "difficulty": 1,
+      "dir": "bench/artifacts/checker-basic-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "symsolve-restore", "expected": "s3cr3t_p4ss", "find_str": "FLAG", "avoid_str": "Wrong", "stdin_len": 11},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "rop-nx-01",
+      "track": "pwn",
+      "expected_route": "pwn-rop",
+      "difficulty": 2,
+      "dir": "bench/artifacts/rop-nx-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "chain-me\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "heap-uaf-01",
+      "track": "pwn",
+      "expected_route": "pwn-heap",
+      "difficulty": 2,
+      "dir": "bench/artifacts/heap-uaf-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "tcache-win\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "heap-house-02",
+      "track": "pwn",
+      "expected_route": "pwn-heap",
+      "difficulty": 3,
+      "dir": "bench/artifacts/heap-house-02",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "house-of-force\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "packed-upx-01",
+      "track": "rev",
+      "expected_route": "rev-packed",
+      "difficulty": 2,
+      "dir": "bench/artifacts/packed-upx-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "unpack-me\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "vm-basic-01",
+      "track": "rev",
+      "expected_route": "rev-vm",
+      "difficulty": 2,
+      "dir": "bench/artifacts/vm-basic-01",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}", "stdin": "v1rtu4l\n"},
+      "env": {"needs_libc": false}
+    },
+    {
+      "id": "checker-xor-02",
+      "track": "rev",
+      "expected_route": "rev-checker",
+      "difficulty": 2,
+      "dir": "bench/artifacts/checker-xor-02",
+      "source": "src.c",
+      "route_fixture": "route.json",
+      "verify": {"kind": "symsolve-restore", "expected": "x0rz42", "find_str": "Correct", "avoid_str": "Wrong", "stdin_len": 6},
+      "env": {"needs_libc": false}
+    }
+  ]
+}

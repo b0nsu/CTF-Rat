@@ -1,0 +1,6 @@
+{
+  "profile": {"imports": ["read", "puts"]},
+  "revq": {"imports": ["read", "puts"], "platform": "elf",
+           "strings": [{"val": "Correct: FLAG{synthetic-xor-checker}"}, {"val": "Wrong"}]},
+  "interesting": [{"func": "main", "score": 8, "why": ["비교함수 호출"]}]
+}

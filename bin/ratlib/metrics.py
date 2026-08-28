@@ -1,7 +1,8 @@
 """Read-only session telemetry aggregator.
 
-Reads tool-result envelopes from a .rat artifact store plus STATE.jsonl and
-emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
+Reads tool-result envelopes from a .rat artifact store plus the authoritative
+typed STATE v2 stream, with legacy STATE.jsonl fallback for pre-v2 sessions,
+and emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, sys
@@ -60,21 +61,41 @@ def guard_started_at(ctf_home, chal=None):
     return obj.get("started_at")
 
 def _first_primitive_pass_ts_v2(state_dir):
-    best = None
+    """Timestamp of the earliest STILL-ACTIVE primitive PASS, never a stale one.
+
+    A raw scan for any "status":"pass" event is not enough: _materialize() stales
+    a primitive whose self_evidence was later invalidated (evidence.invalidated),
+    and a solved-then-invalidated primitive must not count as a solve for
+    benchmarking/gating (ratbench Mode B reads this to decide the "solved" outcome).
+    Only primitive_ids whose MATERIALIZED status is currently pass/consumed
+    contribute; for those, use the timestamp of their most recent pass transition
+    (an earlier pass that was itself invalidated before this one is not the real
+    solve time).
+    """
     try:
-        events = Stream(state_dir).read()
+        stream = Stream(state_dir)
+        events = stream.read()
+        view = stream._materialize(events)
     except (OSError, ValueError):
         return None
+    active_ids = {pid for pid, p in view["primitives"].items() if p.get("status") in ("pass", "consumed")}
+    if not active_ids:
+        return None
+    latest_pass_ts = {}
     for e in events:
-        if e.get("type") != "primitive.revised" or e.get("payload", {}).get("status") != "pass":
+        if e.get("type") != "primitive.revised":
+            continue
+        p = e.get("payload", {})
+        pid = p.get("primitive_id")
+        if pid not in active_ids or p.get("status") != "pass":
             continue
         try:
             ts = int(datetime.fromisoformat(e["at"]).timestamp())
         except (KeyError, ValueError):
             continue
-        if best is None or ts < best:
-            best = ts
-    return best
+        if pid not in latest_pass_ts or ts > latest_pass_ts[pid]:
+            latest_pass_ts[pid] = ts
+    return min(latest_pass_ts.values()) if latest_pass_ts else None
 
 def _first_primitive_pass_ts_legacy(state_dir):
     path = os.path.join(state_dir, "STATE.jsonl")
@@ -112,7 +133,24 @@ def first_primitive_pass_ts(state_dir):
         return _first_primitive_pass_ts_v2(state_dir)
     return _first_primitive_pass_ts_legacy(state_dir)
 
-def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
+def index_backends(root):
+    """Distinct cached artifacts per backend from the canonical cache index.
+
+    Closes a lineage blind spot: the tool-result-derived counts below only see
+    tools that route through the bounded adapter (contracts.execute), so
+    revq/decomp/pwngadget -- which write their own caches and register in the
+    shared index instead -- were invisible to telemetry. The index carries one
+    row per distinct (tool, inputs, params) result, so this is a floor on tool
+    activity (cache hits collapse onto the same row), reported separately from
+    the invocation counts rather than conflated with them.
+    """
+    try:
+        from .cache import Cache
+        return Cache(root).stats().get("by_backend", {})
+    except Exception:
+        return {}
+
+def aggregate(docs, *, guard_started_at=None, verify_pass_at=None, index_backend_counts=None):
     docs = list(docs)
     seen_fingerprints = {}
     duplicate = 0
@@ -156,12 +194,15 @@ def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
         "ghidra_runs": ghidra_runs,
         "revq_runs": revq_runs,
         "duration_ms_total": duration_total,
+        # lineage floor for tools that bypass the tool-result store (revq/decomp/
+        # pwngadget), sourced from the shared cache index -- see index_backends().
+        "indexed_artifacts_by_backend": dict(index_backend_counts) if index_backend_counts else {},
     }
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="rat-metrics")
     ap.add_argument("--root", help=".rat artifact store root (default: ./.rat)")
-    ap.add_argument("--state-dir", help="directory containing STATE.jsonl (default: cwd)")
+    ap.add_argument("--state-dir", help="directory containing .rat/events/STATE.v2.jsonl (legacy STATE.jsonl fallback; default: cwd)")
     ap.add_argument("--ctf-home", help="repo root for ACTIVE.json lookup (default: $CTF_HOME)")
     ap.add_argument("--chal", help="expected active challenge name for guard-begin lookup")
     ns = ap.parse_args(argv)
@@ -173,6 +214,7 @@ def main(argv=None):
         iter_tool_results(root),
         guard_started_at=guard_started_at(ctf_home, ns.chal),
         verify_pass_at=first_primitive_pass_ts(state_dir),
+        index_backend_counts=index_backends(root),
     )
     print(json.dumps(metrics, sort_keys=True, ensure_ascii=False))
     return 0
