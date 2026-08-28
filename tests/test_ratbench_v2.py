@@ -28,8 +28,71 @@ ENTRY = {
     "track": "pwn",
     "difficulty": 1,
     "expected_route": "pwn-stack",
+    "corpus": "private",
+    "capabilities": ["stack-overflow"],
+    "redistributable": False,
     "verify": {"kind": "flag-regex"},
 }
+
+
+def _suite_entry(entry_id, corpus):
+    return {
+        "id": entry_id,
+        "track": "pwn",
+        "expected_route": "pwn-stack",
+        "difficulty": 1,
+        "corpus": corpus,
+        "capabilities": ["stack-overflow"],
+        "redistributable": corpus != "private",
+        "dir": "bench/artifacts/stack-basic-01",
+        "source": "src.c",
+        "route_fixture": "route.json",
+        "verify": {"kind": "flag-regex", "pattern": "FLAG\\{.+\\}"},
+        "env": {"needs_libc": False},
+    }
+
+
+class CorpusGateTests(unittest.TestCase):
+    def _write_suite(self, directory, entries):
+        path = os.path.join(directory, "suite.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "rat.bench-suite/v1", "entries": entries}, fh)
+        return path
+
+    def test_select_entries_projects_one_corpus_before_execution(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_suite(d, [
+                _suite_entry("synthetic-01", "synthetic"),
+                _suite_entry("heldout-01", "private"),
+            ])
+            entries = RATBENCH._select_entries(SimpleNamespace(suite=path, corpus="private", id=None))
+            self.assertEqual([entry["id"] for entry in entries], ["heldout-01"])
+
+    def test_select_entries_fails_closed_for_empty_requested_corpus(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_suite(d, [_suite_entry("synthetic-01", "synthetic")])
+            with self.assertRaisesRegex(RATBENCH.SuiteValidationError, "no entries for corpus: private"):
+                RATBENCH._select_entries(SimpleNamespace(suite=path, corpus="private", id=None))
+
+    def test_cmd_run_rejects_malformed_suite_before_route_or_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bad.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{bad")
+            args = SimpleNamespace(suite=path, corpus=None, id=None, run_id="T")
+            with mock.patch.object(RATBENCH, "_check_route") as route, mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_run(args), 3)
+            route.assert_not_called()
+
+    def test_id_is_scoped_to_selected_corpus(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_suite(d, [
+                _suite_entry("synthetic-01", "synthetic"),
+                _suite_entry("heldout-01", "private"),
+            ])
+            with self.assertRaisesRegex(LookupError, "no entry synthetic-01"):
+                RATBENCH._select_entries(SimpleNamespace(
+                    suite=path, corpus="private", id="synthetic-01"))
 
 
 class ModeBV2RecordTests(unittest.TestCase):
@@ -67,6 +130,9 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["metrics"]["tools"]["ghidra_runs"], 1)
         self.assertEqual(doc["metrics"]["tools"]["symbolic_runs"], 1)
         self.assertIsNone(doc["metrics"]["tools"]["cfgfast_runs"])
+        self.assertEqual(doc["ground_truth"]["corpus"], "private")
+        self.assertEqual(doc["ground_truth"]["capabilities"], ["stack-overflow"])
+        self.assertFalse(doc["ground_truth"]["redistributable"])
 
     def test_flag_without_completion_is_only_solve_claimed(self):
         doc = RATBENCH._mode_b_v2_record(
