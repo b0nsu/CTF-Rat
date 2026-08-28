@@ -17,5 +17,6 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-ctf.md
 - Symbolic execution genuinely stuck (unresolved indirect calls, path explosion) after narrowing → DEEP, scout-subagent read of the decompiled function before retrying.
 
 ## VERIFY
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`, ≥3 active+direct SELF observations) is required before declaring SOLVED, in addition to concrete-verify below.
 - `symsolve.py` concrete-verify (recovered input re-run through the real binary, not just the solver's symbolic state) is the only acceptable evidence for SOLVED here.
 - A symbolic solution that only satisfies angr's model without concrete-verify is a hypothesis, not a primitive PASS.

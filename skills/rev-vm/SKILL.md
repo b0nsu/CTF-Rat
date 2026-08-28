@@ -19,5 +19,6 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-runtim
 - Oracle needed for solve is arithmetic/constraint-heavy on VM registers → `rev-symbolic` via `vmlift.py --solve` (oracle-brute) instead of hand-solving.
 
 ## VERIFY
+- typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`, ≥3 active+direct SELF observations) is required before declaring SOLVED, in addition to the emulator/real-binary cross-check below.
 - `vmlift.py --solve` (or hand-derived input) must be re-executed by the *emulator/lifter* and, where possible, cross-checked against the real binary's VM.
 - Do not claim SOLVED from lifter output alone if the real binary's VM was never exercised with the same bytes.

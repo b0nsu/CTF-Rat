@@ -22,6 +22,7 @@
 ## 4-게이트 판정 절차
 ### L0 하드 스킵 (신호 무관 즉시 후순위)
 지원하지 않는 플랫폼 / 심한 난독화·anti-analysis / 미준비 아키텍처.
+- **kernel amend**: mixed 더미 triage에서는 kernel을 즉시 후순위로 두지만, kernel이 **명시적 목표**이고 환경이 구축된 경우엔 이 하드 스킵을 적용하지 않는다 — 판정·프로토콜은 `kernel/CLAUDE.md`의 "SOLVABILITY (kernel)" 절 참조.
 
 ### L1 정적 prior (recon) — 순서용, 판정 아님
 `recon` / `triage-all` 로 vuln class 가설 + tier. **확신 아님, 착수 순서만.**
@@ -40,10 +41,10 @@ primitive + 남은 템플릿 조각 전부 확보?
 - 완화기법이 재현 가정을 막지 않는가?
 전부 예 → 확신. 조각 하나 빠짐 → STANDARD(작업 필요) 또는 blocker.
 
-### L4 stop-loss (이탈 규칙)
-- 예산: 한 챌린지 primitive 실증까지 easy-tier≈20분/hard≈30분 / probe 3라운드.
-- 초과 & primitive 없음 → 다운그레이드, 다음 챌린지. (rabbit-hole 방지)
-- 막힌 지점 state.md 기록 후 이탈, 나중에 재방문.
+### L4 stop-loss (이탈 규칙 — call/round 단위가 1차, 분은 참고)
+- 1차 예산(객관): primitive 실증까지 **probe 3라운드**(= 새 신호를 노리는 tool/query 시도 묶음 3회). 여기서 라운드 경계는 `rat route`/`rat query`가 append하는 `governor.checked`로 관측된다 — `ratlib.governor.check_progress`가 최근 5회 연속 no-novelty면 stuck을 반환하고, 이는 곧 stop-loss 트리거다.
+- 벽시계(easy≈20분/hard≈30분)는 위 call 예산이 관측 불가할 때만 쓰는 **보조 상한**이다.
+- 초과 & primitive 없음 → 다운그레이드, 다음 챌린지(rabbit-hole 방지). 막힌 지점을 `state no`/`state failclass`로 기록 후 이탈, 나중에 재방문.
 
 ## 최종 verdict
 ```
@@ -56,4 +57,4 @@ SOLVE(작업)  = L0통과 ∧ primitive 유력 ∧ 조각 일부 미확보
 라벨 코퍼스(NYU pwn `initial`점수 · pwnable.kr 점수)에서 **정직 모드**(답 미참조)로 도출·실증하며:
 - SOLVE 판정의 **정밀도**(확신인데 실패=false positive) 측정 → 최소화하도록 게이트 조정.
 - false negative(후순위인데 쉬움)는 허용 — 보수성 우선.
-- 기록: `doctrine/calibration.md` 에 [챌린지 · prior tier · 실제 도출 성공? · FP/FN] 누적.
+- 기록: `docs/calibration.md` 에 [챌린지 · prior tier · 실제 도출 성공? · FP/FN] 누적. (실제 flag·remote·오프셋 상수를 담으므로 doctrine 경로 밖 `docs/`에 둔다 — 오염 금지 하드룰 상 doctrine에 상주 금지.)
