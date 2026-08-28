@@ -92,7 +92,8 @@ class RouteResultSchema(unittest.TestCase):
 class QueryResultSchema(unittest.TestCase):
     def test_valid_doc_passes_for_each_status(self):
         for status in ("ok", "partial", "error"):
-            validate(query_result(status=status))
+            validate(query_result(status=status,
+                                  coverage={"complete": status == "ok", "scope": "x", "omitted": None}))
 
     def test_invalid_status_raises(self):
         with self.assertRaises(ValidationError): validate(query_result(status="pending"))
