@@ -26,12 +26,14 @@ class AnalysisEnvelopeIdentity(unittest.TestCase):
             self.assertEqual(doc["inputs"][0]["digest"], subject_digest)
             self.assertNotEqual(doc["tool"]["build_digest"], subject_digest)
 
-    def test_verify_report_and_analysis_envelopes_share_code_identity(self):
-        self.assertEqual(analysis.VERIFY_BUILD_DIGEST, analysis.ANALYSIS_BUILD_DIGEST)
+    def test_verify_report_has_a_domain_separated_producer_identity(self):
+        self.assertNotEqual(analysis.VERIFY_BUILD_DIGEST, analysis.ANALYSIS_BUILD_DIGEST)
+        doc = analysis.envelope("rat-verify", None, namespace(None), {})
+        self.assertEqual(doc["tool"]["build_digest"], analysis.VERIFY_BUILD_DIGEST)
 
     def test_live_analyzer_build_is_recorded_for_historical_verification(self):
         self.assertEqual(
-            KNOWN_BUILD_DIGESTS.get(analysis.ANALYSIS_BUILD_DIGEST),
+            KNOWN_BUILD_DIGESTS.get(analysis.VERIFY_BUILD_DIGEST),
             "rat-verify",
             "missing rat-verify registry entry for %s" % analysis.ANALYSIS_BUILD_DIGEST,
         )

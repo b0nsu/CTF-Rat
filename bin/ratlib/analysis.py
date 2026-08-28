@@ -5,7 +5,7 @@ exploit.  They share one small envelope/artifact implementation so a later
 tool consumes IDs/artifacts rather than a previous tool's terminal output.
 """
 from __future__ import annotations
-import argparse, base64, hashlib, json, os, platform, re, shutil, sys, tempfile, time, uuid
+import argparse, base64, hashlib, inspect, json, os, platform, re, shutil, sys, tempfile, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from .artifact import put_bytes, put_file, digest_bytes, get, metadata
@@ -22,7 +22,6 @@ def _module_digest():
   for b in iter(lambda:f.read(65536),b""): h.update(b)
  return "sha256:"+h.hexdigest()
 ANALYSIS_BUILD_DIGEST=_module_digest()
-VERIFY_BUILD_DIGEST=ANALYSIS_BUILD_DIGEST
 P2_LIMITATIONS={
  "rat-profile":["format signals are not vulnerability proof"],
  "rat-slice":["call-path reachability only; no value-flow proof"],
@@ -88,7 +87,8 @@ def require_profile(a, r):
     return profile
 def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=(), code=0, started=None):
     started=started or iso(); finished=iso(); input_digest=fdigest(binary) if binary and os.path.isfile(binary) else "sha256:"+"0"*64
-    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":ANALYSIS_BUILD_DIGEST},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":input_digest,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
+    build_digest=VERIFY_BUILD_DIGEST if name=="rat-verify" else ANALYSIS_BUILD_DIGEST
+    doc={"schema":"rat.tool-result/v1","tool":{"name":name,"version":VERSION,"build_digest":build_digest},"run_id":"local","invocation_id":"invoke_"+uuid.uuid4().hex,"status":status,"started_at":started,"finished_at":finished,"duration_ms":max(0,int((datetime.fromisoformat(finished)-datetime.fromisoformat(started)).total_seconds()*1000)),"inputs":([{"role":"binary","digest":input_digest,"size":os.path.getsize(binary)}] if binary and os.path.isfile(binary) else []),"parameters":{k:v for k,v in vars(a).items() if k not in {"binary","store","format","command"} and v is not None},"summary":summary,"artifacts":list(artifacts),"findings":[],"diagnostics":[{"code":"p2","severity":"warning" if status!="ok" else "info","message":x} for x in diagnostics],"exit":{"code":code,"signal":None,"timed_out":status=="timeout","cancelled":False},"provenance":{"platform":{"os":sys.platform,"arch":platform.machine()},"dependency_versions":{},"policy_digest":POLICY,"cache":{"key":None,"hit":False,"source_invocation":None}}}
     if name in P2_LIMITATIONS:
         # Analysis output is deliberately non-promotable.  Only STATE's
         # evidence/primitive lifecycle may promote independently verified
@@ -407,6 +407,19 @@ def verify(a):
     if not environment_match: diagnostics.append("trace environment does not match this verification scenario")
     if verdict!="pass": diagnostics.append("only pass may support confirmed finding or primitive PASS")
     return emit(envelope("rat-verify",a.binary,a,{"verdict":verdict,"repetitions":reps,"environment_match":environment_match,"scope":"local-only","failed_conditions":[i for i,x in enumerate(results) if not x["conditions_met"]]},arts,status=status,diagnostics=diagnostics,code=0 if verdict=="pass" else (EXIT_TIMEOUT if verdict=="inconclusive" else 1),started=started),a)
+
+
+def _verify_build_digest():
+    """Identity for the rat-verify verdict implementation and its helpers."""
+    h=hashlib.sha256(b"rat-verify/v1\0")
+    for fn in (verify, require_profile, load_json_artifact, scenario, scenario_stdin,
+               execution_environment, execute_binary, command, _strict_expect,
+               _oracle_argv, _verify_conditions, artifact):
+        h.update(inspect.getsource(fn).encode())
+    return "sha256:"+h.hexdigest()
+
+
+VERIFY_BUILD_DIGEST=_verify_build_digest()
 def fuzz(a):
     r=root(a,a.binary); started=iso(); corpus=[]
     if a.corpus and os.path.isdir(a.corpus): corpus=[Path(a.corpus,x).read_bytes() for x in os.listdir(a.corpus) if os.path.isfile(Path(a.corpus,x))]
