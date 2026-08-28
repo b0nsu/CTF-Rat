@@ -163,7 +163,8 @@ class DynVerifyStateCompactPassthrough(unittest.TestCase):
             self.assertEqual(code, 0, err)
             doc = json.loads(out)
             self.assertEqual(set(doc), {"invalidating_findings", "confirmed_findings", "pass_primitives",
-                                         "hypotheses", "next_probes", "ruled_out", "truncated", "omitted_counts", "cursor"})
+                                         "hypotheses", "next_probes", "ruled_out", "truncated", "omitted_counts", "cursor",
+                                         "budget_tokens", "estimated_tokens", "budget_exceeded_by_critical_tiers"})
 
     def test_dyn_missing_required_flags_matches_legacy_exit_code(self):
         legacy = subprocess.run([str(BIN / "rat-dyn"), "/bin/true"], text=True, capture_output=True)

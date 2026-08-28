@@ -2,8 +2,8 @@
 
 Time-based "stuck" detection is replaced by a novelty check: if the last
 `window` tool/query actions produced no new artifact digest, finding
-revision, ruled-out route, or primitive status change, force a re-route or
-DEEP escalation instead of continuing to retry.
+revision, ruled-out route, or primitive status change, recommend a re-route
+or DEEP escalation instead of continuing to retry.
 
 This module is the pure decision hook only. Maintaining the rolling
 novelty-flag history and actually triggering re-route/DEEP is the caller's

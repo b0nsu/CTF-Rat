@@ -1,7 +1,10 @@
 import base64
 import json
+import os
 import pathlib
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -13,7 +16,15 @@ from ratlib.schema import validate as validate_contract
 
 class DoctorTests(unittest.TestCase):
     def test_reports_artifact_routes_without_running_regression(self):
-        result = subprocess.run([str(BIN / "rat-doctor"), "/bin/true", "--format", "json"], text=True, capture_output=True)
+        # /bin/true is Linux-specific (absent on macOS); use a synthetic minimal
+        # ELF header instead, same as test_qemu_capability_matches_artifact_architecture.
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory, "fixture-x86_64")
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            header[18:20] = (62).to_bytes(2, "little")
+            binary.write_bytes(header)
+            result = subprocess.run([str(BIN / "rat-doctor"), str(binary), "--format", "json"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         doc = json.loads(result.stdout)
         validate_contract(doc, "rat.tool-result/v1")
@@ -27,6 +38,38 @@ class DoctorTests(unittest.TestCase):
     def test_missing_binary_is_input_error(self):
         result = subprocess.run([str(BIN / "rat-doctor"), "/definitely/missing"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 4)
+
+    def test_qemu_capability_matches_artifact_architecture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory, "foreign-aarch64")
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            header[18:20] = (183).to_bytes(2, "little")
+            binary.write_bytes(header)
+            fake_qemu = pathlib.Path(directory, "qemu-x86_64")
+            fake_qemu.write_text("#!/bin/sh\necho fake-qemu\n")
+            fake_qemu.chmod(fake_qemu.stat().st_mode | stat.S_IXUSR)
+            result = subprocess.run(
+                [sys.executable, str(BIN / "rat-doctor"), str(binary), "--format", "json"],
+                text=True, capture_output=True, env={**os.environ, "PATH": directory},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)["summary"]
+            self.assertEqual(report["binary"]["architecture"], "aarch64")
+            self.assertEqual(report["capabilities"]["qemu"]["status"], "unavailable")
+            self.assertEqual(report["routes"]["qemu"]["status"], "unavailable")
+
+            matching_qemu = pathlib.Path(directory, "qemu-aarch64")
+            matching_qemu.write_text("#!/bin/sh\necho fake-qemu\n")
+            matching_qemu.chmod(matching_qemu.stat().st_mode | stat.S_IXUSR)
+            matched = subprocess.run(
+                [sys.executable, str(BIN / "rat-doctor"), str(binary), "--format", "json"],
+                text=True, capture_output=True, env={**os.environ, "PATH": directory},
+            )
+            self.assertEqual(matched.returncode, 0, matched.stderr)
+            matched_report = json.loads(matched.stdout)["summary"]
+            self.assertEqual(matched_report["capabilities"]["qemu"]["status"], "available")
+            self.assertEqual(matched_report["routes"]["qemu"]["status"], "available")
 
 
 class ScenarioTests(unittest.TestCase):
