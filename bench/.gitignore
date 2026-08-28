@@ -1,6 +1,7 @@
 # Mode A/B run outputs are reproducible and per-machine — not committed.
 results/*.jsonl
 LEADERBOARD.md
+LEADERBOARD.v2.md
 # Compiled fixtures + any real-competition binaries dropped under artifacts/.
 artifacts/**/*.bin
 artifacts/**/a.out
