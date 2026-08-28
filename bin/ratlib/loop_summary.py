@@ -149,7 +149,7 @@ def summarize_instruction_stream(instructions, bit_width=64, internal_branch=Fal
         unsupported.append("register_write_set_incomplete")
 
     recurrences = []
-    if not internal_branch and not calls:
+    if not internal_branch and not calls and write_info_available:
         for reg, delta in sorted(updates.items()):
             if reg in clobbered or delta == 0:
                 continue

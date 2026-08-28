@@ -1,3 +1,4 @@
+import importlib.util
 import pathlib
 import sys
 import unittest
@@ -66,6 +67,15 @@ class LoopSummaryUnit(unittest.TestCase):
         ])
         self.assertEqual(called["recurrences"], [])
         self.assertIn("call_in_loop", called["unsupported"])
+
+    def test_incomplete_write_set_suppresses_candidate(self):
+        out = summarize_instruction_stream([
+            _Insn("add", "eax, 8", writes=("eax",)),
+            _Insn("mov", "eax, edx", writes=()),
+        ], bit_width=32)
+        self.assertEqual(out["recurrences"], [])
+        self.assertFalse(out["register_write_set_complete"])
+        self.assertIn("register_write_set_incomplete", out["unsupported"])
 
     def test_memory_write_is_reported_not_hidden(self):
         out = summarize_instruction_stream([
