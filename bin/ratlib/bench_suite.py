@@ -1,13 +1,18 @@
 """Small fail-closed validator for ratbench suite manifests.
 
-This is intentionally not a new schema subsystem.  ``bench/suite.json`` is the
-canonical manifest and this module validates only the fields ratbench needs to
-compare synthetic, integration, real, and private/held-out corpora safely.
+This is intentionally not a new schema subsystem. ``bench/suite.json`` is the
+canonical manifest shape and this module validates only the fields ratbench
+needs to compare synthetic, integration, real, and private/held-out corpora
+safely.  The optional CLI is a thin preflight/projection adapter for the
+existing ``ratbench --suite`` interface; it does not execute benchmarks.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import re
+import sys
 from collections.abc import Mapping
 
 SCHEMA = "rat.bench-suite/v1"
@@ -88,3 +93,57 @@ def validate_suite(doc):
         if not isinstance(entry.get("env", {}), Mapping):
             raise SuiteValidationError("%s.env must be an object" % entry_id)
     return doc
+
+
+def load_suite(path):
+    """Load one suite document and validate it before any projection or run."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise SuiteValidationError("invalid suite JSON: %s" % exc) from exc
+    except OSError as exc:
+        raise SuiteValidationError("cannot read suite: %s" % exc) from exc
+    return validate_suite(doc)
+
+
+def project_suite(doc, *, corpus=None):
+    """Return a validated suite projection without mutating the source document.
+
+    A corpus projection fails closed when it would be empty.  This prevents a
+    typo or missing local held-out manifest entry from silently producing a
+    zero-entry benchmark that could later be mistaken for measurement evidence.
+    """
+    validate_suite(doc)
+    if corpus is None:
+        entries = list(doc["entries"])
+    else:
+        if corpus not in CORPORA:
+            raise SuiteValidationError("unknown corpus: %s" % corpus)
+        entries = [entry for entry in doc["entries"] if entry.get("corpus") == corpus]
+        if not entries:
+            raise SuiteValidationError("no entries for corpus: %s" % corpus)
+    projected = dict(doc)
+    projected["entries"] = entries
+    return projected
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="python3 -m ratlib.bench_suite",
+        description="validate/project a ratbench suite without executing it",
+    )
+    parser.add_argument("suite", help="suite JSON path")
+    parser.add_argument("--corpus", choices=sorted(CORPORA), help="emit only this corpus")
+    args = parser.parse_args(argv)
+    try:
+        projected = project_suite(load_suite(args.suite), corpus=args.corpus)
+    except SuiteValidationError as exc:
+        print("[bench-suite:err] %s" % exc, file=sys.stderr)
+        return 2
+    print(json.dumps(projected, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
