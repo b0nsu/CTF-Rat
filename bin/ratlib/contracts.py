@@ -27,20 +27,21 @@ def _captured_bytes(stream):
   with open(stream.spool_path,"rb") as f: return f.read()
  return stream.preview
 def _capture_artifact(stream, kind, root):
- """Persist one bounded stream, then best-effort remove its staging spool.
+ """Persist one bounded stream without changing staging-file lifecycle.
 
- The content-addressed artifact is the durable copy. A spool file is only a
- transient runner staging object and must not become a second long-term store.
- Cleanup happens only after ``put_bytes`` succeeds, so a failed artifact write
- leaves the spool available for diagnosis/retry.
+ Callers clean spools only after every capture in the execution result has been
+ persisted, preserving a complete retry/debug staging set if a later write
+ fails.
  """
  data=_captured_bytes(stream)
  rec=put_bytes(data,kind=kind,media_type="text/plain; charset=utf-8",
                logical_name=kind+".txt",root=root)
+ return {k:rec[k] for k in ("kind","digest","media_type","size","logical_name")}
+def _cleanup_spool(stream):
+ """Best-effort cleanup for a spool whose complete result is durable."""
  if stream.spool_path:
   try: os.unlink(stream.spool_path)
   except OSError: pass
- return {k:rec[k] for k in ("kind","digest","media_type","size","logical_name")}
 def _validate_direct_target(build, tool_argv, direct_subject):
  """Fail closed when a trusted SELF verifier targets a different subject.
 
@@ -125,6 +126,8 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
  started=_iso(); result=run(tool_argv,timeout_seconds=timeout,spool_dir=os.path.join(root,"tmp"))
  artifacts=[_capture_artifact(result.stdout,"stdout",root),
             _capture_artifact(result.stderr,"stderr",root)]
+ _cleanup_spool(result.stdout)
+ _cleanup_spool(result.stderr)
  status="timeout" if result.timed_out else ("ok" if result.exit_code==0 else "error")
  # Direct evidence is minted ONLY when the caller names the measured subject and the
  # invocation is a real measurement mode of a registered verifier (see

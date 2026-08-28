@@ -94,21 +94,50 @@ class SpoolLifecycleRegression(unittest.TestCase):
             root = os.path.join(d, ".rat")
             os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
             spool = os.path.join(root, "tmp", "rat-stdout-fixture")
+            stderr_spool = os.path.join(root, "tmp", "rat-stderr-fixture")
             full = b"full bounded capture"
             with open(spool, "wb") as f:
                 f.write(full)
+            with open(stderr_spool, "wb") as f:
+                f.write(b"stderr")
             fake = RunResult(
                 argv=["/bin/echo", "ignored"], returncode=0, exit_code=0,
                 timed_out=False, cancelled=False, duration_ms=1,
                 stdout=CapturedStream(preview=b"full", total_bytes=len(full), truncated=False, spool_path=spool),
-                stderr=CapturedStream(preview=b"", total_bytes=0, truncated=False, spool_path=None),
+                stderr=CapturedStream(preview=b"stderr", total_bytes=6, truncated=False, spool_path=stderr_spool),
                 network_policy="inherit", signal=None, resource_limited=False, tool_version=None,
             )
             with patch("ratlib.contracts.run", return_value=fake):
                 doc = execute(["/bin/echo", "ignored"], root=root, timeout=5)
             self.assertFalse(os.path.exists(spool))
+            self.assertFalse(os.path.exists(stderr_spool))
             stdout = next(a for a in doc["artifacts"] if a["kind"] == "stdout")
             self.assertEqual(stdout["size"], len(full))
+
+    def test_execute_keeps_all_spools_when_later_capture_persistence_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
+            stdout_spool = os.path.join(root, "tmp", "rat-stdout-fixture")
+            stderr_spool = os.path.join(root, "tmp", "rat-stderr-fixture")
+            for spool, data in ((stdout_spool, b"stdout"), (stderr_spool, b"stderr")):
+                with open(spool, "wb") as f:
+                    f.write(data)
+            fake = RunResult(
+                argv=["/bin/echo", "ignored"], returncode=0, exit_code=0,
+                timed_out=False, cancelled=False, duration_ms=1,
+                stdout=CapturedStream(preview=b"stdout", total_bytes=6, truncated=False, spool_path=stdout_spool),
+                stderr=CapturedStream(preview=b"stderr", total_bytes=6, truncated=False, spool_path=stderr_spool),
+                network_policy="inherit", signal=None, resource_limited=False, tool_version=None,
+            )
+            artifact = {"kind": "stdout", "digest": "sha256:" + "a" * 64,
+                        "media_type": "text/plain; charset=utf-8", "size": 6, "logical_name": "stdout.txt"}
+            with patch("ratlib.contracts.run", return_value=fake), \
+                 patch("ratlib.contracts.put_bytes", side_effect=[artifact, OSError("artifact store unavailable")]):
+                with self.assertRaises(OSError):
+                    execute(["/bin/echo", "ignored"], root=root, timeout=5)
+            self.assertTrue(os.path.exists(stdout_spool))
+            self.assertTrue(os.path.exists(stderr_spool))
 
 
 if __name__ == "__main__":
