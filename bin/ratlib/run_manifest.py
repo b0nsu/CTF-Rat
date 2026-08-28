@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import subprocess
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +29,41 @@ def sha256_file(path: str) -> str:
         for chunk in iter(lambda: source.read(64 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def environment_identity() -> dict[str, str]:
+    """Canonical runtime identity shared by run manifests and benchmarks."""
+    return {"os": os.sys.platform, "arch": platform.machine() or "unknown",
+            "runtime": "python-%d.%d" % os.sys.version_info[:2]}
+
+
+def ctf_rat_revision(root: Optional[str] = None) -> str:
+    """Resolve a reproducible CTF-Rat revision without making git mandatory.
+
+    Explicit ``CTF_RAT_REVISION`` wins.  Benchmark callers may then supply the
+    repository root so a normal git checkout records HEAD.  Exported/runtime
+    copies without git metadata preserve the historical ``worktree`` fallback.
+    """
+    explicit = os.environ.get("CTF_RAT_REVISION")
+    if explicit:
+        return explicit
+    if root:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", os.path.abspath(root), "rev-parse", "HEAD"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5, text=True,
+            )
+            revision = proc.stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+                return revision.lower()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "worktree"
+
+
+def toolchain_identity(root: Optional[str] = None) -> dict[str, str]:
+    return {"ctf_rat_revision": ctf_rat_revision(root), "schema_bundle": "v1"}
 
 
 def validate(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -95,6 +131,8 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
     inputs = [_input("binary", binary)]
     if libc:
         inputs.append(_input("libc", libc, "libc.so.6"))
+    toolchain = toolchain_identity()
+    toolchain["newchal_version"] = "p0-v1"
     return {
         "schema": SCHEMA,
         "run_id": "run_" + uuid.uuid4().hex,
@@ -105,10 +143,8 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
         "inputs": inputs,
         "target_policy": {"guard_challenge": name, "allowlist": [remote] if remote else [],
                           "network_mode": "ctfguard-target" if remote else "none"},
-        "environment": {"os": os.sys.platform, "arch": platform.machine() or "unknown",
-                        "runtime": "python-%d.%d" % os.sys.version_info[:2]},
-        "toolchain": {"ctf_rat_revision": os.environ.get("CTF_RAT_REVISION", "worktree"),
-                      "newchal_version": "p0-v1", "schema_bundle": "v1"},
+        "environment": environment_identity(),
+        "toolchain": toolchain,
         "policy": {"archive": {}, "subprocess": {"wall_timeout_seconds": 60,
                                                    "output_hard_cap_bytes": 64 * 1024 * 1024}},
         "state": {"stream_id": None, "latest_event_cursor": None, "latest_checkpoint_id": None},
