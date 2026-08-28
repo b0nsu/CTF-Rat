@@ -6,7 +6,7 @@ from .artifact import put_bytes
 from .cache import Cache, key as cache_key
 from .runner import run
 from .schema import validate
-from .state_v2 import direct_measurement_policy
+from .state_v2 import direct_measurement_policy, trusted_producer_for_build
 
 def _iso(): return datetime.now(timezone.utc).isoformat()
 def direct_evidence_envelope(*, root, producer, measurement, summary=None):
@@ -26,6 +26,43 @@ def _captured_bytes(stream):
  if stream.spool_path:
   with open(stream.spool_path,"rb") as f: return f.read()
  return stream.preview
+def _validate_direct_target(build, tool_argv, direct_subject):
+ """Fail closed when a trusted SELF verifier targets a different subject.
+
+ ``direct_subject`` is caller metadata; the verifier argv is the execution truth.
+ For the registered gdbq/symsolve contracts the measured binary is argv[1].
+ Compare by content so equivalent relative/symlink paths remain portable.
+ """
+ producer=trusted_producer_for_build(build)
+ if producer not in {"gdbq","symsolve","symsolve.py"}:
+  return
+ if len(tool_argv)<2:
+  raise ValueError("direct verifier invocation is missing its measured subject")
+ target=os.fspath(tool_argv[1])
+ if not os.path.isfile(target):
+  raise ValueError("direct verifier target is not an existing file")
+ if _digest_file(target)!=_digest_file(direct_subject):
+  raise ValueError("direct_subject does not match verifier target")
+def _persist_cache_hit_invocation(doc, root):
+ """Persist cache hits for session telemetry without minting cached direct evidence.
+
+ The returned document may still cite the original executed envelope as
+ ``extensions.envelope_digest``. The invocation record itself deliberately drops
+ evidence_policy/envelope_digest so a cache hit cannot masquerade as a fresh SELF
+ measurement while rat-metrics can still count the invocation.
+ """
+ recorded={**doc}
+ ext={**(recorded.get("extensions") or {})}
+ ext.pop("evidence_policy",None)
+ ext.pop("envelope_digest",None)
+ if ext:
+  recorded["extensions"]=ext
+ else:
+  recorded.pop("extensions",None)
+ validate(recorded)
+ raw=json.dumps(recorded,sort_keys=True,separators=(",",":")).encode()
+ put_bytes(raw,kind="tool-result",media_type="application/json",
+           logical_name="cache-hit-invocation.json",root=root)
 def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60, direct_subject=None):
  """Run a tool and preserve its complete bounded stdout/stderr as artifacts.
 
@@ -38,18 +75,19 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
  tool_path=tool_argv[0]; build=_digest_file(tool_path) if os.path.isfile(tool_path) else "sha256:"+"0"*64
  inputs=[{"role":"input","digest":_digest_file(p),"size":os.path.getsize(p)} for p in input_paths if os.path.isfile(p)]
  policy="sha256:"+hashlib.sha256(b"p1-local").hexdigest()
- # Tool output depends on command-line mode too.  Preserve the full argv so
+ # Tool output depends on command-line mode too. Preserve the full argv so
  # measurement, diagnostic, and query modes cannot share one cache envelope.
  cache_parameters={**parameters,"_execution_policy":{"timeout_seconds":timeout,"max_output_bytes":64*1024*1024},
                    "_tool_argv":[str(arg) for arg in tool_argv]}
  # A direct request and a plain request over the same argv/inputs must not alias in
  # the cache: their envelopes differ (one carries an evidence_policy).
  if direct_subject is not None:
-  # The envelope's policy is bound to this specific measured input.  Keeping
+  # The envelope's policy is bound to this specific measured input. Keeping
   # only a boolean here lets two subjects in the same input set alias one
   # another's direct-evidence envelope on a cache hit.
   if direct_subject not in input_paths or not os.path.isfile(direct_subject):
    raise ValueError("direct_subject must name an existing input path")
+  _validate_direct_target(build,tool_argv,direct_subject)
   cache_parameters={**cache_parameters,"_direct_measurement":True,
                     "_direct_subject_digest":_digest_file(direct_subject)}
  ck=cache_key(tool={"name":os.path.basename(tool_path),"version":"legacy-adapter/v1","build_digest":build},inputs=inputs,parameters=cache_parameters,dependencies={},policy_digest=policy)
@@ -64,8 +102,11 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
     "tool_name":tool_name,"params_digest":"unindexed","cache_state":"hit",
     "extensions":extensions,
     "provenance":{**old_doc["provenance"],"cache":{"key":ck,"hit":True,"source_invocation":old_doc.get("invocation_id")}}}
-   validate(doc); return doc
-  except Exception: pass
+   validate(doc)
+   _persist_cache_hit_invocation(doc,root)
+   return doc
+  except Exception:
+   pass
  started=_iso(); result=run(tool_argv,timeout_seconds=timeout,spool_dir=os.path.join(root,"tmp"))
  artifacts=[]
  for kind,data in (("stdout",_captured_bytes(result.stdout)),("stderr",_captured_bytes(result.stderr))):
@@ -85,7 +126,7 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
  doc["extensions"]={**(doc.get("extensions") or {}),"envelope_digest":envelope["digest"]}
  validate(doc)
  # A partial, failed, or truncated run is evidence, not a reusable analysis
- # result.  Re-running with a larger budget must execute the tool again.
+ # result. Re-running with a larger budget must execute the tool again.
  if status=="ok" and not result.stdout.truncated and not result.stderr.truncated:
   cache.put(ck,envelope["digest"])
  return doc
