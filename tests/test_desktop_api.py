@@ -142,28 +142,29 @@ class DesktopApiTests(unittest.TestCase):
     def test_live_update_does_not_mutate_delta_payload_while_materializing_view(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
-            input_digest = "sha256:" + "1" * 64
-            environment_digest = "sha256:" + "2" * 64
             stream.append(
-                "primitive.revised",
+                "observation.recorded",
                 {
-                    "primitive_id": "P1",
-                    "status": "candidate",
-                    "self_evidence": [],
-                    "input_digest": input_digest,
-                    "environment_digest": environment_digest,
+                    "observation_id": "O1",
+                    "quality": {"level": "derived"},
+                    "validity": {"state": "active"},
+                    "legacy_source_id": "legacy-O1",
+                    "legacy_line": 1,
+                    "legacy": {},
                 },
                 actor="migration",
             )
             stream.append(
-                "primitive.consumed",
-                {"primitive_id": "P1", "input_digest": input_digest, "environment_digest": environment_digest},
-                actor="migration",
+                "evidence.invalidated",
+                {"observation_ids": ["O1"], "reason": "desktop projection regression"},
             )
             doc = live_update(root, after_seq=0, limit=10)
-            revised = doc["delta"]["events"][0]
-            self.assertEqual(revised["payload"]["status"], "candidate")
-            self.assertEqual(doc["snapshot"]["view"]["primitives"]["P1"]["status"], "consumed")
+            recorded = doc["delta"]["events"][0]
+            self.assertEqual(recorded["payload"]["validity"], {"state": "active"})
+            self.assertEqual(
+                doc["snapshot"]["view"]["observations"]["O1"]["validity"],
+                {"state": "invalidated", "event_id": "cascade"},
+            )
 
     def test_live_update_unchanged_skips_state_parse_and_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
