@@ -81,6 +81,25 @@ class DesktopHttpTests(unittest.TestCase):
             self.assertTrue(unchanged["delta"]["unchanged"])
             self.assertIsNone(unchanged["snapshot"])
 
+    def test_completion_endpoint_uses_canonical_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self.server(root)
+            status, doc = self.read_json(Request(base + "/api/completion"))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["schema"], "rat.desktop.completion/v1")
+            self.assertFalse(doc["verified"])
+            self.assertEqual(doc["reason"], "no-active-primitive")
+
+    def test_telemetry_endpoint_includes_v21_session_metrics(self):
+        with tempfile.TemporaryDirectory() as root:
+            Stream(root).append("hypothesis.recorded", {"hypothesis_id": "H1"})
+            base = self.server(root)
+            status, doc = self.read_json(Request(base + "/api/telemetry"))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["schema"], "rat.desktop.telemetry/v1")
+            self.assertEqual(doc["event_count"], 1)
+            self.assertEqual(doc["session"]["schema"], "rat.session-metrics/v1")
+
     def test_artifact_generation_hint_round_trips_over_http(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
