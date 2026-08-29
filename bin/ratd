@@ -147,6 +147,14 @@ def _handler(challenge_root, sessions, analyses=None):
                     if set(body) != {"name"} or not isinstance(body.get("name"), str):
                         raise ValueError("function request requires one string field: name")
                     return self._send(200, analyses.function(body["name"]))
+                if parsed.path == "/api/analysis/oracle":
+                    if body:
+                        raise ValueError("oracle request takes no parameters")
+                    return self._send(200, analyses.oracle())
+                if parsed.path == "/api/analysis/slice":
+                    if set(body) != {"backward"} or not isinstance(body.get("backward"), str):
+                        raise ValueError("slice request requires one string field: backward")
+                    return self._send(200, analyses.slice(body["backward"]))
                 if parsed.path == "/api/session/start":
                     if body:
                         raise ValueError("start request takes no parameters")
