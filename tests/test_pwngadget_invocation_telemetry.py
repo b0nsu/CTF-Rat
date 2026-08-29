@@ -44,6 +44,10 @@ class PwnGadgetInvocationTelemetryTests(unittest.TestCase):
             self.assertEqual(len(docs), 2)
             self.assertEqual([d["tool"]["name"] for d in docs], ["pwngadget", "pwngadget"])
             self.assertEqual(sorted(d["cache_state"] for d in docs), ["hit", "miss"])
+            self.assertTrue(all(d["provenance"]["dependency_versions"] == {
+                "engine": "ROPgadget", "engine_version": "7.4"
+            } for d in docs))
+            self.assertEqual(len({d["provenance"]["cache"]["key"] for d in docs}), 1)
 
             metrics = aggregate(docs)
             self.assertEqual(metrics["tool_calls"], 2)

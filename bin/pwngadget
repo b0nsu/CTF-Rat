@@ -177,12 +177,13 @@ def _run_gadget_engine(binary, engine):
     return _captured(res.stdout).decode(errors="replace"), tool, ("truncated" if res.stdout.truncated else None)
 
 
-def _envelope(*, binary, sha, query, arch, limit, gadgets, status, tool_used, cache_state, started, finished, duration_ms, diagnostics=None):
+def _envelope(*, binary, sha, query, arch, limit, gadgets, status, tool_used,
+              engine_version, cache_state, cache_key, started, finished,
+              duration_ms, diagnostics=None):
     # invocation_id identifies THIS process run, distinct from the cache key
     # (sha, query, arch, limit): the cache key is intentionally input-derived so
     # repeat calls hit, but invocation_id must be unique per run or two runs of
     # the same query would look like the same invocation to metrics/provenance.
-    cache_key_digest = _sha256_text("%s|%s|%s|%s" % (sha, query, arch, limit))
     invocation_id = "invoke_" + uuid.uuid4().hex
     # `_envelope` is only ever called on paths that return runner.EXIT_OK (0) to
     # the shell -- a "partial" (truncated/empty) result is still a successful
@@ -200,9 +201,11 @@ def _envelope(*, binary, sha, query, arch, limit, gadgets, status, tool_used, ca
         "summary": {"query": query, "count": len(gadgets), "gadgets": gadgets, "engine": tool_used},
         "artifacts": [], "findings": [], "diagnostics": diagnostics or [],
         "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
-        "provenance": {"platform": sys.platform, "dependency_versions": {tool_used or "none": "n/a"},
+        "provenance": {"platform": sys.platform,
+                       "dependency_versions": {"engine": tool_used or "none",
+                                                "engine_version": engine_version},
                        "policy_digest": _sha256_text("network-free;bounded-runner"),
-                       "cache": {"state": cache_state, "key": cache_key_digest}},
+                       "cache": {"state": cache_state, "key": cache_key}},
         "cache_state": cache_state,
     }
 
@@ -257,7 +260,8 @@ def query_binary(binary, query, arch, limit, fmt):
             # it took the original compute time. Only the gadgets carry over.
             env = _envelope(binary=binary, sha=sha, query=query, arch=arch, limit=limit,
                             gadgets=gadgets, status=status, tool_used=engine,
-                            cache_state="hit", started=now, finished=now, duration_ms=0)
+                            engine_version=engine_version, cache_state="hit", cache_key=k,
+                            started=now, finished=now, duration_ms=0)
             _emit(env, fmt, root)
             return runner.EXIT_OK
         # Corrupt/malformed cache entry: fall through and treat as a miss (recompute).
@@ -282,7 +286,8 @@ def query_binary(binary, query, arch, limit, fmt):
     # Only truncated output is partial because the result set may be incomplete.
     status = _result_status(truncated, gadgets)
     env = _envelope(binary=binary, sha=sha, query=query, arch=arch, limit=limit, gadgets=gadgets,
-                    status=status, tool_used=tool, cache_state=cache_state,
+                    status=status, tool_used=tool, engine_version=engine_version,
+                    cache_state=cache_state, cache_key=k,
                     started=now, finished=datetime.now(timezone.utc).isoformat(), duration_ms=duration_ms,
                     diagnostics=diagnostics)
     if truncated:
@@ -384,7 +389,9 @@ def _selftest():
     # (ratlib.schema is the single source of truth) -- guards silent shape drift.
     now = datetime.now(timezone.utc).isoformat()
     env = _envelope(binary="/bin/ls", sha="sha256:" + "a" * 64, query="pop rdi ; ret", arch="x86-64",
-                    limit=20, gadgets=pr, status="ok", tool_used="ROPgadget", cache_state="miss",
+                    limit=20, gadgets=pr, status="ok", tool_used="ROPgadget",
+                    engine_version="7.4", cache_state="miss",
+                    cache_key="sha256:" + "b" * 64,
                     started=now, finished=now, duration_ms=7)
     try:
         validate(env, "rat.tool-result/v1")
