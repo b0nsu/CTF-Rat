@@ -16,10 +16,38 @@ ratd = importlib.util.module_from_spec(spec)
 loader.exec_module(ratd)
 
 
+class FakeAnalysis:
+    def __init__(self):
+        self.calls = []
+
+    def status(self):
+        return {
+            "schema": "rat.desktop.analysis-status/v1",
+            "ready": True,
+            "busy": False,
+            "target": {"binary": {"name": "chall", "sha256": "sha256:" + "1" * 64, "size": 1}},
+            "modes": {"fast": True, "deep": True, "verify_status": True},
+            "reason": None,
+        }
+
+    def brief(self, mode):
+        self.calls.append(mode)
+        return {
+            "schema": "rat.desktop.analysis-run/v1",
+            "mode": mode,
+            "status": "ok",
+            "target": self.status()["target"],
+            "duration_ms": 1,
+            "exit_code": 0,
+            "result": {"schema": "rat.brief-card/v1", "binary": "chall", "capabilities": {}, "route": {}, "track_summary": {}, "libc": {}, "truncated": [], "side_effects": []},
+            "diagnostic": None,
+        }
+
+
 class DesktopHttpTests(unittest.TestCase):
-    def server(self, root, argv=None):
+    def server(self, root, argv=None, analyses=None):
         sessions = SessionManager(root, argv)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), ratd._handler(root, sessions))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ratd._handler(root, sessions, analyses))
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -38,6 +66,29 @@ class DesktopHttpTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(doc["status"], "ok")
             self.assertFalse(doc["session"]["configured"])
+
+    def test_analysis_status_and_brief_expose_only_bounded_modes(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyses = FakeAnalysis()
+            base = self.server(root, analyses=analyses)
+            status, doc = self.read_json(Request(base + "/api/analysis/status"))
+            self.assertEqual(status, 200)
+            self.assertTrue(doc["ready"])
+            self.assertNotIn("_binary_path", json.dumps(doc))
+
+            headers = {"Content-Type": "application/json", "X-CTF-Rat-Desktop": "1"}
+            status, doc = self.read_json(Request(
+                base + "/api/analysis/brief", data=b'{"mode":"fast"}', method="POST", headers=headers
+            ))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["mode"], "fast")
+            self.assertEqual(analyses.calls, ["fast"])
+
+            for body in (b'{"mode":"verify"}', b'{"mode":"fast","argv":["/bin/sh"]}', b'{"binary":"/bin/sh","mode":"fast"}'):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(Request(base + "/api/analysis/brief", data=body, method="POST", headers=headers), timeout=2)
+                self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(analyses.calls, ["fast"])
 
     def test_event_generation_hint_round_trips_over_http(self):
         with tempfile.TemporaryDirectory() as root:
