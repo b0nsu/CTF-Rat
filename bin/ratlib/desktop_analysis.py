@@ -174,6 +174,15 @@ class AnalysisManager:
                     "result": None,
                     "diagnostic": "rat brief analyzed bytes that do not match the canonical run manifest",
                 }
+            if target.get("libc") is not None:
+                card_libc = card.get("libc") if isinstance(card.get("libc"), dict) else {}
+                if card_libc.get("sha256") != target["libc"]["sha256"]:
+                    return {
+                        **base,
+                        "status": "error",
+                        "result": None,
+                        "diagnostic": "rat brief libc bytes do not match the canonical run manifest",
+                    }
             return {**base, "status": "ok", "result": card, "diagnostic": stderr or None}
         finally:
             self._run_lock.release()
