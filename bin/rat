@@ -8,7 +8,8 @@ rat-verify, state, ratlib.cache). Legacy CLIs are unchanged and still work
 standalone -- this is an additional canonical entrypoint, not a replacement.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.machinery, importlib.util, json, os, subprocess, sys
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, subprocess, sys, time
+from datetime import datetime, timezone
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
@@ -136,6 +137,34 @@ def _gather_revq(binary, fast, store):
         raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
     return mod, rev
 
+def _record_revq_invocation(mod, binary, fast, store, rev, started_at,
+                            started_monotonic, operation, requested=None):
+    """Record one successful in-process revq use through its canonical recorder.
+
+    `rat` intentionally loads revq in-process, so the process observer cannot see
+    a separate revq execve. Reuse revq's existing tool-result producer instead of
+    creating a second telemetry contract. Persistence remains best-effort and can
+    never turn a valid front-door result into a failure.
+    """
+    try:
+        requested_engine = "binutils" if fast else "angr"
+        current_sha = rev.get("sha256") or mod.sha256(binary)
+        _, cache_key = mod._canonical_index(
+            binary, rev.get("engine") or requested_engine, current_sha, store)
+        parameters = {
+            "requested_engine": requested_engine,
+            "effective_engine": rev.get("engine") or requested_engine,
+            "refresh": False,
+            "operation": operation,
+            "requested": requested,
+            "frontdoor": "rat",
+        }
+        mod._persist_invocation(
+            binary, current_sha, requested_engine, False, rev, cache_key, store,
+            started_at, started_monotonic, parameters)
+    except Exception:
+        pass
+
 # ---- legacy tool delegation (subprocess capture -- these tools only print, never return a doc) ----
 def _run_subprocess(argv, timeout=120):
     try:
@@ -244,9 +273,13 @@ def cmd_route(args):
     profile = _gather_profile(binary, store)
     fast = args.fast or not caps.get("angr", False)
     rev, interesting, revq_error = None, None, None
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
+        _record_revq_invocation(mod, binary, fast, store, rev,
+                                revq_started_at, revq_started_monotonic, "route")
     except Exception as exc:
         rev, interesting = None, None
         revq_error = {"code": "analysis_failed",
@@ -440,9 +473,13 @@ def cmd_brief(args):
     fast = args.fast or not caps.get("angr", False)
     rev, interesting, revq_error = None, None, None
     diagnostics = []
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
+        _record_revq_invocation(mod, binary, fast, store, rev,
+                                revq_started_at, revq_started_monotonic, "brief")
     except Exception as exc:
         rev, interesting = None, None
         # A startup brief may legitimately continue without revq (for example
@@ -514,6 +551,8 @@ def cmd_query_func(args):
     if bad:
         return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
@@ -521,6 +560,8 @@ def cmd_query_func(args):
     card = mod.compute_function_card(rev, name)
     if card is None:
         return _emit(*_query_error(query, "input_invalid", "function '%s' not found" % name, EXIT_INPUT), args.format)
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            revq_started_at, revq_started_monotonic, "func", requested=name)
     budget = args.budget_bytes
     # budget_bytes is a per-query pool, not per-list -- share it across
     # callers/callees/strings instead of granting each its own full budget.
@@ -552,11 +593,15 @@ def cmd_query_oracle(args):
     if bad:
         return _emit(*_query_error("oracle", bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            revq_started_at, revq_started_monotonic, "oracle")
     # auto_connect / ambiguity are decided by compute_oracle over the FULL
     # candidate set -- we only bound the *projection* returned to the model, so
     # a binary with many "success"/"failure"-like strings can't blow up a single
