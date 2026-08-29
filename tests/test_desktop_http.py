@@ -26,7 +26,7 @@ class FakeAnalysis:
             "ready": True,
             "busy": False,
             "target": {"binary": {"name": "chall", "sha256": "sha256:" + "1" * 64, "size": 1}},
-            "modes": {"fast": True, "deep": True, "function": True, "verify_status": True},
+            "modes": {"fast": True, "deep": True, "function": True, "oracle": True, "slice": True, "verify_status": True},
             "reason": None,
         }
 
@@ -53,6 +53,31 @@ class FakeAnalysis:
             "duration_ms": 1,
             "exit_code": 0,
             "result": {"schema": "rat.query-result/v1", "query": "func:" + name, "status": "ok", "facts": {}, "heuristics": {}, "artifacts": [], "coverage": {"complete": True, "scope": "func:" + name, "omitted": None}, "diagnostics": [], "provenance": {"cache": {"hit": False}}},
+            "diagnostic": None,
+        }
+
+    def oracle(self):
+        self.calls.append(("oracle", None))
+        return {
+            "schema": "rat.desktop.oracle-query/v1",
+            "status": "partial",
+            "target": self.status()["target"],
+            "duration_ms": 1,
+            "exit_code": 0,
+            "result": {"schema": "rat.query-result/v1", "query": "oracle", "status": "partial", "facts": {}, "heuristics": {"auto_connect": False}, "artifacts": [], "coverage": {"complete": False, "scope": "oracle", "omitted": None}, "diagnostics": [], "provenance": {"cache": {"hit": False}}},
+            "diagnostic": None,
+        }
+
+    def slice(self, backward):
+        self.calls.append(("slice", backward))
+        return {
+            "schema": "rat.desktop.slice-query/v1",
+            "backward": backward,
+            "status": "partial",
+            "target": self.status()["target"],
+            "duration_ms": 1,
+            "exit_code": 0,
+            "result": {"schema": "rat.query-result/v1", "query": "slice", "status": "partial", "facts": {}, "heuristics": {}, "artifacts": [], "coverage": {"complete": False, "scope": "slice", "omitted": None}, "diagnostics": [], "provenance": {"cache": {"hit": False}}},
             "diagnostic": None,
         }
 
@@ -119,6 +144,30 @@ class DesktopHttpTests(unittest.TestCase):
                     urlopen(Request(base + "/api/analysis/function", data=body, method="POST", headers=headers), timeout=2)
                 self.assertEqual(caught.exception.code, 400)
             self.assertEqual(analyses.calls, [("function", "main")])
+
+    def test_oracle_and_slice_accept_only_bounded_bodies(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyses = FakeAnalysis()
+            base = self.server(root, analyses=analyses)
+            headers = {"Content-Type": "application/json", "X-CTF-Rat-Desktop": "1"}
+            status, doc = self.read_json(Request(base + "/api/analysis/oracle", data=b"{}", method="POST", headers=headers))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["schema"], "rat.desktop.oracle-query/v1")
+            status, doc = self.read_json(Request(base + "/api/analysis/slice", data=b'{"backward":"0x401000"}', method="POST", headers=headers))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["backward"], "0x401000")
+            self.assertEqual(analyses.calls, [("oracle", None), ("slice", "0x401000")])
+
+            for path, body in (
+                ("/api/analysis/oracle", b'{"binary":"/bin/sh"}'),
+                ("/api/analysis/oracle", b'{"argv":["sh"]}'),
+                ("/api/analysis/slice", b'{"backward":"0x401000","depth":99}'),
+                ("/api/analysis/slice", b'{"backward":1}'),
+            ):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(Request(base + path, data=body, method="POST", headers=headers), timeout=2)
+                self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(analyses.calls, [("oracle", None), ("slice", "0x401000")])
 
     def test_event_generation_hint_round_trips_over_http(self):
         with tempfile.TemporaryDirectory() as root:
