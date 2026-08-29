@@ -160,13 +160,14 @@ export type AnalysisStatus = {
   ready: boolean;
   busy: boolean;
   target: AnalysisTarget | null;
-  modes: { fast: boolean; deep: boolean; verify_status: boolean };
+  modes: { fast: boolean; deep: boolean; function: boolean; verify_status: boolean };
   reason: string | null;
 };
 
 export type BriefCard = {
   schema: "rat.brief-card/v1";
   binary: string;
+  binary_sha256?: string | null;
   capabilities: Record<string, unknown>;
   route: Record<string, unknown>;
   track_summary: Record<string, unknown>;
@@ -183,6 +184,29 @@ export type AnalysisRun = {
   duration_ms: number;
   exit_code: number;
   result: BriefCard | null;
+  diagnostic: string | null;
+};
+
+export type QueryResult = {
+  schema: "rat.query-result/v1";
+  query: string;
+  status: "ok" | "partial" | "error";
+  facts: Record<string, unknown>;
+  heuristics: Record<string, unknown>;
+  artifacts: unknown[];
+  coverage: { complete: boolean; scope: unknown; omitted: unknown };
+  diagnostics: Array<Record<string, unknown>>;
+  provenance: Record<string, unknown>;
+};
+
+export type FunctionQuery = {
+  schema: "rat.desktop.function-query/v1";
+  name: string;
+  status: "ok" | "partial" | "error" | "timeout";
+  target: AnalysisTarget;
+  duration_ms: number;
+  exit_code: number;
+  result: QueryResult | null;
   diagnostic: string | null;
 };
 
@@ -274,6 +298,10 @@ function control<T>(path: string, body: Record<string, unknown> = {}): Promise<T
 
 export function runBrief(mode: "fast" | "deep"): Promise<AnalysisRun> {
   return control("/api/analysis/brief", { mode });
+}
+
+export function queryFunction(name: string): Promise<FunctionQuery> {
+  return control("/api/analysis/function", { name });
 }
 
 export function startSession(): Promise<Session> {
