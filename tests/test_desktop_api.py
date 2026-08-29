@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.artifact import put_bytes
 import ratlib.artifact as artifact_store
 import ratlib.desktop_api as desktop_api
-from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, live_update, snapshot, telemetry
+from ratlib.desktop_api import artifact_preview, completion, event_delta, list_artifacts, live_update, snapshot, telemetry
 from ratlib.state_v2 import Stream
 
 
@@ -245,7 +245,24 @@ class DesktopApiTests(unittest.TestCase):
             self.assertTrue(preview["truncated"])
             self.assertEqual(preview["encoding"], "base64")
 
-    def test_telemetry_counts_existing_event_types(self):
+    def test_completion_delegates_to_canonical_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            verdict = {
+                "verified": True,
+                "reason": "verified",
+                "primitive_id": "P1",
+                "verification_id": "V1",
+                "report_digest": "sha256:" + "1" * 64,
+                "exploit_task_id": "T1",
+            }
+            with patch.object(desktop_api, "completion_gate", return_value=verdict) as gate:
+                doc = completion(root)
+            gate.assert_called_once_with(os.path.abspath(root))
+            self.assertEqual(doc["schema"], "rat.desktop.completion/v1")
+            self.assertTrue(doc["verified"])
+            self.assertEqual(doc["primitive_id"], "P1")
+
+    def test_telemetry_counts_existing_event_types_and_session_metrics(self):
         with tempfile.TemporaryDirectory() as root:
             stream = Stream(root)
             stream.append("hypothesis.recorded", {"hypothesis_id": "H1"})
@@ -254,6 +271,9 @@ class DesktopApiTests(unittest.TestCase):
             self.assertEqual(doc["event_count"], 2)
             self.assertEqual(doc["event_types"]["hypothesis.recorded"], 1)
             self.assertEqual(doc["groups"]["hypothesis"], 1)
+            self.assertEqual(doc["session"]["schema"], "rat.session-metrics/v1")
+            self.assertEqual(doc["session"]["tool_calls"], 0)
+            self.assertEqual(doc["session"]["duplicate_tool_calls"], 0)
 
 
 if __name__ == "__main__":
