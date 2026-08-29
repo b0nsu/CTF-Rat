@@ -27,19 +27,23 @@ deep 추출은 angr 필요. 실행:  python3 bin/revq <bin> [...]  (venv 활성 
   revq <bin> --func <name|addr>  # 한 함수의 이웃(calls/callers/strings) 컨텍스트 카드
   revq <bin> --xrefs <name|addr> # 이 심볼/주소를 참조/호출하는 곳
   revq <bin> --json              # revmap 원본
-  revq <bin> --fast              # binutils 엔진 (xref 없음, 빠름)
+  revq <bin> --fast              # binutils 엔진 (xref 없음, 빠른 훑기용)
   revq <bin> --refresh           # 캐시 무시하고 재추출
   revq selftest                  # 네트워크·바이너리 무관 순수 로직 검증
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from ratlib.runner import run
 
 SCHEMA = 2
+REVQ_POLICY = "sha256:" + hashlib.sha256(b"revq-local-static-analysis-v1").hexdigest()
 
 # ─────────────────────────── 휴리스틱 사전 ───────────────────────────
 # check-루틴을 가리키는 신호. recon 의 SINK 사전과 목적이 다르다(rev = 판별 로직).
@@ -815,7 +819,71 @@ def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
         return None, None
 
 
+def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key, index_root, started_at, t0):
+    """Persist one successful revq invocation without changing sidecar/cache semantics."""
+    try:
+        from ratlib.artifact import put_bytes
+        from ratlib.cache import resolve_index_root
+        from ratlib.schema import validate
+
+        finished_at = datetime.now(timezone.utc).isoformat()
+        invocation_id = "invoke_" + uuid.uuid4().hex
+        effective_engine = rev.get("engine") or want_engine
+        counts = annotate_counts(rev).get("counts", {})
+        doc = {
+            "schema": "rat.tool-result/v1",
+            "tool": {
+                "name": "revq",
+                "version": str(SCHEMA),
+                "build_digest": "sha256:" + sha256(os.path.realpath(__file__)),
+            },
+            "run_id": invocation_id,
+            "invocation_id": invocation_id,
+            "status": "ok",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": max(0, int((time.monotonic() - t0) * 1000)),
+            "inputs": [{"role": "binary", "digest": "sha256:" + cur_sha}],
+            "parameters": {
+                "requested_engine": want_engine,
+                "effective_engine": effective_engine,
+                "refresh": bool(refresh),
+            },
+            "summary": {
+                "engine": effective_engine,
+                "functions_total": counts.get("functions_total", 0),
+                "strings_total": len(rev.get("strings", [])),
+                "imports_total": len(rev.get("imports", [])),
+                "analysis_complete": bool(rev.get("analysis_complete", False)),
+            },
+            "artifacts": [],
+            "findings": [],
+            "diagnostics": [],
+            "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
+            "provenance": {
+                "platform": sys.platform,
+                "dependency_versions": {"engine": str(effective_engine)},
+                "policy_digest": REVQ_POLICY,
+                "cache": {"state": rev.get("cache_state"), "key": cache_key},
+            },
+            "cache_state": rev.get("cache_state"),
+        }
+        validate(doc, "rat.tool-result/v1")
+        root = resolve_index_root(binpath, override=index_root)
+        put_bytes(
+            json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            kind="tool-result", media_type="application/json",
+            logical_name="revq-%s.json" % invocation_id, root=root,
+            provenance={"producer": "revq", "invocation_id": invocation_id},
+        )
+    except Exception:
+        # Telemetry is observational; never turn a valid revq result into a tool failure.
+        pass
+
+
 def load_or_extract(binpath, want_engine, refresh, index_root=None):
+    started_at = datetime.now(timezone.utc).isoformat()
+    t0 = time.monotonic()
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
     if not refresh and os.path.isfile(cp):
@@ -836,7 +904,9 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
                         if not (existing and existing.get("path") == cp and existing.get("envelope_digest")):
                             idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
                     except Exception: pass
-                return annotate_counts(rev)
+                rev = annotate_counts(rev)
+                _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, ck, index_root, started_at, t0)
+                return rev
         except Exception:
             pass
     rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
@@ -855,6 +925,7 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     if idx and ck:
         try: idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
         except Exception: pass
+    _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, ck, index_root, started_at, t0)
     return rev
 
 
