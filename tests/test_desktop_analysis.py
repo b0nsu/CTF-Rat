@@ -1,4 +1,4 @@
-import json, os, sys, tempfile, unittest
+import json, os, shutil, sys, tempfile, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -107,6 +107,20 @@ class DesktopAnalysisTests(unittest.TestCase):
                 self.assertIn("json", argv)
                 self.assertEqual(kwargs["cwd"], os.path.abspath(root))
                 self.assertLessEqual(kwargs["max_output_bytes"], 256 * 1024)
+
+    def test_real_fast_brief_runs_through_canonical_rat_frontdoor(self):
+        source = "/bin/true"
+        if not os.path.isfile(source):
+            self.skipTest("requires a local ELF /bin/true fixture")
+        with tempfile.TemporaryDirectory() as root:
+            binary = os.path.join(root, "chall")
+            shutil.copy2(source, binary)
+            manifest = new_direct("desktop-real-fast", binary, None, None)
+            atomic_write(os.path.join(root, "run.json"), manifest)
+            doc = AnalysisManager(root).brief("fast")
+            self.assertEqual(doc["status"], "ok", doc.get("diagnostic"))
+            self.assertEqual(doc["result"]["schema"], "rat.brief-card/v1")
+            self.assertEqual(doc["result"]["binary_sha256"], manifest["inputs"][0]["sha256"])
 
     def test_result_digest_must_match_manifest_input(self):
         with tempfile.TemporaryDirectory() as root:
