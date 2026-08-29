@@ -29,9 +29,9 @@ canonical route / query / cache / STATE / artifacts
 
 The browser does not provide a binary path or argv.
 
-`AnalysisManager` reads the challenge's validated `run.json`, resolves the single `binary` input (and optional `libc` input), requires a challenge-local basename, resolves symlinks, rejects root escape, and re-hashes the local file against the manifest SHA-256 and size.
+`AnalysisManager` reads the challenge's validated `run.json`, resolves the single `binary` input (and optional `libc` input), requires a challenge-local basename, resolves symlinks, rejects root escape, and re-hashes the local files against the manifest SHA-256 and size.
 
-After `rat brief` returns, Desktop validates the `rat.brief-card/v1` document and requires its reported `binary_sha256` to match the manifest digest. A changed target is reported as an analysis error rather than accepted as a result for the canonical run.
+After `rat brief` returns, Desktop validates the `rat.brief-card/v1` document and requires its reported `binary_sha256` to match the manifest digest. When the manifest supplies a libc, the returned brief's libc SHA-256 must also match that canonical input. A changed or substituted binary/libc is reported as an analysis error rather than accepted as a result for the canonical run.
 
 Function queries re-hash the target after the bounded query returns and reject the result if the local target changed during analysis.
 
@@ -120,7 +120,7 @@ The query uses `--fast` intentionally. Deeper whole-binary work belongs to DEEP;
 
 The UI button is intentionally named `VERIFY STATUS`, not `VERIFY`.
 
-It calls the existing canonical completion projection. A green `VERIFIED` result therefore still requires the runtime's completion gate to authenticate the active non-stale verification lineage. An unavailable request remains an error/unknown state; Desktop does not fabricate `OPEN` or `VERIFIED`.
+It calls the existing canonical completion projection. A green `VERIFIED` result therefore still requires the runtime's completion gate to authenticate the active non-stale verification lineage. A successful gate response with `verified=false` is displayed as `NOT VERIFIED`; an unavailable request remains an error/unknown state. Desktop does not fabricate a solve-state conclusion beyond the canonical gate.
 
 A future true verifier-execution control requires a canonical verification-request contract that supplies the profile, trace, scenario, primitive, exploit task, and oracle provenance required by `rat-verify`. v0.3 does not invent a Desktop-only substitute for those inputs.
 
@@ -164,7 +164,9 @@ Desktop CI runs the dedicated analysis tests together with existing Desktop test
 - FAST and DEEP fixed-argv construction
 - invalid-mode rejection
 - output-size budget
-- post-run brief digest binding
+- real local `run.json -> AnalysisManager -> rat brief --fast` integration on an Ubuntu ELF fixture
+- post-run brief binary digest binding
+- post-run supplied-libc digest binding
 - bounded Function Card argv/budget/name validation
 - HTTP rejection of injected `argv` or `binary` fields for both briefing and function queries
 
