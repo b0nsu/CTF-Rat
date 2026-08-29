@@ -41,18 +41,25 @@ class DesktopAnalysisTests(unittest.TestCase):
             "side_effects": [],
         }
 
-    def function_result(self, name="main"):
+    def query_result(self, query="func:main", facts=None, heuristics=None, provenance=None, status="ok"):
         return {
             "schema": "rat.query-result/v1",
-            "query": "func:%s" % name,
-            "status": "ok",
-            "facts": {"callers": ["entry"], "callees": ["check"], "strings": ["success"]},
-            "heuristics": {"next": []},
+            "query": query,
+            "status": status,
+            "facts": facts or {},
+            "heuristics": heuristics or {},
             "artifacts": [],
-            "coverage": {"complete": True, "scope": "func:%s" % name, "omitted": None},
+            "coverage": {"complete": status == "ok", "scope": query, "omitted": None},
             "diagnostics": [],
-            "provenance": {"cache": {"hit": False}},
+            "provenance": provenance or {"cache": {"hit": False}},
         }
+
+    def function_result(self, name="main"):
+        return self.query_result(
+            "func:%s" % name,
+            facts={"callers": ["entry"], "callees": ["check"], "strings": ["success"]},
+            heuristics={"next": []},
+        )
 
     def test_resolve_target_uses_manifest_binary_and_rechecks_digest(self):
         with tempfile.TemporaryDirectory() as root:
@@ -188,6 +195,64 @@ class DesktopAnalysisTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     manager.function(bad)
 
+    def test_oracle_query_is_fixed_fast_bounded_rat_query(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, manifest = self.make_challenge(root)
+            payload = json.dumps(self.query_result(
+                "oracle",
+                facts={"success_candidates": [], "failure_candidates": [], "success_candidate_count": 0, "failure_candidate_count": 0},
+                heuristics={"resolved": None, "auto_connect": False},
+                provenance={"binary_sha256": manifest["inputs"][0]["sha256"], "cache": {"hit": False}},
+                status="partial",
+            )).encode()
+            calls = []
+            with patch("ratlib.desktop_analysis.runner_run", side_effect=lambda argv, **kwargs: calls.append((list(argv), kwargs)) or result(stdout=payload)):
+                doc = AnalysisManager(root).oracle()
+            self.assertEqual(doc["schema"], "rat.desktop.oracle-query/v1")
+            self.assertEqual(doc["status"], "partial")
+            argv, kwargs = calls[0]
+            self.assertEqual(argv[1:4], ["query", "oracle", os.path.realpath(binary)])
+            self.assertIn("--fast", argv)
+            self.assertIn("--budget-bytes", argv)
+            self.assertEqual(kwargs["timeout_seconds"], 30.0)
+
+    def test_query_provenance_digest_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_challenge(root)
+            payload = json.dumps(self.query_result(
+                "oracle",
+                provenance={"binary_sha256": "sha256:" + "f" * 64, "cache": {"hit": False}},
+            )).encode()
+            with patch("ratlib.desktop_analysis.runner_run", return_value=result(stdout=payload)):
+                doc = AnalysisManager(root).oracle()
+            self.assertEqual(doc["status"], "error")
+            self.assertIn("canonical run manifest", doc["diagnostic"])
+            self.assertIsNone(doc["result"])
+
+    def test_slice_query_accepts_only_bounded_address_and_fixed_depth_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, _ = self.make_challenge(root)
+            payload = json.dumps(self.query_result(
+                "slice",
+                facts={"target": {"address": "0x401000", "function": "main"}, "within_function": {}, "interproc": {"depth": 2}},
+                heuristics={"claim": "dependency-candidate"},
+                status="partial",
+            )).encode()
+            calls = []
+            with patch("ratlib.desktop_analysis.runner_run", side_effect=lambda argv, **kwargs: calls.append((list(argv), kwargs)) or result(stdout=payload)):
+                doc = AnalysisManager(root).slice(" 4198400 ")
+            self.assertEqual(doc["schema"], "rat.desktop.slice-query/v1")
+            self.assertEqual(doc["backward"], "0x401000")
+            argv, kwargs = calls[0]
+            self.assertEqual(argv[1:4], ["query", "slice", os.path.realpath(binary)])
+            self.assertEqual(argv[argv.index("--backward") + 1], "0x401000")
+            self.assertEqual(argv[argv.index("--depth") + 1], "2")
+            self.assertEqual(argv[argv.index("--source") + 1], "stdin")
+            self.assertEqual(kwargs["timeout_seconds"], 90.0)
+            for bad in ("", "main", "-1", "0x", "0xgg", str(2**64)):
+                with self.assertRaises(ValueError):
+                    AnalysisManager(root).slice(bad)
+
     def test_invalid_mode_and_unready_status_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             manager = AnalysisManager(root)
@@ -195,6 +260,8 @@ class DesktopAnalysisTests(unittest.TestCase):
             self.assertFalse(status["ready"])
             self.assertFalse(status["modes"]["fast"])
             self.assertFalse(status["modes"]["function"])
+            self.assertFalse(status["modes"]["oracle"])
+            self.assertFalse(status["modes"]["slice"])
             self.assertTrue(status["modes"]["verify_status"])
             with self.assertRaises(ValueError):
                 manager.brief("verify")
