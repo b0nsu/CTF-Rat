@@ -160,7 +160,14 @@ export type AnalysisStatus = {
   ready: boolean;
   busy: boolean;
   target: AnalysisTarget | null;
-  modes: { fast: boolean; deep: boolean; function: boolean; verify_status: boolean };
+  modes: {
+    fast: boolean;
+    deep: boolean;
+    function: boolean;
+    oracle: boolean;
+    slice: boolean;
+    verify_status: boolean;
+  };
   reason: string | null;
 };
 
@@ -202,6 +209,27 @@ export type QueryResult = {
 export type FunctionQuery = {
   schema: "rat.desktop.function-query/v1";
   name: string;
+  status: "ok" | "partial" | "error" | "timeout";
+  target: AnalysisTarget;
+  duration_ms: number;
+  exit_code: number;
+  result: QueryResult | null;
+  diagnostic: string | null;
+};
+
+export type OracleQuery = {
+  schema: "rat.desktop.oracle-query/v1";
+  status: "ok" | "partial" | "error" | "timeout";
+  target: AnalysisTarget;
+  duration_ms: number;
+  exit_code: number;
+  result: QueryResult | null;
+  diagnostic: string | null;
+};
+
+export type SliceQuery = {
+  schema: "rat.desktop.slice-query/v1";
+  backward: string;
   status: "ok" | "partial" | "error" | "timeout";
   target: AnalysisTarget;
   duration_ms: number;
@@ -302,6 +330,14 @@ export function runBrief(mode: "fast" | "deep"): Promise<AnalysisRun> {
 
 export function queryFunction(name: string): Promise<FunctionQuery> {
   return control("/api/analysis/function", { name });
+}
+
+export function queryOracle(): Promise<OracleQuery> {
+  return control("/api/analysis/oracle");
+}
+
+export function querySlice(backward: string): Promise<SliceQuery> {
+  return control("/api/analysis/slice", { backward });
 }
 
 export function startSession(): Promise<Session> {
