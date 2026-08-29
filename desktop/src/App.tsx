@@ -3,15 +3,19 @@ import {
   API,
   Artifact,
   ArtifactPreview,
+  Completion,
   EventCursor,
   EventRecord,
   Session,
   Snapshot,
+  Telemetry,
   getArtifactPreview,
   getArtifacts,
+  getCompletion,
   getLiveUpdate,
   getSession,
   getSnapshot,
+  getTelemetry,
   getTerminal,
   sendTerminalInput,
   startSession,
@@ -20,7 +24,10 @@ import {
 
 function eventLabel(event: EventRecord): string {
   const payload = event.payload ?? {};
-  for (const key of ["text", "probe", "phase", "status", "state", "hypothesis_id", "finding_id", "primitive_id", "observation_id"]) {
+  for (const key of [
+    "text", "probe", "phase", "status", "state", "failure_class", "reason",
+    "hypothesis_id", "finding_id", "primitive_id", "observation_id", "verification_id"
+  ]) {
     const value = payload[key];
     if (typeof value === "string" && value.length) return value;
   }
@@ -33,6 +40,9 @@ function group(type: string): string {
   if (type.startsWith("primitive.")) return "PRIM";
   if (type.startsWith("finding.")) return "FIND";
   if (type.startsWith("verification.")) return "VERIFY";
+  if (type.startsWith("failure.")) return "FAIL";
+  if (type.startsWith("alert.")) return "ALERT";
+  if (type.startsWith("evidence.")) return "EVID";
   if (type.startsWith("phase.")) return "PHASE";
   if (type.startsWith("task.")) return "TASK";
   if (type.startsWith("route.")) return "ROUTE";
@@ -48,6 +58,8 @@ function stateCounters(snapshot: Snapshot | null) {
     ["Hypotheses", Object.keys(view.hypotheses).length],
     ["Primitives", Object.keys(view.primitives).length],
     ["Unknowns", Object.keys(view.unknowns).length],
+    ["Failures", view.failures.length],
+    ["Alerts", view.alerts.length],
     ["Next probes", view.next_probes.length]
   ];
 }
@@ -75,12 +87,26 @@ function stateSummary(records: Record<string, unknown>, key: string): string {
     .join(" · ");
 }
 
+function percent(value: number | null | undefined): string {
+  return typeof value === "number" ? `${Math.round(value * 100)}%` : "—";
+}
+
+async function optional<T>(request: Promise<T>): Promise<T | null> {
+  try {
+    return await request;
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
   const [liveSnapshot, setLiveSnapshot] = useState<Snapshot | null>(null);
   const [displaySnapshot, setDisplaySnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
   const [session, setSession] = useState<Session | null>(null);
+  const [completion, setCompletion] = useState<Completion | null>(null);
+  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
   const [terminal, setTerminal] = useState("");
   const [terminalInput, setTerminalInput] = useState("");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -102,8 +128,13 @@ export default function App() {
 
     const initial = async () => {
       try {
-        const [live, currentSession, listing, log] = await Promise.all([
-          getLiveUpdate(null, 1000), getSession(), getArtifacts(), getTerminal(0)
+        const [live, currentSession, listing, log, currentCompletion, currentTelemetry] = await Promise.all([
+          getLiveUpdate(null, 1000),
+          getSession(),
+          getArtifacts(),
+          getTerminal(0),
+          optional(getCompletion()),
+          optional(getTelemetry())
         ]);
         if (!mounted) return;
         if (!live.snapshot) throw new Error("initial live projection omitted snapshot");
@@ -115,6 +146,8 @@ export default function App() {
         setSelectedEvent(delta.events.at(-1) ?? null);
         eventCursor.current = delta.cursor;
         setSession(currentSession);
+        setCompletion(currentCompletion);
+        setTelemetry(currentTelemetry);
         artifactGeneration.current = listing.generation;
         setArtifacts(listing.artifacts);
         setTerminal(log.text);
@@ -160,12 +193,25 @@ export default function App() {
         setSession(currentSession);
         if (stateChanged) {
           if (!live.snapshot) throw new Error("changed live projection omitted snapshot");
-          const listing = await getArtifacts(artifactGeneration.current);
+          const completionRelevant = delta.reset || delta.events.some((event) =>
+            event.type.startsWith("verification.") ||
+            event.type.startsWith("primitive.") ||
+            event.type === "evidence.invalidated"
+          );
+          const [listing, nextCompletion] = await Promise.all([
+            getArtifacts(artifactGeneration.current),
+            completionRelevant ? optional(getCompletion()) : Promise.resolve(null)
+          ]);
           if (!mounted) return;
           setLiveSnapshot(live.snapshot);
           if (replaySeqRef.current === null) setDisplaySnapshot(live.snapshot);
           artifactGeneration.current = listing.generation;
-          if (!listing.unchanged) setArtifacts(listing.artifacts);
+          if (nextCompletion) setCompletion(nextCompletion);
+          if (!listing.unchanged) {
+            setArtifacts(listing.artifacts);
+            const nextTelemetry = await optional(getTelemetry());
+            if (mounted && nextTelemetry) setTelemetry(nextTelemetry);
+          }
         }
         setConnection("live");
         setError(null);
@@ -196,15 +242,18 @@ export default function App() {
   const counters = useMemo(() => stateCounters(displaySnapshot), [displaySnapshot]);
   const focus = useMemo(() => {
     const view = displaySnapshot?.view;
-    if (!view) return { nextProbe: "waiting for STATE", primitives: "none", findings: "none" };
+    if (!view) return { nextProbe: "waiting for STATE", primitives: "none", findings: "none", failure: "none" };
     const nextProbe = objectField(view.next_probes.at(-1), ["probe", "text"]) ?? "no next probe recorded";
+    const failure = objectField(view.failures.at(-1), ["failure_class", "class", "reason"]) ?? "none";
     return {
       nextProbe,
       primitives: stateSummary(view.primitives, "status"),
-      findings: stateSummary(view.findings, "state")
+      findings: stateSummary(view.findings, "state"),
+      failure
     };
   }, [displaySnapshot]);
   const challengeName = liveSnapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
+  const metrics = telemetry?.session;
 
   const runControl = async (action: "start" | "stop") => {
     try {
@@ -278,6 +327,13 @@ export default function App() {
           </div>
         </div>
         <div className="top-actions">
+          <div
+            className={`completion-pill ${completion?.verified ? "verified" : "open"}`}
+            aria-label={`Challenge completion ${completion?.verified ? "verified" : "open"}`}
+            title={completion?.reason ?? "completion gate not checked"}
+          >
+            {completion?.verified ? "VERIFIED" : "OPEN"}
+          </div>
           <div className={`session-pill ${session?.status ?? "idle"}`} aria-label={`Solver session ${session?.status ?? "idle"}`}>{session?.status?.toUpperCase() ?? "IDLE"}</div>
           <button type="button" className="primary" disabled={!session?.configured || session?.status === "running"} onClick={() => void runControl("start")}>Start Solver</button>
           <button type="button" className="danger" disabled={session?.status !== "running"} onClick={() => void runControl("stop")}>Stop</button>
@@ -299,13 +355,16 @@ export default function App() {
           onChange={(event) => void changeReplay(Number(event.target.value))}
         />
         <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
-        <span className="telemetry-inline">events {liveSnapshot?.total_event_count ?? 0} · terminal {session?.log_size ?? 0} B</span>
+        <span className="telemetry-inline">
+          events {liveSnapshot?.total_event_count ?? 0} · tools {metrics?.tool_calls ?? 0} · dup {metrics?.duplicate_tool_calls ?? 0} · cache {percent(metrics?.cache_hit_ratio)}
+        </span>
       </section>
 
       <section className={`focus-bar ${displaySnapshot?.historical ? "historical" : ""}`} aria-label="Solver focus summary">
         <div className="focus-main"><span>NEXT PROBE</span><strong title={focus.nextProbe}>{focus.nextProbe}</strong></div>
         <div className="focus-stat"><span>PRIMITIVES</span><code>{focus.primitives}</code></div>
         <div className="focus-stat"><span>FINDINGS</span><code>{focus.findings}</code></div>
+        <div className={`focus-stat ${focus.failure !== "none" ? "attention" : ""}`}><span>LAST FAILURE</span><code>{focus.failure}</code></div>
       </section>
 
       <main className="workspace">
@@ -319,6 +378,14 @@ export default function App() {
             <span>Total</span><strong>{liveSnapshot?.total_event_count ?? 0}</strong>
             <span>PID</span><strong>{session?.pid ?? "—"}</strong>
             <span>Exit</span><strong>{session?.exit_code ?? "—"}</strong>
+            <span>Solve</span><strong className={completion?.verified ? "metric-good" : ""}>{completion?.verified ? "VERIFIED" : "open"}</strong>
+          </div>
+          <div className="panel-title subsection" id="metrics-title" role="heading" aria-level={3}>RUN METRICS</div>
+          <div className="metric-grid" aria-labelledby="metrics-title">
+            <div><span>tools</span><strong>{metrics?.tool_calls ?? "—"}</strong></div>
+            <div><span>duplicates</span><strong className={(metrics?.duplicate_tool_calls ?? 0) > 0 ? "metric-warn" : ""}>{metrics?.duplicate_tool_calls ?? "—"}</strong></div>
+            <div><span>cache hit</span><strong>{percent(metrics?.cache_hit_ratio)}</strong></div>
+            <div><span>decompiled</span><strong>{metrics?.functions_decompiled ?? "—"}</strong></div>
           </div>
           <div className="panel-title subsection" id="artifacts-title" role="heading" aria-level={3}>ARTIFACTS · {artifacts.length}</div>
           <div className="artifact-list" aria-labelledby="artifacts-title">
