@@ -1,0 +1,120 @@
+import json, os, sys, tempfile, unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
+
+from ratlib.desktop_analysis import AnalysisManager, resolve_target
+from ratlib.run_manifest import atomic_write, new_direct
+
+
+def captured(data=b"", truncated=False):
+    return SimpleNamespace(preview=data, total_bytes=len(data), truncated=truncated, spool_path=None)
+
+
+def result(stdout=b"", stderr=b"", exit_code=0, timed_out=False, duration_ms=7):
+    return SimpleNamespace(
+        stdout=captured(stdout), stderr=captured(stderr), exit_code=exit_code,
+        timed_out=timed_out, duration_ms=duration_ms,
+    )
+
+
+class DesktopAnalysisTests(unittest.TestCase):
+    def make_challenge(self, root, name="chall"):
+        binary = os.path.join(root, name)
+        with open(binary, "wb") as output:
+            output.write(b"desktop-analysis-binary")
+        manifest = new_direct("desktop-test", binary, None, None)
+        atomic_write(os.path.join(root, "run.json"), manifest)
+        return binary, manifest
+
+    def brief_card(self, binary):
+        return {
+            "schema": "rat.brief-card/v1",
+            "binary": binary,
+            "capabilities": {"binutils": True, "angr": False},
+            "route": {"track": "rev", "subroute": "rev-checker", "confidence": 0.8},
+            "track_summary": {"entry": "main"},
+            "libc": {"supplied": False},
+            "truncated": [],
+            "side_effects": [],
+        }
+
+    def test_resolve_target_uses_manifest_binary_and_rechecks_digest(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, manifest = self.make_challenge(root)
+            target = resolve_target(root)
+            self.assertEqual(target["binary"]["name"], "chall")
+            self.assertEqual(target["binary"]["sha256"], manifest["inputs"][0]["sha256"])
+            self.assertEqual(target["_binary_path"], os.path.realpath(binary))
+
+            with open(binary, "ab") as output:
+                output.write(b"tampered")
+            with self.assertRaisesRegex(ValueError, "digest"):
+                resolve_target(root)
+
+    def test_resolve_target_rejects_manifest_path_escape(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "challenge")
+            os.mkdir(root)
+            outside = os.path.join(parent, "outside")
+            with open(outside, "wb") as output:
+                output.write(b"outside")
+            manifest = new_direct("desktop-test", outside, None, None)
+            manifest["inputs"][0]["name"] = "../outside"
+            atomic_write(os.path.join(root, "run.json"), manifest)
+            with self.assertRaisesRegex(ValueError, "basename"):
+                resolve_target(root)
+
+    def test_fast_and_deep_only_select_canonical_rat_brief_mode(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, _ = self.make_challenge(root)
+            card = json.dumps(self.brief_card(binary)).encode()
+            manager = AnalysisManager(root)
+            calls = []
+
+            def fake_run(argv, **kwargs):
+                calls.append((list(argv), kwargs))
+                return result(stdout=card)
+
+            with patch("ratlib.desktop_analysis.runner_run", side_effect=fake_run):
+                fast = manager.brief("fast")
+                deep = manager.brief("deep")
+
+            self.assertEqual(fast["schema"], "rat.desktop.analysis-run/v1")
+            self.assertEqual(fast["status"], "ok")
+            self.assertEqual(deep["status"], "ok")
+            self.assertEqual(calls[0][0][1:3], ["brief", os.path.realpath(binary)])
+            self.assertIn("--fast", calls[0][0])
+            self.assertNotIn("--fast", calls[1][0])
+            for argv, kwargs in calls:
+                self.assertEqual(argv[0], os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "rat")))
+                self.assertIn("--format", argv)
+                self.assertIn("json", argv)
+                self.assertEqual(kwargs["cwd"], os.path.abspath(root))
+                self.assertLessEqual(kwargs["max_output_bytes"], 256 * 1024)
+
+    def test_invalid_mode_and_unready_status_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = AnalysisManager(root)
+            status = manager.status()
+            self.assertFalse(status["ready"])
+            self.assertFalse(status["modes"]["fast"])
+            self.assertTrue(status["modes"]["verify_status"])
+            with self.assertRaises(ValueError):
+                manager.brief("verify")
+
+    def test_tool_failure_is_bounded_structured_result(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_challenge(root)
+            manager = AnalysisManager(root)
+            with patch("ratlib.desktop_analysis.runner_run", return_value=result(stderr=b"failed", exit_code=5)):
+                doc = manager.brief("fast")
+            self.assertEqual(doc["status"], "error")
+            self.assertEqual(doc["exit_code"], 5)
+            self.assertEqual(doc["diagnostic"], "failed")
+            self.assertIsNone(doc["result"])
+
+
+if __name__ == "__main__":
+    unittest.main()
