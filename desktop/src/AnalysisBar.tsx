@@ -37,6 +37,7 @@ export default function AnalysisBar() {
 
   const execute = async (mode: "fast" | "deep") => {
     setBusy(mode);
+    setCompletion(null);
     setError(null);
     try {
       const result = await runBrief(mode);
@@ -52,6 +53,7 @@ export default function AnalysisBar() {
 
   const verifyStatus = async () => {
     setBusy("verify");
+    setRun(null);
     setError(null);
     try {
       setCompletion(await getCompletion());
