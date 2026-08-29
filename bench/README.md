@@ -84,7 +84,7 @@ Current Mode B producers attach a `provenance` object to every `rat.benchmark-re
 - OS, architecture, and Python runtime identity;
 - CTF-Rat revision and schema-bundle identity.
 
-If `CTF_RAT_REVISION` is set it is authoritative; otherwise a normal git checkout records `HEAD`, and exports without git metadata fall back to `worktree`. Historical benchmark-v2 rows without provenance remain readable for compatibility. `ratbench report --schema v2` fails closed if rows under the same `benchmark_run_id` and `ablation_id` contain mixed provenance, rather than aggregating incomparable attempts.
+If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. Historical benchmark-v2 rows without provenance remain readable for compatibility. `ratbench report --schema v2` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
 
 ## Measurement rule
 

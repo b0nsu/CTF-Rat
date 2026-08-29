@@ -304,6 +304,26 @@ class ModeBV2RecordTests(unittest.TestCase):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 3)
             self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v2.md")))
 
+    def test_v2_report_rejects_mixed_provenance_across_ablations(self):
+        first = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance(timeout=600),
+        )
+        second = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "fixture-02"}, run_id="T", ablation_id="A1",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance(timeout=900),
+        )
+        with self.assertRaisesRegex(ValueError, "comparison run T"):
+            RATBENCH._assert_v2_run_provenance([first, second])
+
     def test_v2_report_rejects_malformed_rows_instead_of_biasing_results(self):
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "bench", "results")

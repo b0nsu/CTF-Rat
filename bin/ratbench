@@ -703,16 +703,16 @@ def _read_v2_results(results_dir):
 
 
 def _assert_v2_run_provenance(rows):
-    """One run+ablation cannot silently combine different measurement conditions."""
+    """One comparison run cannot silently combine measurement conditions."""
     groups = {}
     for row in rows:
-        key = (row["benchmark_run_id"], row["ablation_id"])
+        key = row["benchmark_run_id"]
         serialized = json.dumps(row.get("provenance"), sort_keys=True, separators=(",", ":"))
         groups.setdefault(key, set()).add(serialized)
     mixed = [key for key, values in groups.items() if len(values) > 1]
     if mixed:
-        run_id, ablation_id = sorted(mixed)[0]
-        raise ValueError("mixed provenance for benchmark run %s ablation %s" % (run_id, ablation_id))
+        run_id = sorted(mixed)[0]
+        raise ValueError("mixed provenance for benchmark comparison run %s" % run_id)
 
 
 def cmd_report(args):

@@ -19,12 +19,21 @@ class RunManifestIdentityTests(unittest.TestCase):
 
     def test_git_revision_is_used_when_checkout_is_available(self):
         revision = "a" * 40
-        completed = mock.Mock(stdout=revision + "\n")
+        completed = [mock.Mock(stdout=revision + "\n"), mock.Mock(stdout=b""), mock.Mock(stdout=b"")]
         with mock.patch.dict(os.environ, {}, clear=True), \
-             mock.patch.object(run_manifest.subprocess, "run", return_value=completed) as probe:
+             mock.patch.object(run_manifest.subprocess, "run", side_effect=completed) as probe:
             self.assertEqual(run_manifest.ctf_rat_revision("/repo"), revision)
-        probe.assert_called_once()
-        self.assertEqual(probe.call_args.args[0][:4], ["git", "-C", "/repo", "rev-parse"])
+        self.assertEqual(probe.call_args_list[0].args[0][:4], ["git", "-C", "/repo", "rev-parse"])
+
+    def test_dirty_checkout_is_bound_to_content_digest(self):
+        revision = "a" * 40
+        completed = [mock.Mock(stdout=revision + "\n"), mock.Mock(stdout=b"patch"),
+                     mock.Mock(stdout=b"")]
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(run_manifest.subprocess, "run", side_effect=completed):
+            identity = run_manifest.ctf_rat_revision("/repo")
+        self.assertTrue(identity.startswith(revision + "+dirty.sha256:"))
+        self.assertEqual(len(identity.rsplit(":", 1)[1]), 64)
 
     def test_git_failure_degrades_to_worktree_identity(self):
         with mock.patch.dict(os.environ, {}, clear=True), \

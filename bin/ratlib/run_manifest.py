@@ -56,7 +56,30 @@ def ctf_rat_revision(root: Optional[str] = None) -> str:
             )
             revision = proc.stdout.strip()
             if re.fullmatch(r"[0-9a-fA-F]{40}", revision):
-                return revision.lower()
+                revision = revision.lower()
+                diff = subprocess.run(
+                    ["git", "-C", os.path.abspath(root), "diff", "--binary", "HEAD", "--"],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).stdout
+                untracked = subprocess.run(
+                    ["git", "-C", os.path.abspath(root), "ls-files", "--others",
+                     "--exclude-standard", "-z"],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).stdout
+                if not diff and not untracked:
+                    return revision
+                dirty = hashlib.sha256()
+                dirty.update(diff)
+                for relative in sorted(path for path in untracked.split(b"\0") if path):
+                    dirty.update(relative + b"\0")
+                    path = os.path.join(os.path.abspath(root), os.fsdecode(relative))
+                    try:
+                        dirty.update(os.fsencode(sha256_file(path)))
+                    except OSError:
+                        dirty.update(b"unreadable")
+                return revision + "+dirty.sha256:" + dirty.hexdigest()
         except (OSError, subprocess.SubprocessError):
             pass
     return "worktree"
