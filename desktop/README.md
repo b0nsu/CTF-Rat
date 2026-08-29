@@ -2,37 +2,41 @@
 
 Desktop workbench for the CTF-Rat v2 runtime.
 
-The desktop layer is intentionally **not** a second solver implementation. `rat`, STATE v2, artifacts/cache, verification, and orchestration remain canonical. Desktop adds a loopback-only control/observation plane (`ratd`) plus a Tauri/React UI for watching and controlling one explicitly configured local solver process.
+The Desktop layer is intentionally **not** a second solver implementation. `rat`, STATE v2, artifacts/cache, orchestration, verification, completion, and metrics remain canonical. Desktop adds a loopback-only control/observation plane (`ratd`) plus a Tauri/React UI for observing and issuing bounded requests to that runtime.
 
-## v0.2 workbench
+The branch currently contains the **v0.3 development preview**. Package metadata remains `0.2.0` until real-session telemetry is reconciled and the v0.3 release gate is accepted.
 
-- Tauri 2 shell + React/TypeScript UI
+## v0.3 preview workbench
+
+### Observe
+
 - live Activity Timeline from append-only STATE v2
 - materialized current/historical STATE view
-- live solver focus strip for the latest recorded next probe plus current primitive/finding status counts
-- replay slider: inspect what the solver knew at event `#N`
-- serialized polling and latest-request-wins replay updates
-- combined `/api/live` projection: changed STATE delta + current snapshot from one validated JSONL read
-- opaque generation-token fast path for unchanged STATE polling
-- generation tokens are issued only at fully caught-up cursors, never while `has_more=true`
-- automatic workbench reset when the canonical STATE stream ID changes
-- historical replay keeps the conservative canonical path
-- bounded PTY session manager with process-group shutdown
-- Start/Stop controls for one daemon-configured solver command
-- live terminal output + bounded terminal input
-- session-safe terminal cursors across solver and `ratd` restarts
-- failed solver spawn preserves the previous terminal log/cursor generation
-- artifact browser backed by the existing content-addressed store
-- artifact discovery validates metadata/object presence/size without hashing every object
-- artifact inventory generation fast path skips unchanged metadata reloads
-- text/JSON artifact preview and bounded base64 preview for binary artifacts
-- artifact preview uses the canonical store's single-pass streaming verifier and retains only the requested bounded prefix
-- event telemetry API without duplicate telemetry polling in the UI
-- loopback-only HTTP API with restricted browser origins
-- POST controls require `X-CTF-Rat-Desktop: 1`
-- locked npm/Cargo dependency resolution
-- CI-built Linux `.deb` and AppImage bundles
-- no second state DB, cache, solver, or verification path
+- replay slider for event `#N`
+- combined `/api/live` changed-state delta + snapshot projection
+- opaque generation fast path for unchanged STATE polling
+- stream reset handling without mixing event histories
+- current primitive/finding/failure focus strip
+- Primitive/Finding board projected directly from canonical `Stream.view()`
+- Timeline filters for verification, findings, primitives, evidence, and failures
+- evidence navigation: finding/primitive -> observation -> content-addressed artifact
+- event `caused_by` backlinks within the bounded retained Timeline window
+- canonical completion-gate status (`VERIFIED`, `NOT VERIFIED`, or unavailable)
+- bounded session metrics without adding telemetry to the 500 ms idle hot path
+
+### Control / query
+
+- one daemon-configured local solver command with Start/Stop and bounded PTY input
+- FAST -> canonical `rat brief --fast`
+- DEEP -> canonical `rat brief`
+- FUNC -> canonical bounded `rat query func --fast`
+- ORACLE -> canonical bounded `rat query oracle --fast`
+- SLICE -> canonical `rat query slice` with Desktop-fixed `depth=2`, `source=stdin`
+- VERIFY STATUS -> reads the canonical completion gate; it does not execute or replace `rat-verify`
+
+The browser cannot supply an analysis binary path, libc path, arbitrary argv, command, shell fragment, query budget, slice depth, or slice source. Analysis targets come from validated `rat.run/v1` `run.json` inputs and are SHA-256/size checked before use. Results remain bound to the canonical binary identity after execution.
+
+See [`V03_CONTROL.md`](./V03_CONTROL.md) for the exact bounded-control contract and [`DESIGN.md`](./DESIGN.md) for the workbench UI contract.
 
 ## Architecture
 
@@ -42,19 +46,19 @@ Tauri / React Workbench
         | loopback HTTP
         v
       ratd
-     / |  \
     /  |   \
- PTY  STATE  artifact store
-  |     |       |
-configured     existing
-solver cmd     CTF-Rat truth
+   /   |    \
+ PTY  rat   read projections
+  |    |      |
+configured  STATE v2 / artifacts /
+solver cmd  completion / metrics
 ```
 
-`ratd` never accepts arbitrary argv from HTTP. The operator configures a solver command once at daemon startup; the UI can only start/stop that command and send PTY input to the running process.
+Desktop does not own solver, STATE, cache, evidence, finding, primitive, verification, or orchestration semantics.
 
 ## Run from source
 
-Install the locked frontend dependencies:
+Install locked frontend dependencies:
 
 ```bash
 cd desktop
@@ -64,8 +68,6 @@ cd ..
 
 ### Observer mode
 
-Watch an already-running CTF-Rat session:
-
 ```bash
 python3 bin/ratd --challenge /path/to/challenge
 cd desktop && npm run tauri dev
@@ -73,7 +75,7 @@ cd desktop && npm run tauri dev
 
 ### Controlled solver mode
 
-Configure the exact local solver/agent command when starting `ratd`:
+Configure one exact local solver/agent command when starting `ratd`:
 
 ```bash
 python3 bin/ratd \
@@ -81,14 +83,14 @@ python3 bin/ratd \
   --solver-command "<your existing local CTF-Rat agent command>"
 ```
 
-Then open the app:
+Then:
 
 ```bash
 cd desktop
 npm run tauri dev
 ```
 
-The browser/UI does not choose or alter the argv. `--solver-command` is parsed with `shlex.split()` and executed directly without a shell.
+`--solver-command` is parsed with `shlex.split()` and executed directly without a shell. HTTP clients cannot alter the configured argv.
 
 ### Development launcher
 
@@ -103,11 +105,11 @@ With a configured solver command:
 ./desktop/dev.sh /path/to/challenge "<your existing local CTF-Rat agent command>"
 ```
 
-`ratd` listens on `127.0.0.1:8765` by default. In browser/Vite development, `VITE_RATD_URL` may point the frontend at another explicitly chosen loopback `ratd` port. Packaged Tauri v0.2 builds are intentionally narrower: the committed CSP permits only `http://127.0.0.1:8765` and `http://localhost:8765`. A packaged custom endpoint therefore requires a corresponding `app.security.csp` `connect-src` change at build time while preserving the loopback-only policy.
+`ratd` listens on `127.0.0.1:8765` by default. Browser/Vite development may use `VITE_RATD_URL` for another explicitly selected loopback endpoint. Packaged Tauri builds retain a narrower committed CSP and permit the default loopback endpoint.
 
 ## Linux packages
 
-Build the same bundle targets used by CI:
+Build the same targets used by CI:
 
 ```bash
 cd desktop
@@ -115,147 +117,193 @@ npm ci
 npm run tauri -- build --bundles deb,appimage
 ```
 
-Outputs are written below:
+Outputs:
 
 ```text
 desktop/src-tauri/target/release/bundle/deb/
 desktop/src-tauri/target/release/bundle/appimage/
 ```
 
-The `desktop-workbench` GitHub Actions workflow uploads both bundle types as a `ctf-rat-desktop-linux-<sha>` artifact on pull-request validation runs.
-
-The installer contains the Tauri workbench, not a second copy of the CTF-Rat solver runtime. `ratd` and the existing repository/runtime remain the canonical backend and must be available separately.
+The installer contains the Tauri workbench, not a second copy of the CTF-Rat solver runtime. `ratd` and the existing repository/runtime remain the canonical backend.
 
 ## API
 
-Read-only projections:
+### Read projections
 
 ```text
 GET /api/health
+GET /api/analysis/status
 GET /api/live?after_seq=<n>&limit=<n>&stream_id=<id>&known_generation=<opaque>
 GET /api/snapshot
 GET /api/snapshot?until_seq=<n>
 GET /api/events?after_seq=<n>&limit=<n>
 GET /api/telemetry
+GET /api/completion
 GET /api/session
 GET /api/terminal?after=<cursor>&limit=<n>
 GET /api/artifacts?limit=<n>&known_generation=<opaque>
 GET /api/artifacts/<sha256:digest>?max_bytes=<n>
 ```
 
-The workbench uses `/api/live` for the hot path. On a changed STATE generation, `ratd` performs one canonical `Stream.read()` validation, derives the bounded event delta, and feeds shallow payload facades of those already-validated events through the existing `Stream.view()` materializer. The adapter does not own STATE semantics and cannot replace canonical validation. Historical replay continues to use `/api/snapshot?until_seq=`.
+### Bounded controls
 
-`/api/live` and compatibility `/api/events` return an event cursor containing `stream_id`, `seq`, and, only when the cursor has consumed the complete stable generation, an opaque `source_generation` string. The client echoes that value as `known_generation`. If the append-only STATE file is unchanged, `ratd` can answer without reparsing JSONL. A paginated response with `has_more=true` deliberately omits `source_generation`; otherwise a client could skip unread pages by taking the unchanged fast path too early.
+All POST controls require:
 
-If the canonical STATE `stream_id` changes, the delta returns `reset: true` and restarts the sequence cursor from zero. The workbench resets timeline/replay/terminal presentation rather than mixing two streams.
+```text
+X-CTF-Rat-Desktop: 1
+Content-Type: application/json
+```
 
-The terminal `cursor` is an opaque, monotonically increasing value returned by the previous `/api/terminal` response. Clients must pass that returned value back as `after`; it is not a raw byte offset. Cursor generation is persisted in the existing `.rat/desktop/session.json`, so a cursor from an older solver session or a restarted `ratd` safely maps to the beginning of the current truncated terminal log rather than skipping its prefix.
+```text
+POST /api/session/start        {}
+POST /api/session/stop         {}
+POST /api/session/input        {"data":"..."}
 
-### Artifact discovery vs verification
+POST /api/analysis/brief       {"mode":"fast"|"deep"}
+POST /api/analysis/function    {"name":"main"}
+POST /api/analysis/oracle      {}
+POST /api/analysis/slice       {"backward":"0x401000"}
+```
 
-Artifact listing and artifact byte consumption intentionally have different contracts:
+Each analysis endpoint accepts an exact bounded request shape. Extra `argv`, `binary`, `command`, `depth`, `source`, or other fields fail closed.
 
-- `artifact.describe()` / `/api/artifacts` validate immutable metadata schema/digest, object existence, and recorded object size. They do **not** claim that object bytes were SHA-256 verified.
-- `/api/artifacts` returns an opaque metadata-inventory `generation`. If the same generation is echoed back, the daemon can return `unchanged: true` without reopening/parsing every metadata document.
-- `artifact.metadata()`, `artifact.preview()`, `artifact.get()`, and `artifact.verify()` retain content-integrity verification.
-- Desktop preview hashes the complete immutable object once while retaining only the requested `max_bytes` prefix in memory. `total_bytes` is the verified object size.
+## STATE polling contract
 
-The artifact inventory generation is only a performance hint over an immutable metadata tree; it is not evidence and does not weaken byte-consuming verification paths.
+The workbench uses `/api/live` for the hot path. On a changed STATE generation, `ratd` performs one canonical `Stream.read()` validation, derives the event delta, and feeds shallow payload facades of those validated events through the existing `Stream.view()` materializer. Desktop does not own STATE materialization semantics.
+
+A generation token is issued only when a stable response is fully caught up (`has_more=false`). Echoing that token permits an unchanged poll to return without reparsing JSONL. A paginated response deliberately withholds it so unread pages cannot be skipped.
+
+Historical replay uses `/api/snapshot?until_seq=` and the board/Inspector render the selected historical materialized view rather than a separate state model.
+
+## Artifact discovery vs verification
+
+Artifact listing and byte consumption intentionally have different contracts:
+
+- discovery validates metadata schema/digest, object presence, and recorded size without hashing every object
+- the inventory generation is only an opaque performance hint, never integrity evidence
+- preview/get/verify paths retain content SHA-256 verification
+- Desktop preview verifies the whole immutable object while retaining only the requested bounded prefix
+
+## Analysis/query contract
+
+FAST/DEEP/FUNC/ORACLE/SLICE are thin adapters over the existing `rat` front door. They share one in-memory execution lock and bounded wall/CPU/output budgets.
+
+Current bounds are documented in [`V03_CONTROL.md`](./V03_CONTROL.md). Important invariants:
+
+- target comes only from canonical `run.json`
+- target path must resolve inside the challenge root
+- binary/libc inputs are hash/size verified before briefing
+- brief output binary/libc identity must match canonical inputs
+- bounded query results are schema validated and the binary is re-hashed after execution
+- the query result's binary provenance, when present, must match the manifest digest
+- no shell execution
+- no Desktop-specific decompiler/cache/oracle/verification engine
+
+## Primitive/Finding and evidence navigation
+
+The board renders current `findings` and `primitives` from `Stream.view()` only. It does not write STATE or calculate replacement lifecycle states.
+
+Relations shown by the Inspector are references already present in canonical data:
+
+```text
+finding.evidence_observation_ids
+primitive.self_evidence
+observation.evidence            -> artifact digests
+finding.related_findings
+event.caused_by
+```
+
+Evidence artifacts open through the existing verified artifact-preview path.
+
+## Typed intervention boundary
+
+Desktop does not expose a new `investigate`, `rule-out`, `phase`, or generic solver-intent API. The runtime currently has durable low-level orchestration gates, but no single high-level validated intent request contract for Desktop to adapt without inventing semantics.
+
+Until such a canonical interface exists, v0.3 keeps FAST/DEEP and bounded query cards as the supported analysis controls.
 
 ## Measurement harnesses
 
-The benchmarks are deterministic, non-gating evidence for ablation decisions. Absolute values depend on runner load.
-
-### STATE polling
+Synthetic benchmarks are deterministic, non-gating evidence. Absolute values depend on runner load.
 
 ```bash
 python3 tests/bench_desktop_polling.py --events 100,1000,5000 --iterations 7
-```
-
-GitHub Actions run `32674768350` on source commit `61d9055e0e35afc15b7bf665a282bfe50309be59` measured:
-
-| STATE events | unchanged live p50 | legacy changed refresh p50 | combined changed refresh p50 | changed speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 100 | 0.012 ms | 1.114 ms | 0.621 ms | 1.79x |
-| 1,000 | 0.011 ms | 10.062 ms | 5.234 ms | 1.92x |
-| 5,000 | 0.011 ms | 56.019 ms | 28.459 ms | 1.97x |
-
-The first combined implementation deep-copied all events and benchmarked slower than the legacy sequence, so it was not accepted as-is. The retained implementation instead gives `Stream.view()` minimal event facades with shallow payload copies; tests prove that projection-side status changes do not mutate the delta payloads.
-
-### Artifact discovery
-
-```bash
 python3 tests/bench_desktop_artifacts.py --artifacts 10,100,500 --object-bytes 65536 --iterations 7
 ```
 
-The same CI run measured:
+CI uploads both JSONL results as `ctf-rat-desktop-benchmarks-<sha>`.
 
-| Artifacts | Total object bytes | full listing p50 | unchanged inventory p50 | speedup | one preview p50 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 640 KiB | 0.584 ms | 0.169 ms | 3.46x | 0.226 ms |
-| 100 | 6.25 MiB | 5.014 ms | 1.370 ms | 3.66x | 0.291 ms |
-| 500 | 31.25 MiB | 22.860 ms | 4.775 ms | 4.79x | 0.219 ms |
+The optimizations under measurement are:
 
-Listing cost is now metadata/inventory work rather than hashing every object. Preview cost for this fixture remains nearly independent of artifact count because it verifies one selected object.
+- unchanged STATE generation fast path
+- combined changed `/api/live` delta+snapshot path
+- metadata-only artifact discovery
+- unchanged artifact-inventory generation path
+- one-object streaming verified preview
 
-CI uploads both JSONL files together as `ctf-rat-desktop-benchmarks-<sha>`.
+The v0.3 query controls are explicit user actions and are not injected into the 500 ms idle polling loop.
 
 ## Test
 
-Desktop backend and end-to-end tests:
+Backend/Desktop integration tests:
 
 ```bash
 python3 -m unittest \
   tests.test_artifact_describe \
+  tests.test_desktop_analysis \
   tests.test_desktop_api \
   tests.test_desktop_session \
   tests.test_desktop_http \
   tests.test_desktop_e2e
 ```
 
-The E2E smoke test runs a configured local solver fixture through the same session manager and HTTP handler, then verifies PTY terminal output, the combined live STATE projection, unchanged generation round-tripping, historical replay, and the canonical artifact store. API/HTTP tests also lock the caught-up-only STATE generation invariant and artifact-inventory generation behavior.
+`tests.test_desktop_analysis` includes a real local Ubuntu ELF integration path:
 
-All repository Python tests include these through normal discovery:
+```text
+local /bin/true fixture
+-> challenge run.json
+-> AnalysisManager
+-> canonical rat brief --fast
+-> validated rat.brief-card/v1
+```
+
+Full Python regression:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Frontend build check:
+Frontend/Tauri checks:
 
 ```bash
 cd desktop
 npm ci
 npm run build
-```
-
-Tauri compile check:
-
-```bash
+cd ..
 cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-The desktop CI also verifies that `package-lock.json` and `Cargo.lock` remain unchanged by the build.
+CI also builds/validates `.deb` + AppImage bundles and verifies npm/Cargo lockfiles remain unchanged.
 
 ## Current boundaries
 
-- Linux is the canonical solver runtime because CTF-Rat depends on ELF/GDB/angr/pwntools/Ghidra tooling.
-- Windows desktop use should host the solver runtime in WSL2; macOS should use the existing Linux VM/container path where required.
-- Desktop does not submit flags, mutate evidence directly, create findings, or bypass `rat`/verification gates.
+- Linux remains the canonical solver runtime because the analysis stack depends on ELF/GDB/angr/pwntools/Ghidra tooling.
+- Windows Desktop deployments should keep the solver runtime in WSL2; macOS should use the existing Linux VM/container path where required.
+- Desktop does not submit flags, promote evidence, create/revise findings or primitives, or bypass `rat`/verification gates.
 - Arbitrary command execution is not exposed through the HTTP API.
-- Linux installer bundles package the UI shell only; they do not make the Linux CTF-Rat analysis runtime cross-platform.
+- The Linux installer packages the UI shell only; it does not make the Linux CTF-Rat runtime cross-platform.
 
-## Verified release gates
+## v0.3 release gate
 
-The desktop branch CI verifies:
+The implementation is not considered a final `0.3.0` release solely because synthetic CI is green. Before version promotion / PR ready / merge, reconcile real CTF-session telemetry against the agreed baseline, especially:
 
-1. artifact/desktop API/session/HTTP/E2E tests,
-2. Python syntax checks for daemon modules and both benchmark harnesses,
-3. reproducible STATE polling and artifact-discovery benchmark artifacts,
-4. `npm ci` against the committed lockfile,
-5. TypeScript/Vite production build,
-6. `cargo check --locked`,
-7. `.deb` and AppImage bundle generation on PR validation runs,
-8. Debian metadata and AppImage internal executable validation,
-9. unchanged npm/Cargo lockfiles after the build,
-10. upload of both installer artifacts.
+- verified solve / false VERIFIED
+- time to first hypothesis / valid primitive / verified solve / flag
+- tool calls and duplicate tool calls
+- cache requests/hits
+- functions decompiled
+- STATE/artifact growth
+- ratd CPU/RSS and terminal growth
+- missed/reset event anomalies
+- FAST/DEEP/FUNC/ORACLE/SLICE frequency and latency
+
+Until that evidence is available, keep package metadata at `0.2.0` and PR #13 in draft.
