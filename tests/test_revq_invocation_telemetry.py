@@ -114,6 +114,54 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
             self.assertEqual(metrics["cache_hits"], 1)
             self.assertEqual(metrics["cache_misses"], 1)
 
+    def test_rat_query_func_records_only_successful_selector(self):
+        rat = _load_rat()
+        revq = rat._load_revq_module()
+        fixture = revq._fixture()
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as fh:
+                fh.write(b"fixture-binary")
+            root = os.path.join(d, ".rat")
+            valid = SimpleNamespace(binary=binary, name="check", store=root, fast=True,
+                                    budget_bytes=16384, format="json")
+            missing = SimpleNamespace(binary=binary, name="does-not-exist", store=root, fast=True,
+                                      budget_bytes=16384, format="json")
+            with patch.object(revq, "extract_binutils", return_value=fixture), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(rat.cmd_query_func(valid), 0)
+                self.assertNotEqual(rat.cmd_query_func(missing), 0)
+
+            docs = [doc for doc in iter_tool_results(root)
+                    if (doc.get("tool") or {}).get("name") == "revq"]
+            self.assertEqual(len(docs), 1)
+            self.assertEqual(docs[0]["parameters"]["operation"], "func")
+            self.assertEqual(docs[0]["parameters"]["requested"], "check")
+            self.assertEqual(docs[0]["parameters"]["frontdoor"], "rat")
+
+    def test_rat_query_oracle_records_successful_in_process_revq(self):
+        rat = _load_rat()
+        revq = rat._load_revq_module()
+        fixture = revq._fixture()
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as fh:
+                fh.write(b"fixture-binary")
+            root = os.path.join(d, ".rat")
+            args = SimpleNamespace(binary=binary, store=root, fast=True,
+                                   budget_bytes=16384, format="json")
+            with patch.object(revq, "extract_binutils", return_value=fixture), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(rat.cmd_query_oracle(args), 0)
+
+            docs = [doc for doc in iter_tool_results(root)
+                    if (doc.get("tool") or {}).get("name") == "revq"]
+            self.assertEqual(len(docs), 1)
+            self.assertEqual(docs[0]["parameters"]["operation"], "oracle")
+            self.assertEqual(docs[0]["parameters"]["frontdoor"], "rat")
+
     def test_failed_selector_is_not_recorded_as_a_successful_invocation(self):
         revq = _load_revq()
         fixture = {
