@@ -129,7 +129,7 @@
 .mode-tag.function.error,
 .mode-tag.function.timeout { color: var(--color-danger); border-color: var(--color-danger); }
 .verify-tag.verified { color: var(--color-success); border-color: var(--color-success); }
-.verify-tag.open { color: var(--color-fg-muted); }
+.verify-tag.unverified { color: var(--color-fg-muted); }
 
 .function-card {
   grid-column: 1 / -1;
