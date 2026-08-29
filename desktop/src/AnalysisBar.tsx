@@ -4,9 +4,13 @@ import {
   AnalysisStatus,
   Completion,
   FunctionQuery,
+  OracleQuery,
+  SliceQuery,
   getAnalysisStatus,
   getCompletion,
   queryFunction,
+  queryOracle,
+  querySlice,
   runBrief
 } from "./api";
 
@@ -16,6 +20,10 @@ function text(value: unknown): string | null {
 
 function number(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
 function listPreview(value: unknown): { count: number; text: string } {
@@ -36,8 +44,11 @@ export default function AnalysisBar() {
   const [run, setRun] = useState<AnalysisRun | null>(null);
   const [completion, setCompletion] = useState<Completion | null>(null);
   const [functionQuery, setFunctionQuery] = useState<FunctionQuery | null>(null);
+  const [oracleQuery, setOracleQuery] = useState<OracleQuery | null>(null);
+  const [sliceQuery, setSliceQuery] = useState<SliceQuery | null>(null);
   const [functionName, setFunctionName] = useState("");
-  const [busy, setBusy] = useState<"fast" | "deep" | "function" | "verify" | null>(null);
+  const [sliceAddress, setSliceAddress] = useState("");
+  const [busy, setBusy] = useState<"fast" | "deep" | "function" | "oracle" | "slice" | "verify" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshStatus = async () => {
@@ -52,10 +63,17 @@ export default function AnalysisBar() {
     void refreshStatus();
   }, []);
 
-  const execute = async (mode: "fast" | "deep") => {
-    setBusy(mode);
+  const clearResults = () => {
+    setRun(null);
     setCompletion(null);
     setFunctionQuery(null);
+    setOracleQuery(null);
+    setSliceQuery(null);
+  };
+
+  const execute = async (mode: "fast" | "deep") => {
+    setBusy(mode);
+    clearResults();
     setError(null);
     try {
       const result = await runBrief(mode);
@@ -74,8 +92,7 @@ export default function AnalysisBar() {
     const name = functionName.trim();
     if (!name) return;
     setBusy("function");
-    setRun(null);
-    setCompletion(null);
+    clearResults();
     setError(null);
     try {
       const result = await queryFunction(name);
@@ -85,8 +102,46 @@ export default function AnalysisBar() {
       }
       await refreshStatus();
     } catch (exc) {
-      setFunctionQuery(null);
       setError(exc instanceof Error ? exc.message : "function query failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runOracle = async () => {
+    setBusy("oracle");
+    clearResults();
+    setError(null);
+    try {
+      const result = await queryOracle();
+      setOracleQuery(result);
+      if (result.status === "error" || result.status === "timeout") {
+        setError(result.diagnostic ?? "oracle query failed");
+      }
+      await refreshStatus();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "oracle query failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const submitSlice = async (event: FormEvent) => {
+    event.preventDefault();
+    const backward = sliceAddress.trim();
+    if (!backward) return;
+    setBusy("slice");
+    clearResults();
+    setError(null);
+    try {
+      const result = await querySlice(backward);
+      setSliceQuery(result);
+      if (result.status === "error" || result.status === "timeout") {
+        setError(result.diagnostic ?? "slice query failed");
+      }
+      await refreshStatus();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "slice query failed");
     } finally {
       setBusy(null);
     }
@@ -94,13 +149,11 @@ export default function AnalysisBar() {
 
   const verifyStatus = async () => {
     setBusy("verify");
-    setRun(null);
-    setFunctionQuery(null);
+    clearResults();
     setError(null);
     try {
       setCompletion(await getCompletion());
     } catch (exc) {
-      setCompletion(null);
       setError(exc instanceof Error ? exc.message : "verification status unavailable");
     } finally {
       setBusy(null);
@@ -133,6 +186,38 @@ export default function AnalysisBar() {
     };
   }, [functionQuery]);
 
+  const oracleSummary = useMemo(() => {
+    const result = oracleQuery?.result;
+    if (!result) return null;
+    const success = listPreview(result.facts.success_candidates);
+    const failure = listPreview(result.facts.failure_candidates);
+    const successCount = number(result.facts.success_candidate_count) ?? success.count;
+    const failureCount = number(result.facts.failure_candidate_count) ?? failure.count;
+    return {
+      success,
+      failure,
+      successCount,
+      failureCount,
+      autoConnect: result.heuristics.auto_connect === true,
+      complete: result.coverage.complete === true
+    };
+  }, [oracleQuery]);
+
+  const sliceSummary = useMemo(() => {
+    const result = sliceQuery?.result;
+    if (!result) return null;
+    const target = record(result.facts.target);
+    const within = record(result.facts.within_function);
+    const interproc = record(result.facts.interproc);
+    return {
+      target: [text(target?.function), text(target?.address)].filter(Boolean).join(" @ ") || sliceQuery.backward,
+      inputs: listPreview(within?.input_api_calls),
+      calls: listPreview(within?.direct_calls),
+      depth: number(interproc?.depth),
+      complete: result.coverage.complete === true
+    };
+  }, [sliceQuery]);
+
   const disabled = busy !== null || status?.busy === true || status?.ready !== true;
   const target = status?.target?.binary;
 
@@ -152,7 +237,7 @@ export default function AnalysisBar() {
         <button type="button" disabled={disabled || !status?.modes.deep} onClick={() => void execute("deep")}>
           {busy === "deep" ? "DEEP…" : "DEEP"}
         </button>
-        <form className="function-form" onSubmit={submitFunction}>
+        <form className="query-form" onSubmit={submitFunction}>
           <input
             aria-label="Function name for bounded Function Card"
             disabled={disabled || !status?.modes.function}
@@ -163,6 +248,22 @@ export default function AnalysisBar() {
           />
           <button type="submit" disabled={disabled || !status?.modes.function || !functionName.trim()}>
             {busy === "function" ? "FUNC…" : "FUNC"}
+          </button>
+        </form>
+        <button type="button" disabled={disabled || !status?.modes.oracle} onClick={() => void runOracle()}>
+          {busy === "oracle" ? "ORACLE…" : "ORACLE"}
+        </button>
+        <form className="query-form slice-form" onSubmit={submitSlice}>
+          <input
+            aria-label="Backward slice target address"
+            disabled={disabled || !status?.modes.slice}
+            maxLength={18}
+            placeholder="0x401000"
+            value={sliceAddress}
+            onChange={(event) => setSliceAddress(event.target.value)}
+          />
+          <button type="submit" disabled={disabled || !status?.modes.slice || !sliceAddress.trim()}>
+            {busy === "slice" ? "SLICE…" : "SLICE"}
           </button>
         </form>
         <button type="button" className="verify-control" disabled={busy !== null} onClick={() => void verifyStatus()}>
@@ -177,6 +278,20 @@ export default function AnalysisBar() {
             <strong>{functionQuery.name}</strong>
             <code>{functionSummary.complete ? "complete" : functionQuery.status}</code>
             <span>{functionQuery.duration_ms} ms</span>
+          </>
+        ) : oracleQuery && oracleSummary ? (
+          <>
+            <span className={`mode-tag oracle ${oracleQuery.status}`}>ORACLE</span>
+            <strong>{oracleSummary.autoConnect ? "resolved" : "candidates"}</strong>
+            <code>{oracleSummary.successCount} success · {oracleSummary.failureCount} failure</code>
+            <span>{oracleQuery.duration_ms} ms</span>
+          </>
+        ) : sliceQuery && sliceSummary ? (
+          <>
+            <span className={`mode-tag slice ${sliceQuery.status}`}>SLICE</span>
+            <strong>{sliceSummary.target}</strong>
+            <code>{sliceSummary.complete ? "complete" : sliceQuery.status}</code>
+            <span>{sliceQuery.duration_ms} ms</span>
           </>
         ) : run?.status === "ok" && summary ? (
           <>
@@ -193,15 +308,31 @@ export default function AnalysisBar() {
             {completion.verification_id && <code>{completion.verification_id}</code>}
           </>
         ) : (
-          <span className="analysis-hint">FAST/DEEP and FUNC route through canonical `rat`; VERIFY STATUS only reads the completion gate.</span>
+          <span className="analysis-hint">FAST/DEEP/FUNC/ORACLE/SLICE use canonical `rat`; VERIFY STATUS only reads the completion gate.</span>
         )}
       </div>
 
       {functionQuery && functionSummary && (
-        <div className="function-card" aria-label={`Function Card for ${functionQuery.name}`}>
+        <div className="query-card" aria-label={`Function Card for ${functionQuery.name}`}>
           <div><span>CALLERS · {functionSummary.callers.count}</span><code title={functionSummary.callers.text}>{functionSummary.callers.text}</code></div>
           <div><span>CALLEES · {functionSummary.callees.count}</span><code title={functionSummary.callees.text}>{functionSummary.callees.text}</code></div>
           <div><span>STRINGS · {functionSummary.strings.count}</span><code title={functionSummary.strings.text}>{functionSummary.strings.text}</code></div>
+        </div>
+      )}
+
+      {oracleQuery && oracleSummary && (
+        <div className="query-card" aria-label="Oracle candidates">
+          <div><span>SUCCESS · {oracleSummary.successCount}</span><code title={oracleSummary.success.text}>{oracleSummary.success.text}</code></div>
+          <div><span>FAILURE · {oracleSummary.failureCount}</span><code title={oracleSummary.failure.text}>{oracleSummary.failure.text}</code></div>
+          <div><span>AUTO CONNECT</span><code>{oracleSummary.autoConnect ? "yes" : "withheld"}</code></div>
+        </div>
+      )}
+
+      {sliceQuery && sliceSummary && (
+        <div className="query-card" aria-label={`Backward slice for ${sliceQuery.backward}`}>
+          <div><span>TARGET</span><code title={sliceSummary.target}>{sliceSummary.target}</code></div>
+          <div><span>INPUT APIS · {sliceSummary.inputs.count}</span><code title={sliceSummary.inputs.text}>{sliceSummary.inputs.text}</code></div>
+          <div><span>DIRECT CALLS · {sliceSummary.calls.count}</span><code title={sliceSummary.calls.text}>{sliceSummary.calls.text}{sliceSummary.depth === null ? "" : ` · depth ${sliceSummary.depth}`}</code></div>
         </div>
       )}
 
