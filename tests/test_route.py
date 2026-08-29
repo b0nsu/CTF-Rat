@@ -34,6 +34,22 @@ class RouteFixtures(unittest.TestCase):
         r = route(profile=profile(imports=["printf", "read"]))
         self.assertEqual(r["subroute"], "pwn-format")
 
+    def test_heap_only_has_no_pwn_sibling_conflict(self):
+        r = route(profile=profile(imports=["malloc", "free"]))
+        self.assertNotIn("conflict", r)
+
+    def test_coexisting_pwn_sinks_surface_siblings_as_alternatives(self):
+        # heap + format(+input) + overflow sinks all present: primary is pwn-heap,
+        # the other two must appear as pwn-track alternatives with conflict=true.
+        r = route(profile=profile(imports=["malloc", "free", "printf", "read", "gets"]))
+        self.assertEqual(r["subroute"], "pwn-heap")
+        self.assertTrue(r["conflict"])
+        alt_subroutes = {a["subroute"] for a in r["alternatives"]}
+        self.assertIn("pwn-format", alt_subroutes)
+        self.assertTrue({"pwn-stack", "pwn-rop"} & alt_subroutes)
+        for a in r["alternatives"]:
+            self.assertEqual(a["track"], "pwn")
+
     def test_kernel_imports_route_pwn_kernel(self):
         r = route(profile=profile(imports=["copy_from_user", "kmalloc"]))
         self.assertEqual(r["subroute"], "pwn-kernel")
@@ -42,6 +58,15 @@ class RouteFixtures(unittest.TestCase):
         r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
         self.assertEqual(r["subroute"], "rev-packed")
         self.assertEqual(r["track"], "rev")
+        self.assertEqual(r["signals"][0]["quality"], "fact")
+        self.assertEqual(r["confidence"], 0.85)
+
+    def test_entropy_only_is_a_heuristic_packed_candidate(self):
+        r = route(revq=revq(evasion=["고엔트로피 7.54/8 (packing/암호화 의심)"]))
+        self.assertEqual(r["subroute"], "rev-packed")
+        self.assertEqual(r["track"], "rev")
+        self.assertEqual(r["signals"][0]["quality"], "heuristic")
+        self.assertEqual(r["confidence"], 0.55)
 
     def test_vm_dispatch_hint_routes_rev_vm(self):
         r = route(revq=revq(functions=[{"name": "vm_dispatch_loop"}]))

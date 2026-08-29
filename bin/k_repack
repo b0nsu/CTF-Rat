@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# repack.sh — the Phase-2 automated initramfs rebuild loop (HANDOFF item 3)
+# k_repack — the Phase-2 automated initramfs rebuild loop (HANDOFF item 3)
 # ---------------------------------------------------------------------------
 # Turns "edit exploit.c -> get a bootable test image" into ONE command:
-#   1. static-compile the exploit C source (or take a prebuilt static binary)
+#   1. static-compile the exploit C source (or take a prebuilt binary; static preferred)
 #   2. inject it into the extracted initramfs cpio tree
 #   3. re-pack + re-compress, matching the SOURCE image's compression
-# Output is a fresh initramfs ready to hand to run_qemu.sh.
+# Output is a fresh initramfs ready to hand to k_run_qemu.
 #
 # Usage:
-#   repack.sh -i initramfs.cpio.gz -e exploit.c [options]
-#   repack.sh -i initramfs.cpio.gz --bin ./exploit_prebuilt
+#   k_repack -i initramfs.cpio.gz -e exploit.c [options]
+#   k_repack -i initramfs.cpio.gz --bin ./exploit_prebuilt
 #
 #   -i, --initrd FILE   SOURCE initramfs (.cpio[.gz|.xz|.zst]) [required]
 #   -e, --exploit FILE  C source to static-compile and inject
-#       --bin FILE      pre-built static binary to inject (instead of -e)
+#       --bin FILE      prebuilt binary to inject; warns if it is not statically linked
 #   -o, --out FILE      output image (default: <initrd basename>.repacked.<ext>)
 #       --dest PATH     path INSIDE the guest fs (default: /<name>)
 #       --name NAME     binary name in guest (default: exploit)
@@ -26,7 +26,7 @@ set -euo pipefail
 INITRD=""; SRC=""; BIN=""; OUT=""; DEST=""; NAME="exploit"
 CC="gcc -static -O2 -s -no-pie"; OWNER="root:root"; WORKDIR=""; KEEP=0
 
-die(){ echo "repack.sh: $*" >&2; exit 1; }
+die(){ echo "k_repack: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -99,5 +99,5 @@ OUT_ABS=$(readlink -f "$(dirname "$OUT")")/$(basename "$OUT")
     | eval "$COMP" > "$OUT_ABS" )
 
 echo "[+] repacked -> $OUT  ($(du -h "$OUT_ABS" | cut -f1))" >&2
-echo "[+] boot it:  run_qemu.sh -i '$OUT' -k <bzImage>" >&2
+echo "[+] boot it:  k_run_qemu -i '$OUT' -k <bzImage>" >&2
 echo "$OUT"

@@ -146,7 +146,7 @@ def now_iso():
 
 
 def sh(cmd):
-    """리스트 인자 실행 → stdout (실패 시 빈 문자열)."""
+    """리스트 인자를 실행해 stdout을 반환하고, runner 예외에서만 빈 문자열을 반환한다."""
     try:
         result = run(cmd, timeout_seconds=30, tool_version="binutils")
         return result.stdout.preview.decode("utf-8", errors="replace")
@@ -818,7 +818,6 @@ def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
 def load_or_extract(binpath, want_engine, refresh, index_root=None):
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
-    idx, ck = _canonical_index(binpath, want_engine, cur_sha, index_root)
     if not refresh and os.path.isfile(cp):
         try:
             with open(cp) as f:
@@ -826,10 +825,16 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
             # 캐시 유효: 해시 일치 + (요청 엔진과 같거나, 캐시가 정밀 angr)
             if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
+                idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
                 rev["cache_state"] = "hit"
                 if idx and ck:
-                    try: idx.put_entry(ck, backend="revq_json", path=cp)
+                    # Only (re)hash the cache file when the index entry is missing/stale;
+                    # otherwise a plain cache hit paid a full-file sha256 every call.
+                    try:
+                        existing = idx.get_entry(ck)
+                        if not (existing and existing.get("path") == cp and existing.get("envelope_digest")):
+                            idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
                     except Exception: pass
                 return annotate_counts(rev)
         except Exception:
@@ -839,6 +844,7 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     rev["sha256"] = cur_sha
     rev["generated_at"] = now_iso()
     rev["cache_state"] = "miss"
+    idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
     annotate_counts(rev)
     try:
         with open(cp, "w") as f:
@@ -847,7 +853,7 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     except Exception as e:
         info("캐시 기록 실패(무시): %s" % e)
     if idx and ck:
-        try: idx.put_entry(ck, backend="revq_json", path=cp)
+        try: idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
         except Exception: pass
     return rev
 

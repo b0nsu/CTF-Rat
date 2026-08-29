@@ -110,7 +110,8 @@ flowchart LR
 ```
 CLAUDE.md / AGENTS.md      agent entry point (symlink)
 SETUP.md                   environment-agnostic initial setup
-doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
+doctrine/                  SOLVING · SOLVABILITY · PRIMITIVE_GATE · REFUSAL · FINALS
+docs/                       calibration (오염 상수 포함 — doctrine 밖)
 knowledge/                 vendored pwn/rev knowledge + repo-owned learned/ + writeup pipeline
 reference/                 libc-offsets/ · glibc/(list · SOURCES · glibc-fetch)
 bin/                       all tools (+ghidra_scripts/)
@@ -206,7 +207,7 @@ Passing means `ALL GREEN ✅` across the board.
 ## 📐 Operating Principles
 
 > [!IMPORTANT]
-> One active challenge at a time · fan-out only **inside** a challenge · delegate large reads to a subagent and pull back **conclusions only** · `STATE.jsonl` is the **single source of truth** · **no reinventing** what an existing tool already does.
+> One active challenge at a time · fan-out only **inside** a challenge · delegate large reads to a subagent and pull back **conclusions only** · typed `.rat/events/STATE.v2.jsonl` is the canonical state stream (`STATE.jsonl` is legacy inspection/import only) · **no reinventing** what an existing tool already does.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 

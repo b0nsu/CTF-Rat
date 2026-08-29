@@ -1,4 +1,5 @@
-// Ghidra postScript: export every function to a C file + _index.txt
+// Ghidra postScript: attempt every discovered function, export successful C
+// files + _index.txt, and record each per-function failure in the status file.
 // Java variant keeps headless decomp working on Ghidra 12+, where .py scripts require PyGhidra.
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;

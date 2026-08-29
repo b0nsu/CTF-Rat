@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .artifact import get, put_bytes
-from .state_v2 import Stream
+from .state_v2 import Stream, trusted_producer_for_build
 
 PHASES = tuple("solve-P%d" % n for n in range(6))
 ROLES = {"orchestrator", "static-scout", "dynamic-scout", "hypothesis",
@@ -361,6 +361,12 @@ def _verification_report(root, report_digest):
     producer=report["producer"]
     if not isinstance(producer,dict) or set(producer)!={"tool","build_digest"} or producer["tool"]!="rat-verify" or not isinstance(producer["build_digest"],str) or not producer["build_digest"].startswith("sha256:"):
         raise GateError("verification report producer provenance is invalid")
+    # A tool-label string plus a well-formed sha256 prefix is not proof of origin --
+    # any JSON with the right shape could set both. Resolve the build_digest against
+    # the same content-addressed trust registry SELF evidence uses (state_v2) and
+    # require it to actually name the rat-verify producer, not merely look like one.
+    if trusted_producer_for_build(producer["build_digest"])!="rat-verify":
+        raise GateError("verification report build_digest is not a trusted rat-verify build")
     if not all(isinstance(provenance[k],str) and provenance[k] for k in provenance) or not provenance["trace_digest"].startswith("sha256:") or not provenance["environment_digest"].startswith("sha256:"):
         raise GateError("verification report digest provenance is invalid")
     return report

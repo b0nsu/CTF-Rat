@@ -1,4 +1,4 @@
-import os, sys, unittest
+import json, os, pathlib, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 
@@ -46,18 +46,54 @@ class RouteResultSchema(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(route_result(next=[{"query": "x"}]))
 
-    def test_alternatives_field_allowed_when_a_list(self):
-        d = route_result(); d["alternatives"] = ["rev-symbolic"]
+    def test_alternatives_field_allowed_with_valid_shape(self):
+        d = route_result(); d["conflict"] = True
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
         validate(d)
 
     def test_alternatives_field_rejected_when_not_a_list(self):
         d = route_result(); d["alternatives"] = "rev-symbolic"
         with self.assertRaises(ValidationError): validate(d)
 
+    def test_alternatives_element_missing_field_raises(self):
+        d = route_result(); d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack"}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_element_confidence_out_of_range_raises(self):
+        d = route_result()
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 1.5}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_conflict_must_be_bool(self):
+        d = route_result(); d["conflict"] = "yes"
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_conflict_true_without_alternatives_raises(self):
+        d = route_result(); d["conflict"] = True
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_conflict_true_with_empty_alternatives_raises(self):
+        d = route_result(); d["conflict"] = True; d["alternatives"] = []
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_without_conflict_raises(self):
+        d = route_result()
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_alternatives_with_conflict_false_raises(self):
+        d = route_result(); d["conflict"] = False
+        d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_no_conflict_no_alternatives_passes(self):
+        validate(route_result(conflict=False))
+
 class QueryResultSchema(unittest.TestCase):
     def test_valid_doc_passes_for_each_status(self):
         for status in ("ok", "partial", "error"):
-            validate(query_result(status=status))
+            validate(query_result(status=status,
+                                  coverage={"complete": status == "ok", "scope": "x", "omitted": None}))
 
     def test_invalid_status_raises(self):
         with self.assertRaises(ValidationError): validate(query_result(status="pending"))
@@ -83,6 +119,17 @@ class QueryResultSchema(unittest.TestCase):
         # results; the validator is deliberately _need-only, not _strict.
         d = query_result(); d["governor"] = {"stuck": True, "action": "re-route-or-deep-escalate", "reason": "x"}
         validate(d)
+
+    def test_reference_schema_matches_runtime_object_shape(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        schema = json.loads((repo / "schemas" / "rat.query-result.v1.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["facts"]["type"], "object")
+        self.assertEqual(schema["properties"]["heuristics"]["type"], "object")
+        self.assertEqual(schema["properties"]["coverage"]["properties"]["complete"]["type"], "boolean")
+        self.assertTrue(schema["allOf"])
+        validate(query_result(facts={"key": "value"}, heuristics={"next": []}), "rat.query-result/v1")
+        with self.assertRaises(ValidationError):
+            validate(query_result(facts=[], heuristics={}), "rat.query-result/v1")
 
 class CacheStatsSchema(unittest.TestCase):
     def test_valid_doc_passes(self):

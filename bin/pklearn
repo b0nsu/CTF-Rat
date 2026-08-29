@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""pklearn — lesson distillation for the compounding loop (plans/BENCHMARK_LEARNING_LOOP.md L2/L3).
+
+Deterministic evidence collection ONLY. It gathers what the typed STATE v2 stream already
+proves (passed primitives + their digests, verified findings, ruled-out routes, classified
+failures) into a draft lesson skeleton. The Summary / General principle prose is left as a
+TODO for the author (model or human): auto-summaries are NOT generated and NOT promoted —
+same anti-contamination rule as the rest of the kit.
+
+Subcommands:
+  pklearn distill <chal-dir> [--domain rev|pwn] [--name slug] [--dry-run]
+  pklearn promote <lesson.md> --to validated|reused [--evidence <path>]
+  pklearn gaps [--root <dir>]        # aggregate failure.classified, report classes seen >=2
+  pklearn used <lesson.md> --challenge <id> [--result <r>] [--evidence <path>] [--date <d>]
+  pklearn selftest
+"""
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.state_v2 import Stream, stream_path, FAILURE_CLASSES  # noqa: E402
+
+
+def ctf_home():
+    return os.environ.get(
+        "CTF_HOME",
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")),
+    )
+
+
+def learned_dir():
+    return os.path.join(ctf_home(), "knowledge", "learned")
+
+
+def _slugify(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return s or "lesson"
+
+
+def _load_view(chal_dir):
+    """Materialize the STATE v2 view for a challenge directory (or None if no stream)."""
+    if not os.path.exists(stream_path(chal_dir)):
+        return None
+    return Stream(chal_dir).view()
+
+
+def _handoff_path(chal_dir):
+    for name in ("HANDOFF.md", "handoff.md"):
+        p = os.path.join(chal_dir, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# distill
+# ---------------------------------------------------------------------------
+def _draft(chal_dir, domain, view):
+    chal = os.path.basename(os.path.abspath(chal_dir))
+    passed = [p for p in view["primitives"].values() if p.get("status") == "pass"]
+    verified = [f for f in view["findings"].values() if f.get("state") in ("verified", "confirmed")]
+    ruled = list(view.get("ruled_out", {}).values())
+    failures = view.get("failures", [])
+    handoff = _handoff_path(chal_dir)
+
+    L = []
+    L.append("# <TODO: pattern name>")
+    L.append("")
+    L.append("- Status: `candidate`")
+    L.append("- Domain: %s" % (domain or "<TODO: pwn / rev>"))
+    L.append("- Source challenge: %s" % chal)
+    L.append("")
+    L.append("## Summary")
+    L.append("")
+    L.append("<TODO (author): one reusable claim, without challenge-specific addresses or guessed constants.>")
+    L.append("")
+    L.append("## General principle")
+    L.append("")
+    L.append("<TODO (author): why the behavior occurs.>")
+    L.append("")
+    L.append("## Applicability")
+    L.append("")
+    L.append("- Prerequisites: <TODO>")
+    L.append("- Minimum checks: <TODO>")
+    L.append("")
+    L.append("## Failure conditions and counterexamples")
+    L.append("")
+    if ruled:
+        for r in ruled:
+            reason = r.get("reason", "")
+            L.append("- Ruled out: %s%s" % (r.get("text", r.get("fingerprint", "?")),
+                                            " — %s" % reason if reason else ""))
+    if failures:
+        for f in failures:
+            note = f.get("note", "")
+            L.append("- Failure (%s)%s" % (f.get("class", "other"), ": %s" % note if note else ""))
+    if not ruled and not failures:
+        L.append("- <TODO: does not apply when …>")
+    L.append("")
+    L.append("## Evidence")
+    L.append("")
+    if passed:
+        for p in passed:
+            L.append("- typed primitive PASS `%s` (class=%s)" % (p.get("primitive_id", "?"), p.get("class", "?")))
+            if p.get("input_digest"):
+                L.append("  - input_digest: `%s`" % p["input_digest"])
+            if p.get("environment_digest"):
+                L.append("  - environment_digest: `%s`" % p["environment_digest"])
+    if verified:
+        for f in verified:
+            L.append("- verified finding `%s` [%s]" % (f.get("finding_id", "?"), f.get("state")))
+    L.append("- typed `.rat/events/STATE.v2.jsonl` event stream: `%s`" % os.path.relpath(stream_path(chal_dir), ctf_home()))
+    if handoff:
+        L.append("- HANDOFF: `%s`" % os.path.relpath(handoff, ctf_home()))
+    if not passed and not verified:
+        L.append("- <WARNING: no passed primitive or verified finding in STATE — this draft is weak evidence.>")
+    L.append("")
+    L.append("## Reuse history")
+    L.append("")
+    L.append("| Challenge | Result | Evidence | Date |")
+    L.append("|---|---|---|---|")
+    L.append("")
+    return "\n".join(L)
+
+
+def cmd_distill(args):
+    chal_dir = os.path.abspath(args.chal_dir)
+    if not os.path.isdir(chal_dir):
+        print("[pklearn:err] not a directory: %s" % chal_dir, file=sys.stderr); return 4
+    view = _load_view(chal_dir)
+    if view is None:
+        print("[pklearn:err] no STATE.v2.jsonl under %s (run the challenge first)" % chal_dir, file=sys.stderr); return 4
+    passed = [p for p in view["primitives"].values() if p.get("status") == "pass"]
+    verified = [f for f in view["findings"].values() if f.get("state") in ("verified", "confirmed")]
+    draft = _draft(chal_dir, args.domain, view)
+    if args.dry_run:
+        print(draft); return 0
+    if not passed and not verified and not args.allow_weak:
+        # A "candidate" lesson with no typed PASS primitive and no verified/confirmed
+        # finding is not evidence of anything reusable -- it is a hunch with a
+        # skeleton around it. Refuse to persist it into knowledge/learned/ (where
+        # pklearn gaps/INDEX.md treat every file as a real candidate) unless the
+        # caller explicitly acknowledges the weak evidence.
+        print("[pklearn:err] no passed primitive or verified/confirmed finding in STATE for %s "
+              "-- refusing to persist a candidate lesson with no reusable evidence "
+              "(use --dry-run to inspect, or --allow-weak to force)" % chal_dir, file=sys.stderr)
+        return 6
+    domain = args.domain or "rev"
+    slug = args.name or _slugify(os.path.basename(chal_dir))
+    out_path = os.path.join(learned_dir(), domain, slug + ".md")
+    if os.path.exists(out_path):
+        print("[pklearn:err] refusing to overwrite existing lesson: %s" % out_path, file=sys.stderr); return 5
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(draft + "\n")
+    _index_add(domain, slug, os.path.basename(chal_dir))
+    print("[pklearn] draft lesson (candidate): %s" % os.path.relpath(out_path, ctf_home()))
+    print("[pklearn] fill Summary/General principle before `pklearn promote`.")
+    return 0
+
+
+def _index_add(domain, slug, source):
+    idx = os.path.join(learned_dir(), "INDEX.md")
+    if not os.path.isfile(idx):
+        return
+    rel = "%s/%s.md" % (domain, slug)
+    # Evidence column is left as an explicit TODO: it must cite a real reproduction, not
+    # the lesson's own path (which is already the Pattern link).
+    row = "| [%s](%s) | `candidate` | `%s` | %s |" % (slug, rel, source, "<TODO: evidence>")
+    with open(idx, encoding="utf-8") as fh:
+        text = fh.read()
+    if rel in text:
+        return
+    heading = "## Rev" if domain == "rev" else "## Pwn"
+    # Insert the row right after the domain section's table separator via regex.
+    if heading in text:
+        # insert right after the separator row that follows the heading
+        pat = re.compile(r"(%s\n\n\| Pattern .*\n\|---[^\n]*\n)" % re.escape(heading))
+        m = pat.search(text)
+        if m:
+            new = text[:m.end()] + row + "\n" + text[m.end():]
+            with open(idx, "w", encoding="utf-8") as fh:
+                fh.write(new)
+            return
+    # fallback: append at EOF
+    with open(idx, "a", encoding="utf-8") as fh:
+        fh.write("\n" + row + "\n")
+
+
+def _reuse_rows_with_evidence(text):
+    """Reuse-history rows with a real (non-placeholder) Evidence cell."""
+    rows = []
+    for line in text.splitlines():
+        if not line.startswith("| ") or "|---" in line or "Challenge" in line or line.count("|") < 4:
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) >= 3 and cells[2] and cells[2] != "-":
+            rows.append(cells)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# promote
+# ---------------------------------------------------------------------------
+def cmd_promote(args):
+    path = os.path.abspath(args.lesson)
+    if not os.path.isfile(path):
+        print("[pklearn:err] no such lesson: %s" % path, file=sys.stderr); return 4
+    if args.to not in ("validated", "reused"):
+        print("[pklearn:err] --to must be validated|reused", file=sys.stderr); return 2
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    evidence_line = None
+    if args.to == "validated":
+        # A bare --evidence string is not evidence of anything: any caller could pass
+        # "trust me". Require a real, existing file (the actual repro artifact or
+        # counterexample record) and bind its content hash into the lesson, so the
+        # promotion is tamper-evident the same way STATE evidence is.
+        if not args.evidence:
+            print("[pklearn:err] promote --to validated requires --evidence <path> (independent reproduction or counterexample)", file=sys.stderr); return 2
+        ev_path = os.path.abspath(args.evidence)
+        if not os.path.isfile(ev_path):
+            print("[pklearn:err] --evidence path does not exist: %s" % args.evidence, file=sys.stderr); return 2
+        with open(ev_path, "rb") as fh:
+            digest = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+        evidence_line = "- Validated evidence: `%s` (%s)" % (digest, os.path.relpath(ev_path, ctf_home()))
+    else:
+        # "reused" claims the lesson has actually paid off more than once. Require
+        # >=2 reuse rows that each cite real evidence (not the "-" placeholder
+        # cmd_used defaults to), instead of trusting a caller's bare assertion.
+        rows = _reuse_rows_with_evidence(text)
+        if len(rows) < 2:
+            print("[pklearn:err] promote --to reused requires >=2 '## Reuse history' rows with non-placeholder Evidence "
+                  "(found %d); record them with `pklearn used <lesson> --challenge X --evidence <path-or-digest>`" % len(rows), file=sys.stderr)
+            return 2
+    new, n = re.subn(r"(?m)^- Status: `[a-z]+`", "- Status: `%s`" % args.to, text)
+    if n == 0:
+        print("[pklearn:err] no Status line found in lesson", file=sys.stderr); return 5
+    if evidence_line and evidence_line not in new:
+        new = re.sub(r"(?m)^(- Status: `%s`)$" % re.escape(args.to), r"\1\n" + evidence_line, new, count=1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(new)
+    # reflect in INDEX
+    idx = os.path.join(learned_dir(), "INDEX.md")
+    rel = os.path.relpath(path, learned_dir())
+    if os.path.isfile(idx):
+        with open(idx, encoding="utf-8") as fh:
+            itext = fh.read()
+        itext = re.sub(r"(\(%s\)[^\n]*?)`[a-z]+`" % re.escape(rel), r"\1`%s`" % args.to, itext, count=1)
+        with open(idx, "w", encoding="utf-8") as fh:
+            fh.write(itext)
+    print("[pklearn] promoted %s -> %s" % (os.path.basename(path), args.to))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# gaps
+# ---------------------------------------------------------------------------
+def _find_streams(root):
+    hits = []
+    for dirpath, _dirs, files in os.walk(root):
+        if os.path.basename(dirpath) == "events" and "STATE.v2.jsonl" in files:
+            # challenge dir is two levels up: <chal>/.rat/events/STATE.v2.jsonl
+            chal = os.path.dirname(os.path.dirname(dirpath))
+            hits.append(chal)
+    return hits
+
+
+def cmd_gaps(args):
+    root = os.path.abspath(args.root or os.path.join(ctf_home(), "solve"))
+    counts = {c: 0 for c in sorted(FAILURE_CLASSES)}
+    detail = {c: [] for c in sorted(FAILURE_CLASSES)}
+    if os.path.isdir(root):
+        for chal in _find_streams(root):
+            view = _load_view(chal)
+            if not view:
+                continue
+            for f in view.get("failures", []):
+                cls = f.get("class", "other")
+                if cls in counts:
+                    counts[cls] += 1
+                    detail[cls].append((os.path.basename(chal), f.get("note", "")))
+    recurring = {c: n for c, n in counts.items() if n >= 2}
+    print("== pklearn gaps (root: %s) ==" % os.path.relpath(root, ctf_home()))
+    if not any(counts.values()):
+        print("(no classified failures recorded)")
+        return 0
+    for cls in sorted(counts, key=lambda c: -counts[c]):
+        if counts[cls] == 0:
+            continue
+        mark = "  <-- RECURRING (>=2): cite before adding any tool/adapter" if cls in recurring else ""
+        print("%-14s %d%s" % (cls, counts[cls], mark))
+    if recurring:
+        print("\nRecurring classes are the only ones that unlock the '2x bottleneck' tool-addition gate (TOOLING_GAP_ANALYSIS).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# used  (L3 reuse tracking)
+# ---------------------------------------------------------------------------
+def cmd_used(args):
+    path = os.path.abspath(args.lesson)
+    if not os.path.isfile(path):
+        print("[pklearn:err] no such lesson: %s" % path, file=sys.stderr); return 4
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if "## Reuse history" not in text:
+        print("[pklearn:err] lesson has no Reuse history table", file=sys.stderr); return 5
+    row = "| %s | %s | %s | %s |" % (args.challenge, args.result or "applied",
+                                     args.evidence or "-", args.date or "unknown")
+    lines = text.splitlines()
+    # insert after the table separator under Reuse history
+    out = []
+    inserted = False
+    seen_heading = False
+    for i, line in enumerate(lines):
+        out.append(line)
+        if line.strip() == "## Reuse history":
+            seen_heading = True
+        if seen_heading and not inserted and line.startswith("|---"):
+            out.append(row)
+            inserted = True
+    if not inserted:
+        out.append(row)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+    # count existing reuse rows to flag reused-promotion candidacy
+    reuse_rows = [l for l in out if l.startswith("| ") and "|---" not in l
+                  and "Challenge" not in l and l.count("|") >= 4]
+    n_reuse = max(0, len(reuse_rows))
+    print("[pklearn] recorded reuse on %s" % args.challenge)
+    if n_reuse >= 2:
+        print("[pklearn] %d successful applications recorded — candidate for `promote --to reused`." % n_reuse)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def _selftest():
+    import tempfile
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    tmp = tempfile.mkdtemp()
+    prev_ctf_home = os.environ.get("CTF_HOME")
+    try:
+        # two challenge dirs each with a STATE stream carrying failures + ruled-out
+        for name, cls in (("chalA", "route-miss"), ("chalB", "route-miss")):
+            cdir = os.path.join(tmp, "solve", name)
+            os.makedirs(cdir)
+            st = Stream(cdir)
+            st.append("run.initialized", {"challenge": name})
+            st.append("failure.classified", {"failure_id": "fail_1", "class": cls, "note": "note-%s" % name})
+            st.append("route.ruled_out", {"fingerprint": "rt_1", "text": "pwn-heap", "reason": "no heap primitive"})
+        os.environ["CTF_HOME"] = tmp
+        # distill dry-run: skeleton has the sections + TODO placeholders, no auto-summary
+        view = _load_view(os.path.join(tmp, "solve", "chalA"))
+        chk(view is not None, "distill: STATE view materialized")
+        draft = _draft(os.path.join(tmp, "solve", "chalA"), "rev", view)
+        chk("## Evidence" in draft and "## Failure conditions" in draft, "distill: sections present")
+        chk("<TODO (author): one reusable claim" in draft, "distill: Summary left as TODO (no auto-summary)")
+        chk("Ruled out: pwn-heap" in draft, "distill: ruled-out route captured")
+        chk("Failure (route-miss)" in draft, "distill: classified failure captured")
+        # gaps: route-miss appears in 2 challenges -> RECURRING
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_gaps(argparse.Namespace(root=os.path.join(tmp, "solve")))
+        out = buf.getvalue()
+        chk("route-miss" in out and "RECURRING" in out, "gaps: recurring class (>=2) reported")
+        # distill: refuses to persist with no passed primitive / verified finding
+        rc = cmd_distill(argparse.Namespace(chal_dir=os.path.join(tmp, "solve", "chalA"), domain="rev", name="l1", dry_run=False, allow_weak=False))
+        chk(rc != 0, "distill: refuses weak-evidence lesson without --allow-weak")
+        chk(not os.path.exists(os.path.join(learned_dir(), "rev", "l1.md")), "distill: no file written when refused")
+        rc = cmd_distill(argparse.Namespace(chal_dir=os.path.join(tmp, "solve", "chalA"), domain="rev", name="l1", dry_run=False, allow_weak=True))
+        chk(rc == 0, "distill: --allow-weak permits a weak-evidence draft")
+        # used: appending a reuse row
+        lesson = os.path.join(tmp, "lesson.md")
+        with open(lesson, "w") as fh:
+            fh.write("# L\n\n- Status: `candidate`\n\n## Reuse history\n\n| Challenge | Result | Evidence | Date |\n|---|---|---|---|\n")
+        cmd_used(argparse.Namespace(lesson=lesson, challenge="chalX", result="solved", evidence="-", date="2026-01-01"))
+        with open(lesson) as fh:
+            ltext = fh.read()
+        chk("chalX" in ltext and "solved" in ltext, "used: reuse row appended")
+        # promote validated requires evidence, AND the evidence must be a real file (content-hashed)
+        rc = cmd_promote(argparse.Namespace(lesson=lesson, to="validated", evidence=None))
+        chk(rc != 0, "promote: validated without --evidence rejected")
+        rc = cmd_promote(argparse.Namespace(lesson=lesson, to="validated", evidence="repro.txt"))
+        chk(rc != 0, "promote: validated with a nonexistent --evidence path rejected")
+        repro = os.path.join(tmp, "repro.txt")
+        with open(repro, "w") as fh:
+            fh.write("reproduction transcript")
+        cmd_promote(argparse.Namespace(lesson=lesson, to="validated", evidence=repro))
+        with open(lesson) as fh:
+            vtext = fh.read()
+        chk("- Status: `validated`" in vtext, "promote: status updated")
+        chk("- Validated evidence: `sha256:" in vtext, "promote: validated evidence is content-hashed, not a bare string")
+        # promote reused requires >=2 reuse rows with real (non-placeholder) evidence
+        rc = cmd_promote(argparse.Namespace(lesson=lesson, to="reused", evidence=None))
+        chk(rc != 0, "promote: reused with <2 real-evidence reuse rows rejected (the only row has evidence '-')")
+        cmd_used(argparse.Namespace(lesson=lesson, challenge="chalY", result="solved", evidence=repro, date="2026-01-02"))
+        rc = cmd_promote(argparse.Namespace(lesson=lesson, to="reused", evidence=None))
+        chk(rc != 0, "promote: reused still rejected (only 1 of 2 rows has real evidence)")
+        cmd_used(argparse.Namespace(lesson=lesson, challenge="chalZ", result="solved", evidence=repro, date="2026-01-03"))
+        rc = cmd_promote(argparse.Namespace(lesson=lesson, to="reused", evidence=None))
+        chk(rc == 0, "promote: reused accepted once >=2 rows carry real evidence")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        if prev_ctf_home is None:
+            os.environ.pop("CTF_HOME", None)
+        else:
+            os.environ["CTF_HOME"] = prev_ctf_home
+    if fails:
+        print("pklearn selftest: FAIL (%d)" % len(fails)); return 1
+    print("pklearn selftest: OK"); return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pklearn", description="compounding-loop lesson distillation")
+    sub = ap.add_subparsers(dest="cmd")
+
+    d = sub.add_parser("distill", help="build a draft lesson skeleton from a challenge's STATE v2 + HANDOFF")
+    d.add_argument("chal_dir")
+    d.add_argument("--domain", choices=["rev", "pwn"])
+    d.add_argument("--name")
+    d.add_argument("--dry-run", action="store_true")
+    d.add_argument("--allow-weak", action="store_true",
+                   help="persist a candidate lesson even with no passed primitive or verified finding")
+
+    p = sub.add_parser("promote", help="raise a lesson's status")
+    p.add_argument("lesson")
+    p.add_argument("--to", required=True, choices=["validated", "reused"])
+    p.add_argument("--evidence")
+
+    g = sub.add_parser("gaps", help="aggregate classified failures; report classes seen >=2")
+    g.add_argument("--root")
+
+    u = sub.add_parser("used", help="record a successful reuse of a lesson (L3)")
+    u.add_argument("lesson")
+    u.add_argument("--challenge", required=True)
+    u.add_argument("--result")
+    u.add_argument("--evidence")
+    u.add_argument("--date")
+
+    sub.add_parser("selftest", help="pure-logic regression")
+
+    args = ap.parse_args(argv)
+    if args.cmd == "distill":
+        return cmd_distill(args)
+    if args.cmd == "promote":
+        return cmd_promote(args)
+    if args.cmd == "gaps":
+        return cmd_gaps(args)
+    if args.cmd == "used":
+        return cmd_used(args)
+    if args.cmd == "selftest":
+        return _selftest()
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

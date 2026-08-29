@@ -1,0 +1,7 @@
+{
+  "profile": {"imports": ["puts", "strcspn"], "facts": []},
+  "revq": {"imports": ["puts", "strcspn"], "platform": "elf",
+           "functions": [{"name": "vm_dispatch"}, {"name": "main"}],
+           "strings": [{"val": "opcode table"}, {"val": "bytecode"}]},
+  "interesting": []
+}

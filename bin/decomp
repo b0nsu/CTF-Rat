@@ -39,7 +39,19 @@ done
 [ "${#positional[@]}" -ge 1 ] || { echo "usage: decomp [--refresh] [--timeout SEC] [--format text|json] BIN [FUNC]" >&2; exit 2; }
 [[ "$TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo "[!] invalid timeout: $TIMEOUT_SEC" >&2; exit 2; }
 [ "$FORMAT" = text ] || [ "$FORMAT" = json ] || { echo "[!] invalid format: $FORMAT" >&2; exit 2; }
-BIN="$(readlink -f "${positional[0]}")"; FUNC="${positional[1]:-}"
+# Portability guard (macOS/BSD without GNU coreutils):
+#  - `readlink -f` is GNU-specific; fall back to a python resolver.
+#  - `timeout` ships with coreutils; macOS provides it as `gtimeout` (brew install coreutils).
+resolve_path() {
+  readlink -f -- "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+if command -v timeout >/dev/null 2>&1; then TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT=gtimeout
+else
+  echo "[!] 'timeout' 명령이 없습니다 (Ghidra headless 실행에 필수). macOS면 'brew install coreutils'로 gtimeout 설치 후 재시도하세요." >&2
+  exit 3
+fi
+BIN="$(resolve_path "${positional[0]}")"; FUNC="${positional[1]:-}"
 [ -f "$BIN" ] || { echo "[!] input 없음: ${positional[0]}" >&2; exit 4; }
 CACHE="${BIN}.decomp"
 META_TOOL="$CTF_HOME/bin/ratlib/decomp_cache.py"
@@ -80,7 +92,7 @@ if [ ! -f "$CACHE/_index.txt" ]; then
   mkdir -p "$CACHE"; proj="$(mktemp -d)"
   python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" partial --diagnostic "analysis started"
   set +e
-  timeout --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
+  "$TIMEOUT" --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
      -scriptPath "$SCRIPTDIR" -postScript DecompExport.java "$CACHE" \
      -deleteProject >"$CACHE/.ghidra.log" 2>&1
   analysis_rc=$?
@@ -148,7 +160,11 @@ else
   shopt -s nullglob
   matches=("$CACHE"/*"$FUNC"*.c)
   shopt -u nullglob
-  candidates+=("${matches[@]}")
+  # Bash 3 with `set -u` treats an empty array expansion as an unbound
+  # variable.  Only append glob matches when there actually are any.
+  if [ "${#matches[@]}" -gt 0 ]; then
+    candidates+=("${matches[@]}")
+  fi
 
   if [ "${#candidates[@]}" -gt 0 ] && [ -f "${candidates[0]}" ]; then
     emit_file "${candidates[0]}"
@@ -166,7 +182,7 @@ else
       echo "[*] '$FUNC' 함수 캐시 없음; Ghidra one-shot create/decompile 시도 $(printf '0x%x' "$addr")" >&2
       proj="$(mktemp -d)"
       one_log="$CACHE/.ghidra-one-$(printf '%x' "$addr").log"
-      if timeout --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
+      if "$TIMEOUT" --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
           -scriptPath "$SCRIPTDIR" -postScript DecompOne.java "$CACHE" "$(printf '%x' "$addr")" \
           -deleteProject >"$one_log" 2>&1; then
         rm -rf "$proj"

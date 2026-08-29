@@ -25,14 +25,60 @@ T=$(mktemp -d); cd "$T"
 cleanup(){ cd /; rm -rf -- "$T"; }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
-# T1 state roundtrip
-state init st >/dev/null 2>&1; state offset system 0x50d70 t >/dev/null 2>&1; state ok "prim" >/dev/null 2>&1
-state show 2>/dev/null | grep -q "system = 0x50d70" && ok "state offset/show" || no "state offset/show"
-mkdir -p ./pathstate
-state --dir ./pathstate offset keyed 0x4141 path >/dev/null 2>&1
-state show ./pathstate 2>/dev/null | grep -q "keyed = 0x4141" && ok "state explicit path" || no "state explicit path"
-# T2 pwnstage reads STATE offset as int
-$VENV -c "import pwnstage;assert pwnstage.offsets().get('system')==0x50d70" 2>/dev/null && ok "pwnstage.offsets int" || no "pwnstage.offsets int"
+# T1 canonical STATE v2 offset roundtrip with immutable evidence.
+# Direct evidence comes from the real production issuance path: a registered SELF
+# verifier (symsolve, concrete-verify) measuring an actual subject binary. When no
+# real verifier can run here (no angr / no cc), the direct-only checks are skipped --
+# a fabricated fake verifier no longer counts as direct (that was the whole point).
+state init st >/dev/null 2>&1
+DIRECT_OK=0
+if $VENV -c 'import angr' >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+  cat > fx.c <<'CEOF'
+#include <stdio.h>
+int main(void){ puts("HELLO_MARKER"); return 0; }
+CEOF
+  cc -O0 -o fx fx.c >/dev/null 2>&1 && [ -x ./fx ] && DIRECT_OK=1
+fi
+if [ "$DIRECT_OK" = 1 ]; then
+  mkdir -p ./pathstate
+  SYM="$CTF_HOME/bin/symsolve" FX="$(pwd)/fx" MARK="HELLO_MARKER" $VENV - <<'PY' >/dev/null 2>&1
+import os
+from ratlib.contracts import execute
+from ratlib.state_v2 import Stream
+sym=os.environ["SYM"]; fx=os.environ["FX"]; mark=os.environ["MARK"]
+def measure(root):
+ d=execute([sym, fx, "--find-str", mark, "--timeout", "30"], root=Stream(root).root,
+           input_paths=[fx], direct_subject=fx, parameters={"summary":"concrete-verify"}, timeout=90)
+ return d["extensions"]["envelope_digest"]
+s=Stream(".")
+s.append("observation.recorded",{
+ "schema":"rat.observation/v1","observation_id":"offset_system","run_id":"selftest",
+ "created_at":"2026-01-01T00:00:00+00:00","producer":{"tool":"symsolve","build_digest":"sha256:"+"0"*64},
+ "subject":{"kind":"binary"},"kind":"pwn.offset","value":{"key":"system","offset":"0x50d70"},
+ "evidence":[measure(".")],"quality":{"level":"direct"},"validity":{"state":"active"}})
+p=Stream("./pathstate")
+p.append("observation.recorded",{
+ "schema":"rat.observation/v1","observation_id":"offset_keyed","run_id":"selftest",
+ "created_at":"2026-01-01T00:00:00+00:00","producer":{"tool":"symsolve","build_digest":"sha256:"+"0"*64},
+ "subject":{"kind":"binary"},"kind":"pwn.offset","value":{"key":"keyed","offset":"0x4141"},
+ "evidence":[measure("./pathstate")],"quality":{"level":"direct"},"validity":{"state":"active"}})
+PY
+  state get system 2>/dev/null | grep -q "0x50d70" && ok "state v2 offset/get" || no "state v2 offset/get"
+  state show 2>/dev/null | grep -q "OFFSETS (typed/direct)" && ok "state v2 show trust label" || no "state v2 show trust label"
+  state --dir ./pathstate get keyed 2>/dev/null | grep -q "0x4141" && ok "state explicit v2 path" || no "state explicit v2 path"
+  # T2 pwnstage reads only canonical STATE v2 offsets as int and invalidation removes them
+  $VENV -c "import pwnstage;assert pwnstage.offsets().get('system')==0x50d70" 2>/dev/null && ok "pwnstage.offsets int" || no "pwnstage.offsets int"
+  state invalidate-evidence offset_system >/dev/null 2>&1
+  $VENV -c "import pwnstage;assert 'system' not in pwnstage.offsets()" 2>/dev/null && ok "pwnstage invalidation isolation" || no "pwnstage invalidation isolation"
+else
+  skip "state v2 offset/get (direct verifier 없음: angr/cc)"
+  skip "state v2 show trust label (direct verifier 없음)"
+  skip "state explicit v2 path (direct verifier 없음)"
+  skip "pwnstage.offsets int (direct verifier 없음)"
+  skip "pwnstage invalidation isolation (direct verifier 없음)"
+fi
+printf '{"t":"offset","k":"legacy","v":"0xdead","src":"selftest"}\n' > STATE.jsonl
+$VENV -c "import pwnstage;assert 'legacy' not in pwnstage.offsets()" 2>/dev/null && ok "legacy offset isolation" || no "legacy offset isolation"
 # T3 pkflag real vs fake
 pkflag --set 'DH\{[0-9a-f]{4,}\}' >/dev/null 2>&1
 pkflag 'DH{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no

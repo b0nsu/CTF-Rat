@@ -7,12 +7,12 @@
 ## 상태 타입
 
 - `state hypothesis <text>`: 아직 검증 전인 풀이 가설. 체이닝 근거로 사용 금지.
-- `state primitive <name> candidate <evidence>`: 후보 등록(legacy 텍스트 로그). PASS 근거로는 사용 불가.
+- `state primitive candidate <rat.primitive/v1 doc.json>`: 후보 등록(typed v2, `status:"candidate"`). PASS 근거로는 사용 불가.
 - **PASS 기록(typed STATE v2 전용, 필수)**: `state primitive <name> pass <evidence>` 형태의 legacy 명령은 `bin/state`가 거부한다. PASS는 아래 3단계로 typed v2 스트림에 기록해야 한다.
   1. SELF로 직접 확인한 관찰 3개 이상을 `rat.observation/v1` 문서로 각각 기록: `state event append obs_N.json` (각 문서는 `quality.level:"direct"`, `validity.state:"active"`).
-  2. `rat.primitive/v1` 문서를 작성: `status:"pass"`, `self_evidence:[관찰 3개 이상의 observation_id]`, 나머지 필수 필드(`primitive_id`,`name`,`class`,`input_digest`,`environment_digest`,`constraints`,`side_effects`,`remote_equivalent`,`producer`,`revision`).
+  2. `rat.primitive/v1` 문서를 작성: `status:"pass"`, `self_evidence:[관찰 3개 이상의 observation_id]`, 나머지 필수 필드(`primitive_id`,`name`,`class`,`input_digest`,`environment_digest`,`constraints`,`side_effects`,`remote_equivalent`,`producer`,`revision`). **`input_digest`/`environment_digest`는 자유값이 아니다**: SELF observation의 direct 증거 봉투가 실제로 측정한 subject·environment 해시와 정확히 일치해야 한다(도구가 봉투에 stamp한 `subject_digest`/`environment_digest`). 불일치 시 `revise_primitive`가 "PASS SELF evidence must measure the primitive input_digest/environment_digest"로 거부한다 — 바이너리 A의 증거로 바이너리 B PASS를 만들 수 없다.
   3. `state primitive pass primitive.json` 로 typed v2 스트림에 append — `bin/state`/`ratlib.state_v2.revise_primitive`가 "3개의 active+direct SELF observation" invariant를 실제로 검증한다.
-- `state primitive <name> fail|blocked <evidence>`: primitive 실패/보류(legacy 텍스트 로그로 허용). 같은 경로로 체이닝 금지.
+- `state primitive fail <rat.primitive/v1 doc.json>` / `state primitive block <rat.primitive/v1 doc.json>`: primitive 실패/보류. **legacy 텍스트 로그는 `bin/state`가 거부하므로 fail/blocked도 typed v2 문서가 필수**다(각각 `status:"fail"` / `status:"blocked"`). 명령어는 `block`, 문서 status는 `blocked`로 서로 다름에 주의. 같은 경로로 체이닝 금지.
 - `state no <text> -- <reason>`: 재시도 금지 dead-end.
 
 ## Primitive PASS 조건
@@ -35,24 +35,52 @@ Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
 9. safe-linking 대상이면 `encoded_fd == target ^ (chunk_addr >> 12)` 를 실측 주소로 계산했다.
 10. 실패 원인을 libc mismatch 로 올리기 전에 Docker/loopback 또는 leak/build-id/hash 증거를 확보했다.
 
-예:
+예 (스캐폴드는 `state event --example` / `state primitive --example`로 그대로 뽑아 값만 채운다):
+
+**중요**: `evidence`는 사람이 쓴 설명 object가 아니라 **content-addressed artifact digest 문자열 배열**이다
+(`["sha256:..."]`). `quality.level`도 호출자가 주장하는 값이 아니라, 인용한 evidence artifact의
+해시된 바이트에서 런타임이 재계산한다(`state_v2._evidence_quality`) — 아래처럼 `quality`를
+아무 값이나 채워 보내도 실제 값으로 덮어써진다. "direct"를 얻으려면 evidence가 신뢰된 verifier
+(`gdbq`/`symsolve`)의 `rat.tool-result/v1` 성공 envelope를 가리켜야 하고, 그 envelope는 실제로
+`subject_path`(대상 바이너리)를 측정한 것이어야 한다. `rat-adapt`가 이 envelope를 만드는 유일한
+공개 CLI 경로다:
 
 ```sh
 state hypothesis "saved EBP low-byte overwrite may pivot main epilogue into attacker-controlled stack data"
 
-# 최소 입력 실행 후 core/gdb에서 SELF로 직접 확인한 관찰을 3개 이상 기록:
-#   obs_esp.json:   {"schema":"rat.observation/v1", ..., "value":"ESP=0xfffc00bf",
-#                    "quality":{"level":"direct"}, "validity":{"state":"active"}, ...}
-#   obs_marker.json:{"schema":"rat.observation/v1", ..., "value":"[ESP]=0x41424344 attacker marker", ...}
-#   obs_ret.json:   {"schema":"rat.observation/v1", ..., "value":"next ret target=0x80000000", ...}
-state event append obs_esp.json
+# 1) 최소 입력으로 신뢰된 verifier(gdbq)를 실제 측정 모드로 실행 -- --direct-subject가
+#    이 실행을 SELF-measurement로 표시하고, 결과 envelope에 subject_digest/environment_digest를
+#    바인딩한다. 세 개의 서로 다른 측정을 세 번 실행해 서로 다른 envelope 3개를 얻는다.
+r1=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch regs.gdb | \
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
+r2=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch marker.gdb | \
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
+r3=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch ret.gdb | \
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
+
+# 2) 각 envelope digest를 evidence로 인용하는 관찰을 기록. quality/validity는 필수 필드지만
+#    quality.level 값 자체는 런타임이 evidence로부터 재계산하므로 여기 값은 힌트일 뿐이다.
+cat > obs_rsp.json <<JSON
+{"schema":"rat.observation/v1","observation_id":"obs_rsp","run_id":"run_1",
+ "created_at":"2026-01-01T00:00:00Z","producer":{"tool":"gdbq","version":"1"},
+ "subject":{"binary":"./chal"},"kind":"pwn.reg","value":"RSP=0x7fffffffde80",
+ "evidence":["$r1"],"quality":{"level":"direct"},"validity":{"state":"active"}}
+JSON
+#   obs_marker.json: value "[RSP]=0x4141414141414141 attacker marker", evidence=["$r2"] (같은 형식)
+#   obs_ret.json:    value "next ret target=0x401234", evidence=["$r3"] (같은 형식)
+state event append obs_rsp.json
 state event append obs_marker.json
 state event append obs_ret.json
 
-# primitive.json: {"schema":"rat.primitive/v1", "status":"pass",
-#                   "self_evidence":["<obs_esp id>","<obs_marker id>","<obs_ret id>"], ...}
-state primitive pass primitive.json
+# 3) primitive.json: status:"pass", self_evidence=[위 3개 observation_id].
+#    input_digest는 SELF evidence가 실제로 측정한 subject_digest(=측정된 ./chal의 sha256)와,
+#    environment_digest는 측정 호스트의 tooling-owned digest와 정확히 일치해야 한다(불일치 시
+#    PASS는 "must measure the primitive input_digest/environment_digest"로 거부된다).
+state primitive --example > primitive.json    # 스캐폴드 → 값 채우기
+state primitive pass primitive.json           # revise_primitive가 3xactive+direct SELF invariant + subject/env binding 검증
 ```
+
+`state schema rat.primitive/v1` / `state schema rat.observation/v1`로 필수 필드 스키마를 직접 확인할 수 있다.
 
 ## 금지 규칙
 

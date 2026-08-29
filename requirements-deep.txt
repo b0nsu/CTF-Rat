@@ -1,0 +1,7 @@
+# Deep analysis engine — only the CI `analysis-deep` job and local docker/dev
+# (SETUP.md) install these. The fast operational-regression job deliberately
+# stays angr-free (pure-logic selftests), so these are NOT in requirements.txt.
+#
+# Pinned to the version the deep job was confirmed green on.
+-r requirements.txt
+angr==9.2.223

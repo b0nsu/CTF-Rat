@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -115,15 +116,25 @@ def _limit_preexec(limits: ResourceLimits, existing_processes: int):
             cpu_hard = min(cpu_hard, inherited_cpu_hard)
         cpu_soft = min(limits.cpu_seconds, cpu_hard)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_soft, cpu_hard))
-        resource.setrlimit(resource.RLIMIT_AS, (limits.address_space_bytes, limits.address_space_bytes))
+        # macOS neither enforces RLIMIT_AS nor accepts setting it when the inherited
+        # soft limit is RLIM_INFINITY (setrlimit raises "current limit exceeds
+        # maximum limit"), which would kill every spawn from preexec_fn. Skip it
+        # there; the CPU/time limits still bound the child.
+        if sys.platform != "darwin":
+            resource.setrlimit(resource.RLIMIT_AS, (limits.address_space_bytes, limits.address_space_bytes))
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.file_size_bytes, limits.file_size_bytes))
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
         # RLIMIT_NPROC is per real UID, not per child. Preserve room for the
         # user's existing processes and cap this invocation's additional tree.
-        _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        wanted = existing_processes + limits.processes
-        ceiling = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
-        resource.setrlimit(resource.RLIMIT_NPROC, (ceiling, hard))
+        # macOS has no /proc to count existing processes from, so the ceiling
+        # would be computed as just `limits.processes` — a per-UID cap far below
+        # the user's real process count that makes every fork fail with
+        # EAGAIN/BlockingIOError. Skip NPROC there (CPU/time limits still bound).
+        if sys.platform != "darwin":
+            _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+            wanted = existing_processes + limits.processes
+            ceiling = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+            resource.setrlimit(resource.RLIMIT_NPROC, (ceiling, hard))
         resource.setrlimit(resource.RLIMIT_CORE, (limits.core_bytes, limits.core_bytes))
     return apply_limits
 

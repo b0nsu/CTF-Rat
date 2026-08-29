@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "bin"))
 
 from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
+from tests.direct_evidence_helper import direct_evidence_envelope, CANONICAL_SUBJECT, CANONICAL_ENVIRONMENT
 
 
 PKSHARE = ROOT / "bin" / "pkshare"
@@ -37,22 +38,20 @@ class WriteupPipelineTests(unittest.TestCase):
         evidence_digests = []
         for number in range(3):
             observation_id = "obs%d" % number
-            artifact = put_bytes(
-                observation_id.encode(), kind="test-evidence", media_type="text/plain",
-                logical_name=observation_id, root=stream.root,
-                provenance={"evidence_policy": {"level": "direct", "promotion_allowed": True}},
-            )
+            evidence_digest = direct_evidence_envelope(
+                root=stream.root, producer="gdbq", measurement=b"measurement:" + observation_id.encode(),
+                summary=observation_id)
             stream.append(
                 "observation.recorded",
                 {"observation_id": observation_id, "quality": {"level": "direct"},
-                 "validity": {"state": "active"}, "evidence": [artifact["digest"]]},
+                 "validity": {"state": "active"}, "evidence": [evidence_digest]},
             )
             observation_ids.append(observation_id)
-            evidence_digests.append(artifact["digest"])
+            evidence_digests.append(evidence_digest)
         primitive = {
             "schema": "rat.primitive/v1", "primitive_id": "control", "name": "RIP control",
-            "class": "control", "status": "candidate", "input_digest": DIGEST,
-            "environment_digest": "sha256:" + "b" * 64, "self_evidence": [],
+            "class": "control", "status": "candidate", "input_digest": CANONICAL_SUBJECT,
+            "environment_digest": CANONICAL_ENVIRONMENT, "self_evidence": [],
             "constraints": [], "side_effects": [], "remote_equivalent": False,
             "producer": {"tool": "test"}, "revision": 1,
             "extensions": {"reproduction_command": "python3 solve_local.py", "marker_evidence": "RIP=0x41414141"},
@@ -101,11 +100,10 @@ class WriteupPipelineTests(unittest.TestCase):
 
     def test_duplicate_self_evidence_cannot_publish_pass(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.complete_v2(directory, duplicate_self_evidence=True)
-            self.run_pkshare(directory)
-            text = pathlib.Path(directory, "HANDOFF.md").read_text()
-            self.assertIn("`BLOCKED`", text)
-            self.assertIn("self_evidence", text)
+            # The stream is now the lifecycle authority: invalid PASS input
+            # is rejected before a downstream writeup consumer can see it.
+            with self.assertRaisesRegex(ValueError, "distinct active direct SELF"):
+                self.complete_v2(directory, duplicate_self_evidence=True)
 
     def test_v2_invalidation_removes_publishable_pass(self):
         with tempfile.TemporaryDirectory() as directory:

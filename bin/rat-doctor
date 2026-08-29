@@ -20,9 +20,12 @@ from pathlib import Path
 TOOLS = {
     "file": ("file",), "binutils": ("readelf", "objdump"), "gdb": ("gdb",),
     "ghidra": ("analyzeHeadless",), "wine": ("wine", "wine64"),
-    "qemu": ("qemu-x86_64", "qemu-i386", "qemu-aarch64", "qemu-arm"),
 }
 MODULES = {"angr": "angr", "pwntools": "pwn", "qiling": "qiling"}
+QEMU_BY_ARCH = {
+    "x86_64": "qemu-x86_64", "x86": "qemu-i386",
+    "aarch64": "qemu-aarch64", "arm": "qemu-arm",
+}
 
 
 def sha256(path):
@@ -75,9 +78,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not os.path.isfile(args.binary):
         print("rat-doctor: binary is missing or not a regular file", file=sys.stderr); return 4
-    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
-    capabilities.update({name: module(name, import_name) for name, import_name in MODULES.items()})
     fmt = format_info(args.binary)
+    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
+    capabilities["qemu"] = executable((QEMU_BY_ARCH[fmt["architecture"]],)) if fmt["architecture"] in QEMU_BY_ARCH else {
+        "status": "unavailable", "path": None, "version": None,
+        "reason": "no qemu-user mapping for artifact architecture",
+    }
+    capabilities.update({name: module(name, import_name) for name, import_name in MODULES.items()})
     routes = {
         "native": {"status": "available" if fmt["host_executable"] else "unavailable", "reason": None if fmt["host_executable"] else "foreign or unsupported format"},
         "gdb": {"status": "available" if fmt["host_executable"] and capabilities["gdb"]["status"] == "available" else "unavailable"},

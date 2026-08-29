@@ -1,10 +1,11 @@
-"""Bounded state-compact projection.
+"""Evidence-preserving soft-budget state-compact projection.
 
 Priority order (never-drop tiers first): invalidating findings > confirmed
 facts > PASS primitives > active hypotheses > next probes > recent
-ruled-out. Droppable tiers are trimmed oldest-first until the estimate fits
-budget_tokens. Same view + budget_tokens + cursor always yields the same
-output (pure function over already-materialized state, no I/O).
+ruled-out. Critical tiers are never dropped and may exceed ``budget_tokens``;
+the budget limits only droppable tiers after critical evidence is accounted
+for. Same view + budget_tokens + cursor always yields the same output (pure
+function over already-materialized state, no I/O).
 """
 from __future__ import annotations
 import json
@@ -80,7 +81,8 @@ def budget_compact(view, *, budget_tokens=None, cursor=None):
         return {**fixed, "hypotheses": hypotheses, "next_probes": next_probes, "ruled_out": ruled_out,
                 "truncated": False, "omitted_counts": {}, "cursor": cursor}
 
-    remaining = max(0, budget_tokens - estimate_tokens(fixed))
+    critical_tokens = estimate_tokens(fixed)
+    remaining = max(0, budget_tokens - critical_tokens)
     omitted_counts = {}
     hyp_out, remaining = _take_newest_first(
         "hypotheses", list(hypotheses.items()), dict, remaining, omitted_counts)
@@ -90,5 +92,7 @@ def budget_compact(view, *, budget_tokens=None, cursor=None):
         "ruled_out", list(ruled_out.items()), dict, remaining, omitted_counts)
 
     truncated = any(v > 0 for v in omitted_counts.values())
-    return {**fixed, "hypotheses": hyp_out, "next_probes": next_out, "ruled_out": ruled_out_out,
-            "truncated": truncated, "omitted_counts": omitted_counts, "cursor": cursor}
+    projected = {**fixed, "hypotheses": hyp_out, "next_probes": next_out, "ruled_out": ruled_out_out,
+                 "truncated": truncated, "omitted_counts": omitted_counts, "cursor": cursor}
+    return {**projected, "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens(projected),
+            "budget_exceeded_by_critical_tiers": critical_tokens > budget_tokens}

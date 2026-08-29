@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""ratbench — challenge-suite runner + leaderboard (plans/BENCHMARK_LEARNING_LOOP.md B1/B2).
+
+Mode A (scripted-driver, deterministic, CI-able) is a route-unit + oracle-smoke check, NOT
+a route-to-exploit E2E run: it (1) checks route judgment against each entry's committed
+`route.json` fixture with zero external dependencies, and (2) feeds each fixture's known-good
+"magic input" (`verify.stdin` / `verify.find_str`) straight to a real oracle (a compiled
+binary's stdout regex, or angr symsolve). No model, agent, or exploit-construction step is in
+the loop; a "solved" row proves the route+oracle pairing works when handed the answer, not
+that anything discovered the answer. The oracle stage is reported as `skipped` (not failed)
+when its toolchain (gcc / angr) is missing.
+
+Mode B (model-eval) is intentionally on-demand. Each attempt receives an isolated runtime
+export of CTF-Rat plus only the challenge runtime artifact(s): benchmark source, route fixtures,
+known-good inputs, and ground truth remain outside the agent workspace. A bare `FLAG{...}` in
+agent stdout is only a claim. `solved` requires the canonical completion gate: an active typed
+primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS linked to the
+same completed exploit task. When Linux `strace` is usable, Mode B additionally records an
+observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts do not depend
+on agent-authored telemetry.
+
+  ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
+  ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
+  ratbench report [--schema legacy|v2]
+  ratbench selftest
+"""
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib import route as route_mod  # noqa: E402
+from ratlib.bench_suite import CORPORA, SuiteValidationError, load_suite, project_suite  # noqa: E402
+from ratlib.schema import validate  # noqa: E402
+
+
+def ctf_home():
+    return os.environ.get(
+        "CTF_HOME",
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")),
+    )
+
+
+def _suite_path(override=None):
+    return override or os.path.join(ctf_home(), "bench", "suite.json")
+
+
+def _load_suite(path):
+    return load_suite(path)
+
+
+def _select_entries(args):
+    """Validate once, then project one corpus before any benchmark work begins."""
+    suite = project_suite(_load_suite(_suite_path(args.suite)), corpus=getattr(args, "corpus", None))
+    entries = suite["entries"]
+    if getattr(args, "id", None):
+        entries = [entry for entry in entries if entry["id"] == args.id]
+        if not entries:
+            raise LookupError("no entry %s" % args.id)
+    return entries
+
+
+def _have(cmd):
+    from shutil import which
+    return which(cmd) is not None
+
+
+def _have_angr():
+    try:
+        subprocess.run([sys.executable, "-c", "import angr"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return True
+    except Exception:
+        return False
+
+
+def _strace_usable():
+    """Whether observer-owned execve tracing can run without changing eval semantics."""
+    if os.name != "posix" or not _have("strace"):
+        return False
+    try:
+        p = subprocess.run(
+            ["strace", "-qq", "-e", "trace=execve", "-o", os.devnull,
+             sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
+    if trace_path:
+        # Explicit /bin/sh preserves the previous shell-command contract while
+        # making strace the observer rather than a wrapper inside the agent tree.
+        argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-s", "4096",
+                "-o", trace_path, "/bin/sh", "-c", prompt]
+        return subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout, env=env)
+    return subprocess.run(prompt, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=timeout, env=env)
+
+
+# ---------------------------------------------------------------------------
+# route stage (always runs — pure python, no deps)
+# ---------------------------------------------------------------------------
+def _check_route(entry):
+    fx_path = os.path.join(ctf_home(), entry["dir"], entry.get("route_fixture", "route.json"))
+    with open(fx_path, encoding="utf-8") as fh:
+        fx = json.load(fh)
+    result = route_mod.route(profile=fx.get("profile"), revq=fx.get("revq"),
+                             interesting=fx.get("interesting"))
+    got = result.get("subroute")
+    return got == entry["expected_route"], got, result.get("track")
+
+
+# ---------------------------------------------------------------------------
+# verify stage (runs the real fixture when toolchain is present)
+# ---------------------------------------------------------------------------
+def _compile(entry, workdir):
+    src = os.path.join(ctf_home(), entry["dir"], entry.get("source", "src.c"))
+    if not os.path.isfile(src) or not _have("gcc"):
+        return None
+    out = os.path.join(workdir, entry["id"])
+    # -no-pie + -fno-stack-protector keep the synthetic fixtures simple/deterministic.
+    cmd = ["gcc", "-w", "-O1", "-fno-stack-protector", "-no-pie", src, "-o", out]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except Exception:
+        return None
+    return out if os.path.isfile(out) else None
+
+
+def _verify_flag_regex(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    stdin = entry["verify"].get("stdin", "").encode()
+    try:
+        p = subprocess.run([binpath], input=stdin, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=30)
+    except Exception as exc:
+        return "error", str(exc)
+    out = p.stdout.decode(errors="replace")
+    if re.search(entry["verify"]["pattern"], out):
+        return "pass", out.strip().splitlines()[-1] if out.strip() else ""
+    return "fail", "pattern %r not in output" % entry["verify"]["pattern"]
+
+
+def _verify_symsolve(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    if not _have_angr():
+        return "skipped", "no angr"
+    v = entry["verify"]
+    sym = os.path.join(ctf_home(), "solve", "_template", "rev", "symsolve.py")
+    cmd = [sys.executable, sym, binpath, "--find-str", v["find_str"],
+           "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)), "--printable"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    except Exception as exc:
+        return "error", str(exc)
+    out = p.stdout.decode(errors="replace")
+    if v["expected"] in out:
+        return "pass", v["expected"]
+    return "fail", "expected %r not recovered" % v["expected"]
+
+
+def _verify(entry, binpath):
+    kind = entry["verify"]["kind"]
+    if kind == "flag-regex":
+        return _verify_flag_regex(entry, binpath)
+    if kind == "symsolve-restore":
+        return _verify_symsolve(entry, binpath)
+    if kind == "rat-verify-pass":
+        return "skipped", "rat-verify report presence check (not produced in Mode A)"
+    return "skipped", "unknown verify kind %s" % kind
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+def cmd_run(args):
+    import tempfile
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
+    run_id = args.run_id or ("A-%d" % int(time.time()))
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, run_id + ".jsonl")
+    workdir_ctx = tempfile.TemporaryDirectory()
+    workdir = workdir_ctx.name
+    n_fail = 0
+    lines = []
+    print("== ratbench Mode A: %s (%d entries) ==" % (run_id, len(entries)))
+    for e in entries:
+        t0 = time.time()
+        route_ok, got_route, got_track = _check_route(e)
+        binpath = _compile(e, workdir)
+        vstatus, vdetail = _verify(e, binpath)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        if not route_ok:
+            outcome = "route-miss"
+        elif vstatus == "pass":
+            outcome = "solved"
+        elif vstatus == "skipped":
+            outcome = "route-ok-verify-skipped"
+        else:
+            outcome = "verify-fail"
+        if outcome in ("route-miss", "verify-fail"):
+            n_fail += 1
+        rec = {
+            "schema": "rat.bench-result/v1", "mode": "A", "run_id": run_id,
+            "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+            "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
+            "expected_route": e["expected_route"], "got_route": got_route, "got_track": got_track,
+            "route_ok": route_ok, "verify": {"kind": e["verify"]["kind"], "status": vstatus, "detail": vdetail},
+            "outcome": outcome, "wall_ms": elapsed_ms,
+        }
+        lines.append(rec)
+        mark = {"solved": "OK  ", "route-ok-verify-skipped": "~   ",
+                "route-miss": "MISS", "verify-fail": "FAIL"}[outcome]
+        print("  [%s] %-18s route=%s%s verify=%s (%s)" % (
+            mark, e["id"], got_route,
+            "" if route_ok else "!=%s" % e["expected_route"],
+            vstatus, vdetail if vstatus != "pass" else "ok"))
+    for rec in lines:
+        validate(rec, "rat.bench-result/v1")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for rec in lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    print("-- results: %s" % os.path.relpath(out_path, ctf_home()))
+    workdir_ctx.cleanup()
+    if n_fail:
+        print("-- %d entr%s FAILED (route-miss/verify-fail)" % (n_fail, "y" if n_fail == 1 else "ies"))
+        return 1
+    n_skipped = sum(1 for rec in lines if rec["verify"]["status"] == "skipped")
+    if n_skipped:
+        print("-- all entries route-correct, %d/%d verifier%s skipped (missing dependency, not failed)" %
+              (n_skipped, len(lines), "" if n_skipped == 1 else "s"))
+    else:
+        print("-- all entries route-correct and verified")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# eval workspace — runtime only; benchmark truth never enters the agent tree
+# ---------------------------------------------------------------------------
+_RUNTIME_DIRS = ("bin", "doctrine", "knowledge", "reference", "schemas", "skills", "kernel")
+_RUNTIME_FILES = ("CLAUDE.md", "AGENTS.md", "FLAG_FORMAT")
+
+
+def _copy_runtime_export(dst_root):
+    import shutil
+    src_root = ctf_home()
+    os.makedirs(dst_root, exist_ok=True)
+    for name in _RUNTIME_FILES:
+        src = os.path.join(src_root, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dst_root, name))
+    for name in _RUNTIME_DIRS:
+        src = os.path.join(src_root, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(dst_root, name), symlinks=False)
+    template = os.path.join(src_root, "solve", "_template")
+    if os.path.isdir(template):
+        os.makedirs(os.path.join(dst_root, "solve"), exist_ok=True)
+        shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
+
+
+def _runtime_fixture_relpath(relpath):
+    if not isinstance(relpath, str) or not relpath or os.path.isabs(relpath):
+        raise ValueError("runtime fixture path must be relative")
+    normalized = os.path.normpath(relpath)
+    if normalized in ("", ".", os.pardir) or normalized.startswith(os.pardir + os.sep):
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if ".rat" in normalized.split(os.sep):
+        raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+    return normalized
+
+
+def _fixture_file(entry, relpath):
+    normalized = _runtime_fixture_relpath(relpath)
+    base = os.path.realpath(os.path.join(ctf_home(), entry["dir"]))
+    candidate = os.path.realpath(os.path.join(base, normalized))
+    if os.path.commonpath((base, candidate)) != base:
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if not os.path.isfile(candidate):
+        raise ValueError("runtime fixture file missing: %s" % relpath)
+    return candidate
+
+
+def _prepare_eval_workspace(entry, sandbox):
+    """Create a CTF-Rat runtime export plus answer-free challenge directory."""
+    import shutil
+    kit_root = os.path.join(sandbox, "ctf-rat")
+    _copy_runtime_export(kit_root)
+    chal_dir = os.path.join(kit_root, "solve", entry["id"])
+    os.makedirs(chal_dir, exist_ok=True)
+
+    binary_rel = entry.get("binary")
+    if binary_rel:
+        binary = _fixture_file(entry, binary_rel)
+        target = os.path.join(chal_dir, os.path.basename(binary_rel))
+        shutil.copy2(binary, target)
+    else:
+        built = _compile(entry, chal_dir)
+        if built is None:
+            raise RuntimeError("cannot materialize runtime binary (gcc/source unavailable)")
+        target = os.path.join(chal_dir, "chall")
+        os.replace(built, target)
+
+    forbidden = {
+        _runtime_fixture_relpath(entry.get("source", "src.c")),
+        _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
+    }
+    for relpath in entry.get("runtime_files", []) or []:
+        normalized = _runtime_fixture_relpath(relpath)
+        if normalized in forbidden:
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        src = _fixture_file(entry, normalized)
+        dst = os.path.realpath(os.path.join(chal_dir, normalized))
+        if os.path.commonpath((os.path.realpath(chal_dir), dst)) != os.path.realpath(chal_dir):
+            raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    # Explicit invariant: the agent export never contains the benchmark tree.
+    if os.path.exists(os.path.join(kit_root, "bench")):
+        raise RuntimeError("Mode B runtime export leaked benchmark data")
+    return kit_root, chal_dir, target
+
+
+def _agent_environment(kit_root):
+    env = os.environ.copy()
+    env["CTF_HOME"] = kit_root
+    env["PATH"] = os.path.join(kit_root, "bin") + os.pathsep + env.get("PATH", "")
+    for key in ("RAT_INDEX_ROOT", "STATE_PATH", "CTF_TEAM", "PYTHONPATH"):
+        env.pop(key, None)
+    return env
+
+
+def _epoch(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _elapsed_ms(started_epoch, finished_epoch):
+    if not isinstance(started_epoch, (int, float)) or not isinstance(finished_epoch, (int, float)):
+        return None
+    if finished_epoch < started_epoch:
+        return None
+    return int(round((finished_epoch - started_epoch) * 1000))
+
+
+def _first_event_ms(events, started_epoch, predicate):
+    candidates = []
+    for event in events:
+        if not predicate(event):
+            continue
+        event_epoch = _epoch(event.get("at"))
+        latency = _elapsed_ms(started_epoch, event_epoch)
+        if latency is not None:
+            candidates.append(latency)
+    return min(candidates) if candidates else None
+
+
+def _artifact_count(store_root):
+    meta = os.path.join(store_root, "metadata", "sha256")
+    if not os.path.isdir(meta):
+        return 0
+    count = 0
+    for prefix in os.listdir(meta):
+        directory = os.path.join(meta, prefix)
+        if os.path.isdir(directory):
+            count += sum(1 for name in os.listdir(directory) if name.endswith(".json"))
+    return count
+
+
+def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
+                      agent_rc, flag_claimed, completion, events,
+                      primitive_pass_at, artifact_count, process_metrics=None):
+    """Build one honest Mode B `rat.benchmark-result/v2` record.
+
+    Unknown instrumentation is encoded as null, never fabricated as zero. Process
+    metrics are populated only when an observer-owned execve trace was actually
+    available for the attempt.
+    """
+    started_epoch = _epoch(started_at)
+    verified = completion.get("verified") is True
+    verification_id = completion.get("verification_id")
+    process_metrics = process_metrics or {}
+    time_to_first_query_ms = _first_event_ms(
+        events, started_epoch,
+        lambda e: e.get("type") == "governor.checked"
+        and str(e.get("payload", {}).get("action", "")).startswith("query:"),
+    )
+    time_to_first_hypothesis_ms = _first_event_ms(
+        events, started_epoch, lambda e: e.get("type") == "hypothesis.recorded"
+    )
+    time_to_verified_solve_ms = None
+    if verified and verification_id:
+        time_to_verified_solve_ms = _first_event_ms(
+            events, started_epoch,
+            lambda e: e.get("type") == "verification.recorded"
+            and e.get("payload", {}).get("verification_id") == verification_id,
+        )
+    time_to_first_valid_primitive_ms = _elapsed_ms(started_epoch, primitive_pass_at)
+    if verified:
+        outcome = "verified"
+    elif flag_claimed:
+        outcome = "solve-claimed"
+    elif agent_rc == 124:
+        outcome = "censored"
+    else:
+        outcome = "failed"
+    metrics = {
+        "correctness": {"verified_solve": verified,
+                        "false_solved": bool(flag_claimed and not verified),
+                        "oracle_pass": True if verified else None},
+        "latency": {"time_to_first_query_ms": time_to_first_query_ms,
+                    "time_to_first_hypothesis_ms": time_to_first_hypothesis_ms,
+                    "time_to_first_valid_primitive_ms": time_to_first_valid_primitive_ms,
+                    "time_to_verified_solve_ms": time_to_verified_solve_ms},
+        "context": {"input_tokens": None, "output_tokens": None,
+                    "peak_context_tokens": None, "tool_output_bytes": None},
+        "tools": {"tool_calls": process_metrics.get("tool_calls"),
+                  "duplicate_tool_calls": process_metrics.get("duplicate_tool_calls"),
+                  "ghidra_runs": process_metrics.get("ghidra_runs"),
+                  "cfgfast_runs": None,
+                  "symbolic_runs": process_metrics.get("symbolic_runs"),
+                  "subagent_count": None},
+        "cache": {"cache_requests": None, "cache_hits": None,
+                  "cache_hit_ratio": None, "bytes_reused": None, "cold_warm": "cold"},
+        "reasoning": {"hypotheses_created": sum(1 for e in events if e.get("type") == "hypothesis.recorded"),
+                      "hypotheses_refuted": None, "pivot_count": None,
+                      "deep_escalations": None},
+        "artifacts": {"functions_decompiled": None, "raw_output_size": None,
+                      "compressed_output_size": None, "artifact_count": artifact_count},
+    }
+    return {
+        "schema": "rat.benchmark-result/v2",
+        "benchmark_run_id": run_id,
+        "ablation_id": ablation_id,
+        "challenge_id": entry["id"],
+        "attempt": 1,
+        "status": "timeout" if agent_rc == 124 else "completed",
+        "eligible": True,
+        "outcome": outcome,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "metrics": metrics,
+        "oracle": {"kind": "completion-gate", "reason": completion.get("reason"),
+                   "verification_id": verification_id},
+        "ground_truth": {"track": entry.get("track"), "difficulty": entry.get("difficulty"),
+                         "expected_route": entry.get("expected_route"),
+                         "verify_kind": (entry.get("verify") or {}).get("kind"),
+                         "corpus": entry.get("corpus"),
+                         "capabilities": entry.get("capabilities", []),
+                         "redistributable": entry.get("redistributable")},
+    }
+
+
+# ---------------------------------------------------------------------------
+# eval (Mode B — external model CLI, on-demand, human-run, NOT CI)
+# ---------------------------------------------------------------------------
+def cmd_eval(args):
+    """Run an external agent against an answer-free CTF-Rat runtime export."""
+    import shutil
+    import tempfile
+    if not args.agent:
+        print("[ratbench:err] eval requires --agent \"<cli command template>\" (use {dir} placeholder)", file=sys.stderr); return 2
+    agent_bin = args.agent.split()[0]
+    if not _have(agent_bin):
+        print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
+        return 3
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
+    run_id = args.run_id or ("B-%s-%d" % (os.path.basename(agent_bin), int(time.time())))
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, run_id + ".jsonl")
+    v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v2.jsonl")
+    lines = []
+    v2_lines = []
+    trace_enabled = _strace_usable()
+    print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
+    if trace_enabled:
+        print("-- process telemetry: observer execve trace enabled")
+    else:
+        print("-- process telemetry: unavailable (process metrics remain null)")
+    for e in entries:
+        sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
+        try:
+            try:
+                kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
+            except (OSError, ValueError, RuntimeError) as exc:
+                print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
+                return 3
+            prompt = args.agent.replace("{dir}", chal_dir)
+            trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
+            started_at = datetime.now(timezone.utc).isoformat()
+            t0 = time.time()
+            try:
+                p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
+                               timeout=args.timeout, trace_path=trace_path)
+                agent_out = p.stdout.decode(errors="replace")
+                agent_rc = p.returncode
+            except subprocess.TimeoutExpired as exc:
+                partial = exc.stdout or b""
+                agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
+                agent_rc = 124
+            wall = int((time.time() - t0) * 1000)
+            finished_at = datetime.now(timezone.utc).isoformat()
+
+            flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
+            from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics
+            from ratlib.completion import completion_gate
+            from ratlib.state_v2 import Stream
+            primitive_pass_at = first_primitive_pass_ts(chal_dir)
+            typed_pass = primitive_pass_at is not None
+            completion = completion_gate(chal_dir)
+            verified = completion.get("verified") is True
+            if verified:
+                outcome = "solved"
+            elif flag_claimed:
+                outcome = "solve-claimed"
+            else:
+                outcome = "fail"
+            rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
+                   "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+                   "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
+                   "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
+                   "typed_primitive_pass": typed_pass, "verified_solve": verified,
+                   "completion_reason": completion.get("reason"), "wall_ms": wall}
+            lines.append(rec)
+            try:
+                events = Stream(chal_dir).read()
+            except (OSError, ValueError):
+                events = []
+            process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
+            v2_lines.append(_mode_b_v2_record(
+                e, run_id=run_id, ablation_id=args.ablation,
+                started_at=started_at, finished_at=finished_at,
+                agent_rc=agent_rc, flag_claimed=flag_claimed,
+                completion=completion, events=events,
+                primitive_pass_at=primitive_pass_at,
+                artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
+                process_metrics=process_metrics,
+            ))
+            mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
+            detail = ""
+            if outcome == "solve-claimed":
+                detail = "  (flag claimed, verified completion gate NOT satisfied)"
+            elif typed_pass and not verified:
+                detail = "  (primitive PASS present, deterministic verification missing/stale)"
+            print("  [%s] %-18s rc=%s wall=%dms%s" % (mark, e["id"], agent_rc, wall, detail))
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    for rec in lines:
+        validate(rec, "rat.bench-result/v1")
+    for rec in v2_lines:
+        validate(rec, "rat.benchmark-result/v2")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for rec in lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    with open(v2_out_path, "w", encoding="utf-8") as fh:
+        for rec in v2_lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
+    print("-- benchmark v2 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+def _read_legacy_results(results_dir):
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v2.jsonl"):
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return rows
+
+
+def _read_v2_results(results_dir):
+    """Read canonical v2 benchmark rows fail-closed.
+
+    Measurement output is an evidence artifact: malformed JSON or a schema-invalid
+    row must stop the report instead of being silently dropped and biasing rates.
+    """
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".benchmark-v2.jsonl"):
+            continue
+        path = os.path.join(results_dir, fn)
+        with open(path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("%s:%d invalid JSON: %s" % (fn, lineno, exc)) from exc
+                try:
+                    validate(row, "rat.benchmark-result/v2")
+                except Exception as exc:
+                    raise ValueError("%s:%d invalid benchmark-v2 row: %s" % (fn, lineno, exc)) from exc
+                rows.append(row)
+    return rows
+
+
+def cmd_report(args):
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    schema = getattr(args, "schema", "legacy")
+    if schema == "v2":
+        try:
+            rows = _read_v2_results(results_dir)
+        except (OSError, ValueError) as exc:
+            print("[ratbench:err] %s" % exc, file=sys.stderr)
+            return 3
+        lb = _render_v2_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.v2.md")
+    else:
+        rows = _read_legacy_results(results_dir)
+        lb = _render_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.md")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(lb)
+    print(lb)
+    print("-- wrote %s" % os.path.relpath(out_path, ctf_home()))
+    return 0
+
+
+def _render_leaderboard(rows):
+    L = ["# ratbench leaderboard", "",
+         "> Generated by `ratbench report` from `bench/results/*.jsonl`. A/B comparisons are only",
+         "> valid across the SAME suite. Mode A = scripted driver; Mode B = external model eval.", ""]
+    if not rows:
+        L.append("_(no results yet — run `ratbench run`)_")
+        return "\n".join(L) + "\n"
+    runs = {}
+    for r in rows:
+        runs.setdefault(r.get("run_id", "?"), []).append(r)
+    L.append("## Runs")
+    L.append("")
+    L.append("| Run | Mode | Entries | Route OK | Solved | Claimed | Verify-skipped | Failed | Route acc |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    for rid, rs in sorted(runs.items()):
+        n = len(rs)
+        route_ok = sum(1 for x in rs if x.get("route_ok"))
+        solved = sum(1 for x in rs if x.get("outcome") == "solved")
+        claimed = sum(1 for x in rs if x.get("outcome") == "solve-claimed")
+        skipped = sum(1 for x in rs if x.get("outcome") == "route-ok-verify-skipped")
+        failed = sum(1 for x in rs if x.get("outcome") in ("route-miss", "verify-fail", "fail"))
+        acc = "%.0f%%" % (100.0 * route_ok / n) if n else "n/a"
+        mode = rs[0].get("mode", "?")
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %d | %s |" % (rid, mode, n, route_ok, solved, claimed, skipped, failed, acc))
+    latest = {}
+    for r in rows:
+        latest[r.get("id")] = r
+    L.append("")
+    L.append("## By difficulty (latest per entry)")
+    L.append("")
+    L.append("| Difficulty | Entries | Route OK | Solved |")
+    L.append("|---|---|---|---|")
+    by_diff = {}
+    for r in latest.values():
+        by_diff.setdefault(r.get("difficulty"), []).append(r)
+    for d in sorted(by_diff, key=lambda x: (x is None, x)):
+        rs = by_diff[d]
+        L.append("| %s | %d | %d | %d |" % (
+            d, len(rs), sum(1 for x in rs if x.get("route_ok")),
+            sum(1 for x in rs if x.get("outcome") == "solved")))
+    return "\n".join(L) + "\n"
+
+
+def _nested_metric(row, group, name):
+    return ((row.get("metrics") or {}).get(group) or {}).get(name)
+
+
+def _metric_median(rows, group, name, *, suffix=""):
+    values = [_nested_metric(row, group, name) for row in rows]
+    values = [value for value in values
+              if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    total = len(rows)
+    if not values:
+        return "n/a (0/%d)" % total
+    value = statistics.median(values)
+    rendered = ("%.1f" % value).rstrip("0").rstrip(".")
+    return "%s%s (%d/%d)" % (rendered, suffix, len(values), total)
+
+
+def _render_v2_leaderboard(rows):
+    L = ["# ratbench benchmark-v2 leaderboard", "",
+         "> Generated by `ratbench report --schema v2` from `bench/results/*.benchmark-v2.jsonl`.",
+         "> Only `eligible=true` attempts enter solve-rate and metric medians. Metric cells include",
+         "> measured coverage `(non-null/eligible)` so unavailable telemetry is never treated as zero.", ""]
+    if not rows:
+        L.append("_(no benchmark-v2 results yet — run `ratbench eval ...`)_")
+        return "\n".join(L) + "\n"
+    runs = {}
+    for row in rows:
+        runs.setdefault((row["benchmark_run_id"], row["ablation_id"]), []).append(row)
+    L += ["## Runs", "",
+          "| Run | Ablation | Eligible | Verified | False solved | Failed | Censored | Verified rate | Median TTVS | Median tools | Median duplicate | Median cache hit |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|"]
+    for (run_id, ablation_id), rs in sorted(runs.items()):
+        eligible = [row for row in rs if row.get("eligible") is True]
+        n = len(eligible)
+        verified = sum(1 for row in eligible if row.get("outcome") == "verified")
+        false_solved = sum(1 for row in eligible if _nested_metric(row, "correctness", "false_solved") is True)
+        failed = sum(1 for row in eligible if row.get("outcome") == "failed")
+        censored = sum(1 for row in eligible if row.get("outcome") == "censored")
+        rate = ("%.1f%%" % (100.0 * verified / n)) if n else "n/a"
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %s | %s | %s | %s | %s |" % (
+            run_id, ablation_id, n, verified, false_solved, failed, censored, rate,
+            _metric_median(eligible, "latency", "time_to_verified_solve_ms", suffix="ms"),
+            _metric_median(eligible, "tools", "tool_calls"),
+            _metric_median(eligible, "tools", "duplicate_tool_calls"),
+            _metric_median(eligible, "cache", "cache_hit_ratio"),
+        ))
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def _selftest():
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    suite = _load_suite(_suite_path())
+    ids = {e["id"] for e in suite["entries"]}
+    chk({"stack-basic-01", "fmt-basic-01", "checker-basic-01"} <= ids, "suite: synthetic entries present")
+    for e in suite["entries"]:
+        ok, got, _track = _check_route(e)
+        chk(ok, "route: %s -> %s (expected %s)" % (e["id"], got, e["expected_route"]))
+    bad = dict(suite["entries"][0]); bad["expected_route"] = "pwn-heap"
+    ok, _got, _t = _check_route(bad)
+    chk(not ok, "route: misassignment detected (negative test)")
+    chk("bench" not in _RUNTIME_DIRS and "tests" not in _RUNTIME_DIRS and "fixtures" not in _RUNTIME_DIRS,
+        "eval: runtime export allowlist excludes benchmark/test fixture trees")
+    lb = _render_leaderboard([
+        {"run_id": "T", "mode": "A", "id": "x", "difficulty": 1, "route_ok": True, "outcome": "solved"},
+        {"run_id": "T", "mode": "A", "id": "y", "difficulty": 1, "route_ok": False, "outcome": "route-miss"},
+    ])
+    chk("Route acc" in lb and "50%" in lb, "report: leaderboard renders route accuracy")
+    if fails:
+        print("ratbench selftest: FAIL (%d)" % len(fails)); return 1
+    print("ratbench selftest: OK"); return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ratbench", description="challenge-suite runner + leaderboard")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("run", help="Mode A scripted driver over the suite")
+    r.add_argument("--id"); r.add_argument("--suite"); r.add_argument("--run-id")
+    r.add_argument("--corpus", choices=sorted(CORPORA))
+    ev = sub.add_parser("eval", help="Mode B external agent CLI eval (on-demand, not CI)")
+    ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
+    ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
+    ev.add_argument("--corpus", choices=sorted(CORPORA))
+    ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
+    ev.add_argument("--timeout", type=int, default=600)
+    rep = sub.add_parser("report", help="render a legacy or benchmark-v2 leaderboard from results")
+    rep.add_argument("--suite")
+    rep.add_argument("--schema", choices=("legacy", "v2"), default="legacy")
+    sub.add_parser("selftest", help="pure-logic regression")
+    args = ap.parse_args(argv)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "eval":
+        return cmd_eval(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "selftest":
+        return _selftest()
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

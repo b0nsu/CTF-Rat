@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""dump_heap — large kernel memory/state -> a FILE, via batch GDB over the QEMU gdbstub.
+"""k_dump_heap — large kernel memory/state -> a FILE, via batch GDB over the QEMU gdbstub.
 
-The kernel-side sibling of ~/ctf/bin/gdbq's "ask GDB in batch, strip the noise" pattern,
+The kernel-side sibling of $CTF_HOME/bin/gdbq's "ask GDB in batch, strip the noise" pattern,
 specialised for *large* state that must NOT be dumped inline into an LLM conversation
 (HANDOFF item 4 + the "메모리 조회 → 파일로 빼고 grep" To-Be rule). It attaches to the
 QEMU gdbstub, runs the requested reads, ANSI-strips the output, writes it to a timestamped
-file under ~/ctf/kernel/dumps/, and prints ONLY the path + a short preview to stdout.
+file under $CTF_HOME/kernel/dumps/, and prints ONLY the path + a short preview to stdout.
 
 Runs plain gdb with -nx (no pwndbg) for fast, deterministic, noise-free dumps — pwndbg's
 context panels are exactly what we don't want in a bulk memory dump.
 
 Usage:
-  dump_heap.py --regs                          # full register set -> file
-  dump_heap.py --addr 0xffffffff81e00000 --len 512
-  dump_heap.py --vmlinux ./vmlinux --sym modprobe_path --len 32
-  dump_heap.py --cmd "info registers" --cmd "x/40gx \$rsp"   # arbitrary batch cmds
+  k_dump_heap --regs                          # full register set -> file
+  k_dump_heap --addr 0xffffffff81e00000 --len 512
+  k_dump_heap --vmlinux ./vmlinux --sym modprobe_path --len 32
+  k_dump_heap --cmd "info registers" --cmd "x/40gx \$rsp"   # arbitrary batch cmds
 
 Options:
   --host HOST      gdbstub host (default localhost)
@@ -43,7 +43,7 @@ DUMPDIR = os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.di
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="dump_heap", add_help=True,
+    ap = argparse.ArgumentParser(prog="k_dump_heap", add_help=True,
                                  description="kernel state -> file via batch GDB")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("-p", "--port", default="1234")

@@ -3,11 +3,13 @@ CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null |
 RATLIB_BIN="$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)"
 # newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]
 set -euo pipefail
+# Portability: `readlink -f` is GNU-specific; fall back to a python resolver on macOS/BSD.
+resolve_path() { readlink -f -- "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 if [ "$#" -lt 2 ]; then
   echo "usage: newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]" >&2
   exit 2
 fi
-CTF="$(readlink -f -- "$CTF_HOME")"; NAME="$1"; BIN="$2"; shift 2
+CTF="$(resolve_path "$CTF_HOME")"; NAME="$1"; BIN="$2"; shift 2
 RUN_SOURCE=""; POSITIONAL=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -44,7 +46,7 @@ if [ -n "$REMOTE" ]; then
 fi
 RUN_ABS=""
 if [ -n "$RUN_SOURCE" ]; then
-  RUN_ABS="$(readlink -f -- "$RUN_SOURCE")"
+  RUN_ABS="$(resolve_path "$RUN_SOURCE")"
   PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" <<'PY'
 import sys
 from ratlib.run_manifest import read
@@ -56,7 +58,7 @@ except (OSError, ValueError) as exc:
 PY
 fi
 SOLVE_ROOT="$CTF/solve"; mkdir -p -- "$SOLVE_ROOT"
-SOLVE_ROOT="$(readlink -f -- "$SOLVE_ROOT")"; D="$SOLVE_ROOT/$NAME"
+SOLVE_ROOT="$(resolve_path "$SOLVE_ROOT")"; D="$SOLVE_ROOT/$NAME"
 if [ -L "$D" ]; then
   echo "[newchal:err] solve destination must not be a symlink: $D" >&2
   exit 5
@@ -75,11 +77,15 @@ if incoming["run_id"] != existing["run_id"]:
     raise SystemExit(5)
 PY
 fi
-BIN_ABS="$(readlink -f -- "$BIN" 2>/dev/null || printf '%s' "$BIN")"
+# Use resolve_path (readlink -f with a python realpath fallback), not raw
+# `readlink -f`: on macOS/BSD `readlink -f` fails and the old fallback left a
+# RELATIVE path, so the later `cd "$D"` + `cp -- "$BIN_ABS"` resolved against the
+# wrong directory and aborted the scaffold. Absolutize before the cd.
+BIN_ABS="$(resolve_path "$BIN")"
 LIBC_ABS=""
-if [ -n "$LIBC" ]; then LIBC_ABS="$(readlink -f -- "$LIBC" 2>/dev/null || printf '%s' "$LIBC")"; fi
+if [ -n "$LIBC" ]; then LIBC_ABS="$(resolve_path "$LIBC")"; fi
 "$CTF/bin/ctfguard" check-newchal "$NAME" >/dev/null
-mkdir -p -- "$D"; D="$(readlink -f -- "$D")"
+mkdir -p -- "$D"; D="$(resolve_path "$D")"
 case "$D/" in "$SOLVE_ROOT"/*/) ;; *) echo "[newchal:err] destination escaped solve root" >&2; exit 5;; esac
 cd "$D"
 cp -- "$BIN_ABS" ./
@@ -96,13 +102,19 @@ fi
 # pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
 if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
   echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
+  # `timeout` is GNU coreutils; macOS ships it as `gtimeout`. If neither exists,
+  # run pwninit unbounded (it's optional) rather than failing the scaffold.
+  TIMEOUT_CMD=""
+  if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout 60"
+  elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout 60"
+  else echo "[!] 'timeout' 없음(coreutils 미설치) → pwninit을 시간제한 없이 실행. 멈추면 Ctrl-C 후 reference/glibc/로 수동 매칭."; fi
   set +e
-  timeout 60 pwninit --bin "$BN" --libc ./libc.so.6 --no-template 2>&1 \
+  $TIMEOUT_CMD pwninit --bin "$BN" --libc ./libc.so.6 --no-template 2>&1 \
      | grep -vE 'unstripping|launchpad|failed unstripping'
   pwninit_rc=${PIPESTATUS[0]}
   set -e
   if [ "$pwninit_rc" -ne 0 ]; then
-    echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → glibc-aio 로 수동 patchelf 필요"
+    echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → reference/glibc/ 에서 libc 버전 수동 매칭 후 patchelf 필요 (reference/glibc/SOURCES 참조)"
   fi
 fi
 python3 - "$D" "$BN" "$HOST" "$PORT" <<'PY'

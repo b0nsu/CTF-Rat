@@ -21,12 +21,20 @@ def _register_index(cache: str, prov: dict, binary: str) -> None:
     observable through the same index revq/rat-profile use. Anchoring the
     root off the binary (via the shared resolver) is what makes "one index"
     actually hold across all three tools.
+
+    `envelope_digest` pins the produced artifact by content (the `_index.txt`
+    export listing) so the lineage row survives deletion or staling of the
+    mutable `path`; without it a dropped cache dir leaves a dangling row that
+    can't be told from a live one.
     """
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
         from ratlib.cache import Cache, resolve_index_root
         idx_root = resolve_index_root(binary)
-        Cache(idx_root).put_entry("sha256:" + cache_key(prov), backend="decomp_dir", path=cache)
+        index_txt = os.path.join(cache, "_index.txt")
+        env_digest = "sha256:" + sha256(index_txt) if os.path.isfile(index_txt) else None
+        Cache(idx_root).put_entry("sha256:" + cache_key(prov), backend="decomp_dir",
+                                  path=cache, envelope_digest=env_digest)
     except Exception:
         pass
 

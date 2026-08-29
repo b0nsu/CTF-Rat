@@ -11,7 +11,7 @@ metadata:
 
 # CTF Local Analysis Write-up Generator
 
-Generate an honest local analysis record from `STATE.jsonl` and the supplied artifacts.
+Generate an honest local analysis record from the typed STATE v2 stream and supplied artifacts; inspect legacy `STATE.jsonl` only as unverified historical input.
 The canonical field contract is `doctrine/WRITEUP_FORMAT.md`.
 
 ## Scope

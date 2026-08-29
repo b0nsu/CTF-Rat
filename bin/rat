@@ -17,7 +17,9 @@ from ratlib.artifact import get as artifact_get
 from ratlib.cache import Cache, resolve_index_root
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
 from ratlib.governor import check_progress
-from ratlib.route import route as route_fn
+from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
+                          STRONG_OVERFLOW_IMPORTS as route_mod_STRONG,
+                          WEAK_OVERFLOW_IMPORTS as route_mod_WEAK)
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
 from ratlib.state_v2 import Stream, cursor as event_cursor
@@ -49,9 +51,11 @@ def _render_next(items):
 def _render_route_text(doc):
     if doc.get("error"):
         return "ROUTE       error (%s)" % doc["error"].get("message")
+    skill = doc.get("skill")
+    skill_line = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else (skill or "-")
     lines = ["ROUTE       %s" % doc.get("subroute"),
               "CONFIDENCE  %.2f" % (doc.get("confidence") or 0.0),
-              "SKILL       %s" % (doc.get("skill") or "-")]
+              "SKILL       %s" % skill_line]
     if doc.get("conflict"):
         lines.append("CONFLICT    yes")
     signals = doc.get("signals") or []
@@ -99,7 +103,7 @@ def _print(doc, fmt):
         print("%s: %s" % (label, status))
 
 def _emit(doc, code, fmt):
-    """Single validate->print->return exit shared by every subcommand.
+    """Validate, print, and return structured in-process route/query results.
     Validates against the doc's own schema, matching the explicit-literal
     validate() calls this replaced -- behavior identical, one call site."""
     validate(doc, doc["schema"]); _print(doc, fmt); return code
@@ -142,6 +146,20 @@ def _run_subprocess(argv, timeout=120):
     except OSError as exc:
         return 3, "", str(exc)
 
+def _detect_platform_file(binary):
+    """Classify a binary container via `file`, independent of revq extraction
+    (mirrors revq._detect_platform). Used by brief's support-scope note."""
+    code, out, _ = _run_subprocess(["file", "--", binary])
+    if code != 0:
+        return None
+    if "PE32" in out or "MS Windows" in out:
+        return "pe"
+    if "ELF" in out:
+        return "elf"
+    if "Mach-O" in out:
+        return "macho"
+    return "?"
+
 def _doctor_capabilities(binary):
     code, out, _ = _run_subprocess([os.path.join(BIN, "rat-doctor"), binary, "--format", "json"])
     if code != 0:
@@ -170,8 +188,17 @@ _STATE_PROGRESS_EVENT_TYPES = {
     "observation.recorded", "finding.revised", "primitive.revised", "primitive.consumed",
     "evidence.invalidated", "hypothesis.recorded", "unknown.recorded", "route.ruled_out", "next.recorded",
 }
-def _governor_wrap(store, action, novelty_key, doc):
-    stream = Stream(os.path.dirname(store))
+# The solving STATE lives next to the challenge binary (dirname(binary)/.rat),
+# NOT under the cache/index store. Those coincide by default because the default
+# index root is dirname(binary)/.rat, but `--store /elsewhere` overrides only the
+# cache/artifact location and must not relocate the STATE namespace the governor
+# reads progress from -- otherwise a custom store makes the governor blind to
+# real solving progress and report false-stuck. Anchor on the binary directly.
+def _state_dir(binary):
+    return os.path.dirname(os.path.realpath(binary))
+
+def _governor_wrap(state_dir, action, novelty_key, doc):
+    stream = Stream(state_dir)
     events = stream.read()
     progress = [e for e in events if e["type"] in _STATE_PROGRESS_EVENT_TYPES]
     state_cursor = event_cursor(progress[-1]) if progress else None
@@ -216,18 +243,269 @@ def cmd_route(args):
     caps = _doctor_capabilities(binary)
     profile = _gather_profile(binary, store)
     fast = args.fast or not caps.get("angr", False)
-    rev, interesting = None, None
+    rev, interesting, revq_error = None, None, None
     try:
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
-    except Exception:
+    except Exception as exc:
         rev, interesting = None, None
+        revq_error = {"code": "analysis_failed",
+                      "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    if revq_error:
+        result["diagnostics"] = [revq_error]
     result["capabilities"] = {**result["capabilities"], **caps}
     novelty_key = {"track": result["track"], "subroute": result["subroute"],
                    "signals": [s["value"] for s in result["signals"]]}
-    result = _governor_wrap(store, "route", novelty_key, result)
+    result = _governor_wrap(_state_dir(binary), "route", novelty_key, result)
     return _emit(result, EXIT_OK, args.format)
+
+def _file_sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    except OSError:
+        return None
+
+def _libc_match(binary_dir, libc_path, db_path=None):
+    """Supplied-libc digest + a hash-verified version match against the pwnlibc DB.
+
+    The only trustworthy signal is the content hash: a libc renamed to look like
+    a known version but with different bytes must NOT report a match. We compare
+    the computed sha256 against the pwnlibc offset DB
+    (reference/libc-offsets/libc-db.json, built via `pwnlibc index build`); a
+    filename heuristic is deliberately not used because it silently mislabels
+    renamed binaries and undermines honest-mode. When the DB is absent or the
+    digest is unknown, reference_match stays None -> the card renders "unknown".
+
+    "unknown" is deliberately ambiguous between "no DB present" and "DB present
+    but no matching entry" -- both are an honest non-answer. A DB that IS present
+    but fails to load/parse is a DIFFERENT situation (an operator-actionable
+    tooling fault, not a normal no-match), so it is reported separately via
+    ``db_status`` rather than being silently folded into the same "unknown".
+    """
+    out = {"supplied": None, "sha256": None, "reference_match": None, "match_method": None, "db_status": "absent"}
+    candidate = libc_path
+    if candidate is None:
+        for name in ("libc.so.6", "libc-2.27.so", "libc.so"):
+            p = os.path.join(binary_dir, name)
+            if os.path.isfile(p):
+                candidate = p; break
+    if candidate is None or not os.path.isfile(candidate):
+        return out
+    out["supplied"] = os.path.relpath(candidate)
+    digest = _file_sha256(candidate)
+    out["sha256"] = digest
+    hexdigest = digest.split(":", 1)[1] if digest and ":" in digest else digest
+    if db_path is None:
+        db_path = os.path.join(BIN, "..", "reference", "libc-offsets", "libc-db.json")
+    if os.path.isfile(db_path):
+        try:
+            with open(db_path, encoding="utf-8") as fh:
+                db = json.load(fh)
+            out["db_status"] = "ok"
+            if hexdigest:
+                for e in db.get("entries", []):
+                    if e.get("sha256") == hexdigest:
+                        out["reference_match"] = e.get("version")
+                        out["match_method"] = "sha256"
+                        break
+        except (OSError, ValueError) as exc:
+            # Distinct from "absent": an operator needs to know the DB exists but
+            # is unreadable/malformed (bad `pwnlibc index build` output, truncated
+            # write, etc), not just "no match found".
+            out["db_status"] = "corrupt: %s" % exc
+    return out
+
+def _pwn_summary(profile):
+    facts = {f.get("kind"): f.get("value") for f in (profile or {}).get("facts", []) or []}
+    imports = set((profile or {}).get("imports", []) or [])
+    prot = {k: facts.get(k) for k in ("elf.nx", "elf.pie", "elf.canary", "elf.relro") if k in facts}
+    sinks = sorted(imports & (route_mod_STRONG | route_mod_WEAK | {"printf", "fprintf", "malloc", "free", "system"}))
+    return {"protections": prot, "sinks": sinks}
+
+def _rev_summary(revq, interesting):
+    top = []
+    for it in (interesting or [])[:5]:
+        top.append({"func": it.get("func"), "score": it.get("score"), "why": it.get("why")})
+    return {"top_interesting": top, "evasion": (revq or {}).get("evasion", []) or [],
+            "platform": (revq or {}).get("platform")}
+
+def _render_brief_text(card):
+    L = ["BRIEF       %s" % card["binary"]]
+    if card.get("binary_sha256"):
+        L.append("SHA256      %s" % card["binary_sha256"])
+    caps = card["capabilities"]
+    L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
+    r = card["route"]
+    L += ["", "ROUTE       %s / %s (conf %.2f)" % (r.get("track"), r.get("subroute"), r.get("confidence") or 0.0)]
+    if card.get("skill_path"):
+        L.append("SKILL       %s" % card["skill_path"])
+    if r.get("conflict"):
+        L.append("CONFLICT    yes -> %s" % ", ".join(a.get("subroute") for a in r.get("alternatives", [])))
+    nxt = r.get("next") or []
+    if nxt:
+        L += ["NEXT        " + "; ".join("%s %s" % (n.get("query", ""), n.get("target") or "") for n in nxt)]
+    ts = card["track_summary"]
+    if "protections" in ts:
+        L += ["", "PROTECTIONS " + (", ".join("%s=%s" % (k, v) for k, v in ts["protections"].items()) or "-"),
+              "SINKS       " + (", ".join(ts["sinks"]) or "-")]
+    if "top_interesting" in ts:
+        L += ["", "INTERESTING"]
+        for it in ts["top_interesting"]:
+            L.append("  %-20s score=%s" % (it.get("func"), it.get("score")))
+        if ts.get("evasion"):
+            L.append("EVASION     " + "; ".join(ts["evasion"]))
+        if ts.get("platform") and ts["platform"] != "elf":
+            L.append("PLATFORM    %s" % ts["platform"])
+    libc = card["libc"]
+    if libc.get("supplied"):
+        if libc.get("reference_match"):
+            match_line = "%s (sha256-verified)" % libc["reference_match"]
+        elif str(libc.get("db_status", "")).startswith("corrupt"):
+            # Never collapse "DB is broken" into the same "unknown" a caller sees
+            # for an honest no-match -- one is an operator-actionable tooling
+            # fault (`pwnlibc index build` output is bad/truncated), the other isn't.
+            match_line = "unknown -- libc DB is CORRUPT (%s); rebuild with `pwnlibc index build`" % libc["db_status"]
+        else:
+            match_line = "unknown (build DB via `pwnlibc index build` or run `pwnlibc identify`)"
+        L += ["", "LIBC        %s" % libc["supplied"], "  match     %s" % match_line]
+    if card["truncated"]:
+        L += ["", "TRUNCATED   %s (raise --budget-tokens)" % ", ".join(card["truncated"])]
+    for se in card["side_effects"]:
+        L.append("NOTE        %s" % se)
+    return "\n".join(L)
+
+def _bound_brief_to_budget(card, budget_tokens, *, render=None):
+    """Bound the card to the token budget (approx 4 bytes/token).
+
+    Drop the lowest-priority sections first, re-checking after each cut so we
+    never discard a section that did not need trimming. Honors the plan's
+    truncation contract and never claims a trim brought the card under budget
+    when it did not: if the core route/header alone exceed the budget, that is
+    surfaced as an explicit "over-budget" marker in `truncated` rather than
+    silently shipping an over-budget card. Mutates and returns `card`.
+    """
+    budget_bytes = budget_tokens * 4
+    render = render or _render_brief_text
+    def over():
+        return len(render(card).encode()) > budget_bytes
+    if over():
+        card["libc"] = {"supplied": None, "sha256": None, "reference_match": None,
+                        "match_method": None, "note": "trimmed for budget"}
+        card["truncated"].append("libc")
+    if over():
+        card["track_summary"] = {"note": "trimmed for budget"}
+        card["truncated"].append("track_summary")
+    if over() and (card["route"].get("next") or []):
+        card["route"]["next"] = []
+        card["truncated"].append("route.next")
+    if over():
+        card["truncated"].append("over-budget")
+    return card
+
+def _empty_brief_card(binary, budget_tokens):
+    """A schema-conformant rat.brief-card/v1 shell for the error/diagnostics path.
+
+    route/query both stay schema-conformant on error so a --format json caller
+    always gets one document shape to parse; brief used to fall back to a bare
+    stderr string instead, breaking that contract for this one subcommand.
+    """
+    route = route_fn()
+    return {
+        "schema": "rat.brief-card/v1", "binary": binary, "binary_sha256": None,
+        "capabilities": {}, "route": route, "skill_path": None,
+        "track_summary": {}, "libc": {"supplied": None, "sha256": None, "reference_match": None, "match_method": None, "db_status": "absent"},
+        "budget_tokens": budget_tokens, "truncated": [], "side_effects": [], "diagnostics": [],
+    }
+
+def cmd_brief(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        card = _empty_brief_card(binary, args.budget_tokens)
+        card["error"] = bad
+        card["diagnostics"] = [{"code": bad["code"], "severity": "error", "message": bad["message"]}]
+        if args.format == "json":
+            print(json.dumps(card, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print("rat brief: %s" % bad["message"], file=sys.stderr)
+        return EXIT_INPUT
+    store = resolve_index_root(binary, override=args.store)
+    caps = _doctor_capabilities(binary)
+    profile = _gather_profile(binary, store)
+    fast = args.fast or not caps.get("angr", False)
+    rev, interesting, revq_error = None, None, None
+    diagnostics = []
+    try:
+        mod, rev = _gather_revq(binary, fast, store)
+        interesting = mod.compute_interesting(rev)
+    except Exception as exc:
+        rev, interesting = None, None
+        # A startup brief may legitimately continue without revq (for example
+        # unsupported containers), but never silently turn an analyzer fault
+        # into an ordinary low-confidence route.
+        revq_error = "%s: %s" % (type(exc).__name__, str(exc) or "no detail")
+    route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    route["capabilities"] = {**route.get("capabilities", {}), **caps}
+    # brief shares route's side effect: it appends governor.checked to STATE.
+    novelty_key = {"track": route["track"], "subroute": route["subroute"],
+                   "signals": [s["value"] for s in route["signals"]]}
+    route = _governor_wrap(_state_dir(binary), "brief", novelty_key, route)
+    subroute = route.get("subroute")
+    skill_path = ("skills/%s/SKILL.md" % subroute) if subroute in ROUTE_SKILLS else None
+    track_summary = _pwn_summary(profile) if route.get("track") == "pwn" else _rev_summary(rev, interesting)
+    libc = _libc_match(os.path.dirname(os.path.realpath(binary)), args.libc)
+    card = {
+        "schema": "rat.brief-card/v1", "binary": os.path.relpath(binary) if not os.path.isabs(binary) else binary,
+        "binary_sha256": _file_sha256(binary),
+        "capabilities": caps, "route": route, "skill_path": skill_path,
+        "track_summary": track_summary, "libc": libc,
+        "budget_tokens": args.budget_tokens, "truncated": [],
+        "side_effects": ["rat brief appended a governor.checked event to STATE (same as `rat route`)."],
+        "diagnostics": diagnostics,
+    }
+    if revq_error:
+        # Prose for the text renderer (unchanged) PLUS a structured entry a
+        # --format json consumer can branch on without parsing free text.
+        card["side_effects"].append("revq analysis unavailable; brief is partial: %s" % revq_error)
+        diagnostics.append({"code": "analysis_failed", "severity": "warning",
+                            "message": "revq analysis unavailable; brief is partial: %s" % revq_error})
+    if str(libc.get("db_status", "")).startswith("corrupt"):
+        card["side_effects"].append("libc DB is corrupt (%s); rebuild with `pwnlibc index build`" % libc["db_status"])
+        diagnostics.append({"code": "libc_db_corrupt", "severity": "warning",
+                            "message": "libc DB is present but failed to load: %s" % libc["db_status"]})
+    # Support-scope guard: this kit targets ELF/Linux (PE is handled rev-only via
+    # Qiling). A macOS Mach-O / unrecognized container legitimately routes to
+    # unknown -- surface that as an expected support limit so a weak model does
+    # not thrash trying to force a route on an out-of-scope binary.
+    # revq can fail to load an out-of-scope binary (e.g. angr chokes on Mach-O),
+    # leaving rev=None and no platform -- fall back to a direct `file` classification
+    # so the support-scope note fires even when extraction bailed.
+    platform = (rev or {}).get("platform") or _detect_platform_file(binary)
+    if platform in ("macho", "?"):
+        note = ("non-ELF binary detected (platform=%s): this kit targets ELF/Linux (PE is rev-only). "
+                "ROUTE/PLATFORM reading unknown here is expected, not a failure -- re-run on the ELF/Linux artifact."
+                % platform)
+        card["side_effects"].append(note)
+        diagnostics.append({"code": "out_of_scope_platform", "severity": "info", "message": note})
+    if args.budget_tokens:
+        json_render = lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        _bound_brief_to_budget(card, args.budget_tokens,
+                               render=json_render if args.format == "json" else _render_brief_text)
+    # brief_card only checks that `route` is a Mapping; re-validate the embedded
+    # route doc against its own contract so a malformed route (e.g. a broken
+    # conflict/alternatives coupling) cannot ride inside a "valid" brief card.
+    validate(card["route"], "rat.route-result/v1")
+    validate(card, "rat.brief-card/v1")
+    if args.format == "json":
+        print(json.dumps(card, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(_render_brief_text(card))
+    return EXIT_OK
 
 def cmd_query_func(args):
     binary, name = args.binary, args.name
@@ -265,7 +543,7 @@ def cmd_query_func(args):
                            diagnostics=diagnostics,
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
-    doc = _governor_wrap(store, "query:func", {"query": query, "facts": facts}, doc)
+    doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_oracle(args):
@@ -279,25 +557,46 @@ def cmd_query_oracle(args):
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
-    facts = {"success_candidates": oracle["success_candidates"], "failure_candidates": oracle["failure_candidates"]}
+    # auto_connect / ambiguity are decided by compute_oracle over the FULL
+    # candidate set -- we only bound the *projection* returned to the model, so
+    # a binary with many "success"/"failure"-like strings can't blow up a single
+    # oracle query's context. Truncation never changes the resolve decision.
+    succ_full, fail_full = oracle["success_candidates"], oracle["failure_candidates"]
+    budget = args.budget_bytes
+    kept, truncated, omit = truncate_lists_sharing_budget(
+        [("success_candidates", succ_full), ("failure_candidates", fail_full)], budget)
+    facts = {**kept, "success_candidate_count": len(succ_full), "failure_candidate_count": len(fail_full)}
     heuristics = {"resolved": oracle["resolved"], "auto_connect": oracle["auto_connect"]}
     diagnostics = []
     if oracle["ambiguous"]:
         diagnostics.append({"code": "ambiguous", "severity": "warning",
                              "message": "multiple success/failure candidates; auto-connect withheld"})
-    elif not oracle["success_candidates"] and not oracle["failure_candidates"]:
+    elif not succ_full and not fail_full:
         diagnostics.append({"code": "partial", "severity": "warning", "message": "no success/failure string candidates found"})
+    if truncated:
+        diagnostics.append({"code": "partial", "severity": "warning",
+                             "message": "candidates truncated at item boundary (budget_bytes=%d); counts are exact" % budget})
     if oracle["auto_connect"]:
         r = oracle["resolved"]
         heuristics["next"] = [{"query": "symsolve.py --find %#x --avoid %#x" % (r["success"]["addr"], r["failure"]["addr"]), "target": binary}]
-    status = "ok" if oracle["auto_connect"] else "partial"
+    status = "ok" if oracle["auto_connect"] and not truncated else "partial"
     doc = _query_envelope("oracle", status=status, facts=facts, heuristics=heuristics, artifacts=[],
-                           coverage={"complete": oracle["auto_connect"], "scope": "binary-strings+xrefs",
-                                     "omitted": None if oracle["auto_connect"] else "unresolved-candidates"},
+                           coverage={"complete": oracle["auto_connect"] and not truncated, "scope": "binary-strings+xrefs",
+                                     "omitted": (None if oracle["auto_connect"] else "unresolved-candidates") if not truncated
+                                                else {"truncated_counts": {"success_candidates": omit["success_candidates"],
+                                                                            "failure_candidates": omit["failure_candidates"]}}},
                            diagnostics=diagnostics,
-                           provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}})
-    doc = _governor_wrap(store, "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
+                           provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}},
+                           budget_bytes=budget)
+    doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
+
+def _slice_complete(slice_doc):
+    s = slice_doc.get("summary", {})
+    counters = (s.get("unresolved_aliases"), s.get("unresolved_indirect_calls"))
+    return (slice_doc.get("status") == "ok"
+            and all(isinstance(value, int) and not isinstance(value, bool) and value == 0
+                    for value in counters))
 
 def cmd_query_slice(args):
     binary = args.binary
@@ -326,11 +625,15 @@ def cmd_query_slice(args):
         msgs = [d.get("message", "") for d in slice_doc.get("diagnostics", [])] or ["rat-slice reported error"]
         return _emit(*_query_error("slice", "input_invalid", "; ".join(msgs), EXIT_INPUT), args.format)
     s = slice_doc.get("summary", {})
-    unresolved = bool(s.get("unresolved_aliases", 0)) or s.get("unresolved_indirect_calls", 0) == 1
-    status = "partial" if unresolved or slice_doc.get("status") == "partial" else "ok"
-    # C9: `claim` is a heuristic label, never a fact -- it must not appear in `facts`.
-    facts = {"target": s.get("target"), "within_function": s.get("within_function"), "interproc": s.get("interproc")}
+    complete = _slice_complete(slice_doc)
+    status = "ok" if complete else "partial"
+    # C9/C10: claims and loop recurrences are heuristic candidates, never facts.
+    within_function = dict(s.get("within_function") or {})
+    loop_analysis = within_function.pop("loop_analysis", None)
+    facts = {"target": s.get("target"), "within_function": within_function, "interproc": s.get("interproc")}
     heuristics = {"claim": s.get("claim")}
+    if loop_analysis is not None:
+        heuristics["loop_analysis"] = loop_analysis
     diagnostics = []
     for d in slice_doc.get("diagnostics", []):
         msg = d.get("message", "")
@@ -338,14 +641,14 @@ def cmd_query_slice(args):
         diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
     doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
                            artifacts=slice_doc.get("artifacts", []),
-                           coverage={"complete": not unresolved,
+                           coverage={"complete": complete,
                                      "scope": "backward-data-slice depth=%s" % (s.get("interproc") or {}).get("depth"),
                                      "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
                                                  "unresolved_indirect_calls": s.get("unresolved_indirect_calls")}},
                            diagnostics=diagnostics,
                            provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
                                        "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
-    doc = _governor_wrap(store, "query:slice", {"facts": facts, "heuristics": heuristics}, doc)
+    doc = _governor_wrap(_state_dir(binary), "query:slice", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_dyn(rest):
@@ -380,6 +683,12 @@ def cmd_selftest(_args=None):
     c = {"schema": "rat.cache-stats/v1", "store": "/tmp/x", "total_entries": 0, "by_backend": {},
          "oldest_produced_at": None, "newest_produced_at": None}
     validate(c, "rat.cache-stats/v1")
+    b = {"schema": "rat.brief-card/v1", "binary": "x", "binary_sha256": None,
+         "capabilities": {"angr": False}, "route": {"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6},
+         "skill_path": "skills/pwn-stack/SKILL.md", "track_summary": {"protections": {}, "sinks": []},
+         "libc": {"supplied": None}, "budget_tokens": 1500, "truncated": [],
+         "side_effects": ["governor.checked appended"]}
+    validate(b, "rat.brief-card/v1")
     check = check_progress([False] * 5)
     assert check["stuck"] is True, check
     kept, truncated, omitted = truncate_by_item([1, 2, 3], 1)
@@ -392,23 +701,34 @@ def cmd_selftest(_args=None):
     return EXIT_OK
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="rat")
+    p = argparse.ArgumentParser(
+        prog="rat", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="rat — single front door thin dispatcher (route/brief/query/dyn/verify/state/cache).",
+        epilog="side effect: `rat route`, `rat brief`, and every `rat query ...` append a\n"
+               "governor.checked event to the challenge STATE (Progress Novelty Governor).\n"
+               "This is bookkeeping, not solving progress; see doctrine/SOLVABILITY.md.")
     sub = p.add_subparsers(dest="command")
 
-    pr = sub.add_parser("route")
+    pr = sub.add_parser("route", help="judge track/subroute/skill from cached profile+revq (thin combinator)")
     pr.add_argument("binary"); pr.add_argument("--store"); pr.add_argument("--fast", action="store_true")
     pr.add_argument("--format", choices=("text", "json"), default="text")
 
-    pq = sub.add_parser("query")
+    pb = sub.add_parser("brief", help="one-shot startup briefing card (doctor+route+recon/revq+libc, budgeted)")
+    pb.add_argument("binary"); pb.add_argument("--store"); pb.add_argument("--fast", action="store_true")
+    pb.add_argument("--libc"); pb.add_argument("--budget-tokens", type=int, default=1500)
+    pb.add_argument("--format", choices=("text", "json"), default="text")
+
+    pq = sub.add_parser("query", help="bounded read-only queries (func|oracle|slice) over cached artifacts")
     qsub = pq.add_subparsers(dest="subcommand")
-    pf = qsub.add_parser("func")
+    pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
     pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     pf.add_argument("--format", choices=("text", "json"), default="text")
-    po = qsub.add_parser("oracle")
+    po = qsub.add_parser("oracle", help="success/failure string candidates + symsolve auto-connect")
     po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
+    po.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     po.add_argument("--format", choices=("text", "json"), default="text")
-    ps = qsub.add_parser("slice")
+    ps = qsub.add_parser("slice", help="backward data slice to an input sink (delegates rat-slice)")
     ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--source", default="stdin"); ps.add_argument("--store")
     ps.add_argument("--format", choices=("text", "json"), default="text")
@@ -419,16 +739,16 @@ def build_parser():
     # these three by slicing sys.argv directly (same convention bin/state's
     # own top-level dispatch uses) before this parser ever sees them. These
     # placeholders exist only so `--help` lists the subcommands.
-    sub.add_parser("dyn", add_help=False)
-    sub.add_parser("verify", add_help=False)
-    sub.add_parser("state", add_help=False)
+    sub.add_parser("dyn", add_help=False, help="forward argv to rat-dyn (dynamic exec trace)")
+    sub.add_parser("verify", add_help=False, help="forward argv to rat-verify (deterministic verification)")
+    sub.add_parser("state", add_help=False, help="`rat state compact ...` -> state compact (token-bounded view)")
 
-    pcache = sub.add_parser("cache")
+    pcache = sub.add_parser("cache", help="cache/index inspection")
     cachesub = pcache.add_subparsers(dest="subcommand")
-    pcachestats = cachesub.add_parser("stats")
+    pcachestats = cachesub.add_parser("stats", help="cache entry counts by backend + age")
     pcachestats.add_argument("--store"); pcachestats.add_argument("--format", choices=("text", "json"), default="text")
 
-    sub.add_parser("selftest")
+    sub.add_parser("selftest", help="in-process route/query/brief/governor self-check")
     return p
 
 def main(argv=None):
@@ -450,6 +770,7 @@ def main(argv=None):
     p = build_parser()
     args = p.parse_args(argv)
     if args.command == "route": return cmd_route(args)
+    if args.command == "brief": return cmd_brief(args)
     if args.command == "query":
         if args.subcommand == "func": return cmd_query_func(args)
         if args.subcommand == "oracle": return cmd_query_oracle(args)
