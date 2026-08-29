@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AnalysisRun,
   AnalysisStatus,
   Completion,
+  FunctionQuery,
   getAnalysisStatus,
   getCompletion,
+  queryFunction,
   runBrief
 } from "./api";
 
@@ -16,11 +18,26 @@ function number(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function listPreview(value: unknown): { count: number; text: string } {
+  if (!Array.isArray(value)) return { count: 0, text: "—" };
+  const items = value.slice(0, 6).map((item) => {
+    if (typeof item === "string" || typeof item === "number") return String(item);
+    try {
+      return JSON.stringify(item);
+    } catch {
+      return String(item);
+    }
+  });
+  return { count: value.length, text: items.join(" · ") || "—" };
+}
+
 export default function AnalysisBar() {
   const [status, setStatus] = useState<AnalysisStatus | null>(null);
   const [run, setRun] = useState<AnalysisRun | null>(null);
   const [completion, setCompletion] = useState<Completion | null>(null);
-  const [busy, setBusy] = useState<"fast" | "deep" | "verify" | null>(null);
+  const [functionQuery, setFunctionQuery] = useState<FunctionQuery | null>(null);
+  const [functionName, setFunctionName] = useState("");
+  const [busy, setBusy] = useState<"fast" | "deep" | "function" | "verify" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshStatus = async () => {
@@ -38,6 +55,7 @@ export default function AnalysisBar() {
   const execute = async (mode: "fast" | "deep") => {
     setBusy(mode);
     setCompletion(null);
+    setFunctionQuery(null);
     setError(null);
     try {
       const result = await runBrief(mode);
@@ -51,9 +69,33 @@ export default function AnalysisBar() {
     }
   };
 
+  const submitFunction = async (event: FormEvent) => {
+    event.preventDefault();
+    const name = functionName.trim();
+    if (!name) return;
+    setBusy("function");
+    setRun(null);
+    setCompletion(null);
+    setError(null);
+    try {
+      const result = await queryFunction(name);
+      setFunctionQuery(result);
+      if (result.status === "error" || result.status === "timeout") {
+        setError(result.diagnostic ?? "function query failed");
+      }
+      await refreshStatus();
+    } catch (exc) {
+      setFunctionQuery(null);
+      setError(exc instanceof Error ? exc.message : "function query failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const verifyStatus = async () => {
     setBusy("verify");
     setRun(null);
+    setFunctionQuery(null);
     setError(null);
     try {
       setCompletion(await getCompletion());
@@ -80,6 +122,17 @@ export default function AnalysisBar() {
     };
   }, [run]);
 
+  const functionSummary = useMemo(() => {
+    const facts = functionQuery?.result?.facts;
+    if (!facts) return null;
+    return {
+      callers: listPreview(facts.callers),
+      callees: listPreview(facts.callees),
+      strings: listPreview(facts.strings),
+      complete: functionQuery?.result?.coverage.complete === true
+    };
+  }, [functionQuery]);
+
   const disabled = busy !== null || status?.busy === true || status?.ready !== true;
   const target = status?.target?.binary;
 
@@ -99,13 +152,33 @@ export default function AnalysisBar() {
         <button type="button" disabled={disabled || !status?.modes.deep} onClick={() => void execute("deep")}>
           {busy === "deep" ? "DEEP…" : "DEEP"}
         </button>
+        <form className="function-form" onSubmit={submitFunction}>
+          <input
+            aria-label="Function name for bounded Function Card"
+            disabled={disabled || !status?.modes.function}
+            maxLength={256}
+            placeholder="function"
+            value={functionName}
+            onChange={(event) => setFunctionName(event.target.value)}
+          />
+          <button type="submit" disabled={disabled || !status?.modes.function || !functionName.trim()}>
+            {busy === "function" ? "FUNC…" : "FUNC"}
+          </button>
+        </form>
         <button type="button" className="verify-control" disabled={busy !== null} onClick={() => void verifyStatus()}>
           {busy === "verify" ? "VERIFY…" : "VERIFY STATUS"}
         </button>
       </div>
 
       <div className="analysis-result" role="status" aria-live="polite">
-        {run?.status === "ok" && summary ? (
+        {functionQuery && functionSummary ? (
+          <>
+            <span className={`mode-tag function ${functionQuery.status}`}>FUNC</span>
+            <strong>{functionQuery.name}</strong>
+            <code>{functionSummary.complete ? "complete" : functionQuery.status}</code>
+            <span>{functionQuery.duration_ms} ms</span>
+          </>
+        ) : run?.status === "ok" && summary ? (
           <>
             <span className={`mode-tag ${run.mode}`}>{run.mode.toUpperCase()}</span>
             <strong>{summary.route}</strong>
@@ -120,9 +193,17 @@ export default function AnalysisBar() {
             {completion.verification_id && <code>{completion.verification_id}</code>}
           </>
         ) : (
-          <span className="analysis-hint">FAST uses canonical `rat brief --fast`; DEEP uses canonical `rat brief`. VERIFY STATUS never fabricates a solve.</span>
+          <span className="analysis-hint">FAST/DEEP and FUNC route through canonical `rat`; VERIFY STATUS only reads the completion gate.</span>
         )}
       </div>
+
+      {functionQuery && functionSummary && (
+        <div className="function-card" aria-label={`Function Card for ${functionQuery.name}`}>
+          <div><span>CALLERS · {functionSummary.callers.count}</span><code title={functionSummary.callers.text}>{functionSummary.callers.text}</code></div>
+          <div><span>CALLEES · {functionSummary.callees.count}</span><code title={functionSummary.callees.text}>{functionSummary.callees.text}</code></div>
+          <div><span>STRINGS · {functionSummary.strings.count}</span><code title={functionSummary.strings.text}>{functionSummary.strings.text}</code></div>
+        </div>
+      )}
 
       {error && <div className="analysis-error" role="alert" title={error}>{error}</div>}
     </section>
