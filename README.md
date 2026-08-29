@@ -43,6 +43,7 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 - [🧭 Entry Points & Rules](#-entry-points--rules)
 - [📂 Layout](#-layout)
 - [🛠️ Core Tools](#️-core-tools)
+- [📊 Telemetry metrics](#-telemetry-metrics)
 - [✅ Tests](#-tests-after-modifying-tools)
 - [📐 Operating Principles](#-operating-principles)
 
@@ -185,6 +186,15 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 - **Handoff & knowledge** — `pkshare` → `HANDOFF.md`; `writeupcheck` quality gate → reviewed lessons land in `knowledge/learned/`. Typed STATE v2 takes precedence; legacy PASS entries are shown only as candidates. Completion docs require an operator attestation linked to an evidence digest.
 
 </details>
+
+<div align="right"><a href="#readme-top">↑ back to top</a></div>
+
+## 📊 Telemetry metrics
+
+`rat-metrics` reports cache reuse as an effective-result measure: `cache_hit_ratio` counts only
+cache hits whose result status is `ok`. A lookup that finds a non-OK cached result remains an
+effective cache miss and increments `cache_unusable_hits`; it does not count as duplicate work.
+`bypass` and unknown cache participation remain outside cache request and ratio calculations.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 

@@ -136,6 +136,8 @@ class Aggregate(unittest.TestCase):
         self.assertEqual(metrics["cache_requests"], 0)
         self.assertEqual(metrics["cache_hits"], 0)
         self.assertEqual(metrics["cache_misses"], 0)
+        self.assertEqual(metrics["cache_unusable_hits"], 0)
+        self.assertEqual(metrics["duplicate_tool_calls"], 0)
         self.assertIsNone(metrics["cache_hit_ratio"])
 
     def test_direct_subjects_use_distinct_cache_entries(self):
@@ -171,6 +173,7 @@ class Aggregate(unittest.TestCase):
         self.assertEqual(m["duplicate_tool_calls"], 1)
         self.assertEqual(m["cache_misses"], 2)
         self.assertEqual(m["cache_hits"], 0)
+        self.assertEqual(m["cache_unusable_hits"], 0)
 
     def test_cache_hit_is_not_counted_as_duplicate_but_is_a_cache_request(self):
         docs = [envelope(cache_state="miss"), envelope(cache_state="hit")]
@@ -178,13 +181,19 @@ class Aggregate(unittest.TestCase):
         self.assertEqual(m["duplicate_tool_calls"], 0)
         self.assertEqual(m["cache_hits"], 1)
         self.assertEqual(m["cache_requests"], 2)
+        self.assertEqual(m["cache_unusable_hits"], 0)
         self.assertAlmostEqual(m["cache_hit_ratio"], 0.5)
 
-    def test_timeout_or_partial_run_never_counts_as_cache_hit(self):
-        docs = [envelope(status="timeout", cache_state="hit"), envelope(status="partial", cache_state="hit")]
+    def test_unusable_cache_hits_remain_effective_misses_without_duplicates(self):
+        docs = [envelope(status=status, cache_state="hit")
+                for status in ("partial", "timeout", "error", "cancelled")]
         m = aggregate(docs)
+        self.assertEqual(m["cache_requests"], 4)
         self.assertEqual(m["cache_hits"], 0)
-        self.assertEqual(m["cache_misses"], 2)
+        self.assertEqual(m["cache_misses"], 4)
+        self.assertEqual(m["cache_unusable_hits"], 4)
+        self.assertEqual(m["duplicate_tool_calls"], 0)
+        self.assertEqual(m["cache_hit_ratio"], 0.0)
 
     def test_truncated_run_is_never_a_cache_hit_via_contracts_execute(self):
         with tempfile.TemporaryDirectory() as d:

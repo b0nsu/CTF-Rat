@@ -315,11 +315,15 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
     primitive-PASS timestamp. New callers should pass ``primitive_pass_at``
     and ``verified_solve_at`` explicitly. ``time_to_flag_sec`` retains its v1
     primitive-PASS meaning; verified-solve latency is exposed separately.
+
+    ``cache_hit_ratio`` measures effective successful reuse. A cache lookup
+    that returns a non-OK result remains an effective miss and is separately
+    exposed through ``cache_unusable_hits``; it is not duplicate computation.
     """
     docs = list(docs)
     seen_fingerprints = {}
     duplicate = 0
-    cache_hits = cache_misses = 0
+    cache_hits = cache_misses = cache_unusable_hits = 0
     tool_name_counts = {}
     duration_total = 0
     for doc in docs:
@@ -330,10 +334,15 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
             cache_state = cache.get("state")
             if cache_state is None and cache.get("hit") is True:
                 cache_state = "hit"
-        is_hit = cache_state == "hit" and status == "ok"
-        if is_hit:
-            cache_hits += 1
-        elif cache_state in {"hit", "miss"}:
+        if cache_state == "hit":
+            if status == "ok":
+                cache_hits += 1
+            else:
+                # The cache lookup succeeded but did not yield reusable output.
+                # It remains an effective miss without implying recomputation.
+                cache_misses += 1
+                cache_unusable_hits += 1
+        elif cache_state == "miss":
             cache_misses += 1
             fp = operation_fingerprint(doc)
             if fp in seen_fingerprints:
@@ -357,6 +366,7 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         "cache_requests": cache_requests,
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
+        "cache_unusable_hits": cache_unusable_hits,
         "cache_hit_ratio": (cache_hits / cache_requests) if cache_requests else None,
         "time_to_first_valid_primitive_sec": time_to_first_valid_primitive_sec,
         "time_to_verified_solve_sec": time_to_verified_solve_sec,
