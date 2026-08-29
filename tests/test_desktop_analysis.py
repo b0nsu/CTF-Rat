@@ -41,6 +41,19 @@ class DesktopAnalysisTests(unittest.TestCase):
             "side_effects": [],
         }
 
+    def function_result(self, name="main"):
+        return {
+            "schema": "rat.query-result/v1",
+            "query": "func:%s" % name,
+            "status": "ok",
+            "facts": {"callers": ["entry"], "callees": ["check"], "strings": ["success"]},
+            "heuristics": {"next": []},
+            "artifacts": [],
+            "coverage": {"complete": True, "scope": "func:%s" % name, "omitted": None},
+            "diagnostics": [],
+            "provenance": {"cache": {"hit": False}},
+        }
+
     def test_resolve_target_uses_manifest_binary_and_rechecks_digest(self):
         with tempfile.TemporaryDirectory() as root:
             binary, manifest = self.make_challenge(root)
@@ -106,12 +119,43 @@ class DesktopAnalysisTests(unittest.TestCase):
             self.assertIn("canonical run manifest", doc["diagnostic"])
             self.assertIsNone(doc["result"])
 
+    def test_function_query_is_fixed_fast_bounded_rat_query(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, _ = self.make_challenge(root)
+            payload = json.dumps(self.function_result()).encode()
+            calls = []
+
+            def fake_run(argv, **kwargs):
+                calls.append((list(argv), kwargs))
+                return result(stdout=payload)
+
+            with patch("ratlib.desktop_analysis.runner_run", side_effect=fake_run):
+                doc = AnalysisManager(root).function("  main  ")
+            self.assertEqual(doc["schema"], "rat.desktop.function-query/v1")
+            self.assertEqual(doc["name"], "main")
+            self.assertEqual(doc["status"], "ok")
+            argv, kwargs = calls[0]
+            self.assertEqual(argv[1:5], ["query", "func", os.path.realpath(binary), "main"])
+            self.assertIn("--fast", argv)
+            self.assertIn("--budget-bytes", argv)
+            self.assertEqual(kwargs["timeout_seconds"], 30.0)
+            self.assertLessEqual(kwargs["max_output_bytes"], 256 * 1024)
+
+    def test_function_query_rejects_unbounded_names(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_challenge(root)
+            manager = AnalysisManager(root)
+            for bad in ("", "\n", "x" * 257):
+                with self.assertRaises(ValueError):
+                    manager.function(bad)
+
     def test_invalid_mode_and_unready_status_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             manager = AnalysisManager(root)
             status = manager.status()
             self.assertFalse(status["ready"])
             self.assertFalse(status["modes"]["fast"])
+            self.assertFalse(status["modes"]["function"])
             self.assertTrue(status["modes"]["verify_status"])
             with self.assertRaises(ValueError):
                 manager.brief("verify")
