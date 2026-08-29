@@ -188,7 +188,7 @@ export default function AnalysisBar() {
           </>
         ) : completion ? (
           <>
-            <span className={`verify-tag ${completion.verified ? "verified" : "open"}`}>{completion.verified ? "VERIFIED" : "OPEN"}</span>
+            <span className={`verify-tag ${completion.verified ? "verified" : "unverified"}`}>{completion.verified ? "VERIFIED" : "NOT VERIFIED"}</span>
             <strong>{completion.reason}</strong>
             {completion.verification_id && <code>{completion.verification_id}</code>}
           </>
