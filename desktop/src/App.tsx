@@ -23,7 +23,8 @@ import {
 } from "./api";
 
 type EntityKind = "primitive" | "finding" | "observation";
-type StateEntitySelection = { kind: EntityKind; id: string; value: Record<string, unknown> };
+type EntityKey = { kind: EntityKind; id: string };
+type StateEntity = EntityKey & { value: Record<string, unknown> };
 type TimelineFilter = "all" | "verify" | "findings" | "primitives" | "evidence" | "failures";
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -108,11 +109,11 @@ function stateSummary(records: Record<string, unknown>, key: string): string {
     .join(" · ");
 }
 
-function entityTitle(entity: StateEntitySelection): string {
+function entityTitle(entity: StateEntity): string {
   return objectField(entity.value, ["name", "title", "kind", "class"]) ?? entity.id;
 }
 
-function entityState(entity: StateEntitySelection): string {
+function entityState(entity: StateEntity): string {
   if (entity.kind === "observation") {
     return objectField(asRecord(entity.value.validity), ["state"])
       ?? objectField(asRecord(entity.value.quality), ["level"])
@@ -121,10 +122,9 @@ function entityState(entity: StateEntitySelection): string {
   return objectField(entity.value, ["status", "state"]) ?? "unknown";
 }
 
-function entityMeta(entity: StateEntitySelection): Array<[string, string]> {
+function entityMeta(entity: StateEntity): Array<[string, string]> {
   const rows: Array<[string, string]> = [["id", entity.id]];
-  const state = entityState(entity);
-  rows.push([entity.kind === "observation" ? "validity" : "status", state]);
+  rows.push([entity.kind === "observation" ? "validity" : "status", entityState(entity)]);
   const className = objectField(entity.value, ["class", "kind"]);
   if (className) rows.push([entity.kind === "observation" ? "kind" : "class", className]);
   const revision = entity.value.revision;
@@ -158,6 +158,15 @@ function boardRank(kind: EntityKind, value: Record<string, unknown>): number {
   return (ranks[status] ?? 7) * 10 + (kind === "primitive" ? 0 : 1);
 }
 
+function resolveEntity(snapshot: Snapshot | null, key: EntityKey | null): StateEntity | null {
+  if (!snapshot || !key) return null;
+  let value: unknown;
+  if (key.kind === "primitive") value = snapshot.view.primitives[key.id];
+  else if (key.kind === "finding") value = snapshot.view.findings[key.id];
+  else value = snapshot.view.observations[key.id];
+  return value ? { ...key, value: asRecord(value) } : null;
+}
+
 function percent(value: number | null | undefined): string {
   return typeof value === "number" ? `${Math.round(value * 100)}%` : "—";
 }
@@ -175,7 +184,7 @@ export default function App() {
   const [displaySnapshot, setDisplaySnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
-  const [selectedEntity, setSelectedEntity] = useState<StateEntitySelection | null>(null);
+  const [selectedEntityKey, setSelectedEntityKey] = useState<EntityKey | null>(null);
   const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>("all");
   const [session, setSession] = useState<Session | null>(null);
   const [completion, setCompletion] = useState<Completion | null>(null);
@@ -248,7 +257,7 @@ export default function App() {
         if (delta.reset) {
           setEvents(delta.events.slice(-3000));
           setSelectedEvent(delta.events.at(-1) ?? null);
-          setSelectedEntity(null);
+          setSelectedEntityKey(null);
           setSelectedArtifact(null);
           replaySeqRef.current = null;
           setReplaySeq(null);
@@ -329,7 +338,7 @@ export default function App() {
 
   const boardEntities = useMemo(() => {
     const view = displaySnapshot?.view;
-    if (!view) return [] as StateEntitySelection[];
+    if (!view) return [] as StateEntity[];
     const primitives = Object.entries(view.primitives).map(([id, value]) => ({ kind: "primitive" as const, id, value: asRecord(value) }));
     const findings = Object.entries(view.findings).map(([id, value]) => ({ kind: "finding" as const, id, value: asRecord(value) }));
     return [...primitives, ...findings]
@@ -337,6 +346,10 @@ export default function App() {
       .slice(0, 24);
   }, [displaySnapshot]);
 
+  const selectedEntity = useMemo(
+    () => resolveEntity(displaySnapshot, selectedEntityKey),
+    [displaySnapshot, selectedEntityKey]
+  );
   const visibleEvents = useMemo(() => events.filter((event) => eventMatchesFilter(event, timelineFilter)), [events, timelineFilter]);
   const challengeName = liveSnapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
   const metrics = telemetry?.session;
@@ -369,7 +382,7 @@ export default function App() {
 
   const selectArtifactDigest = async (digest: string) => {
     try {
-      setSelectedEntity(null);
+      setSelectedEntityKey(null);
       setSelectedArtifact(await getArtifactPreview(digest));
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "artifact preview failed");
@@ -382,23 +395,21 @@ export default function App() {
 
   const selectTimelineEvent = (event: EventRecord) => {
     setSelectedEvent(event);
-    setSelectedEntity(null);
+    setSelectedEntityKey(null);
     setSelectedArtifact(null);
   };
 
-  const selectStateEntity = (kind: EntityKind, id: string, value: unknown) => {
-    setSelectedEntity({ kind, id, value: asRecord(value) });
+  const selectStateEntity = (kind: EntityKind, id: string) => {
+    setSelectedEntityKey({ kind, id });
     setSelectedArtifact(null);
   };
 
   const selectObservation = (id: string) => {
-    const value = displaySnapshot?.view.observations[id];
-    if (value) selectStateEntity("observation", id, value);
+    if (displaySnapshot?.view.observations[id]) selectStateEntity("observation", id);
   };
 
   const selectFinding = (id: string) => {
-    const value = displaySnapshot?.view.findings[id];
-    if (value) selectStateEntity("finding", id, value);
+    if (displaySnapshot?.view.findings[id]) selectStateEntity("finding", id);
   };
 
   const selectCausedBy = (eventId: string) => {
@@ -409,7 +420,7 @@ export default function App() {
   const changeReplay = async (value: number) => {
     const request = ++replayRequest.current;
     const max = liveSnapshot?.total_event_count ?? 0;
-    setSelectedEntity(null);
+    setSelectedEntityKey(null);
     if (value >= max) {
       replaySeqRef.current = null;
       setReplaySeq(null);
@@ -510,7 +521,7 @@ export default function App() {
           <div className="state-entity-list" aria-labelledby="board-title">
             {boardEntities.map((entity) => {
               const status = entityState(entity);
-              const selected = selectedEntity?.kind === entity.kind && selectedEntity.id === entity.id;
+              const selected = selectedEntityKey?.kind === entity.kind && selectedEntityKey.id === entity.id;
               return (
                 <button
                   type="button"
@@ -518,7 +529,7 @@ export default function App() {
                   data-status={status}
                   aria-pressed={selected}
                   key={`${entity.kind}:${entity.id}`}
-                  onClick={() => selectStateEntity(entity.kind, entity.id, entity.value)}
+                  onClick={() => selectStateEntity(entity.kind, entity.id)}
                 >
                   <span className="entity-kind">{entity.kind === "primitive" ? "PRIM" : "FIND"}</span>
                   <span className="entity-main"><strong title={entityTitle(entity)}>{entityTitle(entity)}</strong><small title={entity.id}>{entity.id}</small></span>
@@ -625,10 +636,10 @@ export default function App() {
               <div className="inspector-head"><span>{selectedEntity.kind.toUpperCase()}</span><strong>{entityState(selectedEntity)}</strong></div>
               <h2>{entityTitle(selectedEntity)}</h2>
               <div className="inspector-meta">
-                {entityMeta(selectedEntity).map(([label, value]) => <span key={`${label}-label`}>{label}</span>).flatMap((label, index) => {
-                  const row = entityMeta(selectedEntity)[index];
-                  return [label, <code key={`${row[0]}-value`} title={row[1]}>{row[1]}</code>];
-                })}
+                {entityMeta(selectedEntity).flatMap(([label, value]) => [
+                  <span key={`${label}-label`}>{label}</span>,
+                  <code key={`${label}-value`} title={value}>{value}</code>
+                ])}
               </div>
               {entityObservationIds.length > 0 && (
                 <div className="relation-block">
@@ -648,7 +659,7 @@ export default function App() {
                   <div>{relatedFindings.map((id) => <button type="button" className="relation-chip" key={id} disabled={!displaySnapshot?.view.findings[id]} onClick={() => selectFinding(id)}>{id}</button>)}</div>
                 </div>
               )}
-              {selectedEvent && <button type="button" className="link-button" onClick={() => setSelectedEntity(null)}>Show selected event</button>}
+              {selectedEvent && <button type="button" className="link-button" onClick={() => setSelectedEntityKey(null)}>Show selected event</button>}
               <pre tabIndex={0}>{JSON.stringify(selectedEntity.value, null, 2)}</pre>
             </>
           ) : selectedEvent ? (
