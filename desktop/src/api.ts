@@ -141,6 +141,51 @@ export type Completion = {
   exploit_task_id?: string;
 };
 
+export type AnalysisInput = {
+  role: string;
+  name: string;
+  sha256: string;
+  size: number;
+};
+
+export type AnalysisTarget = {
+  run_id: string | null;
+  challenge: string | null;
+  binary: AnalysisInput;
+  libc: AnalysisInput | null;
+};
+
+export type AnalysisStatus = {
+  schema: "rat.desktop.analysis-status/v1";
+  ready: boolean;
+  busy: boolean;
+  target: AnalysisTarget | null;
+  modes: { fast: boolean; deep: boolean; verify_status: boolean };
+  reason: string | null;
+};
+
+export type BriefCard = {
+  schema: "rat.brief-card/v1";
+  binary: string;
+  capabilities: Record<string, unknown>;
+  route: Record<string, unknown>;
+  track_summary: Record<string, unknown>;
+  libc: Record<string, unknown>;
+  truncated: unknown[];
+  side_effects: unknown[];
+};
+
+export type AnalysisRun = {
+  schema: "rat.desktop.analysis-run/v1";
+  mode: "fast" | "deep";
+  status: "ok" | "error" | "timeout";
+  target: AnalysisTarget;
+  duration_ms: number;
+  exit_code: number;
+  result: BriefCard | null;
+  diagnostic: string | null;
+};
+
 export type TerminalDelta = {
   schema: string;
   after: number;
@@ -215,12 +260,20 @@ export function getCompletion(): Promise<Completion> {
   return request("/api/completion");
 }
 
+export function getAnalysisStatus(): Promise<AnalysisStatus> {
+  return request("/api/analysis/status");
+}
+
 function control<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
   return request(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-CTF-Rat-Desktop": "1" },
     body: JSON.stringify(body)
   });
+}
+
+export function runBrief(mode: "fast" | "deep"): Promise<AnalysisRun> {
+  return control("/api/analysis/brief", { mode });
 }
 
 export function startSession(): Promise<Session> {
