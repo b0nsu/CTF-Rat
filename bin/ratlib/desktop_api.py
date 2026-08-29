@@ -9,6 +9,14 @@ from collections import Counter
 from typing import Any
 
 from .artifact import describe as artifact_describe, preview as artifact_read_preview
+from .completion import completion_gate
+from .metrics import (
+    aggregate as aggregate_metrics,
+    first_primitive_pass_ts,
+    first_verified_solve_ts,
+    index_backends,
+    iter_tool_results,
+)
 from .state_v2 import Stream, cursor
 
 SNAPSHOT_SCHEMA = "rat.desktop.snapshot/v1"
@@ -17,6 +25,7 @@ LIVE_SCHEMA = "rat.desktop.live/v1"
 ARTIFACTS_SCHEMA = "rat.desktop.artifacts/v1"
 PREVIEW_SCHEMA = "rat.desktop.artifact-preview/v1"
 TELEMETRY_SCHEMA = "rat.desktop.telemetry/v1"
+COMPLETION_SCHEMA = "rat.desktop.completion/v1"
 MAX_ARTIFACTS = 2000
 MAX_PREVIEW = 256 * 1024
 
@@ -289,10 +298,24 @@ def live_update(
     }
 
 
+def completion(challenge_root: str) -> dict[str, Any]:
+    """Return the canonical verified-solve decision without reimplementing it."""
+    verdict = completion_gate(os.path.abspath(challenge_root))
+    return {"schema": COMPLETION_SCHEMA, **verdict}
+
+
 def telemetry(challenge_root: str) -> dict[str, Any]:
-    events = Stream(os.path.abspath(challenge_root)).read()
+    root = os.path.abspath(challenge_root)
+    stream = Stream(root)
+    events = stream.read()
     types = Counter(event["type"] for event in events)
     groups = Counter(event["type"].split(".", 1)[0] for event in events)
+    session_metrics = aggregate_metrics(
+        iter_tool_results(stream.root),
+        primitive_pass_at=first_primitive_pass_ts(root),
+        verified_solve_at=first_verified_solve_ts(root),
+        index_backend_counts=index_backends(stream.root),
+    )
     return {
         "schema": TELEMETRY_SCHEMA,
         "event_count": len(events),
@@ -300,6 +323,7 @@ def telemetry(challenge_root: str) -> dict[str, Any]:
         "groups": dict(sorted(groups.items())),
         "first_at": events[0]["at"] if events else None,
         "last_at": events[-1]["at"] if events else None,
+        "session": session_metrics,
     }
 
 
