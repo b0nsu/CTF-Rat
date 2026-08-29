@@ -3,7 +3,7 @@
 
 HTTP clients cannot choose commands. A single solver argv is configured by the
 operator at daemon startup. Desktop-triggered analysis is restricted to
-manifest-selected targets and canonical ``rat brief`` FAST/DEEP invocations.
+manifest-selected targets and canonical bounded ``rat`` invocations.
 """
 from __future__ import annotations
 import argparse, json, os, shlex, signal, sys
@@ -143,6 +143,10 @@ def _handler(challenge_root, sessions, analyses=None):
                     if set(body) != {"mode"} or body.get("mode") not in {"fast", "deep"}:
                         raise ValueError("analysis request requires mode fast or deep")
                     return self._send(200, analyses.brief(body["mode"]))
+                if parsed.path == "/api/analysis/function":
+                    if set(body) != {"name"} or not isinstance(body.get("name"), str):
+                        raise ValueError("function request requires one string field: name")
+                    return self._send(200, analyses.function(body["name"]))
                 if parsed.path == "/api/session/start":
                     if body:
                         raise ValueError("start request takes no parameters")
