@@ -19,6 +19,9 @@ export type StateView = {
   ruled_out: Record<string, unknown>;
   unknowns: Record<string, unknown>;
   next_probes: unknown[];
+  notes: unknown[];
+  alerts: unknown[];
+  failures: unknown[];
 };
 
 export type Snapshot = {
@@ -99,6 +102,24 @@ export type ArtifactPreview = {
   total_bytes: number;
 };
 
+export type SessionMetrics = {
+  schema: "rat.session-metrics/v1";
+  tool_calls: number;
+  duplicate_tool_calls: number;
+  cache_requests: number;
+  cache_hits: number;
+  cache_misses: number;
+  cache_hit_ratio: number | null;
+  time_to_first_valid_primitive_sec: number | null;
+  time_to_verified_solve_sec: number | null;
+  time_to_flag_sec: number | null;
+  functions_decompiled: number;
+  ghidra_runs: number;
+  revq_runs: number;
+  duration_ms_total: number;
+  indexed_artifacts_by_backend: Record<string, number>;
+};
+
 export type Telemetry = {
   schema: string;
   event_count: number;
@@ -106,6 +127,18 @@ export type Telemetry = {
   groups: Record<string, number>;
   first_at: string | null;
   last_at: string | null;
+  session: SessionMetrics;
+};
+
+export type Completion = {
+  schema: "rat.desktop.completion/v1";
+  verified: boolean;
+  reason: string;
+  detail?: string;
+  primitive_id?: string;
+  verification_id?: string;
+  report_digest?: string;
+  exploit_task_id?: string;
 };
 
 export type TerminalDelta = {
@@ -176,6 +209,10 @@ export function getArtifactPreview(digest: string): Promise<ArtifactPreview> {
 
 export function getTelemetry(): Promise<Telemetry> {
   return request("/api/telemetry");
+}
+
+export function getCompletion(): Promise<Completion> {
+  return request("/api/completion");
 }
 
 function control<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
