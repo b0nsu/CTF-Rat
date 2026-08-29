@@ -55,6 +55,25 @@ BIN="$(resolve_path "${positional[0]}")"; FUNC="${positional[1]:-}"
 [ -f "$BIN" ] || { echo "[!] input 없음: ${positional[0]}" >&2; exit 4; }
 CACHE="${BIN}.decomp"
 META_TOOL="$CTF_HOME/bin/ratlib/decomp_cache.py"
+read -r DECOMP_STARTED_AT DECOMP_STARTED_NS < <(python3 - <<'PY'
+import time
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).isoformat(), time.monotonic_ns())
+PY
+)
+DECOMP_CACHE_STATE=miss
+DECOMP_RESULT_STATUS=ok
+DECOMP_OPERATION=list
+[ -n "$FUNC" ] && DECOMP_OPERATION=function
+record_decomp_invocation(){
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    python3 "$META_TOOL" invocation "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" \
+      "$DECOMP_CACHE_STATE" "$DECOMP_RESULT_STATUS" "$DECOMP_OPERATION" "$FUNC" \
+      "$DECOMP_STARTED_AT" "$DECOMP_STARTED_NS" >/dev/null 2>&1 || true
+  fi
+}
+trap record_decomp_invocation EXIT
 emit_file(){
   if [ "$FORMAT" = json ]; then
     python3 - "$1" <<'PY'
@@ -77,6 +96,10 @@ if [ -f "$CACHE/_index.txt" ]; then
   if [ "$cache_rc" -eq 10 ]; then
     echo "[!] legacy decomp cache: provenance 없음, read-only partial로 사용" >&2
     echo "RAT_STATUS=partial RAT_EXIT=0" >&2
+    DECOMP_CACHE_STATE=bypass
+    DECOMP_RESULT_STATUS=partial
+  elif [ "$cache_rc" -eq 0 ]; then
+    DECOMP_CACHE_STATE=hit
   elif [ "$cache_rc" -ne 0 ]; then
     echo "[!] decomp cache $cache_state: 재분석 필요" >&2
     mv "$CACHE" "$CACHE.$cache_state.$(date +%s)"
@@ -178,6 +201,7 @@ else
       addr=$((addr - 0x300000))
     fi
     printf -v gh "FUN_%08x.c" "$addr"
+    DECOMP_CACHE_STATE=miss
     if [ -x "$GHIDRA/support/analyzeHeadless" ]; then
       echo "[*] '$FUNC' 함수 캐시 없음; Ghidra one-shot create/decompile 시도 $(printf '0x%x' "$addr")" >&2
       proj="$(mktemp -d)"
@@ -217,6 +241,8 @@ else
     stop=$((addr + 192))
     echo "[!] '$FUNC' 함수 캐시 없음; disassembly fallback around $(printf '0x%x' "$addr")" >&2
     echo "RAT_STATUS=fallback RAT_EXIT=0" >&2
+    DECOMP_CACHE_STATE=bypass
+    DECOMP_RESULT_STATUS=partial
     if [ "$FORMAT" = json ]; then
       fallback="$(objdump -d --start-address="$start" --stop-address="$stop" "$BIN")"
       python3 - "$FUNC" "$fallback" <<'PY'
