@@ -819,7 +819,8 @@ def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
         return None, None
 
 
-def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key, index_root, started_at, t0):
+def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
+                        index_root, started_at, t0, parameters):
     """Persist one successful revq invocation without changing sidecar/cache semantics."""
     try:
         from ratlib.artifact import put_bytes
@@ -844,11 +845,7 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key, 
             "finished_at": finished_at,
             "duration_ms": max(0, int((time.monotonic() - t0) * 1000)),
             "inputs": [{"role": "binary", "digest": "sha256:" + cur_sha}],
-            "parameters": {
-                "requested_engine": want_engine,
-                "effective_engine": effective_engine,
-                "refresh": bool(refresh),
-            },
+            "parameters": parameters,
             "summary": {
                 "engine": effective_engine,
                 "functions_total": counts.get("functions_total", 0),
@@ -882,8 +879,6 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key, 
 
 
 def load_or_extract(binpath, want_engine, refresh, index_root=None):
-    started_at = datetime.now(timezone.utc).isoformat()
-    t0 = time.monotonic()
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
     if not refresh and os.path.isfile(cp):
@@ -905,7 +900,6 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
                             idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
                     except Exception: pass
                 rev = annotate_counts(rev)
-                _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, ck, index_root, started_at, t0)
                 return rev
         except Exception:
             pass
@@ -925,7 +919,6 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     if idx and ck:
         try: idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
         except Exception: pass
-    _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, ck, index_root, started_at, t0)
     return rev
 
 
@@ -964,17 +957,27 @@ def main(argv):
     if not os.path.isfile(args.binary):
         die("파일 없음: %s" % args.binary)
 
-    rev = load_or_extract(args.binary, "binutils" if args.fast else "angr", args.refresh)
+    started_at = datetime.now(timezone.utc).isoformat()
+    t0 = time.monotonic()
+    requested_engine = "binutils" if args.fast else "angr"
+    rev = load_or_extract(args.binary, requested_engine, args.refresh)
+    operation = "summary"
+    requested = None
 
     if args.json:
+        operation = "json"
         print(json.dumps(rev, indent=2, ensure_ascii=False))
     elif args.funcs:
+        operation = "funcs"
         print(render_funcs(rev, args.sort, args.limit))
     elif args.strings:
+        operation = "strings"
         print(render_strings(rev, args.grep, args.limit))
     elif args.imports:
+        operation = "imports"
         print(render_imports(rev))
     elif args.interesting:
+        operation = "interesting"
         inter = compute_interesting(rev)
         if not inter:
             print("(interesting 후보 없음 — VM/난독화 가능성. --strings 확인)")
@@ -983,17 +986,37 @@ def main(argv):
             for w in it["why"]:
                 print("     - " + w)
     elif args.oracle:
+        operation = "oracle"
         print(json.dumps(compute_oracle(rev), ensure_ascii=False, separators=(",", ":")))
     elif args.func:
+        operation = "func"
+        requested = args.func
         card = compute_function_card(rev, args.func)
         if card is None:
             print("[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % args.func)
             return 1
         print(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
     elif args.xrefs:
+        operation = "xrefs"
+        requested = args.xrefs
         print(render_xrefs(rev, args.xrefs))
     else:
         print(render_summary(rev))
+    _, cache_key = _canonical_index(args.binary, rev.get("engine") or requested_engine,
+                                    rev.get("sha256") or sha256(args.binary))
+    parameters = {
+        "requested_engine": requested_engine,
+        "effective_engine": rev.get("engine") or requested_engine,
+        "refresh": bool(args.refresh),
+        "operation": operation,
+        "requested": requested,
+        "limit": args.limit,
+        "sort": args.sort,
+        "grep": args.grep,
+    }
+    _persist_invocation(args.binary, rev.get("sha256") or sha256(args.binary),
+                        requested_engine, args.refresh, rev, cache_key, None,
+                        started_at, t0, parameters)
     return 0
 
 

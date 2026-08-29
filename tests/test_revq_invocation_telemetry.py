@@ -43,17 +43,16 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
             root = os.path.join(d, ".rat")
 
             with patch.object(revq, "extract_binutils", return_value=fixture), \
+                 contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
-                first = revq.load_or_extract(binary, "binutils", False)
-                second = revq.load_or_extract(binary, "binutils", False)
-
-            self.assertEqual(first["cache_state"], "miss")
-            self.assertEqual(second["cache_state"], "hit")
+                self.assertEqual(revq.main([binary, "--fast", "--json"]), 0)
+                self.assertEqual(revq.main([binary, "--fast", "--json"]), 0)
             docs = list(iter_tool_results(root))
             self.assertEqual(len(docs), 2)
             self.assertEqual([doc["tool"]["name"] for doc in docs], ["revq", "revq"])
             self.assertEqual(sorted(doc["cache_state"] for doc in docs), ["hit", "miss"])
             self.assertEqual([doc["summary"]["engine"] for doc in docs], ["binutils", "binutils"])
+            self.assertTrue(all(doc["parameters"]["operation"] == "json" for doc in docs))
             self.assertEqual(len({doc["invocation_id"] for doc in docs}), 2)
 
             metrics = aggregate(docs)
@@ -62,6 +61,23 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
             self.assertEqual(metrics["cache_hits"], 1)
             self.assertEqual(metrics["cache_misses"], 1)
             self.assertEqual(metrics["duplicate_tool_calls"], 0)
+
+    def test_failed_selector_is_not_recorded_as_a_successful_invocation(self):
+        revq = _load_revq()
+        fixture = {
+            "schema": revq.SCHEMA, "engine": "binutils", "arch": "AMD64",
+            "pie": False, "stripped": False, "imports": [], "strings": [],
+            "functions": [],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as fh:
+                fh.write(b"fixture-binary")
+            with patch.object(revq, "extract_binutils", return_value=fixture), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(revq.main([binary, "--fast", "--func", "missing"]), 1)
+            self.assertEqual(list(iter_tool_results(os.path.join(d, ".rat"))), [])
 
 
 if __name__ == "__main__":
