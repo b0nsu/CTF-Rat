@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 
-from ratlib.desktop_api import artifact_preview, event_delta, list_artifacts, live_update, snapshot, telemetry
+from ratlib.desktop_api import artifact_preview, completion, event_delta, list_artifacts, live_update, snapshot, telemetry
 from ratlib.desktop_session import SessionManager
 
 MAX_BODY = 16 * 1024
@@ -104,6 +104,8 @@ def _handler(challenge_root, sessions):
                     ))
                 if parsed.path == "/api/telemetry":
                     return self._send(200, telemetry(challenge_root))
+                if parsed.path == "/api/completion":
+                    return self._send(200, completion(challenge_root))
                 if parsed.path == "/api/session":
                     return self._send(200, sessions.status())
                 if parsed.path == "/api/terminal":
