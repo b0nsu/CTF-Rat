@@ -9,6 +9,7 @@ before preserving the original CLI output/exit behavior.
 from __future__ import annotations
 
 import json
+import copy
 
 from . import analysis
 from .artifact import put_bytes
@@ -23,6 +24,15 @@ def _persist_invocation(doc, args):
     the underlying CLI keeps its pre-existing behavior.
     """
     try:
+        exit_info = doc.get("exit") or {}
+        if doc.get("status") not in {"ok", "partial"} or exit_info.get("code") != 0:
+            return
+        doc = copy.deepcopy(doc)
+        if doc.get("cache_state") is None:
+            doc["cache_state"] = "bypass"
+            provenance = doc.setdefault("provenance", {})
+            cache = provenance.setdefault("cache", {})
+            cache["state"] = "bypass"
         validate(doc)
         store = analysis.root(args, getattr(args, "binary", None))
         raw = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()

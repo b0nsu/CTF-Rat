@@ -102,6 +102,19 @@ class ProcessTraceMetrics(unittest.TestCase):
             self.assertIsNone(process_trace_metrics(os.path.join(d, "missing.log"), os.path.join(d, "kit")))
 
 class Aggregate(unittest.TestCase):
+    def test_bypass_and_unknown_states_are_not_cache_requests(self):
+        bypass = envelope(cache_state="bypass")
+        unknown = envelope()
+        del unknown["cache_state"]
+        unknown["provenance"]["cache"] = {"key": None, "hit": False,
+                                            "source_invocation": None}
+        metrics = aggregate([bypass, unknown])
+        self.assertEqual(metrics["tool_calls"], 2)
+        self.assertEqual(metrics["cache_requests"], 0)
+        self.assertEqual(metrics["cache_hits"], 0)
+        self.assertEqual(metrics["cache_misses"], 0)
+        self.assertIsNone(metrics["cache_hit_ratio"])
+
     def test_direct_subjects_use_distinct_cache_entries(self):
         with tempfile.TemporaryDirectory() as d:
             tool = os.path.join(d, "measure")

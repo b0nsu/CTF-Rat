@@ -326,11 +326,14 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         status = doc.get("status")
         cache_state = doc.get("cache_state")
         if cache_state is None:
-            cache_state = "hit" if (doc.get("provenance", {}) or {}).get("cache", {}).get("hit") else "miss"
+            cache = (doc.get("provenance", {}) or {}).get("cache", {}) or {}
+            cache_state = cache.get("state")
+            if cache_state is None and cache.get("hit") is True:
+                cache_state = "hit"
         is_hit = cache_state == "hit" and status == "ok"
         if is_hit:
             cache_hits += 1
-        else:
+        elif cache_state in {"hit", "miss"}:
             cache_misses += 1
             fp = operation_fingerprint(doc)
             if fp in seen_fingerprints:

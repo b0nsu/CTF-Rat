@@ -13,6 +13,13 @@ from ratlib.metrics import aggregate, iter_tool_results
 
 
 class AnalysisInvocationTelemetryTests(unittest.TestCase):
+    def test_error_envelope_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = type("Args", (), {"store": d, "binary": None})()
+            doc = analysis.envelope("rat-profile", None, args, {}, status="error", code=4)
+            analysis_cli._persist_invocation(doc, args)
+            self.assertEqual(list(iter_tool_results(d)), [])
+
     def _fake_command(self, argv, timeout, stdin=None, cwd=None, env=None):
         name = argv[0]
         if name == "file":
