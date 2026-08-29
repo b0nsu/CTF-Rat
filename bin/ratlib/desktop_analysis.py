@@ -2,8 +2,9 @@
 
 Desktop never accepts analysis argv or target paths from HTTP. The challenge's
 validated rat.run/v1 manifest selects the target, and this adapter invokes the
-existing ``rat brief`` front door in either FAST or DEEP mode. STATE, cache,
-artifacts, routing, and verification remain owned by the canonical runtime.
+existing ``rat`` front door for FAST/DEEP briefing and bounded function queries.
+STATE, cache, artifacts, routing, and verification remain owned by the canonical
+runtime.
 """
 from __future__ import annotations
 
@@ -18,8 +19,10 @@ from .schema import validate
 
 STATUS_SCHEMA = "rat.desktop.analysis-status/v1"
 RUN_SCHEMA = "rat.desktop.analysis-run/v1"
+FUNCTION_SCHEMA = "rat.desktop.function-query/v1"
 MODES = {"fast", "deep"}
 MAX_RESULT_BYTES = 256 * 1024
+FUNCTION_BUDGET_BYTES = 32 * 1024
 
 
 def _input_for_role(manifest: dict[str, Any], role: str) -> dict[str, Any] | None:
@@ -83,6 +86,17 @@ def _public_target(target: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in target.items() if not key.startswith("_")}
 
 
+def _function_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("function name must be a string")
+    name = value.strip()
+    if not name or len(name.encode("utf-8")) > 256:
+        raise ValueError("function name must be between 1 and 256 UTF-8 bytes")
+    if any(not char.isprintable() for char in name):
+        raise ValueError("function name must contain printable characters only")
+    return name
+
+
 class AnalysisManager:
     """Serialize bounded Desktop-triggered calls into the canonical ``rat`` CLI."""
 
@@ -98,7 +112,7 @@ class AnalysisManager:
                 "ready": True,
                 "busy": self._run_lock.locked(),
                 "target": _public_target(target),
-                "modes": {"fast": True, "deep": True, "verify_status": True},
+                "modes": {"fast": True, "deep": True, "function": True, "verify_status": True},
                 "reason": None,
             }
         except (OSError, ValueError) as exc:
@@ -107,7 +121,7 @@ class AnalysisManager:
                 "ready": False,
                 "busy": self._run_lock.locked(),
                 "target": None,
-                "modes": {"fast": False, "deep": False, "verify_status": True},
+                "modes": {"fast": False, "deep": False, "function": False, "verify_status": True},
                 "reason": str(exc),
             }
 
@@ -161,5 +175,63 @@ class AnalysisManager:
                     "diagnostic": "rat brief analyzed bytes that do not match the canonical run manifest",
                 }
             return {**base, "status": "ok", "result": card, "diagnostic": stderr or None}
+        finally:
+            self._run_lock.release()
+
+    def function(self, name: str) -> dict[str, Any]:
+        name = _function_name(name)
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("another desktop analysis request is already running")
+        try:
+            target = resolve_target(self.root)
+            rat = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rat"))
+            argv = [
+                rat, "query", "func", target["_binary_path"], name,
+                "--fast", "--budget-bytes", str(FUNCTION_BUDGET_BYTES), "--format", "json",
+            ]
+            result = runner_run(
+                argv,
+                cwd=self.root,
+                timeout_seconds=30.0,
+                limits=ResourceLimits(cpu_seconds=30),
+                preview_bytes=MAX_RESULT_BYTES,
+                max_output_bytes=MAX_RESULT_BYTES,
+                tool_version="desktop-v0.3",
+            )
+            stderr = result.stderr.preview.decode("utf-8", "replace")[-4096:]
+            base = {
+                "schema": FUNCTION_SCHEMA,
+                "name": name,
+                "target": _public_target(target),
+                "duration_ms": result.duration_ms,
+                "exit_code": result.exit_code,
+            }
+            if result.timed_out:
+                return {**base, "status": "timeout", "result": None, "diagnostic": "rat query func timed out"}
+            if result.stdout.truncated:
+                return {**base, "status": "error", "result": None, "diagnostic": "rat query func exceeded desktop output budget"}
+            try:
+                doc = json.loads(result.stdout.preview.decode("utf-8"))
+                validate(doc, "rat.query-result/v1")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                return {**base, "status": "error", "result": None, "diagnostic": stderr or "invalid rat query result: %s" % exc}
+            if sha256_file(target["_binary_path"]) != target["binary"]["sha256"]:
+                return {
+                    **base,
+                    "status": "error",
+                    "result": None,
+                    "diagnostic": "function query target changed during analysis",
+                }
+            diagnostics = doc.get("diagnostics", [])
+            diagnostic = None
+            if diagnostics and isinstance(diagnostics[0], dict):
+                diagnostic = diagnostics[0].get("message")
+            status = doc.get("status") if doc.get("status") in {"ok", "partial", "error"} else "error"
+            return {
+                **base,
+                "status": status,
+                "result": doc,
+                "diagnostic": diagnostic or (stderr if result.exit_code != 0 else None),
+            }
         finally:
             self._run_lock.release()
