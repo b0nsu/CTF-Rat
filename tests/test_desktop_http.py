@@ -26,12 +26,12 @@ class FakeAnalysis:
             "ready": True,
             "busy": False,
             "target": {"binary": {"name": "chall", "sha256": "sha256:" + "1" * 64, "size": 1}},
-            "modes": {"fast": True, "deep": True, "verify_status": True},
+            "modes": {"fast": True, "deep": True, "function": True, "verify_status": True},
             "reason": None,
         }
 
     def brief(self, mode):
-        self.calls.append(mode)
+        self.calls.append(("brief", mode))
         return {
             "schema": "rat.desktop.analysis-run/v1",
             "mode": mode,
@@ -40,6 +40,19 @@ class FakeAnalysis:
             "duration_ms": 1,
             "exit_code": 0,
             "result": {"schema": "rat.brief-card/v1", "binary": "chall", "capabilities": {}, "route": {}, "track_summary": {}, "libc": {}, "truncated": [], "side_effects": []},
+            "diagnostic": None,
+        }
+
+    def function(self, name):
+        self.calls.append(("function", name))
+        return {
+            "schema": "rat.desktop.function-query/v1",
+            "name": name,
+            "status": "ok",
+            "target": self.status()["target"],
+            "duration_ms": 1,
+            "exit_code": 0,
+            "result": {"schema": "rat.query-result/v1", "query": "func:" + name, "status": "ok", "facts": {}, "heuristics": {}, "artifacts": [], "coverage": {"complete": True, "scope": "func:" + name, "omitted": None}, "diagnostics": [], "provenance": {"cache": {"hit": False}}},
             "diagnostic": None,
         }
 
@@ -82,13 +95,30 @@ class DesktopHttpTests(unittest.TestCase):
             ))
             self.assertEqual(status, 200)
             self.assertEqual(doc["mode"], "fast")
-            self.assertEqual(analyses.calls, ["fast"])
+            self.assertEqual(analyses.calls, [("brief", "fast")])
 
             for body in (b'{"mode":"verify"}', b'{"mode":"fast","argv":["/bin/sh"]}', b'{"binary":"/bin/sh","mode":"fast"}'):
                 with self.assertRaises(HTTPError) as caught:
                     urlopen(Request(base + "/api/analysis/brief", data=body, method="POST", headers=headers), timeout=2)
                 self.assertEqual(caught.exception.code, 400)
-            self.assertEqual(analyses.calls, ["fast"])
+            self.assertEqual(analyses.calls, [("brief", "fast")])
+
+    def test_function_query_accepts_only_one_name_field(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyses = FakeAnalysis()
+            base = self.server(root, analyses=analyses)
+            headers = {"Content-Type": "application/json", "X-CTF-Rat-Desktop": "1"}
+            status, doc = self.read_json(Request(
+                base + "/api/analysis/function", data=b'{"name":"main"}', method="POST", headers=headers
+            ))
+            self.assertEqual(status, 200)
+            self.assertEqual(doc["name"], "main")
+            self.assertEqual(analyses.calls, [("function", "main")])
+            for body in (b'{"name":"main","binary":"/bin/sh"}', b'{"name":"main","argv":["sh"]}', b'{"name":1}'):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(Request(base + "/api/analysis/function", data=body, method="POST", headers=headers), timeout=2)
+                self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(analyses.calls, [("function", "main")])
 
     def test_event_generation_hint_round_trips_over_http(self):
         with tempfile.TemporaryDirectory() as root:
