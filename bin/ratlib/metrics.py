@@ -286,15 +286,13 @@ def first_verified_solve_ts(state_dir):
     return None
 
 def index_backends(root):
-    """Distinct cached artifacts per backend from the canonical cache index.
+    """Distinct reusable cache artifacts per backend from the canonical index.
 
-    Closes a lineage blind spot: the tool-result-derived counts below only see
-    tools that route through the bounded adapter (contracts.execute), so
-    revq/decomp/pwngadget -- which write their own caches and register in the
-    shared index instead -- were invisible to telemetry. The index carries one
-    row per distinct (tool, inputs, params) result, so this is a floor on tool
-    activity (cache hits collapse onto the same row), reported separately from
-    the invocation counts rather than conflated with them.
+    Cache lineage and invocation history answer different questions. Successful
+    revq/decomp/pwngadget calls now also persist tool-result invocations, while
+    the shared index still carries one row per distinct reusable result and is
+    useful for historical/lineage visibility. Cache hits collapse onto that row,
+    so these counts must never be interpreted as invocation counts.
     """
     try:
         from .cache import Cache
@@ -315,6 +313,11 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
     primitive-PASS timestamp. New callers should pass ``primitive_pass_at``
     and ``verified_solve_at`` explicitly. ``time_to_flag_sec`` retains its v1
     primitive-PASS meaning; verified-solve latency is exposed separately.
+
+    Tool-result documents prove successful semantic invocations, but they do not
+    prove how many functions a decomp invocation actually decompiled or how many
+    Ghidra processes ran internally. Those stronger metrics remain ``None`` here;
+    observer-owned process traces are the authoritative source for Ghidra runs.
     """
     docs = list(docs)
     seen_fingerprints = {}
@@ -347,9 +350,8 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         primitive_pass_at = verify_pass_at
     time_to_first_valid_primitive_sec = _elapsed_seconds(guard_started_at, primitive_pass_at)
     time_to_verified_solve_sec = _elapsed_seconds(guard_started_at, verified_solve_at)
-    ghidra_runs = sum(n for name, n in tool_name_counts.items() if "ghidra" in name.lower())
     revq_runs = tool_name_counts.get("revq", 0)
-    functions_decompiled = tool_name_counts.get("decomp", 0)
+    decomp_invocations = tool_name_counts.get("decomp", 0)
     return {
         "schema": "rat.session-metrics/v1",
         "tool_calls": len(docs),
@@ -361,12 +363,13 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         "time_to_first_valid_primitive_sec": time_to_first_valid_primitive_sec,
         "time_to_verified_solve_sec": time_to_verified_solve_sec,
         "time_to_flag_sec": time_to_first_valid_primitive_sec,
-        "functions_decompiled": functions_decompiled,
-        "ghidra_runs": ghidra_runs,
+        "functions_decompiled": None,
+        "ghidra_runs": None,
+        "decomp_invocations": decomp_invocations,
         "revq_runs": revq_runs,
         "duration_ms_total": duration_total,
-        # lineage floor for tools that bypass the tool-result store (revq/decomp/
-        # pwngadget), sourced from the shared cache index -- see index_backends().
+        # Cache-lineage counts are distinct from invocation history; cache hits
+        # intentionally collapse onto the same reusable result row.
         "indexed_artifacts_by_backend": dict(index_backend_counts) if index_backend_counts else {},
     }
 
