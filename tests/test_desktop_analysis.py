@@ -28,10 +28,11 @@ class DesktopAnalysisTests(unittest.TestCase):
         atomic_write(os.path.join(root, "run.json"), manifest)
         return binary, manifest
 
-    def brief_card(self, binary):
+    def brief_card(self, binary, digest):
         return {
             "schema": "rat.brief-card/v1",
             "binary": binary,
+            "binary_sha256": digest,
             "capabilities": {"binutils": True, "angr": False},
             "route": {"track": "rev", "subroute": "rev-checker", "confidence": 0.8},
             "track_summary": {"entry": "main"},
@@ -68,8 +69,8 @@ class DesktopAnalysisTests(unittest.TestCase):
 
     def test_fast_and_deep_only_select_canonical_rat_brief_mode(self):
         with tempfile.TemporaryDirectory() as root:
-            binary, _ = self.make_challenge(root)
-            card = json.dumps(self.brief_card(binary)).encode()
+            binary, manifest = self.make_challenge(root)
+            card = json.dumps(self.brief_card(binary, manifest["inputs"][0]["sha256"])).encode()
             manager = AnalysisManager(root)
             calls = []
 
@@ -93,6 +94,17 @@ class DesktopAnalysisTests(unittest.TestCase):
                 self.assertIn("json", argv)
                 self.assertEqual(kwargs["cwd"], os.path.abspath(root))
                 self.assertLessEqual(kwargs["max_output_bytes"], 256 * 1024)
+
+    def test_result_digest_must_match_manifest_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, _ = self.make_challenge(root)
+            card = json.dumps(self.brief_card(binary, "sha256:" + "f" * 64)).encode()
+            manager = AnalysisManager(root)
+            with patch("ratlib.desktop_analysis.runner_run", return_value=result(stdout=card)):
+                doc = manager.brief("fast")
+            self.assertEqual(doc["status"], "error")
+            self.assertIn("canonical run manifest", doc["diagnostic"])
+            self.assertIsNone(doc["result"])
 
     def test_invalid_mode_and_unready_status_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
