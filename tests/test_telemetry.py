@@ -50,8 +50,31 @@ class BenchmarkResultV2Schema(unittest.TestCase):
             },
         }
 
-    def test_valid_document_passes(self):
+    def _provenance(self):
+        return {
+            "suite_digest": D,
+            "corpora": ["private"],
+            "agent": {"executable": "codex", "command_digest": D,
+                      "model_id": "gpt-test", "reasoning_effort": "high"},
+            "execution": {"timeout_seconds": 600, "observer_execve_trace": True},
+            "environment": {"os": "linux", "arch": "x86_64", "runtime": "python-3.12"},
+            "toolchain": {"ctf_rat_revision": "a" * 40, "schema_bundle": "v1"},
+        }
+
+    def test_valid_document_passes_without_provenance_for_backward_compatibility(self):
         validate(self._valid())
+
+    def test_valid_optional_provenance_passes(self):
+        doc = self._valid(); doc["provenance"] = self._provenance()
+        validate(doc)
+
+    def test_bad_provenance_digest_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["suite_digest"] = "sha256:bad"
+        with self.assertRaises(ValidationError): validate(doc)
+
+    def test_bad_provenance_timeout_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["execution"]["timeout_seconds"] = 0
+        with self.assertRaises(ValidationError): validate(doc)
 
     def test_missing_metric_group_rejected(self):
         doc = self._valid(); del doc["metrics"]["cache"]
@@ -102,6 +125,19 @@ class ProcessTraceMetrics(unittest.TestCase):
             self.assertIsNone(process_trace_metrics(os.path.join(d, "missing.log"), os.path.join(d, "kit")))
 
 class Aggregate(unittest.TestCase):
+    def test_bypass_and_unknown_states_are_not_cache_requests(self):
+        bypass = envelope(cache_state="bypass")
+        unknown = envelope()
+        del unknown["cache_state"]
+        unknown["provenance"]["cache"] = {"key": None, "hit": False,
+                                            "source_invocation": None}
+        metrics = aggregate([bypass, unknown])
+        self.assertEqual(metrics["tool_calls"], 2)
+        self.assertEqual(metrics["cache_requests"], 0)
+        self.assertEqual(metrics["cache_hits"], 0)
+        self.assertEqual(metrics["cache_misses"], 0)
+        self.assertIsNone(metrics["cache_hit_ratio"])
+
     def test_direct_subjects_use_distinct_cache_entries(self):
         with tempfile.TemporaryDirectory() as d:
             tool = os.path.join(d, "measure")

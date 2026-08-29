@@ -52,6 +52,19 @@ def _suite_entry(entry_id, corpus):
     }
 
 
+def _provenance(*, timeout=600, command_digest=None):
+    digest = command_digest or ("sha256:" + "a" * 64)
+    return {
+        "suite_digest": "sha256:" + "b" * 64,
+        "corpora": ["private"],
+        "agent": {"executable": "codex", "command_digest": digest,
+                  "model_id": "gpt-test", "reasoning_effort": "high"},
+        "execution": {"timeout_seconds": timeout, "observer_execve_trace": True},
+        "environment": {"os": "linux", "arch": "x86_64", "runtime": "python-3.12"},
+        "toolchain": {"ctf_rat_revision": "c" * 40, "schema_bundle": "v1"},
+    }
+
+
 class CorpusGateTests(unittest.TestCase):
     def _write_suite(self, directory, entries):
         path = os.path.join(directory, "suite.json")
@@ -95,6 +108,38 @@ class CorpusGateTests(unittest.TestCase):
                     suite=path, corpus="private", id="synthetic-01"))
 
 
+class BenchmarkProvenanceTests(unittest.TestCase):
+    def test_provenance_hashes_exact_execution_set_and_agent_template(self):
+        entries = [_suite_entry("heldout-01", "private")]
+        args = SimpleNamespace(
+            agent="codex --model gpt-test solve {dir}", timeout=321,
+            model_id="gpt-test", reasoning_effort="high",
+        )
+        environment = {"os": "linux", "arch": "x86_64", "runtime": "python-3.12"}
+        toolchain = {"ctf_rat_revision": "d" * 40, "schema_bundle": "v1"}
+        with mock.patch.object(RATBENCH, "environment_identity", return_value=environment), \
+             mock.patch.object(RATBENCH, "toolchain_identity", return_value=toolchain):
+            doc = RATBENCH._benchmark_provenance(args, "codex", entries, True)
+        self.assertEqual(doc["suite_digest"], RATBENCH.suite_digest(RATBENCH._selected_suite_doc(entries)))
+        self.assertEqual(doc["corpora"], ["private"])
+        self.assertEqual(doc["agent"]["executable"], "codex")
+        self.assertEqual(doc["agent"]["command_digest"], RATBENCH._command_digest(args.agent))
+        self.assertEqual(doc["agent"]["model_id"], "gpt-test")
+        self.assertEqual(doc["agent"]["reasoning_effort"], "high")
+        self.assertEqual(doc["execution"], {"timeout_seconds": 321, "observer_execve_trace": True})
+        self.assertEqual(doc["environment"], environment)
+        self.assertEqual(doc["toolchain"], toolchain)
+        RATBENCH.validate({
+            **RATBENCH._mode_b_v2_record(
+                ENTRY, run_id="B-test", ablation_id="A0",
+                started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+                agent_rc=1, flag_claimed=False,
+                completion={"verified": False, "reason": "no-active-verification"},
+                events=[], primitive_pass_at=None, artifact_count=0, provenance=doc,
+            )
+        }, "rat.benchmark-result/v2")
+
+
 class ModeBV2RecordTests(unittest.TestCase):
     def test_verified_record_uses_canonical_outcome_and_measured_latencies(self):
         events = [
@@ -113,6 +158,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             events=events, primitive_pass_at=1787961603, artifact_count=7,
             process_metrics={"tool_calls": 4, "duplicate_tool_calls": 1,
                              "ghidra_runs": 1, "symbolic_runs": 1},
+            provenance=_provenance(),
         )
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
         self.assertEqual(doc["schema"], "rat.benchmark-result/v2")
@@ -133,6 +179,19 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["ground_truth"]["corpus"], "private")
         self.assertEqual(doc["ground_truth"]["capabilities"], ["stack-overflow"])
         self.assertFalse(doc["ground_truth"]["redistributable"])
+        self.assertEqual(doc["provenance"], _provenance())
+
+    def test_old_v2_record_without_provenance_remains_valid(self):
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-old", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+        )
+        self.assertNotIn("provenance", doc)
+        RATBENCH.validate(doc, "rat.benchmark-result/v2")
 
     def test_flag_without_completion_is_only_solve_claimed(self):
         doc = RATBENCH._mode_b_v2_record(
@@ -194,6 +253,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             primitive_pass_at=None, artifact_count=2,
             process_metrics={"tool_calls": 4, "duplicate_tool_calls": 1,
                              "ghidra_runs": 1, "symbolic_runs": 0},
+            provenance=_provenance(),
         )
         failed = RATBENCH._mode_b_v2_record(
             {**ENTRY, "id": "fixture-02"}, run_id="T", ablation_id="A0",
@@ -202,6 +262,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             agent_rc=1, flag_claimed=False,
             completion={"verified": False, "reason": "no-active-verification"},
             events=[], primitive_pass_at=None, artifact_count=1,
+            provenance=_provenance(),
         )
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "bench", "results")
@@ -217,6 +278,51 @@ class ModeBV2RecordTests(unittest.TestCase):
             self.assertIn("4 (1/2)", leaderboard)
             self.assertIn("1 (1/2)", leaderboard)
             self.assertIn("n/a (0/2)", leaderboard)
+
+    def test_v2_report_rejects_mixed_provenance_for_same_run_ablation(self):
+        first = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0, provenance=_provenance(timeout=600),
+        )
+        second = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "fixture-02"}, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0, provenance=_provenance(timeout=900),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            results = os.path.join(d, "bench", "results")
+            os.makedirs(results)
+            with open(os.path.join(results, "T.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(first) + "\n")
+                fh.write(json.dumps(second) + "\n")
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 3)
+            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v2.md")))
+
+    def test_v2_report_rejects_mixed_provenance_across_ablations(self):
+        first = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="T", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance(timeout=600),
+        )
+        second = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "fixture-02"}, run_id="T", ablation_id="A1",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance(timeout=900),
+        )
+        with self.assertRaisesRegex(ValueError, "comparison run T"):
+            RATBENCH._assert_v2_run_provenance([first, second])
 
     def test_v2_report_rejects_malformed_rows_instead_of_biasing_results(self):
         with tempfile.TemporaryDirectory() as d:

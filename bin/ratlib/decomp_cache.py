@@ -7,10 +7,13 @@ import json
 import os
 import sys
 import tempfile
+import time
+import uuid
 from datetime import datetime, timezone
 
 
 SCHEMA = "rat.decomp-cache/v1"
+_INVOCATION_POLICY = "sha256:" + hashlib.sha256(b"decomp-local-ghidra-v1").hexdigest()
 
 
 def _register_index(cache: str, prov: dict, binary: str) -> None:
@@ -132,6 +135,73 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
         _register_index(cache, prov, binary)
 
 
+def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str,
+                      cache_state: str, status: str, operation: str, requested: str,
+                      started_at: str, started_ns: int) -> bool:
+    """Persist one successful decomp CLI invocation using the canonical tool-result stream.
+
+    The mutable decomp directory remains the cache source of truth.  This record is
+    observational only: every CLI invocation gets a unique id while cache identity
+    stays input/provenance-derived, so a warm hit cannot disappear into one index row.
+    """
+    try:
+        if cache_state not in {"hit", "miss", "bypass"}:
+            raise ValueError("invalid cache state")
+        if status not in {"ok", "partial"}:
+            raise ValueError("invalid successful result status")
+        if operation not in {"list", "function"}:
+            raise ValueError("invalid operation")
+        prov = provenance(binary, ghidra_home, script_dir)
+        meta = load_meta(cache) or {}
+        finished = datetime.now(timezone.utc).isoformat()
+        duration_ms = max(0, (time.monotonic_ns() - int(started_ns)) // 1_000_000)
+        invocation_id = "invoke_" + uuid.uuid4().hex
+        tool_path = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "decomp"))
+        dependency_versions = {"ghidra": prov["ghidra_version"]}
+        dependency_versions.update({"script:" + name: digest for name, digest in sorted(prov["scripts"].items())})
+        doc = {
+            "schema": "rat.tool-result/v1",
+            "tool": {"name": "decomp", "version": "1", "build_digest": "sha256:" + sha256(tool_path)},
+            "run_id": invocation_id,
+            "invocation_id": invocation_id,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished,
+            "duration_ms": int(duration_ms),
+            "inputs": [{"role": "binary", "digest": "sha256:" + prov["binary_sha256"]}],
+            "parameters": {"operation": operation, "requested": requested or None},
+            "summary": {
+                "cache_status": meta.get("status"),
+                "functions_total": meta.get("functions_total"),
+                "functions_exported": meta.get("functions_exported"),
+            },
+            "artifacts": [],
+            "findings": [],
+            "diagnostics": [],
+            "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
+            "provenance": {
+                "platform": sys.platform,
+                "dependency_versions": dependency_versions,
+                "policy_digest": _INVOCATION_POLICY,
+                "cache": {"state": cache_state, "key": "sha256:" + cache_key(prov)},
+            },
+            "cache_state": cache_state,
+        }
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+        from ratlib.artifact import put_bytes
+        from ratlib.cache import resolve_index_root
+        from ratlib.schema import validate as validate_schema
+        validate_schema(doc, "rat.tool-result/v1")
+        payload = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        put_bytes(payload, kind="tool-result", media_type="application/json",
+                  logical_name="decomp-%s.json" % invocation_id,
+                  root=resolve_index_root(binary),
+                  provenance={"tool": "decomp", "invocation_id": invocation_id})
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -140,12 +210,25 @@ def main(argv=None) -> int:
         sp.add_argument("cache"); sp.add_argument("binary"); sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
         if name == "write":
             sp.add_argument("status", choices=("complete", "partial")); sp.add_argument("--diagnostic", default="")
+    sp = sub.add_parser("invocation")
+    sp.add_argument("cache"); sp.add_argument("binary"); sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
+    sp.add_argument("cache_state", choices=("hit", "miss", "bypass"))
+    sp.add_argument("status", choices=("ok", "partial"))
+    sp.add_argument("operation", choices=("list", "function"))
+    sp.add_argument("requested")
+    sp.add_argument("started_at")
+    sp.add_argument("started_ns", type=int)
     a = p.parse_args(argv)
     if a.cmd == "key":
         print(cache_key(provenance(a.binary, a.ghidra_home, a.script_dir))); return 0
     if a.cmd == "validate":
         valid, reason = validate(a.cache, a.binary, a.ghidra_home, a.script_dir)
         print(reason); return 0 if valid else {"legacy": 10, "stale": 11, "partial": 12}[reason]
+    if a.cmd == "invocation":
+        record_invocation(a.cache, a.binary, a.ghidra_home, a.script_dir,
+                          a.cache_state, a.status, a.operation, a.requested,
+                          a.started_at, a.started_ns)
+        return 0
     write_meta(a.cache, a.binary, a.ghidra_home, a.script_dir, a.status, a.diagnostic); return 0
 
 

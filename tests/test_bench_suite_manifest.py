@@ -8,7 +8,9 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "bin"))
 
-from ratlib.bench_suite import SuiteValidationError, load_suite, project_suite, validate_suite
+from ratlib.bench_suite import (
+    SuiteValidationError, load_suite, project_suite, suite_digest, validate_suite,
+)
 
 
 class BenchSuiteManifestTests(unittest.TestCase):
@@ -21,6 +23,15 @@ class BenchSuiteManifestTests(unittest.TestCase):
         self.assertIs(validate_suite(self.suite), self.suite)
         self.assertTrue(all(entry["corpus"] == "synthetic" for entry in self.suite["entries"]))
         self.assertTrue(all(entry["redistributable"] is True for entry in self.suite["entries"]))
+
+    def test_suite_digest_is_stable_and_content_sensitive(self):
+        first = suite_digest(self.suite)
+        second = suite_digest(copy.deepcopy(self.suite))
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
+        changed = copy.deepcopy(self.suite)
+        changed["entries"][0]["difficulty"] += 1
+        self.assertNotEqual(first, suite_digest(changed))
 
     def test_duplicate_id_is_rejected(self):
         doc = copy.deepcopy(self.suite)
@@ -69,6 +80,15 @@ class BenchSuiteManifestTests(unittest.TestCase):
         projected = project_suite(doc, corpus="private")
         self.assertEqual([entry["id"] for entry in projected["entries"]], ["heldout-stack-01"])
         self.assertEqual(len(doc["entries"]), len(self.suite["entries"]) + 1)
+
+    def test_projected_suite_digest_tracks_exact_execution_set(self):
+        doc = copy.deepcopy(self.suite)
+        private = copy.deepcopy(doc["entries"][0])
+        private.update({"id": "heldout-stack-01", "corpus": "private", "redistributable": False})
+        doc["entries"].append(private)
+        synthetic = project_suite(doc, corpus="synthetic")
+        private_only = project_suite(doc, corpus="private")
+        self.assertNotEqual(suite_digest(synthetic), suite_digest(private_only))
 
     def test_project_suite_rejects_empty_corpus(self):
         with self.assertRaisesRegex(SuiteValidationError, "no entries for corpus: private"):

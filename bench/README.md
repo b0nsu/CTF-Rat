@@ -47,7 +47,9 @@ Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `art
 
 ## Fail-closed preflight and corpus projection
 
-Validate the local manifest and emit only the intended corpus before running a benchmark:
+`ratbench run/eval` validates the suite and applies `--corpus` before route/oracle/agent execution. A missing requested corpus is an error, not a zero-entry benchmark.
+
+For an explicit standalone preflight, the same canonical implementation can emit a projected suite without executing anything:
 
 ```sh
 PYTHONPATH=bin python3 -m ratlib.bench_suite \
@@ -55,18 +57,35 @@ PYTHONPATH=bin python3 -m ratlib.bench_suite \
   > /tmp/ctf-rat-private-suite.json
 ```
 
-The command exits non-zero for malformed JSON/schema, unsafe paths, duplicate IDs, invalid metadata, or an empty requested corpus. It does not execute a solver or benchmark. The projected file is consumed by the existing runner:
+The command exits non-zero for malformed JSON/schema, unsafe paths, duplicate IDs, invalid metadata, or an empty requested corpus. Direct Mode B execution can use the local suite without an intermediate file:
 
 ```sh
 python3 bin/ratbench eval \
-  --suite /tmp/ctf-rat-private-suite.json \
-  --run-id B-private-A0-001 \
+  --suite bench/local-suite.json \
+  --corpus private \
+  --run-id B-private-001 \
   --ablation A0 \
+  --model-id '<model label>' \
+  --reasoning-effort '<effort label>' \
   --agent '<agent-cli using {dir}>'
 ```
 
-Use a separate projected suite/run ID for each corpus and ablation. Do not mix synthetic fixtures with real/private entries in a solve-rate comparison.
+Use a separate run ID when measurement conditions change. Do not mix synthetic fixtures with real/private entries in a solve-rate comparison.
+
+## Benchmark-v2 provenance
+
+Current Mode B producers attach a `provenance` object to every `rat.benchmark-result/v2` row. It records:
+
+- SHA-256 of the exact validated post-filter suite execution set;
+- selected corpus class(es);
+- agent executable name and SHA-256 of the exact agent command template (the raw command is not stored);
+- optional `--model-id` and `--reasoning-effort` labels;
+- timeout and whether observer-owned `execve` tracing was available;
+- OS, architecture, and Python runtime identity;
+- CTF-Rat revision and schema-bundle identity.
+
+If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. Historical benchmark-v2 rows without provenance remain readable for compatibility. `ratbench report --schema v2` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
 
 ## Measurement rule
 
-Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v2 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
+Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v2 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
