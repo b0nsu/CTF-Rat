@@ -133,6 +133,31 @@ class DesktopAnalysisTests(unittest.TestCase):
             self.assertIn("canonical run manifest", doc["diagnostic"])
             self.assertIsNone(doc["result"])
 
+    def test_supplied_libc_digest_must_match_manifest_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = os.path.join(root, "chall")
+            libc = os.path.join(root, "libc.so.6")
+            with open(binary, "wb") as output:
+                output.write(b"desktop-analysis-binary")
+            with open(libc, "wb") as output:
+                output.write(b"desktop-analysis-libc")
+            manifest = new_direct("desktop-libc", binary, libc, None)
+            atomic_write(os.path.join(root, "run.json"), manifest)
+            binary_input = next(item for item in manifest["inputs"] if item["role"] == "binary")
+            card = self.brief_card(binary, binary_input["sha256"])
+            card["libc"] = {
+                "supplied": "libc.so.6",
+                "sha256": "sha256:" + "f" * 64,
+                "reference_match": None,
+                "match_method": None,
+                "db_status": "absent",
+            }
+            with patch("ratlib.desktop_analysis.runner_run", return_value=result(stdout=json.dumps(card).encode())):
+                doc = AnalysisManager(root).brief("fast")
+            self.assertEqual(doc["status"], "error")
+            self.assertIn("libc bytes", doc["diagnostic"])
+            self.assertIsNone(doc["result"])
+
     def test_function_query_is_fixed_fast_bounded_rat_query(self):
         with tempfile.TemporaryDirectory() as root:
             binary, _ = self.make_challenge(root)
