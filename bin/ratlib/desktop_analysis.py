@@ -153,6 +153,13 @@ class AnalysisManager:
                 validate(card, "rat.brief-card/v1")
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 return {**base, "status": "error", "result": None, "diagnostic": "invalid rat brief result: %s" % exc}
+            if card.get("binary_sha256") != target["binary"]["sha256"]:
+                return {
+                    **base,
+                    "status": "error",
+                    "result": None,
+                    "diagnostic": "rat brief analyzed bytes that do not match the canonical run manifest",
+                }
             return {**base, "status": "ok", "result": card, "diagnostic": stderr or None}
         finally:
             self._run_lock.release()
