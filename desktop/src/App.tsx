@@ -25,7 +25,7 @@ import {
 function eventLabel(event: EventRecord): string {
   const payload = event.payload ?? {};
   for (const key of [
-    "text", "probe", "phase", "status", "state", "failure_class", "reason",
+    "text", "probe", "phase", "status", "state", "failure_class", "class", "reason",
     "hypothesis_id", "finding_id", "primitive_id", "observation_id", "verification_id"
   ]) {
     const value = payload[key];
@@ -254,6 +254,7 @@ export default function App() {
   }, [displaySnapshot]);
   const challengeName = liveSnapshot?.challenge_root.split(/[\\/]/).filter(Boolean).at(-1) ?? "No challenge";
   const metrics = telemetry?.session;
+  const completionLabel = completion === null ? "UNKNOWN" : completion.verified ? "VERIFIED" : "OPEN";
 
   const runControl = async (action: "start" | "stop") => {
     try {
@@ -328,11 +329,11 @@ export default function App() {
         </div>
         <div className="top-actions">
           <div
-            className={`completion-pill ${completion?.verified ? "verified" : "open"}`}
-            aria-label={`Challenge completion ${completion?.verified ? "verified" : "open"}`}
-            title={completion?.reason ?? "completion gate not checked"}
+            className={`completion-pill ${completion?.verified ? "verified" : completion ? "open" : "unknown"}`}
+            aria-label={`Challenge completion ${completionLabel.toLowerCase()}`}
+            title={completion?.reason ?? "completion gate unavailable"}
           >
-            {completion?.verified ? "VERIFIED" : "OPEN"}
+            {completionLabel}
           </div>
           <div className={`session-pill ${session?.status ?? "idle"}`} aria-label={`Solver session ${session?.status ?? "idle"}`}>{session?.status?.toUpperCase() ?? "IDLE"}</div>
           <button type="button" className="primary" disabled={!session?.configured || session?.status === "running"} onClick={() => void runControl("start")}>Start Solver</button>
@@ -356,7 +357,7 @@ export default function App() {
         />
         <code>{replaySeq === null ? "LIVE" : `#${replaySeq}`}</code>
         <span className="telemetry-inline">
-          events {liveSnapshot?.total_event_count ?? 0} · tools {metrics?.tool_calls ?? 0} · dup {metrics?.duplicate_tool_calls ?? 0} · cache {percent(metrics?.cache_hit_ratio)}
+          events {liveSnapshot?.total_event_count ?? 0} · tools {metrics ? metrics.tool_calls : "—"} · dup {metrics ? metrics.duplicate_tool_calls : "—"} · cache {percent(metrics?.cache_hit_ratio)}
         </span>
       </section>
 
@@ -378,7 +379,7 @@ export default function App() {
             <span>Total</span><strong>{liveSnapshot?.total_event_count ?? 0}</strong>
             <span>PID</span><strong>{session?.pid ?? "—"}</strong>
             <span>Exit</span><strong>{session?.exit_code ?? "—"}</strong>
-            <span>Solve</span><strong className={completion?.verified ? "metric-good" : ""}>{completion?.verified ? "VERIFIED" : "open"}</strong>
+            <span>Solve</span><strong className={completion?.verified ? "metric-good" : ""}>{completion === null ? "—" : completion.verified ? "VERIFIED" : "open"}</strong>
           </div>
           <div className="panel-title subsection" id="metrics-title" role="heading" aria-level={3}>RUN METRICS</div>
           <div className="metric-grid" aria-labelledby="metrics-title">
