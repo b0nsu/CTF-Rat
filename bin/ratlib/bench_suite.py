@@ -9,6 +9,7 @@ existing ``ratbench --suite`` interface; it does not execute benchmarks.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -93,6 +94,13 @@ def validate_suite(doc):
         if not isinstance(entry.get("env", {}), Mapping):
             raise SuiteValidationError("%s.env must be an object" % entry_id)
     return doc
+
+
+def suite_digest(doc):
+    """Content digest for the exact validated suite/projection being measured."""
+    validate_suite(doc)
+    raw = json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def load_suite(path):

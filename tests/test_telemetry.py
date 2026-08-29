@@ -50,8 +50,31 @@ class BenchmarkResultV2Schema(unittest.TestCase):
             },
         }
 
-    def test_valid_document_passes(self):
+    def _provenance(self):
+        return {
+            "suite_digest": D,
+            "corpora": ["private"],
+            "agent": {"executable": "codex", "command_digest": D,
+                      "model_id": "gpt-test", "reasoning_effort": "high"},
+            "execution": {"timeout_seconds": 600, "observer_execve_trace": True},
+            "environment": {"os": "linux", "arch": "x86_64", "runtime": "python-3.12"},
+            "toolchain": {"ctf_rat_revision": "a" * 40, "schema_bundle": "v1"},
+        }
+
+    def test_valid_document_passes_without_provenance_for_backward_compatibility(self):
         validate(self._valid())
+
+    def test_valid_optional_provenance_passes(self):
+        doc = self._valid(); doc["provenance"] = self._provenance()
+        validate(doc)
+
+    def test_bad_provenance_digest_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["suite_digest"] = "sha256:bad"
+        with self.assertRaises(ValidationError): validate(doc)
+
+    def test_bad_provenance_timeout_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["execution"]["timeout_seconds"] = 0
+        with self.assertRaises(ValidationError): validate(doc)
 
     def test_missing_metric_group_rejected(self):
         doc = self._valid(); del doc["metrics"]["cache"]

@@ -91,14 +91,35 @@ def benchmark_result(d):
     if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
     if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
     if d["outcome"] not in {"verified","solve-claimed","failed","censored","unknown","skipped"}: raise ValidationError("invalid benchmark outcome")
+def _benchmark_provenance(d):
+    if not isinstance(d,Mapping): raise ValidationError("invalid benchmark provenance")
+    _strict(d,{"suite_digest","corpora","agent","execution","environment","toolchain"})
+    _need(d,("suite_digest","corpora","agent","execution","environment","toolchain")); _digest(d["suite_digest"])
+    corpora=d["corpora"]
+    if not isinstance(corpora,list) or not corpora or any(not isinstance(x,str) or x not in {"synthetic","integration","real","private"} for x in corpora) or len(corpora)!=len(set(corpora)): raise ValidationError("invalid benchmark provenance corpora")
+    agent=d["agent"]
+    if not isinstance(agent,Mapping) or set(agent)!={"executable","command_digest","model_id","reasoning_effort"}: raise ValidationError("invalid benchmark provenance agent")
+    if not isinstance(agent["executable"],str) or not agent["executable"]: raise ValidationError("invalid benchmark agent executable")
+    _digest(agent["command_digest"])
+    for key in ("model_id","reasoning_effort"):
+        if agent[key] is not None and (not isinstance(agent[key],str) or not agent[key]): raise ValidationError("invalid benchmark agent %s" % key)
+    execution=d["execution"]
+    if not isinstance(execution,Mapping) or set(execution)!={"timeout_seconds","observer_execve_trace"}: raise ValidationError("invalid benchmark provenance execution")
+    if not isinstance(execution["timeout_seconds"],int) or isinstance(execution["timeout_seconds"],bool) or execution["timeout_seconds"] < 1: raise ValidationError("invalid benchmark timeout")
+    if not isinstance(execution["observer_execve_trace"],bool): raise ValidationError("invalid benchmark observer flag")
+    environment=d["environment"]
+    if not isinstance(environment,Mapping) or set(environment)!={"os","arch","runtime"} or any(not isinstance(environment[k],str) or not environment[k] for k in environment): raise ValidationError("invalid benchmark environment")
+    toolchain=d["toolchain"]
+    if not isinstance(toolchain,Mapping) or set(toolchain)!={"ctf_rat_revision","schema_bundle"} or any(not isinstance(toolchain[k],str) or not toolchain[k] for k in toolchain): raise ValidationError("invalid benchmark toolchain")
 def benchmark_result_v2(d):
     _need(d,("schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"))
-    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"})
+    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance"})
     if d["ablation_id"] not in {"A0","A1","A2","A3","A4","A5"}: raise ValidationError("invalid ablation")
     if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
     if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
     if d["outcome"] not in {"verified","solve-claimed","failed","censored","unknown","skipped"}: raise ValidationError("invalid benchmark outcome")
     _iso(d["started_at"]); _iso(d["finished_at"])
+    if "provenance" in d: _benchmark_provenance(d["provenance"])
     groups = {
         "correctness": {"verified_solve","false_solved","oracle_pass"},
         "latency": {"time_to_first_query_ms","time_to_first_hypothesis_ms","time_to_first_valid_primitive_ms","time_to_verified_solve_ms"},
