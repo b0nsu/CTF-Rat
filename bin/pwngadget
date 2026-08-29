@@ -26,7 +26,9 @@ from datetime import datetime, timezone
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 
+from ratlib.artifact import put_bytes  # noqa: E402
 from ratlib.cache import Cache, canonical_key, resolve_index_root  # noqa: E402
+from ratlib.schema import validate  # noqa: E402
 from ratlib import runner  # noqa: E402
 
 TOOL_VERSION = "1"
@@ -256,7 +258,7 @@ def query_binary(binary, query, arch, limit, fmt):
             env = _envelope(binary=binary, sha=sha, query=query, arch=arch, limit=limit,
                             gadgets=gadgets, status=status, tool_used=engine,
                             cache_state="hit", started=now, finished=now, duration_ms=0)
-            _emit(env, fmt)
+            _emit(env, fmt, root)
             return runner.EXIT_OK
         # Corrupt/malformed cache entry: fall through and treat as a miss (recompute).
     t0 = time.monotonic()
@@ -286,7 +288,7 @@ def query_binary(binary, query, arch, limit, fmt):
     if truncated:
         # Do not cache an incomplete dump: a later, larger-budget run must re-execute.
         print("[pwngadget:warn] %s output truncated at capture cap; result not cached" % tool, file=sys.stderr)
-        _emit(env, fmt)
+        _emit(env, fmt, root)
         return runner.EXIT_OK
     # persist filtered result as the cached artifact
     cache_dir = os.path.join(root, "pwngadget")
@@ -295,11 +297,24 @@ def query_binary(binary, query, arch, limit, fmt):
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(env, fh, sort_keys=True)
     cache.put_entry(k, backend="pwngadget", path=out_path, envelope_digest=_sha256_text(json.dumps(env, sort_keys=True)))
-    _emit(env, fmt)
+    _emit(env, fmt, root)
     return runner.EXIT_OK
 
 
-def _emit(env, fmt):
+def _persist_invocation(env, root):
+    """Best-effort persist one already-canonical result for invocation telemetry."""
+    try:
+        validate(env, "rat.tool-result/v1")
+        raw = json.dumps(env, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        put_bytes(raw, kind="tool-result", media_type="application/json",
+                  logical_name="pwngadget-invocation.json", root=root)
+    except Exception:
+        return
+
+
+def _emit(env, fmt, root=None):
+    if root is not None:
+        _persist_invocation(env, root)
     if fmt == "json":
         print(json.dumps(env, sort_keys=True, ensure_ascii=False)); return
     s = env["summary"]
@@ -372,7 +387,6 @@ def _selftest():
                     limit=20, gadgets=pr, status="ok", tool_used="ROPgadget", cache_state="miss",
                     started=now, finished=now, duration_ms=7)
     try:
-        from ratlib.schema import validate
         validate(env, "rat.tool-result/v1")
         chk(env["duration_ms"] == 7 and env["run_id"] == env["invocation_id"], "envelope: validates + real duration + invocation-scoped run_id")
     except Exception as exc:
