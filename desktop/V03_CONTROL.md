@@ -2,7 +2,7 @@
 
 ## Status
 
-This is the first v0.3 slice. It adds a bounded control surface without turning Desktop into a second solver or a generic command runner.
+This v0.3 slice adds bounded control and query surfaces without turning Desktop into a second solver, decompiler, verifier, or generic command runner.
 
 ## Canonical path
 
@@ -15,11 +15,12 @@ Desktop AnalysisManager
         |
         | fixed argv only
         v
-rat brief --fast    (FAST)
-rat brief           (DEEP)
+rat brief --fast              (FAST)
+rat brief                     (DEEP)
+rat query func ... --fast     (Function Card)
         |
         v
-canonical route / cache / STATE / artifacts
+canonical route / query / cache / STATE / artifacts
 ```
 
 `VERIFY STATUS` is deliberately different: it re-reads `/api/completion`, which delegates to the canonical completion gate. It does not execute a new verifier and cannot turn a primitive PASS into a solved challenge.
@@ -30,9 +31,11 @@ The browser does not provide a binary path or argv.
 
 `AnalysisManager` reads the challenge's validated `run.json`, resolves the single `binary` input (and optional `libc` input), requires a challenge-local basename, resolves symlinks, rejects root escape, and re-hashes the local file against the manifest SHA-256 and size.
 
-After `rat brief` returns, Desktop validates the `rat.brief-card/v1` document and requires its reported `binary_sha256` to match the manifest digest. This closes the adapter's pre-run/post-run identity check; a changed target is reported as an analysis error rather than accepted as a result for the canonical run.
+After `rat brief` returns, Desktop validates the `rat.brief-card/v1` document and requires its reported `binary_sha256` to match the manifest digest. A changed target is reported as an analysis error rather than accepted as a result for the canonical run.
 
-Private resolved filesystem paths are never serialized by `/api/analysis/status` or `/api/analysis/brief`.
+Function queries re-hash the target after the bounded query returns and reject the result if the local target changed during analysis.
+
+Private resolved filesystem paths are never serialized by the Desktop analysis APIs.
 
 ## HTTP surface
 
@@ -42,7 +45,7 @@ Read-only status:
 GET /api/analysis/status
 ```
 
-Bounded analysis:
+Bounded briefing:
 
 ```text
 POST /api/analysis/brief
@@ -59,6 +62,18 @@ or:
 ```
 
 The body must contain exactly one field, `mode`, and only `fast` or `deep` are accepted. Requests containing `argv`, `binary`, paths, or additional fields fail closed.
+
+Bounded Function Card query:
+
+```text
+POST /api/analysis/function
+X-CTF-Rat-Desktop: 1
+Content-Type: application/json
+
+{"name":"main"}
+```
+
+The body must contain exactly one string field, `name`. The adapter trims surrounding whitespace, limits the name to 256 UTF-8 bytes, rejects control characters, and passes it as one argv element. It never treats the name as shell syntax.
 
 ## FAST
 
@@ -80,6 +95,27 @@ rat brief <manifest-binary> --format json --budget-tokens 1500
 
 This is not a separate Desktop analysis implementation. `rat brief` decides which canonical analysis capabilities are available; if a richer dependency is unavailable, the brief contract remains responsible for the resulting capability/diagnostic state.
 
+## Function Card
+
+The Function Card path invokes:
+
+```text
+rat query func <manifest-binary> <function-name> \
+  --fast --budget-bytes 32768 --format json
+```
+
+Desktop validates the returned `rat.query-result/v1` document and renders a bounded projection of the canonical facts:
+
+- callers
+- callees
+- strings
+- coverage completeness
+- query status and duration
+
+The UI previews at most six items per list even though the backend query result itself is already budget-bounded. Desktop does not decompile the function and does not create a parallel function-analysis cache.
+
+The query uses `--fast` intentionally. Deeper whole-binary work belongs to DEEP; a Function Card is a targeted, bounded working-set query.
+
 ## VERIFY STATUS
 
 The UI button is intentionally named `VERIFY STATUS`, not `VERIFY`.
@@ -90,17 +126,20 @@ A future true verifier-execution control requires a canonical verification-reque
 
 ## Concurrency and budgets
 
-Desktop serializes FAST/DEEP requests with one in-memory lock. The lock is only an execution guard; it is not state or evidence and is discarded on daemon restart.
+Desktop serializes FAST, DEEP, and Function Card requests with one in-memory lock. The lock is only an execution guard; it is not state or evidence and is discarded on daemon restart.
 
 Current adapter budgets:
 
 - FAST wall timeout: 30 seconds
 - DEEP wall timeout: 90 seconds
-- child CPU limit: 60 seconds
+- Function Card wall timeout: 30 seconds
+- brief child CPU limit: 60 seconds
+- Function Card child CPU limit: 30 seconds
 - stdout/stderr hard cap: 256 KiB each
 - brief context budget: 1,500 tokens
+- Function Card fact budget: 32 KiB
 
-STATE, artifact, cache, and governor side effects are whatever the canonical `rat brief` implementation records. Desktop does not reproduce them.
+STATE, artifact, cache, query, and governor side effects are whatever the canonical `rat` implementation records. Desktop does not reproduce them.
 
 ## UI
 
@@ -108,8 +147,10 @@ The v0.3 command bar sits above the existing workbench and keeps the v0.2 inform
 
 - manifest-selected target name and shortened digest
 - FAST / DEEP controls
+- bounded function-name input + FUNC action
 - VERIFY STATUS
 - latest route/subroute, confidence, duration, and next bounded query when available
+- compact Function Card facts for callers/callees/strings
 - bounded error status
 
 The main STATE timeline, terminal, artifact browser, replay, and inspector remain unchanged.
@@ -124,6 +165,7 @@ Desktop CI runs the dedicated analysis tests together with existing Desktop test
 - invalid-mode rejection
 - output-size budget
 - post-run brief digest binding
-- HTTP rejection of injected `argv` or `binary` fields
+- bounded Function Card argv/budget/name validation
+- HTTP rejection of injected `argv` or `binary` fields for both briefing and function queries
 
 The Desktop workflow also watches the canonical dependencies used by this adapter: `bin/rat`, `run_manifest.py`, `runner.py`, and `schema.py`, in addition to the existing STATE/artifact/completion dependencies.
