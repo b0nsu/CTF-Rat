@@ -2,7 +2,7 @@
 
 Desktop never accepts analysis argv or target paths from HTTP. The challenge's
 validated rat.run/v1 manifest selects the target, and this adapter invokes the
-existing ``rat`` front door for FAST/DEEP briefing and bounded function queries.
+existing ``rat`` front door for FAST/DEEP briefing and bounded query cards.
 STATE, cache, artifacts, routing, and verification remain owned by the canonical
 runtime.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from typing import Any
 
@@ -20,9 +21,11 @@ from .schema import validate
 STATUS_SCHEMA = "rat.desktop.analysis-status/v1"
 RUN_SCHEMA = "rat.desktop.analysis-run/v1"
 FUNCTION_SCHEMA = "rat.desktop.function-query/v1"
+ORACLE_SCHEMA = "rat.desktop.oracle-query/v1"
+SLICE_SCHEMA = "rat.desktop.slice-query/v1"
 MODES = {"fast", "deep"}
 MAX_RESULT_BYTES = 256 * 1024
-FUNCTION_BUDGET_BYTES = 32 * 1024
+QUERY_BUDGET_BYTES = 32 * 1024
 
 
 def _input_for_role(manifest: dict[str, Any], role: str) -> dict[str, Any] | None:
@@ -97,6 +100,52 @@ def _function_name(value: str) -> str:
     return name
 
 
+def _address(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("slice target must be an address string")
+    text = value.strip()
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", text):
+        raise ValueError("slice target must be a hexadecimal or decimal address")
+    parsed = int(text[2:], 16) if text.lower().startswith("0x") else int(text, 10)
+    if parsed < 0 or parsed > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("slice target address is out of range")
+    return hex(parsed)
+
+
+def _query_diagnostic(doc: dict[str, Any], stderr: str) -> str | None:
+    diagnostics = doc.get("diagnostics", [])
+    if diagnostics and isinstance(diagnostics[0], dict):
+        message = diagnostics[0].get("message")
+        if isinstance(message, str) and message:
+            return message
+    return stderr or None
+
+
+def _query_output(result, target: dict[str, Any], label: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    stderr = result.stderr.preview.decode("utf-8", "replace")[-4096:]
+    if result.timed_out:
+        return "timeout", None, "%s timed out" % label
+    if result.stdout.truncated:
+        return "error", None, "%s exceeded desktop output budget" % label
+    try:
+        doc = json.loads(result.stdout.preview.decode("utf-8"))
+        validate(doc, "rat.query-result/v1")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return "error", None, stderr or "invalid %s result: %s" % (label, exc)
+
+    expected = target["binary"]["sha256"]
+    provenance = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
+    reported = provenance.get("binary_sha256")
+    if isinstance(reported, str) and reported != expected:
+        return "error", None, "%s result does not match the canonical run manifest" % label
+    if sha256_file(target["_binary_path"]) != expected:
+        return "error", None, "%s target changed during analysis" % label
+
+    status = doc.get("status") if doc.get("status") in {"ok", "partial", "error"} else "error"
+    diagnostic = _query_diagnostic(doc, stderr if result.exit_code != 0 else "")
+    return status, doc, diagnostic
+
+
 class AnalysisManager:
     """Serialize bounded Desktop-triggered calls into the canonical ``rat`` CLI."""
 
@@ -112,7 +161,14 @@ class AnalysisManager:
                 "ready": True,
                 "busy": self._run_lock.locked(),
                 "target": _public_target(target),
-                "modes": {"fast": True, "deep": True, "function": True, "verify_status": True},
+                "modes": {
+                    "fast": True,
+                    "deep": True,
+                    "function": True,
+                    "oracle": True,
+                    "slice": True,
+                    "verify_status": True,
+                },
                 "reason": None,
             }
         except (OSError, ValueError) as exc:
@@ -121,7 +177,14 @@ class AnalysisManager:
                 "ready": False,
                 "busy": self._run_lock.locked(),
                 "target": None,
-                "modes": {"fast": False, "deep": False, "function": False, "verify_status": True},
+                "modes": {
+                    "fast": False,
+                    "deep": False,
+                    "function": False,
+                    "oracle": False,
+                    "slice": False,
+                    "verify_status": True,
+                },
                 "reason": str(exc),
             }
 
@@ -196,7 +259,7 @@ class AnalysisManager:
             rat = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rat"))
             argv = [
                 rat, "query", "func", target["_binary_path"], name,
-                "--fast", "--budget-bytes", str(FUNCTION_BUDGET_BYTES), "--format", "json",
+                "--fast", "--budget-bytes", str(QUERY_BUDGET_BYTES), "--format", "json",
             ]
             result = runner_run(
                 argv,
@@ -207,40 +270,82 @@ class AnalysisManager:
                 max_output_bytes=MAX_RESULT_BYTES,
                 tool_version="desktop-v0.3",
             )
-            stderr = result.stderr.preview.decode("utf-8", "replace")[-4096:]
-            base = {
+            status, doc, diagnostic = _query_output(result, target, "rat query func")
+            return {
                 "schema": FUNCTION_SCHEMA,
                 "name": name,
                 "target": _public_target(target),
                 "duration_ms": result.duration_ms,
                 "exit_code": result.exit_code,
-            }
-            if result.timed_out:
-                return {**base, "status": "timeout", "result": None, "diagnostic": "rat query func timed out"}
-            if result.stdout.truncated:
-                return {**base, "status": "error", "result": None, "diagnostic": "rat query func exceeded desktop output budget"}
-            try:
-                doc = json.loads(result.stdout.preview.decode("utf-8"))
-                validate(doc, "rat.query-result/v1")
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                return {**base, "status": "error", "result": None, "diagnostic": stderr or "invalid rat query result: %s" % exc}
-            if sha256_file(target["_binary_path"]) != target["binary"]["sha256"]:
-                return {
-                    **base,
-                    "status": "error",
-                    "result": None,
-                    "diagnostic": "function query target changed during analysis",
-                }
-            diagnostics = doc.get("diagnostics", [])
-            diagnostic = None
-            if diagnostics and isinstance(diagnostics[0], dict):
-                diagnostic = diagnostics[0].get("message")
-            status = doc.get("status") if doc.get("status") in {"ok", "partial", "error"} else "error"
-            return {
-                **base,
                 "status": status,
                 "result": doc,
-                "diagnostic": diagnostic or (stderr if result.exit_code != 0 else None),
+                "diagnostic": diagnostic,
+            }
+        finally:
+            self._run_lock.release()
+
+    def oracle(self) -> dict[str, Any]:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("another desktop analysis request is already running")
+        try:
+            target = resolve_target(self.root)
+            rat = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rat"))
+            argv = [
+                rat, "query", "oracle", target["_binary_path"],
+                "--fast", "--budget-bytes", str(QUERY_BUDGET_BYTES), "--format", "json",
+            ]
+            result = runner_run(
+                argv,
+                cwd=self.root,
+                timeout_seconds=30.0,
+                limits=ResourceLimits(cpu_seconds=30),
+                preview_bytes=MAX_RESULT_BYTES,
+                max_output_bytes=MAX_RESULT_BYTES,
+                tool_version="desktop-v0.3",
+            )
+            status, doc, diagnostic = _query_output(result, target, "rat query oracle")
+            return {
+                "schema": ORACLE_SCHEMA,
+                "target": _public_target(target),
+                "duration_ms": result.duration_ms,
+                "exit_code": result.exit_code,
+                "status": status,
+                "result": doc,
+                "diagnostic": diagnostic,
+            }
+        finally:
+            self._run_lock.release()
+
+    def slice(self, backward: str) -> dict[str, Any]:
+        backward = _address(backward)
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("another desktop analysis request is already running")
+        try:
+            target = resolve_target(self.root)
+            rat = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rat"))
+            argv = [
+                rat, "query", "slice", target["_binary_path"],
+                "--backward", backward, "--depth", "2", "--source", "stdin", "--format", "json",
+            ]
+            result = runner_run(
+                argv,
+                cwd=self.root,
+                timeout_seconds=90.0,
+                limits=ResourceLimits(cpu_seconds=60),
+                preview_bytes=MAX_RESULT_BYTES,
+                max_output_bytes=MAX_RESULT_BYTES,
+                tool_version="desktop-v0.3",
+            )
+            status, doc, diagnostic = _query_output(result, target, "rat query slice")
+            return {
+                "schema": SLICE_SCHEMA,
+                "backward": backward,
+                "target": _public_target(target),
+                "duration_ms": result.duration_ms,
+                "exit_code": result.exit_code,
+                "status": status,
+                "result": doc,
+                "diagnostic": diagnostic,
             }
         finally:
             self._run_lock.release()
