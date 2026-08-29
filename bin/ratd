@@ -2,7 +2,8 @@
 """ratd — loopback-only control/observation plane for CTF-Rat Desktop.
 
 HTTP clients cannot choose commands. A single solver argv is configured by the
-operator at daemon startup and process control is limited to that command.
+operator at daemon startup. Desktop-triggered analysis is restricted to
+manifest-selected targets and canonical ``rat brief`` FAST/DEEP invocations.
 """
 from __future__ import annotations
 import argparse, json, os, shlex, signal, sys
@@ -12,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 
+from ratlib.desktop_analysis import AnalysisManager
 from ratlib.desktop_api import artifact_preview, completion, event_delta, list_artifacts, live_update, snapshot, telemetry
 from ratlib.desktop_session import SessionManager
 
@@ -26,9 +28,11 @@ def _json_bytes(doc):
     return (json.dumps(doc, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _handler(challenge_root, sessions):
+def _handler(challenge_root, sessions, analyses=None):
+    analyses = analyses or AnalysisManager(challenge_root)
+
     class Handler(BaseHTTPRequestHandler):
-        server_version = "ratd/0.2"
+        server_version = "ratd/0.3"
 
         def log_message(self, fmt, *args):
             sys.stderr.write("ratd: " + (fmt % args) + "\n")
@@ -83,6 +87,8 @@ def _handler(challenge_root, sessions):
                 query = parse_qs(parsed.query)
                 if parsed.path == "/api/health":
                     return self._send(200, {"schema": "rat.desktop.health/v1", "status": "ok", "challenge_root": challenge_root, "session": sessions.status()})
+                if parsed.path == "/api/analysis/status":
+                    return self._send(200, analyses.status())
                 if parsed.path == "/api/snapshot":
                     until = query.get("until_seq", [None])[0]
                     return self._send(200, snapshot(challenge_root, until_seq=None if until is None else int(until)))
@@ -133,6 +139,10 @@ def _handler(challenge_root, sessions):
             parsed = urlparse(self.path)
             try:
                 body = self._body()
+                if parsed.path == "/api/analysis/brief":
+                    if set(body) != {"mode"} or body.get("mode") not in {"fast", "deep"}:
+                        raise ValueError("analysis request requires mode fast or deep")
+                    return self._send(200, analyses.brief(body["mode"]))
                 if parsed.path == "/api/session/start":
                     if body:
                         raise ValueError("start request takes no parameters")
@@ -175,7 +185,8 @@ def main():
         parser.error("--port must be between 1 and 65535")
     solver_argv = shlex.split(args.solver_command) if args.solver_command else []
     sessions = SessionManager(root, solver_argv)
-    server = ThreadingHTTPServer((args.host, args.port), _handler(root, sessions))
+    analyses = AnalysisManager(root)
+    server = ThreadingHTTPServer((args.host, args.port), _handler(root, sessions, analyses))
     signal.signal(signal.SIGTERM, _interrupt)
     signal.signal(signal.SIGINT, _interrupt)
     print("ratd: http://%s:%d  challenge=%s" % (args.host, args.port, root), file=sys.stderr)
