@@ -10,6 +10,18 @@ def route_result(**overrides):
     doc.update(overrides)
     return doc
 
+def active_route(**overrides):
+    doc = route_result(
+        skill=None,
+        commitment="provisional",
+        dimensions={"vulnerability_surfaces": ["stack-overwrite-candidate"],
+                    "program_shapes": [], "obstacles": [], "constraints": []},
+        unresolved=["prove overwrite"],
+        score_semantics="heuristic-rank-not-probability",
+    )
+    doc.update(overrides)
+    return doc
+
 def query_result(**overrides):
     doc = {"schema": "rat.query-result/v1", "query": "func:main", "status": "ok", "facts": {},
            "heuristics": {}, "artifacts": [], "coverage": {"complete": True, "scope": "x", "omitted": None},
@@ -26,6 +38,12 @@ def cache_stats(**overrides):
 class RouteResultSchema(unittest.TestCase):
     def test_valid_doc_passes(self):
         validate(route_result())
+
+    def test_legacy_route_without_active_triage_overlay_still_passes(self):
+        validate(route_result())
+
+    def test_valid_optional_active_triage_overlay_passes(self):
+        validate(active_route())
 
     def test_missing_field_raises(self):
         d = route_result(); del d["skill"]
@@ -89,6 +107,39 @@ class RouteResultSchema(unittest.TestCase):
     def test_no_conflict_no_alternatives_passes(self):
         validate(route_result(conflict=False))
 
+    def test_provisional_route_cannot_lock_skill(self):
+        with self.assertRaises(ValidationError):
+            validate(active_route(skill="pwn-stack"))
+
+    def test_unknown_route_cannot_lock_skill(self):
+        with self.assertRaises(ValidationError):
+            validate(active_route(commitment="unknown", skill="rev-symbolic"))
+
+    def test_conflicting_active_route_must_be_provisional(self):
+        d = active_route(commitment="committed", skill="rev-checker", conflict=True,
+                         alternatives=[{"track": "pwn", "subroute": "pwn-format", "confidence": 0.55}])
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_overlay_is_all_or_nothing_for_backward_compatibility(self):
+        d = route_result(commitment="provisional", skill=None)
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_dimensions_require_all_four_orthogonal_axes(self):
+        d = active_route(dimensions={"vulnerability_surfaces": [], "program_shapes": [], "obstacles": []})
+        with self.assertRaises(ValidationError): validate(d)
+
+    def test_bad_score_semantics_raises(self):
+        with self.assertRaises(ValidationError):
+            validate(active_route(score_semantics="probability"))
+
+    def test_reference_schema_describes_active_triage_overlay(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        schema = json.loads((repo / "schemas" / "rat.route-result.v1.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["commitment"]["enum"], ["committed", "provisional", "unknown"])
+        self.assertEqual(schema["properties"]["score_semantics"]["const"], "heuristic-rank-not-probability")
+        self.assertEqual(set(schema["properties"]["dimensions"]["required"]),
+                         {"vulnerability_surfaces", "program_shapes", "obstacles", "constraints"})
+
 class QueryResultSchema(unittest.TestCase):
     def test_valid_doc_passes_for_each_status(self):
         for status in ("ok", "partial", "error"):
@@ -115,8 +166,6 @@ class QueryResultSchema(unittest.TestCase):
             validate(query_result(provenance={}))
 
     def test_extra_fields_allowed_not_strict(self):
-        # bin/rat's dispatcher attaches an extra `governor` key onto route/query
-        # results; the validator is deliberately _need-only, not _strict.
         d = query_result(); d["governor"] = {"stuck": True, "action": "re-route-or-deep-escalate", "reason": "x"}
         validate(d)
 
