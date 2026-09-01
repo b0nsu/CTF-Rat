@@ -146,6 +146,10 @@ ctfpull ctfd --list [--category pwn]
 ctfpull ctfd --id 42 [--dest DIR]        # download → extract → detect ELF → run.json → newchal
 ```
 
+기본 수집 경로는 `solve/<name>/artifact/`이며, 생성된 풀이 파일과 제공 원본이
+`solve/<name>/` 한 곳에 모인다. `--dest DIR`을 명시하면 기존처럼 `DIR/<name>/`에
+스테이징한다.
+
 Config precedence: CLI > env vars (`CTFD_URL` / `CTFD_TOKEN`) > dotenv (`--env`, default `./.ctfd.env`).
 
 </details>
