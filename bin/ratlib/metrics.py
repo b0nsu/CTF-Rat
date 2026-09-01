@@ -75,9 +75,6 @@ def _trace_candidate_path(value, kit_root, challenge_dir=None):
         return None
     if os.path.isabs(value):
         return os.path.realpath(value)
-    # Agent commands normally use absolute $CTF_HOME paths. These two bounded
-    # fallbacks cover `./bin/rat` from the kit root and relative paths from the
-    # challenge directory without trying to reconstruct arbitrary chdir history.
     bases = [kit_root]
     if challenge_dir:
         bases.append(challenge_dir)
@@ -88,14 +85,7 @@ def _trace_candidate_path(value, kit_root, challenge_dir=None):
     return os.path.realpath(value)
 
 def _trace_tool_call(exec_path, argv, kit_root, challenge_dir=None):
-    """Return (canonical tool name, tool argv) for one CTF-Rat process exec.
-
-    Only top-level `bin/*` tools and the explicit executable rev templates are
-    counted. Internal helper modules under `bin/ratlib` are implementation detail
-    rather than agent-visible tool calls. Interpreter-mediated invocations such
-    as `python3 $CTF_HOME/bin/revq ...` canonicalize to the same tool/argv shape
-    as direct execution, so duplicate detection is not syntax-dependent.
-    """
+    """Return (canonical tool name, tool argv) for one CTF-Rat process exec."""
     if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
         return None
     bin_root = os.path.realpath(os.path.join(kit_root, "bin"))
@@ -125,14 +115,7 @@ def _normalize_trace_arg(value, kit_root, challenge_dir=None):
     return value
 
 def process_trace_metrics(path, kit_root, challenge_dir=None):
-    """Parse observer-owned execve telemetry into benchmark-safe process metrics.
-
-    This deliberately measures *process-level CTF-Rat tool invocations*, not
-    every internal Python function call. Actual Ghidra headless executions are
-    counted separately even though `analyzeHeadless` is outside the kit. If the
-    trace cannot be read, return None so callers preserve the `unknown != 0`
-    invariant instead of fabricating an empty run.
-    """
+    """Parse observer-owned execve telemetry into benchmark-safe process metrics."""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             lines = list(fh)
@@ -188,17 +171,61 @@ def guard_started_at(ctf_home, chal=None):
         return None
     return obj.get("started_at")
 
-def _first_primitive_pass_ts_v2(state_dir):
-    """Timestamp of the earliest STILL-ACTIVE primitive PASS, never a stale one.
+def route_assessment_metrics(state_dir):
+    """Summarize commitment-aware route assessments already recorded in STATE.
 
-    A raw scan for any "status":"pass" event is not enough: _materialize() stales
-    a primitive whose self_evidence was later invalidated (evidence.invalidated),
-    and a solved-then-invalidated primitive must not count as a solve for
-    benchmarking/gating. Only primitive_ids whose MATERIALIZED status is
-    currently pass/consumed contribute; for those, use the timestamp of their
-    most recent pass transition (an earlier pass invalidated before this one is
-    not the current valid primitive time).
+    `rat route` and `rat brief` store these as ordinary ``note.recorded`` events
+    with ``kind=route-assessment``.  Reusing the existing stream keeps routing
+    telemetry observer-readable without adding a second database or a new STATE
+    event family. Repeating the same assessment increases assessment_count but
+    not revision_count; the latter counts adjacent fingerprint transitions.
     """
+    try:
+        events = Stream(state_dir).read()
+    except (OSError, ValueError):
+        return {
+            "first_route": None, "first_route_commitment": None,
+            "first_route_conflict": None, "first_route_candidate_count": None,
+            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_skill": None,
+        }
+    rows = []
+    for event in events:
+        if event.get("type") != "note.recorded":
+            continue
+        payload = event.get("payload", {}) or {}
+        if payload.get("kind") != "route-assessment":
+            continue
+        rows.append(payload)
+    if not rows:
+        return {
+            "first_route": None, "first_route_commitment": None,
+            "first_route_conflict": None, "first_route_candidate_count": None,
+            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_skill": None,
+        }
+    first = rows[0]
+    revisions = 0
+    previous = first.get("fingerprint")
+    for row in rows[1:]:
+        current = row.get("fingerprint")
+        if current != previous:
+            revisions += 1
+        previous = current
+    first_skill = next((row.get("skill") for row in rows if row.get("skill")), None)
+    alternatives = first.get("alternatives") or []
+    return {
+        "first_route": first.get("subroute"),
+        "first_route_commitment": first.get("commitment"),
+        "first_route_conflict": bool(first.get("conflict")),
+        "first_route_candidate_count": 1 + len(alternatives),
+        "route_assessment_count": len(rows),
+        "route_revision_count": revisions,
+        "first_skill": first_skill,
+    }
+
+def _first_primitive_pass_ts_v2(state_dir):
+    """Timestamp of the earliest STILL-ACTIVE primitive PASS, never a stale one."""
     try:
         stream = Stream(state_dir)
         events = stream.read()
@@ -246,27 +273,13 @@ def _first_primitive_pass_ts_legacy(state_dir):
     return best
 
 def first_primitive_pass_ts(state_dir):
-    """Typed STATE v2 is the authoritative PASS gate (>=3 active direct SELF
-    observations, enforced by ratlib.state_v2.revise_primitive) -- prefer it.
-    Legacy STATE.jsonl is only consulted for pre-v2 sessions that never wrote
-    a v2 stream; the legacy `state primitive ... pass` command is rejected.
-
-    Once a v2 stream exists it is authoritative: a session that wrote typed
-    events but has no typed PASS has NOT passed, so we must not silently fall
-    back to a legacy PASS. Legacy is consulted only when no v2 stream existed.
-    """
+    """Typed STATE v2 is authoritative once the v2 stream exists."""
     if os.path.exists(Stream(state_dir).path):
         return _first_primitive_pass_ts_v2(state_dir)
     return _first_primitive_pass_ts_legacy(state_dir)
 
 def first_verified_solve_ts(state_dir):
-    """Timestamp of the authenticated, currently-active verified solve.
-
-    The canonical completion gate re-authenticates the immutable rat-verify
-    report and checks its primitive/exploit-task lineage. Only the matching
-    verification.recorded event is eligible for solve latency; primitive PASS
-    alone deliberately returns None here.
-    """
+    """Timestamp of the authenticated, currently-active verified solve."""
     try:
         events = Stream(state_dir).read()
     except (OSError, ValueError):
@@ -286,14 +299,7 @@ def first_verified_solve_ts(state_dir):
     return None
 
 def index_backends(root):
-    """Distinct reusable cache artifacts per backend from the canonical index.
-
-    Cache lineage and invocation history answer different questions. Successful
-    revq/decomp/pwngadget calls now also persist tool-result invocations, while
-    the shared index still carries one row per distinct reusable result and is
-    useful for historical/lineage visibility. Cache hits collapse onto that row,
-    so these counts must never be interpreted as invocation counts.
-    """
+    """Distinct reusable cache artifacts per backend from the canonical index."""
     try:
         from .cache import Cache
         return Cache(root).stats().get("by_backend", {})
@@ -306,18 +312,13 @@ def _elapsed_seconds(started_at, finished_at):
     return None
 
 def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
-              verified_solve_at=None, verify_pass_at=None, index_backend_counts=None):
+              verified_solve_at=None, verify_pass_at=None, index_backend_counts=None,
+              route_metrics=None):
     """Aggregate telemetry without conflating primitive proof with solved state.
 
-    ``verify_pass_at`` retains its v1 meaning as a compatibility alias for the
-    primitive-PASS timestamp. New callers should pass ``primitive_pass_at``
-    and ``verified_solve_at`` explicitly. ``time_to_flag_sec`` retains its v1
-    primitive-PASS meaning; verified-solve latency is exposed separately.
-
-    Tool-result documents prove successful semantic invocations, but they do not
-    prove how many functions a decomp invocation actually decompiled or how many
-    Ghidra processes ran internally. Those stronger metrics remain ``None`` here;
-    observer-owned process traces are the authoritative source for Ghidra runs.
+    Route metrics are optional for backward-compatible programmatic callers. Live
+    ``rat-metrics`` supplies them from STATE; unavailable history remains explicit
+    ``None``/zero rather than being inferred from the current router.
     """
     docs = list(docs)
     seen_fingerprints = {}
@@ -352,6 +353,7 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
     time_to_verified_solve_sec = _elapsed_seconds(guard_started_at, verified_solve_at)
     revq_runs = tool_name_counts.get("revq", 0)
     decomp_invocations = tool_name_counts.get("decomp", 0)
+    route_metrics = route_metrics or {}
     return {
         "schema": "rat.session-metrics/v1",
         "tool_calls": len(docs),
@@ -368,9 +370,14 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         "decomp_invocations": decomp_invocations,
         "revq_runs": revq_runs,
         "duration_ms_total": duration_total,
-        # Cache-lineage counts are distinct from invocation history; cache hits
-        # intentionally collapse onto the same reusable result row.
         "indexed_artifacts_by_backend": dict(index_backend_counts) if index_backend_counts else {},
+        "first_route": route_metrics.get("first_route"),
+        "first_route_commitment": route_metrics.get("first_route_commitment"),
+        "first_route_conflict": route_metrics.get("first_route_conflict"),
+        "first_route_candidate_count": route_metrics.get("first_route_candidate_count"),
+        "route_assessment_count": route_metrics.get("route_assessment_count", 0),
+        "route_revision_count": route_metrics.get("route_revision_count", 0),
+        "first_skill": route_metrics.get("first_skill"),
     }
 
 def main(argv=None):
@@ -390,6 +397,7 @@ def main(argv=None):
         primitive_pass_at=first_primitive_pass_ts(state_dir),
         verified_solve_at=first_verified_solve_ts(state_dir),
         index_backend_counts=index_backends(root),
+        route_metrics=route_assessment_metrics(state_dir),
     )
     print(json.dumps(metrics, sort_keys=True, ensure_ascii=False))
     return 0
