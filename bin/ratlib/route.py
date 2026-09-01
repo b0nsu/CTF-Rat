@@ -20,11 +20,8 @@ facts are not collapsed into one categorical route.
 from __future__ import annotations
 
 HEAP_IMPORTS = {"malloc", "free", "calloc", "realloc"}
-# Unbounded-by-nature sinks: presence is strong attention evidence, but still not
-# callsite proof that attacker-controlled data reaches an unsafe invocation.
 STRONG_OVERFLOW_IMPORTS = {"gets", "strcpy", "strcat", "sprintf",
                           "scanf", "__isoc99_scanf", "__isoc99_sscanf"}
-# Sinks that CAN be bounded correctly; presence is only a heuristic overflow signal.
 WEAK_OVERFLOW_IMPORTS = {"read", "memcpy", "fgets", "fread"}
 OVERFLOW_IMPORTS = STRONG_OVERFLOW_IMPORTS | WEAK_OVERFLOW_IMPORTS
 FORMAT_IMPORTS = {"printf", "fprintf", "dprintf", "syslog"}
@@ -33,10 +30,15 @@ KERNEL_IMPORTS = {"copy_from_user", "copy_to_user", "kmalloc", "kfree", "module_
 VM_HINTS = ("vm", "opcode", "bytecode", "dispatch", "interpreter")
 CRYPTO_HINTS = ("aes", "des", "rc4", "md5", "sha", "base64", "xor", "rsa", "hmac", "crc")
 
-SKILLS = {
+# All installed route skills remain discoverable here for callers that need an
+# inventory. SKILLS is intentionally narrower: bin/rat imports it as the set from
+# which a startup brief may synthesize skill_path, so it must contain only routes
+# whose current evidence is strong enough to commit without another discriminator.
+ALL_SKILLS = {
     "rev-checker", "rev-vm", "rev-packed", "rev-symbolic",
     "pwn-stack", "pwn-format", "pwn-heap", "pwn-rop", "pwn-kernel",
 }
+SKILLS = {"rev-checker", "rev-packed", "pwn-kernel"}
 
 
 def _fact(profile, kind, default=None):
@@ -98,15 +100,12 @@ def _pwn_candidate(imports, profile):
         nx = _fact(profile, "elf.nx")
         if nx is True:
             sigs.append(_sig("elf-nx", True, "fact"))
-            # Compatibility label only: NX is an exploitation constraint, not a
-            # vulnerability class. `dimensions` below keeps that distinction.
             return "pwn-rop", confidence, sigs
         return "pwn-stack", confidence, sigs
     return None
 
 
 def _pwn_all_candidates(imports, profile):
-    """All import-derived PWN candidates, best-first."""
     out = []
     if imports & HEAP_IMPORTS:
         out.append(("pwn-heap", 0.55))
@@ -148,15 +147,10 @@ def _active_triage_overlay(result):
             unresolved.append("ROP is only an exploitation strategy candidate after control-flow influence is measured")
     elif subroute == "pwn-kernel":
         dims["program_shapes"].append("kernel-module")
-        # Kernel-only API imports are a sufficiently discriminating execution
-        # domain signal to select the kernel skill, though no exploit primitive is
-        # implied by that commitment.
         commitment = "committed"
         unresolved.append("kernel object lifetime and copy_to/from_user semantics still require direct measurement")
     elif subroute == "rev-checker":
         dims["program_shapes"].append("checker")
-        # A mechanically detected compare-calling interesting function is enough
-        # to choose the bounded checker skill when no competing route survives.
         commitment = "committed"
         unresolved.append("checker semantics and success/failure oracle remain unverified")
     elif subroute == "rev-vm":
@@ -164,8 +158,6 @@ def _active_triage_overlay(result):
         unresolved.append("VM naming/string hints do not prove a dispatch loop or bytecode semantics")
     elif subroute == "rev-packed":
         dims["obstacles"].append("packing")
-        # A fact-grade UPX/packer signal safely commits the *next action* to
-        # unpacking. Entropy-only suspicion remains provisional.
         commitment = "committed" if _signal_quality(result, "evasion") == "fact" else "provisional"
         unresolved.append("packing is an analysis obstacle; underlying checker/VM/other program shape remains open")
     elif subroute == "rev-symbolic":
@@ -182,9 +174,6 @@ def _active_triage_overlay(result):
     result["dimensions"] = dims
     result["unresolved"] = unresolved
     result["score_semantics"] = "heuristic-rank-not-probability"
-    # This is the actual commitment gate. Keep subroute as the compatibility
-    # suggestion, but do not expose a route-specific skill until the evidence is
-    # strong enough to commit.
     result["skill"] = subroute if commitment == "committed" and subroute in SKILLS else None
     return result
 
@@ -233,8 +222,6 @@ def route(*, profile=None, revq=None, interesting=None):
             return _finalize(_result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target), is_pe)
 
         pwn_subroute, pwn_confidence, pwn_signals = pwn
-        # Keep a deterministic primary suggestion for compatibility, but surface
-        # the competing route and force commitment back to provisional below.
         if calls_cmp or rev_confidence >= pwn_confidence:
             signals.extend(rev_signals)
             result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
@@ -276,8 +263,6 @@ def _result(track, subroute, confidence, signals, capabilities, next_target=None
         "confidence": confidence,
         "signals": signals,
         "capabilities": capabilities,
-        # Filled by _active_triage_overlay; initialized here so every internal
-        # partial result has the legacy field before finalization.
         "skill": None,
         "next": _next_hint(subroute, next_target),
     }
@@ -288,9 +273,6 @@ _NEXT_QUERY = {
     "rev-vm": "solve/_template/rev/vmlift.py --disasm",
     "rev-packed": "gdbq",
     "rev-symbolic": "rat query oracle",
-    # Provisional PWN routes deliberately point at evidence-gathering rather than
-    # an exploit chain. `rat query pwn` is the bounded static capability frontdoor;
-    # runtime primitive proof still belongs to pwncrash/gdbq/state PASS.
     "pwn-stack": "rat query pwn",
     "pwn-format": "rat query pwn",
     "pwn-heap": "rat query pwn",
