@@ -48,7 +48,7 @@ class RouteFixtures(unittest.TestCase):
         self.assertIn("pwn-format", alt_subroutes)
         self.assertTrue({"pwn-stack", "pwn-rop"} & alt_subroutes)
         for a in r["alternatives"]:
-            self.assertEqual(a["track"], "pwn")
+            self.assertEqual(r["track"], "pwn")
 
     def test_kernel_imports_route_pwn_kernel(self):
         r = route(profile=profile(imports=["copy_from_user", "kmalloc"]))
@@ -102,11 +102,74 @@ class RouteMixedSignal(unittest.TestCase):
         self.assertTrue(r["conflict"])
         self.assertEqual(r["alternatives"][0]["subroute"], "pwn-format")
 
+class ActiveTriageCommitment(unittest.TestCase):
+    def test_heap_imports_are_provisional_not_skill_lock(self):
+        r = route(profile=profile(imports=["malloc", "free"]))
+        self.assertEqual(r["subroute"], "pwn-heap")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+        self.assertIn("heap-lifetime-candidate", r["dimensions"]["vulnerability_surfaces"])
+        self.assertTrue(r["unresolved"])
+
+    def test_printf_read_is_provisional_until_format_control_is_proved(self):
+        r = route(profile=profile(imports=["printf", "read"]))
+        self.assertEqual(r["subroute"], "pwn-format")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+        self.assertTrue(any("format argument" in x for x in r["unresolved"]))
+        self.assertEqual(r["next"][0]["query"], "rat query pwn")
+
+    def test_nx_is_constraint_not_vulnerability_surface(self):
+        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", True)]))
+        self.assertEqual(r["subroute"], "pwn-rop")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIn("stack-overwrite-candidate", r["dimensions"]["vulnerability_surfaces"])
+        self.assertIn("nx", r["dimensions"]["constraints"])
+        self.assertIsNone(r["skill"])
+
+    def test_explicit_checker_without_competitor_can_commit(self):
+        r = route(revq=revq(imports=["memcmp"]),
+                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        self.assertEqual(r["commitment"], "committed")
+        self.assertEqual(r["skill"], "rev-checker")
+        self.assertIn("checker", r["dimensions"]["program_shapes"])
+
+    def test_mixed_checker_and_pwn_signal_forces_provisional(self):
+        r = route(profile=profile(imports=["printf", "read"]),
+                  revq=revq(imports=["printf", "read", "memcmp"]),
+                  interesting=[{"func": "check_flag", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        self.assertTrue(r["conflict"])
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+        self.assertTrue(any("multiple plausible routes" in x for x in r["unresolved"]))
+
+    def test_fact_grade_packing_commits_action_but_underlying_shape_stays_open(self):
+        r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
+        self.assertEqual(r["commitment"], "committed")
+        self.assertEqual(r["skill"], "rev-packed")
+        self.assertIn("packing", r["dimensions"]["obstacles"])
+        self.assertTrue(any("underlying" in x for x in r["unresolved"]))
+
+    def test_entropy_only_packing_stays_provisional(self):
+        r = route(revq=revq(evasion=["고엔트로피 7.54/8 (packing/암호화 의심)"]))
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+
+    def test_unknown_has_unknown_commitment(self):
+        r = route(profile=profile(), revq=revq())
+        self.assertEqual(r["commitment"], "unknown")
+        self.assertIsNone(r["skill"])
+
+    def test_score_is_explicitly_not_probability(self):
+        r = route(profile=profile(imports=["gets"]))
+        self.assertEqual(r["score_semantics"], "heuristic-rank-not-probability")
+        validate(r, "rat.route-result/v1")
+
 class RouteDeterminism(unittest.TestCase):
     def test_identical_inputs_produce_identical_route(self):
         p, rv, inter = profile(imports=["gets"], facts=[("elf.nx", True)]), None, None
         self.assertEqual(route(profile=p, revq=rv, interesting=inter),
-                          route(profile=p, revq=rv, interesting=inter))
+                         route(profile=p, revq=rv, interesting=inter))
 
 class RouteDegradation(unittest.TestCase):
     def test_missing_revq_still_routes_from_profile_alone(self):
@@ -142,7 +205,7 @@ class RouteResultShape(unittest.TestCase):
 
     def test_revq_interesting_signal_carries_func_and_score_as_heuristic(self):
         r = route(revq=revq(imports=["memcmp"]),
-                   interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
         interesting_signals = [s for s in r["signals"] if s["kind"] == "revq-interesting"]
         self.assertEqual(len(interesting_signals), 1)
         self.assertEqual(interesting_signals[0]["quality"], "heuristic")
