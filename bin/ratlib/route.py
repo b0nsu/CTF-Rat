@@ -15,7 +15,9 @@ class has been identified.  The model-facing commitment gate is:
 
 The `dimensions` projection deliberately separates vulnerability surfaces,
 program shapes, analysis obstacles, and exploitation constraints so orthogonal
-facts are not collapsed into one categorical route.
+facts are not collapsed into one categorical route.  On conflicts it projects
+both the primary route and every named alternative; the compatibility label is
+still singular, but the model-facing working set is not.
 """
 from __future__ import annotations
 
@@ -122,52 +124,87 @@ def _signal_quality(result, kind):
     return next((s.get("quality") for s in result.get("signals", []) if s.get("kind") == kind), None)
 
 
+def _append_unique(items, value):
+    if value not in items:
+        items.append(value)
+
+
+def _candidate_subroutes(result):
+    """Return primary + alternatives in deterministic ranking order, deduped."""
+    out = []
+    for subroute in [result.get("subroute")] + [
+        item.get("subroute") for item in result.get("alternatives", []) or []
+        if isinstance(item, dict)
+    ]:
+        if subroute and subroute not in out:
+            out.append(subroute)
+    return out
+
+
+def _project_subroute_dimension(subroute, dims, unresolved):
+    """Project one ranked candidate without changing commitment or route rank."""
+    if subroute == "unknown":
+        _append_unique(unresolved, "insufficient deterministic evidence to select a bounded first probe")
+    elif subroute == "pwn-heap":
+        _append_unique(dims["vulnerability_surfaces"], "heap-lifetime-candidate")
+        _append_unique(unresolved, "allocator imports do not prove UAF/double-free/overlap or attacker-controlled lifetime")
+    elif subroute == "pwn-format":
+        _append_unique(dims["vulnerability_surfaces"], "format-string-candidate")
+        _append_unique(unresolved, "prove attacker control reaches a format argument before treating this as format-string")
+    elif subroute in {"pwn-stack", "pwn-rop"}:
+        _append_unique(dims["vulnerability_surfaces"], "stack-overwrite-candidate")
+        _append_unique(unresolved, "prove a concrete overwrite/PC-control primitive; import presence alone is insufficient")
+        if subroute == "pwn-rop":
+            _append_unique(dims["constraints"], "nx")
+            _append_unique(unresolved, "ROP is only an exploitation strategy candidate after control-flow influence is measured")
+    elif subroute == "pwn-kernel":
+        _append_unique(dims["program_shapes"], "kernel-module")
+        _append_unique(unresolved, "kernel object lifetime and copy_to/from_user semantics still require direct measurement")
+    elif subroute == "rev-checker":
+        _append_unique(dims["program_shapes"], "checker")
+        _append_unique(unresolved, "checker semantics and success/failure oracle remain unverified")
+    elif subroute == "rev-vm":
+        _append_unique(dims["program_shapes"], "vm-candidate")
+        _append_unique(unresolved, "VM naming/string hints do not prove a dispatch loop or bytecode semantics")
+    elif subroute == "rev-packed":
+        _append_unique(dims["obstacles"], "packing")
+        _append_unique(unresolved, "packing is an analysis obstacle; underlying checker/VM/other program shape remains open")
+    elif subroute == "rev-symbolic":
+        _append_unique(dims["program_shapes"], "symbolic-candidate")
+        _append_unique(unresolved, "generic interesting/crypto hints do not justify symbolic execution before an oracle is bounded")
+
+
 def _active_triage_overlay(result):
-    """Project a categorical compatibility label into multi-axis triage state."""
+    """Project ranked compatibility labels into a multi-axis triage state.
+
+    The primary subroute still owns compatibility ranking and the commitment
+    decision.  The model-facing dimensions, however, include every explicit
+    alternative so a conflict cannot silently collapse orthogonal evidence back
+    to the primary label that won the ranking tie-break.
+    """
     subroute = result.get("subroute")
     dims = {"vulnerability_surfaces": [], "program_shapes": [], "obstacles": [], "constraints": []}
     unresolved = []
     commitment = "provisional"
 
+    for candidate in _candidate_subroutes(result):
+        _project_subroute_dimension(candidate, dims, unresolved)
+
     if subroute == "unknown":
         commitment = "unknown"
-        unresolved.append("insufficient deterministic evidence to select a bounded first probe")
-    elif subroute == "pwn-heap":
-        dims["vulnerability_surfaces"].append("heap-lifetime-candidate")
-        unresolved.append("allocator imports do not prove UAF/double-free/overlap or attacker-controlled lifetime")
-    elif subroute == "pwn-format":
-        dims["vulnerability_surfaces"].append("format-string-candidate")
-        unresolved.append("prove attacker control reaches a format argument before treating this as format-string")
-    elif subroute in {"pwn-stack", "pwn-rop"}:
-        dims["vulnerability_surfaces"].append("stack-overwrite-candidate")
-        unresolved.append("prove a concrete overwrite/PC-control primitive; import presence alone is insufficient")
-        if subroute == "pwn-rop":
-            dims["constraints"].append("nx")
-            unresolved.append("ROP is only an exploitation strategy candidate after control-flow influence is measured")
-    elif subroute == "pwn-kernel":
-        dims["program_shapes"].append("kernel-module")
+    elif subroute in {"pwn-kernel", "rev-checker"}:
         commitment = "committed"
-        unresolved.append("kernel object lifetime and copy_to/from_user semantics still require direct measurement")
-    elif subroute == "rev-checker":
-        dims["program_shapes"].append("checker")
-        commitment = "committed"
-        unresolved.append("checker semantics and success/failure oracle remain unverified")
-    elif subroute == "rev-vm":
-        dims["program_shapes"].append("vm-candidate")
-        unresolved.append("VM naming/string hints do not prove a dispatch loop or bytecode semantics")
     elif subroute == "rev-packed":
-        dims["obstacles"].append("packing")
         commitment = "committed" if _signal_quality(result, "evasion") == "fact" else "provisional"
-        unresolved.append("packing is an analysis obstacle; underlying checker/VM/other program shape remains open")
-    elif subroute == "rev-symbolic":
-        dims["program_shapes"].append("symbolic-candidate")
-        unresolved.append("generic interesting/crypto hints do not justify symbolic execution before an oracle is bounded")
 
     if any(s.get("kind") == "pe-platform" for s in result.get("signals", [])):
-        dims["constraints"].append("pe-windows")
+        _append_unique(dims["constraints"], "pe-windows")
     if result.get("conflict"):
         commitment = "provisional"
-        unresolved.insert(0, "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill")
+        conflict_note = "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill"
+        if conflict_note in unresolved:
+            unresolved.remove(conflict_note)
+        unresolved.insert(0, conflict_note)
 
     result["commitment"] = commitment
     result["dimensions"] = dims
