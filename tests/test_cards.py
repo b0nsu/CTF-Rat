@@ -40,13 +40,25 @@ class PwnCapabilityCard(unittest.TestCase):
         self.assertEqual(card["facts"]["sinks"]["format"], ["printf"])
         self.assertEqual(card["facts"]["sinks"]["overflow_bounded"], ["read"])
 
+    def test_versioned_elf_imports_are_canonicalized_before_projection_and_route(self):
+        card = project_pwn_capability(profile(
+            imports=("printf@GLIBC_2.2.5", "read@@GLIBC_2.2.5"),
+            facts=(("elf.nx", True),),
+        ))
+        self.assertEqual(card["facts"]["sinks"]["format"], ["printf"])
+        self.assertEqual(card["facts"]["sinks"]["overflow_bounded"], ["read"])
+        self.assertEqual(card["facts"]["imports_total"], 2)
+        routes = card["heuristics"]["candidate_routes"]
+        self.assertEqual(routes[0]["subroute"], "pwn-format")
+        self.assertIn("pwn-rop", {r["subroute"] for r in routes[1:]})
+
     def test_command_import_is_attention_fact_not_a_vulnerability_route(self):
         card = project_pwn_capability(profile(imports=("system",)))
         self.assertEqual(card["facts"]["sinks"]["command_exec"], ["system"])
         self.assertEqual(card["heuristics"]["candidate_routes"], [])
 
     def test_projection_is_deterministic_and_deduplicates_imports(self):
-        p = profile(imports=("read", "read", "printf"), facts=(("elf.nx", True),))
+        p = profile(imports=("read", "read@GLIBC_2.2.5", "printf"), facts=(("elf.nx", True),))
         self.assertEqual(project_pwn_capability(p), project_pwn_capability(p))
         self.assertEqual(project_pwn_capability(p)["facts"]["imports_total"], 2)
 
