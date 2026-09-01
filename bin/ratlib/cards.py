@@ -42,6 +42,23 @@ def _binary_digest(profile):
     return None
 
 
+def _canonical_imports(profile):
+    """Canonicalize deterministic ELF import names without changing evidence grade.
+
+    ``readelf -sW`` can expose a dynamic symbol as ``read@GLIBC_2.2.5`` (or
+    ``foo@@VER``).  Route/capability vocabularies intentionally use stable API
+    names, so strip only the ELF symbol-version suffix.  Do not perform fuzzy
+    matching or aliases here: the resulting base name still comes directly from
+    the profile's imported-symbol fact.
+    """
+    out = set()
+    for value in (profile.get("imports", []) or []):
+        if not isinstance(value, str) or not value:
+            continue
+        out.add(value.split("@", 1)[0])
+    return out
+
+
 def project_pwn_capability(profile):
     """Return a deterministic, bounded-ready PWN capability projection.
 
@@ -55,7 +72,7 @@ def project_pwn_capability(profile):
     if not isinstance(profile, Mapping):
         raise TypeError("profile must be a mapping")
 
-    imports = {x for x in (profile.get("imports", []) or []) if isinstance(x, str)}
+    imports = _canonical_imports(profile)
     facts = _fact_map(profile)
     protections = {kind: facts[kind] for kind in PROTECTION_FACTS if kind in facts}
     sinks = {
@@ -69,7 +86,12 @@ def project_pwn_capability(profile):
     }
     sink_counts = {kind: len(values) for kind, values in sinks.items()}
 
-    routed = route_fn(profile=profile)
+    # The canonical router expects stable API names.  Feed it a shallow copy of
+    # the same deterministic profile with only ELF symbol-version suffixes
+    # removed; do not mutate the cached artifact.
+    routing_profile = dict(profile)
+    routing_profile["imports"] = sorted(imports)
+    routed = route_fn(profile=routing_profile)
     candidate_routes = []
     if routed.get("track") == "pwn":
         candidate_routes.append({
