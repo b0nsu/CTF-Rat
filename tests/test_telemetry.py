@@ -2,7 +2,8 @@ import json, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 from ratlib.contracts import execute
-from ratlib.metrics import aggregate, operation_fingerprint, first_primitive_pass_ts, process_trace_metrics
+from ratlib.metrics import (aggregate, operation_fingerprint, first_primitive_pass_ts,
+                            process_trace_metrics, route_assessment_metrics)
 from ratlib.state_v2 import Stream
 
 D = "sha256:" + "a" * 64
@@ -211,9 +212,6 @@ class Aggregate(unittest.TestCase):
         self.assertEqual(aggregate([envelope()])["indexed_artifacts_by_backend"], {})
 
     def test_indexed_artifacts_surface_tools_that_bypass_the_tool_result_store(self):
-        # revq/decomp/pwngadget register in the shared cache index, not the
-        # tool-result store metrics scans -- so with zero tool-result docs the
-        # index backends are the only lineage signal they leave.
         from ratlib.cache import Cache, canonical_key
         from ratlib.metrics import index_backends
         with tempfile.TemporaryDirectory() as d:
@@ -224,9 +222,77 @@ class Aggregate(unittest.TestCase):
             c.put_entry(canonical_key(binary_sha256="sha256:" + "a" * 64, tool_name="pwngadget",
                         tool_version="1", params={"q": "ret"}, dep_versions={}), backend="pwngadget", path="/tmp/g.json")
             m = aggregate([], index_backend_counts=index_backends(root))
-            self.assertEqual(m["tool_calls"], 0)  # nothing in the tool-result store
+            self.assertEqual(m["tool_calls"], 0)
             self.assertEqual(m["indexed_artifacts_by_backend"].get("revq_json"), 1)
             self.assertEqual(m["indexed_artifacts_by_backend"].get("pwngadget"), 1)
+
+    def test_route_metrics_surface_without_changing_existing_callers(self):
+        m = aggregate([], route_metrics={"first_route": "pwn-format",
+                                         "first_route_commitment": "provisional",
+                                         "first_route_conflict": True,
+                                         "first_route_candidate_count": 2,
+                                         "route_assessment_count": 3,
+                                         "route_revision_count": 1,
+                                         "first_skill": "rev-checker"})
+        self.assertEqual(m["first_route"], "pwn-format")
+        self.assertEqual(m["first_route_commitment"], "provisional")
+        self.assertTrue(m["first_route_conflict"])
+        self.assertEqual(m["route_revision_count"], 1)
+        self.assertEqual(m["first_skill"], "rev-checker")
+
+class RouteAssessmentMetrics(unittest.TestCase):
+    def _append(self, stream, fingerprint, subroute, commitment, *, conflict=False,
+                alternatives=(), skill=None, source="route"):
+        stream.append("note.recorded", {
+            "note_id": "route-assessment-" + fingerprint,
+            "kind": "route-assessment",
+            "source": source,
+            "fingerprint": "sha256:" + fingerprint * 64,
+            "track": "pwn" if subroute.startswith("pwn-") else "rev",
+            "subroute": subroute,
+            "confidence": 0.55,
+            "commitment": commitment,
+            "conflict": conflict,
+            "alternatives": list(alternatives),
+            "skill": skill,
+            "dimensions": {},
+        })
+
+    def test_empty_state_is_explicitly_unmeasured(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = route_assessment_metrics(d)
+            self.assertIsNone(m["first_route"])
+            self.assertIsNone(m["first_route_commitment"])
+            self.assertEqual(m["route_assessment_count"], 0)
+            self.assertEqual(m["route_revision_count"], 0)
+
+    def test_identical_reassessment_is_not_revision(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Stream(d)
+            self._append(s, "a", "pwn-format", "provisional", conflict=True,
+                         alternatives=["rev-checker"])
+            self._append(s, "a", "pwn-format", "provisional", conflict=True,
+                         alternatives=["rev-checker"], source="brief")
+            m = route_assessment_metrics(d)
+            self.assertEqual(m["first_route"], "pwn-format")
+            self.assertEqual(m["first_route_commitment"], "provisional")
+            self.assertTrue(m["first_route_conflict"])
+            self.assertEqual(m["first_route_candidate_count"], 2)
+            self.assertEqual(m["route_assessment_count"], 2)
+            self.assertEqual(m["route_revision_count"], 0)
+            self.assertIsNone(m["first_skill"])
+
+    def test_changed_fingerprint_counts_revision_and_first_committed_skill(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Stream(d)
+            self._append(s, "a", "pwn-format", "provisional", conflict=True,
+                         alternatives=["rev-checker"])
+            self._append(s, "b", "rev-checker", "committed", skill="rev-checker")
+            self._append(s, "b", "rev-checker", "committed", skill="rev-checker", source="brief")
+            m = route_assessment_metrics(d)
+            self.assertEqual(m["route_assessment_count"], 3)
+            self.assertEqual(m["route_revision_count"], 1)
+            self.assertEqual(m["first_skill"], "rev-checker")
 
 class FirstPrimitivePassTs(unittest.TestCase):
     """Once a v2 stream exists it is authoritative: a legacy PASS must never
