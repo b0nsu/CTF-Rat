@@ -46,8 +46,8 @@ def _canonical_imports(profile):
     """Canonicalize deterministic ELF import names without changing evidence grade.
 
     ``readelf -sW`` can expose a dynamic symbol as ``read@GLIBC_2.2.5`` (or
-    ``foo@@VER``).  Route/capability vocabularies intentionally use stable API
-    names, so strip only the ELF symbol-version suffix.  Do not perform fuzzy
+    ``foo@@VER``). Route/capability vocabularies intentionally use stable API
+    names, so strip only the ELF symbol-version suffix. Do not perform fuzzy
     matching or aliases here: the resulting base name still comes directly from
     the profile's imported-symbol fact.
     """
@@ -59,13 +59,35 @@ def _canonical_imports(profile):
     return out
 
 
+def _discriminating_next(candidate_routes):
+    """Choose one bounded *post-capability* probe, never another PWN card.
+
+    `rat route` intentionally points provisional PWN classifications at
+    ``rat query pwn`` first so the model sees one compact static capability
+    projection.  Once inside that card, repeating the same query would be a
+    no-information loop.  Advance to the cheapest existing tool that can test
+    the primary candidate's missing premise instead.  These are experiment
+    suggestions, not proof and not automatic execution.
+    """
+    primary = next((item.get("subroute") for item in candidate_routes if item.get("primary")), None)
+    probes = {
+        "pwn-stack": {"query": "pwncrash", "target": "reproduce-overwrite-and-measure-control-offset"},
+        "pwn-rop": {"query": "pwncrash", "target": "prove-PC-control-before-ROP-gadget-inventory"},
+        "pwn-format": {"query": "decomp", "target": "printf-family-callsite: prove-format-argument-user-control"},
+        "pwn-heap": {"query": "decomp", "target": "allocator/menu-callsite: map-object-lifetime-before-heap-technique"},
+        "pwn-kernel": {"query": "k_dump_heap", "target": "kernel-object-lifetime-and-copy-user-surface"},
+    }
+    probe = probes.get(primary)
+    return [probe] if probe else []
+
+
 def project_pwn_capability(profile):
     """Return a deterministic, bounded-ready PWN capability projection.
 
     Facts are restricted to binary-profile observations: protection properties,
-    import-derived sink groups, and exact counts.  Route selection is explicitly
+    import-derived sink groups, and exact counts. Route selection is explicitly
     heuristic because the presence of an API does not prove vulnerable use at a
-    callsite.  The result intentionally contains no ``verified_primitive`` field;
+    callsite. The result intentionally contains no ``verified_primitive`` field;
     verified primitive lifecycle is canonical in STATE v2 and must not be
     duplicated by a static projection.
     """
@@ -86,9 +108,6 @@ def project_pwn_capability(profile):
     }
     sink_counts = {kind: len(values) for kind, values in sinks.items()}
 
-    # The canonical router expects stable API names.  Feed it a shallow copy of
-    # the same deterministic profile with only ELF symbol-version suffixes
-    # removed; do not mutate the cached artifact.
     routing_profile = dict(profile)
     routing_profile["imports"] = sorted(imports)
     routed = route_fn(profile=routing_profile)
@@ -116,9 +135,9 @@ def project_pwn_capability(profile):
     ]
     subroutes = {item.get("subroute") for item in candidate_routes}
     if "pwn-rop" in subroutes:
-        limitations.append("ROP gadget/register-loading capability is unresolved until pwnropcheck or equivalent deterministic inventory")
+        limitations.append("ROP gadget/register-loading capability is unresolved until PC control is measured and pwnropcheck inventory is justified")
     if "pwn-format" in subroutes:
-        limitations.append("format argument offset and read/write reachability are unresolved until measured")
+        limitations.append("format argument control, offset, and read/write reachability are unresolved until measured")
     if "pwn-heap" in subroutes:
         limitations.append("allocator lifetime, reuse, overlap, and safe-linking constraints are unresolved until measured")
     if "pwn-kernel" in subroutes:
@@ -135,7 +154,7 @@ def project_pwn_capability(profile):
         "heuristics": {
             "candidate_routes": candidate_routes,
             "signals": list(routed.get("signals", []) or []),
-            "next": list(routed.get("next", []) or []),
+            "next": _discriminating_next(candidate_routes),
             "limitations": limitations,
         },
         "provenance": {
