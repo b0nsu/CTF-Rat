@@ -443,13 +443,15 @@ def _runtime_input_digest(chal_dir):
 def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
                       primitive_pass_at, artifact_count, process_metrics=None,
-                      provenance=None, runtime_input_digest=None):
+                      provenance=None, runtime_input_digest=None, routing_metrics=None):
     """Build one honest Mode B `rat.benchmark-result/v2` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
     metrics are populated only when an observer-owned execve trace was actually
-    available for the attempt. Provenance is optional only to keep old fixtures/
-    result rows readable; the live Mode B producer always supplies it.
+    available for the attempt. Routing telemetry is an optional projection of
+    route-assessment STATE notes; historical rows without it remain valid.
+    Provenance is optional only to keep old fixtures/result rows readable; the
+    live Mode B producer always supplies it.
     """
     started_epoch = _epoch(started_at)
     verified = completion.get("verified") is True
@@ -527,6 +529,8 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
     }
     if provenance is not None:
         doc["provenance"] = provenance
+    if routing_metrics is not None:
+        doc["routing"] = dict(routing_metrics)
     return doc
 
 
@@ -591,7 +595,7 @@ def cmd_eval(args):
             finished_at = datetime.now(timezone.utc).isoformat()
 
             flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
-            from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics
+            from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics, route_assessment_metrics
             from ratlib.completion import completion_gate
             from ratlib.state_v2 import Stream
             primitive_pass_at = first_primitive_pass_ts(chal_dir)
@@ -616,6 +620,7 @@ def cmd_eval(args):
             except (OSError, ValueError):
                 events = []
             process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
+            routing_metrics = route_assessment_metrics(chal_dir)
             v2_lines.append(_mode_b_v2_record(
                 e, run_id=run_id, ablation_id=args.ablation,
                 started_at=started_at, finished_at=finished_at,
@@ -624,7 +629,7 @@ def cmd_eval(args):
                 primitive_pass_at=primitive_pass_at,
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
                 process_metrics=process_metrics, provenance=run_provenance,
-                runtime_input_digest=runtime_input_digest,
+                runtime_input_digest=runtime_input_digest, routing_metrics=routing_metrics,
             ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""

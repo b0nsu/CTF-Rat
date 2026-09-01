@@ -65,6 +65,20 @@ def _provenance(*, timeout=600, command_digest=None):
     }
 
 
+def _routing(**overrides):
+    doc = {
+        "first_route": "pwn-stack",
+        "first_route_commitment": "provisional",
+        "first_route_conflict": False,
+        "first_route_candidate_count": 1,
+        "route_assessment_count": 2,
+        "route_revision_count": 1,
+        "first_skill": "pwn-stack",
+    }
+    doc.update(overrides)
+    return doc
+
+
 class CorpusGateTests(unittest.TestCase):
     def _write_suite(self, directory, entries):
         path = os.path.join(directory, "suite.json")
@@ -158,7 +172,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             events=events, primitive_pass_at=1787961603, artifact_count=7,
             process_metrics={"tool_calls": 4, "duplicate_tool_calls": 1,
                              "ghidra_runs": 1, "symbolic_runs": 1},
-            provenance=_provenance(),
+            provenance=_provenance(), routing_metrics=_routing(),
         )
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
         self.assertEqual(doc["schema"], "rat.benchmark-result/v2")
@@ -180,8 +194,9 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["ground_truth"]["capabilities"], ["stack-overflow"])
         self.assertFalse(doc["ground_truth"]["redistributable"])
         self.assertEqual(doc["provenance"], _provenance())
+        self.assertEqual(doc["routing"], _routing())
 
-    def test_old_v2_record_without_provenance_remains_valid(self):
+    def test_old_v2_record_without_provenance_or_routing_remains_valid(self):
         doc = RATBENCH._mode_b_v2_record(
             ENTRY, run_id="B-old", ablation_id="A0",
             started_at="2026-08-29T00:00:00+00:00",
@@ -191,7 +206,40 @@ class ModeBV2RecordTests(unittest.TestCase):
             events=[], primitive_pass_at=None, artifact_count=0,
         )
         self.assertNotIn("provenance", doc)
+        self.assertNotIn("routing", doc)
         RATBENCH.validate(doc, "rat.benchmark-result/v2")
+
+    def test_routing_projection_rejects_incoherent_revision_count(self):
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-test", ablation_id="A2",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            routing_metrics=_routing(route_assessment_count=1, route_revision_count=1),
+        )
+        with self.assertRaises(Exception):
+            RATBENCH.validate(doc, "rat.benchmark-result/v2")
+
+    def test_empty_routing_projection_is_valid_and_does_not_fabricate_a_route(self):
+        empty = {
+            "first_route": None, "first_route_commitment": None,
+            "first_route_conflict": None, "first_route_candidate_count": None,
+            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_skill": None,
+        }
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-test", ablation_id="A2",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            routing_metrics=empty,
+        )
+        RATBENCH.validate(doc, "rat.benchmark-result/v2")
+        self.assertEqual(doc["routing"], empty)
 
     def test_flag_without_completion_is_only_solve_claimed(self):
         doc = RATBENCH._mode_b_v2_record(

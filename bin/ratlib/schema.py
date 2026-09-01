@@ -111,15 +111,39 @@ def _benchmark_provenance(d):
     if not isinstance(environment,Mapping) or set(environment)!={"os","arch","runtime"} or any(not isinstance(environment[k],str) or not environment[k] for k in environment): raise ValidationError("invalid benchmark environment")
     toolchain=d["toolchain"]
     if not isinstance(toolchain,Mapping) or set(toolchain)!={"ctf_rat_revision","schema_bundle"} or any(not isinstance(toolchain[k],str) or not toolchain[k] for k in toolchain): raise ValidationError("invalid benchmark toolchain")
+def _benchmark_routing(d):
+    """Validate optional observer-owned route/commitment telemetry.
+
+    The projection is optional so historical benchmark-v2 rows remain readable.
+    Live Mode B producers populate it from the canonical STATE route-assessment
+    notes; no route is inferred retroactively from the current router.
+    """
+    fields={"first_route","first_route_commitment","first_route_conflict","first_route_candidate_count","route_assessment_count","route_revision_count","first_skill"}
+    if not isinstance(d,Mapping) or set(d)!=fields: raise ValidationError("invalid benchmark routing fields")
+    if d["first_route"] is not None and (not isinstance(d["first_route"],str) or not d["first_route"]): raise ValidationError("invalid benchmark first_route")
+    if d["first_route_commitment"] not in {None,"committed","provisional","unknown"}: raise ValidationError("invalid benchmark first_route_commitment")
+    if d["first_route_conflict"] is not None and not isinstance(d["first_route_conflict"],bool): raise ValidationError("invalid benchmark first_route_conflict")
+    count=d["first_route_candidate_count"]
+    if count is not None and (not isinstance(count,int) or isinstance(count,bool) or count < 1): raise ValidationError("invalid benchmark first_route_candidate_count")
+    for key in ("route_assessment_count","route_revision_count"):
+        value=d[key]
+        if not isinstance(value,int) or isinstance(value,bool) or value < 0: raise ValidationError("invalid benchmark %s" % key)
+    if d["route_revision_count"] > max(0,d["route_assessment_count"]-1): raise ValidationError("route revisions exceed assessments")
+    if d["first_skill"] is not None and (not isinstance(d["first_skill"],str) or not d["first_skill"]): raise ValidationError("invalid benchmark first_skill")
+    if d["route_assessment_count"] == 0:
+        if any(d[key] is not None for key in ("first_route","first_route_commitment","first_route_conflict","first_route_candidate_count","first_skill")): raise ValidationError("empty routing assessment cannot report first-route fields")
+    elif d["first_route"] is None or d["first_route_commitment"] is None or d["first_route_conflict"] is None or d["first_route_candidate_count"] is None:
+        raise ValidationError("routing assessment requires first-route fields")
 def benchmark_result_v2(d):
     _need(d,("schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"))
-    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance"})
+    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance","routing"})
     if d["ablation_id"] not in {"A0","A1","A2","A3","A4","A5"}: raise ValidationError("invalid ablation")
     if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
     if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
     if d["outcome"] not in {"verified","solve-claimed","failed","censored","unknown","skipped"}: raise ValidationError("invalid benchmark outcome")
     _iso(d["started_at"]); _iso(d["finished_at"])
     if "provenance" in d: _benchmark_provenance(d["provenance"])
+    if "routing" in d: _benchmark_routing(d["routing"])
     groups = {
         "correctness": {"verified_solve","false_solved","oracle_pass"},
         "latency": {"time_to_first_query_ms","time_to_first_hypothesis_ms","time_to_first_valid_primitive_ms","time_to_verified_solve_ms"},

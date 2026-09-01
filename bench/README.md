@@ -86,6 +86,32 @@ Current Mode B producers attach a `provenance` object to every `rat.benchmark-re
 
 If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. Historical benchmark-v2 rows without provenance remain readable for compatibility. `ratbench report --schema v2` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
 
+## Benchmark-v2 routing projection
+
+Live Mode B rows also attach an optional top-level `routing` object derived from the existing STATE `route-assessment` notes. It is observer-readable telemetry, not ground truth and not a reconstructed classification. Historical benchmark-v2 rows without this projection remain valid.
+
+The projection records:
+
+- `first_route` and `first_route_commitment`;
+- whether the first assessment had a conflict and how many primary/alternative candidates were visible;
+- total route assessments and actual route revisions;
+- the first route-specific skill that was locked, if any.
+
+An attempt that never ran the routing front door reports `route_assessment_count=0` and leaves all first-route fields `null`; it must not fabricate an `unknown` route after the fact. This makes hard-route versus active-triage runs directly inspectable without treating a route label as solve correctness.
+
+## Architecture ablation rule
+
+`--ablation A0|A1|...` is a **measurement label only**. It does not secretly change router behavior, prompts, model configuration, or runtime policy. An architecture ablation must change one real implementation/configuration variable and be reproduced under otherwise identical conditions.
+
+For routing studies, prefer revision-based ablation over hidden runtime switches:
+
+1. run the hard-route baseline revision on one held-out corpus with a unique `benchmark_run_id`;
+2. run the active-triage revision on the same corpus/model/reasoning effort/environment/timeout/toolchain except for the intended CTF-Rat revision;
+3. label the rows consistently (for example baseline `A0`, active-triage `A1`) while relying on `provenance.toolchain.ctf_rat_revision` as the authoritative implementation identity;
+4. compare `verified_solve` and latency/tool metrics together with the `routing` projection (`first_route_commitment`, conflict rate, route revisions, first skill lock).
+
+Do not reuse one `benchmark_run_id` across different revisions: provenance validation intentionally fails closed on mixed measurement conditions. Synthetic Mode A route accuracy may guard compatibility, but it is not evidence that one routing architecture solves real challenges better.
+
 ## Measurement rule
 
 Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v2 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
