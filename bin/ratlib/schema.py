@@ -157,14 +157,37 @@ def route_result(d):
                 raise ValidationError("invalid alternative shape")
             if not isinstance(alt["confidence"],(int,float)) or not 0 <= alt["confidence"] <= 1:
                 raise ValidationError("invalid alternative confidence")
-    # conflict and alternatives are two halves of one fact: a real conflict must
-    # name at least one alternative, and listing alternatives without flagging a
-    # conflict is incoherent. Enforce the coupling in both directions.
     has_alts = bool(d.get("alternatives"))
     if d.get("conflict") is True and not has_alts:
         raise ValidationError("conflict requires non-empty alternatives")
     if has_alts and d.get("conflict") is not True:
         raise ValidationError("alternatives require conflict true")
+
+    # Active-triage fields are optional so historical rat.route-result/v1 rows
+    # remain readable. Once a producer emits the overlay, validate it as a
+    # coherent commitment gate rather than accepting arbitrary extra metadata.
+    if "commitment" in d:
+        if d["commitment"] not in {"committed","provisional","unknown"}:
+            raise ValidationError("invalid route commitment")
+        if d["commitment"] != "committed" and d["skill"] is not None:
+            raise ValidationError("non-committed route cannot lock a skill")
+        if d.get("conflict") is True and d["commitment"] != "provisional":
+            raise ValidationError("conflicting route must remain provisional")
+    if "dimensions" in d:
+        dims = d["dimensions"]
+        fields = {"vulnerability_surfaces","program_shapes","obstacles","constraints"}
+        if not isinstance(dims,Mapping) or set(dims) != fields:
+            raise ValidationError("invalid route dimensions")
+        if any(not isinstance(dims[name],list) or any(not isinstance(v,str) for v in dims[name]) for name in fields):
+            raise ValidationError("invalid route dimension values")
+    if "unresolved" in d and (not isinstance(d["unresolved"],list) or any(not isinstance(v,str) for v in d["unresolved"])):
+        raise ValidationError("invalid route unresolved")
+    if "score_semantics" in d and d["score_semantics"] != "heuristic-rank-not-probability":
+        raise ValidationError("invalid route score semantics")
+    overlay_fields = {"commitment","dimensions","unresolved","score_semantics"}
+    present = overlay_fields & set(d)
+    if present and present != overlay_fields:
+        raise ValidationError("active-triage route overlay must be complete")
 
 _QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
 def query_result(d):
@@ -194,8 +217,6 @@ def brief_card(d):
 
 _BENCH_OUTCOMES = {"route-miss","solved","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
 def bench_result(d):
-    # Mode A and Mode B rows share a small required core; extra per-mode fields are
-    # intentionally open (no _strict) so the two shapes validate under one contract.
     _need(d,("schema","mode","run_id","id","track","outcome","wall_ms"))
     if d["mode"] not in {"A","B"}: raise ValidationError("invalid bench mode")
     if d["outcome"] not in _BENCH_OUTCOMES: raise ValidationError("invalid bench outcome")
