@@ -8,13 +8,22 @@ CTF-Rat keeps long-lived truth in deterministic artifacts and STATE. Model conte
 
 ## PWN capability projection
 
-`ratlib.cards.project_pwn_capability(profile)` applies the same idea to PWN without inventing runtime evidence. It projects only deterministic binary-profile facts:
+`rat query pwn <binary>` is the canonical front door for the equivalent PWN projection. Internally it reuses `ratlib.cards.project_pwn_capability(profile)` and the existing `rat-profile` + deterministic router; it does not introduce another analyzer, cache, state database, or evidence schema.
+
+The query projects only deterministic binary-profile facts:
 
 - ELF protections (`NX`, `PIE`, canary, RELRO) when present in the profile;
 - grouped imported sink APIs (unbounded/bounded overflow, format, heap, kernel, input, command execution);
 - exact import/sink counts.
 
-The route (`pwn-stack`, `pwn-format`, `pwn-heap`, `pwn-rop`, `pwn-kernel`) remains a heuristic projection from the existing deterministic router. API presence never proves that the callsite is unsafe.
+Example:
+
+```bash
+rat query pwn ./chall --format json
+rat query pwn ./chall --budget-bytes 4096 --format json
+```
+
+The route (`pwn-stack`, `pwn-format`, `pwn-heap`, `pwn-rop`, `pwn-kernel`) stays under `heuristics.candidate_routes`. API presence never proves that the callsite is unsafe. Output lists are bounded by the query budget while `sink_counts` remain exact.
 
 The projection MUST NOT claim RIP/PC control, arbitrary read/write, a stable leak, heap overlap/reuse, or a kernel object primitive. Those are runtime primitive claims and remain canonical in STATE v2, where PASS promotion requires deterministic direct evidence.
 
@@ -23,7 +32,8 @@ The projection MUST NOT claim RIP/PC control, arbitrary read/write, a stable lea
 ```text
 binary
   -> rat-profile / revq deterministic artifacts
-  -> bounded REV Function Card or PWN Capability Card
+  -> rat query func | rat query pwn
+  -> bounded Function/Capability projection
   -> model hypothesis
   -> targeted experiment
   -> STATE v2 primitive lifecycle
