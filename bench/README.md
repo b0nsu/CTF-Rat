@@ -97,7 +97,9 @@ The projection records:
 - total route assessments and actual route revisions;
 - the first route-specific skill that was locked, if any.
 
-An attempt that never ran the routing front door reports `route_assessment_count=0` and leaves all first-route fields `null`; it must not fabricate an `unknown` route after the fact. This makes hard-route versus active-triage runs directly inspectable without treating a route label as solve correctness.
+An attempt that never ran the routing front door reports `route_assessment_count=0` and leaves all first-route fields `null`; it must not fabricate an `unknown` route after the fact. This makes instrumented routing runs directly inspectable without treating a route label as solve correctness.
+
+Detailed routing metrics are available only on revisions that emit STATE `route-assessment` notes and project them into benchmark-v2. Pre-instrumentation hard-route revisions can still be compared on verified solve/latency/tool metrics, but their route revision/conflict/skill-lock fields do not exist. If routing-level A/B is required against the old behavior, use a measurement-only backport of this telemetry to the hard-route implementation; do not infer historical route events from current code.
 
 ## Architecture ablation rule
 
@@ -108,7 +110,7 @@ For routing studies, prefer revision-based ablation over hidden runtime switches
 1. run the hard-route baseline revision on one held-out corpus with a unique `benchmark_run_id`;
 2. run the active-triage revision on the same corpus/model/reasoning effort/environment/timeout/toolchain except for the intended CTF-Rat revision;
 3. label the rows consistently (for example baseline `A0`, active-triage `A1`) while relying on `provenance.toolchain.ctf_rat_revision` as the authoritative implementation identity;
-4. compare `verified_solve` and latency/tool metrics together with the `routing` projection (`first_route_commitment`, conflict rate, route revisions, first skill lock).
+4. compare `verified_solve` and latency/tool metrics on both runs; compare the detailed `routing` projection (`first_route_commitment`, conflict rate, route revisions, first skill lock) only when both revisions carry the instrumentation described above.
 
 Do not reuse one `benchmark_run_id` across different revisions: provenance validation intentionally fails closed on mixed measurement conditions. Synthetic Mode A route accuracy may guard compatibility, but it is not evidence that one routing architecture solves real challenges better.
 
