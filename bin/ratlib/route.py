@@ -30,15 +30,14 @@ KERNEL_IMPORTS = {"copy_from_user", "copy_to_user", "kmalloc", "kfree", "module_
 VM_HINTS = ("vm", "opcode", "bytecode", "dispatch", "interpreter")
 CRYPTO_HINTS = ("aes", "des", "rc4", "md5", "sha", "base64", "xor", "rsa", "hmac", "crc")
 
-# All installed route skills remain discoverable here for callers that need an
-# inventory. SKILLS is intentionally narrower: bin/rat imports it as the set from
-# which a startup brief may synthesize skill_path, so it must contain only routes
-# whose current evidence is strong enough to commit without another discriminator.
-ALL_SKILLS = {
+# Installed route-skill inventory. Commitment is a property of each route result,
+# not of the inventory: callers that inspect SKILLS must continue to see every
+# installed skill, while result["skill"] stays None until the commitment gate
+# below allows that specific route to lock one.
+SKILLS = {
     "rev-checker", "rev-vm", "rev-packed", "rev-symbolic",
     "pwn-stack", "pwn-format", "pwn-heap", "pwn-rop", "pwn-kernel",
 }
-SKILLS = {"rev-checker", "rev-packed", "pwn-kernel"}
 
 
 def _fact(profile, kind, default=None):
