@@ -16,6 +16,7 @@ sys.path.insert(0, BIN)
 
 from ratlib.artifact import get as artifact_get
 from ratlib.cache import Cache, resolve_index_root
+from ratlib.cards import project_pwn_capability
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
 from ratlib.governor import check_progress
 from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
@@ -587,6 +588,41 @@ def cmd_query_func(args):
     doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
+def cmd_query_pwn(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("pwn", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    profile = _gather_profile(binary, store)
+    if profile is None:
+        return _emit(*_query_error("pwn", "dependency_missing", "rat-profile produced no usable binary profile", EXIT_DEPENDENCY), args.format)
+    card = project_pwn_capability(profile)
+    budget = args.budget_bytes
+    sink_items = sorted(card["facts"]["sinks"].items())
+    kept, truncated, omit = truncate_lists_sharing_budget(sink_items, budget)
+    facts = {**card["facts"], "sinks": kept}
+    diagnostics = []
+    if truncated:
+        diagnostics.append({"code": "partial", "severity": "warning",
+                            "message": "PWN sink projection truncated at item boundary (budget_bytes=%d); counts remain exact" % budget})
+    cache_state = (profile.get("provenance") or {}).get("cache") or {}
+    if not isinstance(cache_state, dict):
+        cache_state = {}
+    if "hit" not in cache_state:
+        cache_state = {**cache_state, "hit": True if cache_state.get("state") == "hit" else None}
+    doc = _query_envelope(
+        "pwn", status="partial" if truncated else "ok", facts=facts,
+        heuristics=card["heuristics"], artifacts=[],
+        coverage={"complete": not truncated, "scope": "binary-profile imports+protections",
+                  "omitted": {"truncated_counts": omit} if truncated else None},
+        diagnostics=diagnostics,
+        provenance={**card["provenance"], "cache": cache_state},
+        budget_bytes=budget,
+    )
+    doc = _governor_wrap(_state_dir(binary), "query:pwn", {"facts": facts, "heuristics": card["heuristics"]}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
 def cmd_query_oracle(args):
     binary = args.binary
     bad = _check_binary(binary)
@@ -721,6 +757,9 @@ def cmd_selftest(_args=None):
     r = route_fn(profile={"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
     assert r["subroute"] == "pwn-rop", r
     validate(r, "rat.route-result/v1")
+    pwn_card = project_pwn_capability({"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
+    assert pwn_card["heuristics"]["candidate_routes"][0]["subroute"] == "pwn-rop", pwn_card
+    assert "verified_primitive" not in pwn_card["facts"], pwn_card
     q = _query_envelope("selftest", status="ok", facts={}, heuristics={}, artifacts=[],
                          coverage={"complete": True, "scope": "selftest", "omitted": None},
                          diagnostics=[], provenance={"cache": {"hit": False}})
@@ -763,7 +802,7 @@ def build_parser():
     pb.add_argument("--libc"); pb.add_argument("--budget-tokens", type=int, default=1500)
     pb.add_argument("--format", choices=("text", "json"), default="text")
 
-    pq = sub.add_parser("query", help="bounded read-only queries (func|oracle|slice) over cached artifacts")
+    pq = sub.add_parser("query", help="bounded read-only queries (func|oracle|pwn|slice) over cached artifacts")
     qsub = pq.add_subparsers(dest="subcommand")
     pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
@@ -773,6 +812,9 @@ def build_parser():
     po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
     po.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     po.add_argument("--format", choices=("text", "json"), default="text")
+    pp = qsub.add_parser("pwn", help="static PWN capability card from profile facts; never claims runtime primitive PASS")
+    pp.add_argument("binary"); pp.add_argument("--store"); pp.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pp.add_argument("--format", choices=("text", "json"), default="text")
     ps = qsub.add_parser("slice", help="backward data slice to an input sink (delegates rat-slice)")
     ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--source", default="stdin"); ps.add_argument("--store")
@@ -819,6 +861,7 @@ def main(argv=None):
     if args.command == "query":
         if args.subcommand == "func": return cmd_query_func(args)
         if args.subcommand == "oracle": return cmd_query_oracle(args)
+        if args.subcommand == "pwn": return cmd_query_pwn(args)
         if args.subcommand == "slice": return cmd_query_slice(args)
         p.parse_args(["query", "--help"]); return EXIT_USAGE
     if args.command == "cache":
