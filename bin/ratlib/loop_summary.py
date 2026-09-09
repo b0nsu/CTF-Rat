@@ -25,12 +25,28 @@ _X86_ALIASES = {
     "bpl":"rbp","bp":"rbp","ebp":"rbp","rbp":"rbp",
     "spl":"rsp","sp":"rsp","esp":"rsp","rsp":"rsp",
 }
+_X86_WIDTHS = {
+    "al":8,"ah":8,"ax":16,"eax":32,"rax":64,
+    "bl":8,"bh":8,"bx":16,"ebx":32,"rbx":64,
+    "cl":8,"ch":8,"cx":16,"ecx":32,"rcx":64,
+    "dl":8,"dh":8,"dx":16,"edx":32,"rdx":64,
+    "sil":8,"si":16,"esi":32,"rsi":64,
+    "dil":8,"di":16,"edi":32,"rdi":64,
+    "bpl":8,"bp":16,"ebp":32,"rbp":64,
+    "spl":8,"sp":16,"esp":32,"rsp":64,
+}
 for _i in range(8, 16):
     _X86_ALIASES.update({
         "r%d" % _i: "r%d" % _i,
         "r%dd" % _i: "r%d" % _i,
         "r%dw" % _i: "r%d" % _i,
         "r%db" % _i: "r%d" % _i,
+    })
+    _X86_WIDTHS.update({
+        "r%d" % _i: 64,
+        "r%dd" % _i: 32,
+        "r%dw" % _i: 16,
+        "r%db" % _i: 8,
     })
 
 _REG = r"(?:r(?:1[0-5]|[89])(?:d|w|b)?|r(?:ax|bx|cx|dx|si|di|bp|sp)|e(?:ax|bx|cx|dx|si|di|bp|sp)|[abcd][hl]|[abcd]x|[sd]il?|[bs]pl?)"
@@ -48,6 +64,12 @@ def normalize_register(name):
     return _X86_ALIASES.get(str(name).strip().lower(), str(name).strip().lower())
 
 
+def _register_width(name):
+    if not name:
+        return None
+    return _X86_WIDTHS.get(str(name).strip().lower())
+
+
 def _parse_int(value):
     try:
         return int(value, 0)
@@ -55,8 +77,8 @@ def _parse_int(value):
         return None
 
 
-def parse_affine_update(mnemonic, op_str):
-    """Return (canonical_register, delta) for a supported immediate update."""
+def _parse_affine_update_detail(mnemonic, op_str):
+    """Return operand/family/width/delta for one supported immediate update."""
     text = "%s %s" % ((mnemonic or "").strip(), (op_str or "").strip())
     for rx, sign in _UPDATE_PATTERNS:
         m = rx.match(text)
@@ -64,11 +86,22 @@ def parse_affine_update(mnemonic, op_str):
             value = _parse_int(m.group(2))
             if value is None:
                 return None
-            return normalize_register(m.group(1)), sign * value
+            operand = m.group(1).lower()
+            return {"operand": operand, "family": normalize_register(operand),
+                    "width": _register_width(operand), "delta": sign * value}
     m = _INCDEC.match(text)
     if m:
-        return normalize_register(m.group(2)), (1 if m.group(1).lower() == "inc" else -1)
+        operand = m.group(2).lower()
+        return {"operand": operand, "family": normalize_register(operand),
+                "width": _register_width(operand),
+                "delta": 1 if m.group(1).lower() == "inc" else -1}
     return None
+
+
+def parse_affine_update(mnemonic, op_str):
+    """Compatibility helper: return (canonical_register, delta)."""
+    detail = _parse_affine_update_detail(mnemonic, op_str)
+    return (detail["family"], detail["delta"]) if detail else None
 
 
 def _raw_insn(wrapper):
@@ -106,12 +139,21 @@ def summarize_instruction_stream(instructions, bit_width=64, internal_branch=Fal
     mnemonic/op_str/address and optionally regs_access/reg_name.  The function
     refuses to emit a recurrence for a register if it observes another write to
     that register that is not one of the supported immediate updates.
+
+    On AMD64, a 32-bit destination (for example ``eax``) is modeled as a 32-bit
+    recurrence whose write zero-extends into the 64-bit register family.  8/16-bit
+    partial writes are deliberately rejected: treating them as whole-register
+    affine updates would invent semantics for the untouched upper bits.
     """
+    arch_width = int(bit_width or 64)
     updates = {}
     clobbered = set()
+    suppressed = set()
     calls = []
     memory_writes = 0
     write_info_available = True
+    saw_partial_register_write = False
+    saw_mixed_register_width = False
 
     for insn in instructions:
         mnemonic, op_str, address = _insn_fields(insn)
@@ -121,7 +163,8 @@ def summarize_instruction_stream(instructions, bit_width=64, internal_branch=Fal
         if _first_operand_is_memory(op_str) and mnem not in {"cmp", "test", "lea"}:
             memory_writes += 1
 
-        affine = parse_affine_update(mnemonic, op_str)
+        detail = _parse_affine_update_detail(mnemonic, op_str)
+        affine = (detail["family"], detail["delta"]) if detail else None
         writes = _written_registers(insn)
         if not writes:
             if affine:
@@ -129,9 +172,29 @@ def summarize_instruction_stream(instructions, bit_width=64, internal_branch=Fal
             elif mnem not in {"cmp", "test", "jmp", "je", "jne", "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe", "nop"}:
                 write_info_available = False
 
-        if affine:
-            reg, delta = affine
-            updates[reg] = updates.get(reg, 0) + delta
+        if detail:
+            reg = detail["family"]
+            delta = detail["delta"]
+            width = int(detail["width"] or arch_width)
+            if width < arch_width and not (arch_width == 64 and width == 32):
+                # 8/16-bit writes preserve upper bits. We intentionally do not
+                # synthesize a whole-family recurrence from that partial state.
+                suppressed.add(reg)
+                saw_partial_register_write = True
+            else:
+                semantics = "zero-extend-to-64" if arch_width == 64 and width == 32 else "full-width"
+                previous = updates.get(reg)
+                signature = (detail["operand"], width, semantics)
+                if previous and previous["signature"] != signature:
+                    suppressed.add(reg)
+                    saw_mixed_register_width = True
+                else:
+                    if previous is None:
+                        updates[reg] = {"delta": delta, "signature": signature,
+                                        "operand": detail["operand"], "width": width,
+                                        "write_semantics": semantics}
+                    else:
+                        previous["delta"] += delta
             for reg_written in writes:
                 if reg_written and reg_written != reg:
                     clobbered.add(reg_written)
@@ -147,19 +210,36 @@ def summarize_instruction_stream(instructions, bit_width=64, internal_branch=Fal
         unsupported.append("memory_state_unmodeled")
     if not write_info_available:
         unsupported.append("register_write_set_incomplete")
+    if saw_partial_register_write:
+        unsupported.append("partial_register_write")
+    if saw_mixed_register_width:
+        unsupported.append("mixed_register_width")
 
     recurrences = []
     if not internal_branch and not calls and write_info_available:
-        for reg, delta in sorted(updates.items()):
-            if reg in clobbered or delta == 0:
+        for reg, info in sorted(updates.items()):
+            delta = info["delta"]
+            if reg in clobbered or reg in suppressed or delta == 0:
                 continue
+            width = info["width"]
+            operand = info["operand"]
+            semantics = info["write_semantics"]
+            if semantics == "zero-extend-to-64":
+                target = operand
+                formula = "%s(N) = %s(0) %s %d*N (mod 2^%d); each write zero-extends into %s" % (
+                    operand, operand, "+" if delta >= 0 else "-", abs(delta), width, reg)
+            else:
+                target = reg
+                formula = "%s(N) = %s(0) %s %d*N (mod 2^%d)" % (
+                    reg, reg, "+" if delta >= 0 else "-", abs(delta), width)
             recurrences.append({
-                "target": reg,
+                "target": target,
+                "register_family": reg,
                 "kind": "affine-delta",
                 "delta": delta,
-                "bit_width": int(bit_width or 64),
-                "formula": "%s(N) = %s(0) %s %d*N (mod 2^%d)" % (
-                    reg, reg, "+" if delta >= 0 else "-", abs(delta), int(bit_width or 64)),
+                "bit_width": width,
+                "write_semantics": semantics,
+                "formula": formula,
                 "quality": "candidate",
             })
     if not recurrences:
@@ -247,6 +327,7 @@ def summarize_function_loops(project, func, max_blocks=DEFAULT_MAX_BLOCKS, max_l
             "candidate summary only; not a def-use proof",
             "heap/global aliasing and memory recurrences are not modeled",
             "trip counts and exit predicates are not solved",
+            "8/16-bit x86 partial-register recurrences are rejected rather than approximated",
         ],
     }
     if arch not in {"AMD64", "X86", "x86_64", "i386"}:
