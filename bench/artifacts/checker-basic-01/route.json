@@ -1,6 +1,8 @@
 {
   "profile": {"imports": ["memcmp", "read", "puts"]},
   "revq": {"imports": ["memcmp", "read", "puts"], "platform": "elf",
-           "strings": [{"val": "s3cr3t_p4ss"}, {"val": "Wrong"}]},
-  "interesting": [{"func": "main", "score": 8, "why": ["비교함수 호출"]}]
+           "functions": [{"name": "main", "calls": ["memcmp", "read", "puts"],
+                          "strings": ["s3cr3t_p4ss", "FLAG{synthetic-checker-ok}", "Wrong"]}],
+           "strings": [{"val": "s3cr3t_p4ss"}, {"val": "FLAG{synthetic-checker-ok}"}, {"val": "Wrong"}]},
+  "interesting": [{"func": "main", "score": 8, "why": ["display-only"]}]
 }
