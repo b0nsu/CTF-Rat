@@ -22,7 +22,7 @@ def completion_gate(root, verification_id=None):
     try:
         stream = Stream(root)
         events = stream.read()
-        view = stream.view()
+        view = stream._materialize(events)
     except (OSError, ValueError) as exc:
         return {"verified": False, "reason": "state-invalid", "detail": str(exc)}
 
