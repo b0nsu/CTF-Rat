@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -26,47 +25,26 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _safe_function_name(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
-
-
 def payload_manifest(cache: str):
-    """Return a deterministic manifest for the exported index + C payloads.
+    """Return a deterministic manifest of the observed exported payload.
 
-    The index is authoritative for which decompilations must exist. Newer
-    DecompExport rows carry an explicit output basename in column four;
-    DecompOne rows use the historical three-column form and its safe function
-    name. Extra .c files are also included so later mutations cannot hide from
-    the seal.
+    Completeness stays owned by DecompExport's discovered/exported/failure
+    status contract. This seal only protects the files that make up a complete
+    cache at metadata-write time: `_index.txt` plus every regular `.c` export.
     """
     index = os.path.join(cache, "_index.txt")
     if not os.path.isfile(index) or os.path.islink(index):
         return None
-
-    required = {"_index.txt"}
     try:
-        with open(index, encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                line = raw.rstrip("\n")
-                if not line.strip():
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 3 or not parts[1]:
-                    return None
-                output = parts[3] if len(parts) >= 4 and parts[3] else _safe_function_name(parts[1])
-                required.add(output + ".c")
-    except OSError:
-        return None
-
-    try:
-        for name in os.listdir(cache):
-            if name.endswith(".c"):
-                required.add(name)
+        names = ["_index.txt"] + sorted(
+            name for name in os.listdir(cache)
+            if name.endswith(".c") and os.path.isfile(os.path.join(cache, name))
+        )
     except OSError:
         return None
 
     rows = []
-    for name in sorted(required):
+    for name in names:
         path = os.path.join(cache, name)
         if os.path.islink(path) or not os.path.isfile(path):
             return None
@@ -184,7 +162,7 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
     sealed = payload_digest(cache) if status == "complete" else None
     if status == "complete" and sealed is None:
         status = "partial"
-        diagnostics = diagnostics or "cache payload incomplete"
+        diagnostics = diagnostics or "cache payload unavailable"
 
     payload = {
         "schema": SCHEMA, "key": cache_key(prov), "status": status,
