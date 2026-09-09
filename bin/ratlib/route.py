@@ -31,6 +31,13 @@ INPUT_IMPORTS = {"read", "gets", "scanf", "fgets"}
 KERNEL_IMPORTS = {"copy_from_user", "copy_to_user", "kmalloc", "kfree", "module_init", "module_exit"}
 VM_HINTS = ("vm", "opcode", "bytecode", "dispatch", "interpreter")
 CRYPTO_HINTS = ("aes", "des", "rc4", "md5", "sha", "base64", "xor", "rsa", "hmac", "crc")
+# Stable compare APIs used by revq's interesting-function scorer.  Route consumes
+# revq's structured functions[].calls, never the scorer's human-readable `why`
+# strings, so localization/rendering changes cannot alter routing semantics.
+CHECKER_COMPARE_CALLS = {
+    "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "strstr",
+    "strcoll", "bcmp", "wcscmp", "wcsncmp",
+}
 
 # Installed route-skill inventory. Commitment is a property of each route result,
 # not of the inventory: callers that inspect SKILLS must continue to see every
@@ -55,6 +62,25 @@ def _profile_imports(profile):
 
 def _revq_imports(revq):
     return set((revq or {}).get("imports", []) or [])
+
+
+def _function_calls(revq, function_name):
+    """Return canonical calls recovered for one exact revq function record."""
+    if not isinstance(function_name, str) or not function_name:
+        return set()
+    for func in (revq or {}).get("functions", []) or []:
+        if not isinstance(func, dict) or func.get("name") != function_name:
+            continue
+        return {
+            call.split("@", 1)[0]
+            for call in (func.get("calls", []) or [])
+            if isinstance(call, str) and call
+        }
+    return set()
+
+
+def _checker_compare_calls(revq, function_name):
+    return sorted(_function_calls(revq, function_name) & CHECKER_COMPARE_CALLS)
 
 
 def _evasion(revq):
@@ -243,9 +269,11 @@ def route(*, profile=None, revq=None, interesting=None):
     top = (interesting or [None])[0] if interesting else None
     if top:
         score = top.get("score", 0)
-        why = top.get("why", [])
-        calls_cmp = any("비교함수 호출" in w for w in why)
+        compare_calls = _checker_compare_calls(revq, top.get("func"))
+        calls_cmp = bool(compare_calls)
         rev_signals = [_sig("revq-interesting", {"func": top.get("func"), "score": score}, "heuristic")]
+        if compare_calls:
+            rev_signals.append(_sig("compare-calls", compare_calls, "fact"))
         if calls_cmp:
             rev_subroute, rev_confidence, rev_target = "rev-checker", min(0.5 + score / 20.0, 0.9), top.get("func")
         else:
