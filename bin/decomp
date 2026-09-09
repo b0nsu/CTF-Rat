@@ -84,6 +84,12 @@ PY
     cat "$1"
   fi
 }
+reseal_decomp_cache(){
+  # DecompOne mutates both _index.txt and one .c payload.  A successful mutation
+  # must become a new complete cache generation before we serve it as canonical.
+  python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" complete >/dev/null 2>&1 || return 1
+  python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null 2>&1
+}
 
 if [ "$REFRESH" -eq 1 ] && [ -d "$CACHE" ]; then
   mv "$CACHE" "$CACHE.stale.$(date +%s)"
@@ -142,9 +148,14 @@ if [ ! -f "$CACHE/_index.txt" ]; then
   python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null
   cache_post_rc=$?
   set -e
-  if [ "$cache_post_rc" -eq 12 ]; then
-    echo "[!] 일부 함수 decompile 실패; partial cache로 보존" >&2
-    echo "RAT_STATUS=partial RAT_EXIT=70" >&2
+  if [ "$cache_post_rc" -ne 0 ]; then
+    if [ "$cache_post_rc" -eq 12 ]; then
+      echo "[!] 일부 함수 decompile 실패; partial cache로 보존" >&2
+      echo "RAT_STATUS=partial RAT_EXIT=70" >&2
+    else
+      echo "[!] decomp cache integrity 검증 실패; 결과를 canonical cache로 사용하지 않음" >&2
+      echo "RAT_STATUS=error RAT_EXIT=70" >&2
+    fi
     exit 70
   fi
 fi
@@ -214,21 +225,25 @@ else
           if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$CACHE/$gh"; then
             echo "[!] Ghidra one-shot 결과 품질 낮음; 캐시 제거 후 disassembly fallback 사용" >&2
             rm -f "$CACHE/$gh"
-          else
+          elif reseal_decomp_cache; then
             emit_file "$CACHE/$gh"
             exit 0
+          else
+            echo "[!] Ghidra one-shot cache integrity 재봉인 실패; disassembly fallback 사용" >&2
           fi
         fi
         # A containing function may have been decompiled under a different name.
-        if grep -q "^$(printf '%08x' "$addr")	" "$CACHE/_index.txt" 2>/dev/null; then
+        if grep -q "^$(printf '%08x' "$addr")\t" "$CACHE/_index.txt" 2>/dev/null; then
           one_name="$(awk -F '\t' -v a="$(printf '%08x' "$addr")" '$1==a {print $2}' "$CACHE/_index.txt" | tail -1)"
           if [ -n "$one_name" ] && [ -f "$CACHE/$one_name.c" ]; then
             if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$CACHE/$one_name.c"; then
               echo "[!] Ghidra one-shot 결과 품질 낮음; 캐시 제거 후 disassembly fallback 사용" >&2
               rm -f "$CACHE/$one_name.c"
-            else
+            elif reseal_decomp_cache; then
               emit_file "$CACHE/$one_name.c"
               exit 0
+            else
+              echo "[!] Ghidra one-shot cache integrity 재봉인 실패; disassembly fallback 사용" >&2
             fi
           fi
         fi
