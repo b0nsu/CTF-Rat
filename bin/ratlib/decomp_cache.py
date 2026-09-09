@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -12,34 +13,9 @@ import uuid
 from datetime import datetime, timezone
 
 
-SCHEMA = "rat.decomp-cache/v1"
-_INVOCATION_POLICY = "sha256:" + hashlib.sha256(b"decomp-local-ghidra-v1").hexdigest()
-
-
-def _register_index(cache: str, prov: dict, binary: str) -> None:
-    """Best-effort registration in the shared canonical cache index.
-
-    The existing provenance key (`cache_key(prov)`) stays the source of
-    truth for hit/stale/partial here; this only makes that decision
-    observable through the same index revq/rat-profile use. Anchoring the
-    root off the binary (via the shared resolver) is what makes "one index"
-    actually hold across all three tools.
-
-    `envelope_digest` pins the produced artifact by content (the `_index.txt`
-    export listing) so the lineage row survives deletion or staling of the
-    mutable `path`; without it a dropped cache dir leaves a dangling row that
-    can't be told from a live one.
-    """
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
-        from ratlib.cache import Cache, resolve_index_root
-        idx_root = resolve_index_root(binary)
-        index_txt = os.path.join(cache, "_index.txt")
-        env_digest = "sha256:" + sha256(index_txt) if os.path.isfile(index_txt) else None
-        Cache(idx_root).put_entry("sha256:" + cache_key(prov), backend="decomp_dir",
-                                  path=cache, envelope_digest=env_digest)
-    except Exception:
-        pass
+SCHEMA = "rat.decomp-cache/v2"
+PAYLOAD_SCHEMA = "rat.decomp-payload/v1"
+_INVOCATION_POLICY = "sha256:" + hashlib.sha256(b"decomp-local-ghidra-v2-payload-integrity").hexdigest()
 
 
 def sha256(path: str) -> str:
@@ -48,6 +24,79 @@ def sha256(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _safe_function_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def payload_manifest(cache: str):
+    """Return a deterministic manifest for the exported index + C payloads.
+
+    The index is authoritative for which decompilations must exist. Newer
+    DecompExport rows carry an explicit output basename in column four;
+    DecompOne rows use the historical three-column form and its safe function
+    name. Extra .c files are also included so later mutations cannot hide from
+    the seal.
+    """
+    index = os.path.join(cache, "_index.txt")
+    if not os.path.isfile(index) or os.path.islink(index):
+        return None
+
+    required = {"_index.txt"}
+    try:
+        with open(index, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3 or not parts[1]:
+                    return None
+                output = parts[3] if len(parts) >= 4 and parts[3] else _safe_function_name(parts[1])
+                required.add(output + ".c")
+    except OSError:
+        return None
+
+    try:
+        for name in os.listdir(cache):
+            if name.endswith(".c"):
+                required.add(name)
+    except OSError:
+        return None
+
+    rows = []
+    for name in sorted(required):
+        path = os.path.join(cache, name)
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None
+        try:
+            rows.append({"path": name, "size": os.path.getsize(path), "sha256": sha256(path)})
+        except OSError:
+            return None
+    return rows
+
+
+def payload_digest(cache: str):
+    manifest = payload_manifest(cache)
+    if manifest is None:
+        return None
+    raw = json.dumps({"schema": PAYLOAD_SCHEMA, "files": manifest},
+                     sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _register_index(cache: str, prov: dict, binary: str, envelope_digest=None) -> None:
+    """Best-effort registration in the shared canonical cache index."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+        from ratlib.cache import Cache, resolve_index_root
+        idx_root = resolve_index_root(binary)
+        env_digest = envelope_digest if envelope_digest is not None else payload_digest(cache)
+        Cache(idx_root).put_entry("sha256:" + cache_key(prov), backend="decomp_dir",
+                                  path=cache, envelope_digest=env_digest)
+    except Exception:
+        pass
 
 
 def ghidra_version(home: str) -> str:
@@ -97,7 +146,11 @@ def validate(cache: str, binary: str, ghidra_home: str, script_dir: str) -> tupl
         return False, "stale"
     if meta.get("status") != "complete" or not os.path.isfile(os.path.join(cache, "_index.txt")):
         return False, "partial"
-    _register_index(cache, prov, binary)
+    expected = meta.get("payload_digest")
+    current = payload_digest(cache)
+    if not isinstance(expected, str) or current is None or current != expected:
+        return False, "corrupt"
+    _register_index(cache, prov, binary, envelope_digest=current)
     return True, "hit"
 
 
@@ -110,16 +163,33 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
             total = sum(1 for line in f if line.strip())
     exported = total; discovered = total; failed = []
     try:
-        with open(os.path.join(cache, ".rat-decomp-status.json"), encoding="utf-8") as f: export_status=json.load(f)
-        discovered=int(export_status.get("discovered", total)); exported=int(export_status.get("exported", total)); failed=list(export_status.get("failed", []))
+        with open(os.path.join(cache, ".rat-decomp-status.json"), encoding="utf-8") as f:
+            export_status = json.load(f)
+        discovered = int(export_status.get("discovered", total))
+        exported = int(export_status.get("exported", total))
+        failed = list(export_status.get("failed", []))
     except (OSError, ValueError, TypeError):
         pass
+
+    # DecompOne can append a valid function after the original full export.
+    # When there are no recorded failures, the current index is the stronger
+    # observation for exported/discovered counts than stale exporter counters.
+    if not failed:
+        discovered = max(discovered, total)
+        exported = max(exported, total)
     if failed or exported != discovered:
-        status="partial"
-        diagnostics=diagnostics or "function export incomplete"
+        status = "partial"
+        diagnostics = diagnostics or "function export incomplete"
+
+    sealed = payload_digest(cache) if status == "complete" else None
+    if status == "complete" and sealed is None:
+        status = "partial"
+        diagnostics = diagnostics or "cache payload incomplete"
+
     payload = {
         "schema": SCHEMA, "key": cache_key(prov), "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(), "provenance": prov,
+        "payload_schema": PAYLOAD_SCHEMA, "payload_digest": sealed,
         "functions_total": discovered, "functions_exported": exported,
         "failed_functions": failed, "diagnostics": [diagnostics] if diagnostics else [],
     }
@@ -132,18 +202,13 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
     if payload["status"] == "complete":
-        _register_index(cache, prov, binary)
+        _register_index(cache, prov, binary, envelope_digest=sealed)
 
 
 def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str,
                       cache_state: str, status: str, operation: str, requested: str,
                       started_at: str, started_ns: int) -> bool:
-    """Persist one successful decomp CLI invocation using the canonical tool-result stream.
-
-    The mutable decomp directory remains the cache source of truth.  This record is
-    observational only: every CLI invocation gets a unique id while cache identity
-    stays input/provenance-derived, so a warm hit cannot disappear into one index row.
-    """
+    """Persist one successful decomp CLI invocation using the canonical tool-result stream."""
     try:
         if cache_state not in {"hit", "miss", "bypass"}:
             raise ValueError("invalid cache state")
@@ -192,8 +257,8 @@ def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str
         from ratlib.cache import resolve_index_root
         from ratlib.schema import validate as validate_schema
         validate_schema(doc, "rat.tool-result/v1")
-        payload = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        put_bytes(payload, kind="tool-result", media_type="application/json",
+        encoded = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        put_bytes(encoded, kind="tool-result", media_type="application/json",
                   logical_name="decomp-%s.json" % invocation_id,
                   root=resolve_index_root(binary),
                   provenance={"tool": "decomp", "invocation_id": invocation_id})
@@ -223,7 +288,7 @@ def main(argv=None) -> int:
         print(cache_key(provenance(a.binary, a.ghidra_home, a.script_dir))); return 0
     if a.cmd == "validate":
         valid, reason = validate(a.cache, a.binary, a.ghidra_home, a.script_dir)
-        print(reason); return 0 if valid else {"legacy": 10, "stale": 11, "partial": 12}[reason]
+        print(reason); return 0 if valid else {"legacy": 10, "stale": 11, "partial": 12, "corrupt": 13}[reason]
     if a.cmd == "invocation":
         record_invocation(a.cache, a.binary, a.ghidra_home, a.script_dir,
                           a.cache_state, a.status, a.operation, a.requested,
