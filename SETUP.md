@@ -68,7 +68,7 @@ angr 미설치 환경이면 revq 는 `selftest`·`--fast`(binutils) 만, symsolv
 
 ## 7. 사용 (진입점)
 - **풀이 진입**: 레포 루트에서 `claude`(또는 codex) → `CLAUDE.md` 자동 로드(풀이 doctrine 진입점).
-- **수집/스캐폴드**: `ctfpull ctfd --id N` → `newchal <name> <bin> [libc] [host:port]`
+- **수집/스캐폴드**: `ctfpull ctfd --id N` → `solve/<name>/artifact/`에 원본 수집 → `newchal <name> <bin> [libc] [host:port]`
 - **rev**: `revq <bin>` → `revq <bin> --func <후보>` → `decomp <bin> <fn>` → `symsolve … --find-str …`
 - **pwn**: `recon <bin>` → `decomp` → `pwnkit`/`pwnstage` → `state` 로 진행 기록
 - **주소 계산**: `pwncalc elf-offset --elf ./libc.so.6 --symbol puts` →

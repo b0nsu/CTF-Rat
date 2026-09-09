@@ -678,6 +678,23 @@ class CtfpullDefaultsTests(unittest.TestCase):
             self.assertEqual(module.CTF_HOME, os.path.abspath(temp))
             self.assertIn(os.path.join(os.path.abspath(temp), ".ctfd.env"), module.DEFAULT_ENV_PATHS)
 
+    def test_default_staging_lives_inside_challenge_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old = os.environ.get("CTF_HOME")
+            os.environ["CTF_HOME"] = temp
+            try:
+                module = load_ctfpull_module()
+            finally:
+                if old is None: os.environ.pop("CTF_HOME", None)
+                else: os.environ["CTF_HOME"] = old
+            self.assertEqual(module.challenge_staging_path(None, "warmup_pwn"),
+                             os.path.join(temp, "solve", "warmup_pwn", "artifact"))
+
+    def test_explicit_destination_keeps_legacy_layout(self):
+        module = load_ctfpull_module()
+        self.assertEqual(module.challenge_staging_path("/tmp/incoming", "warmup_pwn"),
+                         "/tmp/incoming/warmup_pwn")
+
 
 class SelftestExitTests(unittest.TestCase):
     def test_forced_failure_is_nonzero_and_reported(self):

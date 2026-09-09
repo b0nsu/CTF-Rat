@@ -325,6 +325,13 @@ def write_run_manifest(path, payload):
     atomic_write_run_manifest(path, payload)
 
 
+def challenge_staging_path(dest, name):
+    """Return the ingest directory while keeping explicit --dest compatible."""
+    if dest is None:
+        return os.path.join(CTF_HOME, "solve", name, "artifact")
+    return os.path.join(os.path.abspath(os.path.expanduser(dest)), name)
+
+
 def render_newchal_cmd(name, main_bin, libc, conn, run_manifest=None):
     argv = ["newchal", name, main_bin]
     if conn and libc:
@@ -366,7 +373,7 @@ def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newcha
         die("문제 상세 응답 형식 이상 (id=%s)" % chal_id)
     name = slugify(detail.get("name", "chal_%s" % chal_id))
     conn = parse_connection_info(detail.get("connection_info"))
-    staging = os.path.join(dest, name)
+    staging = challenge_staging_path(dest, name)
     os.makedirs(staging, exist_ok=True)
     info("문제: %s (id=%s, cat=%s) → %s" % (detail.get("name"), chal_id, detail.get("category"), staging))
     if conn:
@@ -522,7 +529,7 @@ def main():
     g.add_argument("--all", action="store_true", help="일괄 fetch")
     sp.add_argument("--category", help="카테고리 필터 (예: pwn, rev)")
     sp.add_argument("--json", action="store_true", help="목록을 JSON으로")
-    sp.add_argument("--dest", default=os.path.join(CTF_HOME, "solve_incoming"), help="스테이징 루트")
+    sp.add_argument("--dest", help="스테이징 루트 (기본: solve/<name>/artifact)")
     sp.add_argument("--bin", dest="bin_hint", help="메인 바이너리 파일명 강제 지정")
     sp.add_argument("--no-newchal", action="store_true", help="newchal 호출 없이 스테이징만")
     sp.add_argument("--no-extract", action="store_true", help="첨부 archive를 해제하지 않음")
