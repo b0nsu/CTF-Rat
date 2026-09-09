@@ -1,7 +1,7 @@
 import argparse, os, sqlite3, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.cache import Cache, canonical_key, key as legacy_key, resolve_index_root
-from ratlib.decomp_cache import cache_key as decomp_cache_key, provenance as decomp_provenance, write_meta as write_decomp_meta
+from ratlib.decomp_cache import cache_key as decomp_cache_key, payload_digest as decomp_payload_digest, provenance as decomp_provenance, write_meta as write_decomp_meta
 
 def ck(**overrides):
     base = dict(binary_sha256="sha256:" + "a" * 64, tool_name="revq", tool_version="2",
@@ -104,11 +104,8 @@ class DecompCacheIndexRegistration(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertEqual(entry["backend"], "decomp_dir")
             self.assertEqual(entry["path"], cache)
-            # content anchor pins the export listing so the row survives path deletion
-            import hashlib as _h
-            with open(os.path.join(cache, "_index.txt"), "rb") as f:
-                want = "sha256:" + _h.sha256(f.read()).hexdigest()
-            self.assertEqual(entry["envelope_digest"], want)
+            # Content anchor pins the complete sealed payload, not just _index.txt.
+            self.assertEqual(entry["envelope_digest"], decomp_payload_digest(cache))
 
     def test_lineage_survives_cache_dir_deletion(self):
         import shutil
