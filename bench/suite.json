@@ -140,10 +140,11 @@
       "binary": "inst_prof.bin",
       "route_fixture": "route.json",
       "fetch": {
-        "url": "https://raw.githubusercontent.com/google/google-ctf/main/2017/quals/2017-pwn-inst-prof/attachments/inst_prof",
+        "url": "https://raw.githubusercontent.com/google/google-ctf/c61f722741b8b998a402597ab01713c62a6ecbbe/2017/quals/2017-pwn-inst-prof/attachments/inst_prof",
         "git_blob_sha1": "af7c5b1f940cf2a121936ccb525d627e9aa23ae8",
         "license": "Apache-2.0",
         "source_repository": "google/google-ctf",
+        "source_revision": "c61f722741b8b998a402597ab01713c62a6ecbbe",
         "source_path": "2017/quals/2017-pwn-inst-prof/attachments/inst_prof"
       },
       "verify": {"kind": "rat-verify-pass"},
