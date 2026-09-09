@@ -15,8 +15,8 @@ def profile(imports=(), facts=()):
     }
 
 
-def revq(imports=()):
-    return {"imports": list(imports), "evasion": [], "functions": [], "strings": []}
+def revq(imports=(), functions=()):
+    return {"imports": list(imports), "evasion": [], "functions": list(functions), "strings": []}
 
 
 class RouteConflictDimensions(unittest.TestCase):
@@ -43,11 +43,12 @@ class RouteConflictDimensions(unittest.TestCase):
     def test_rev_primary_conflict_keeps_pwn_surface_visible(self):
         r = route(
             profile=profile(imports=["printf", "read"]),
-            revq=revq(imports=["printf", "read", "memcmp"]),
+            revq=revq(imports=["printf", "read", "memcmp"],
+                      functions=[{"name": "check_flag", "calls": ["memcmp"]}]),
             interesting=[{
                 "func": "check_flag",
                 "score": 8,
-                "why": ["비교함수 호출: memcmp"],
+                "why": ["display-only"],
             }],
         )
 
