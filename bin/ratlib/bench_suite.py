@@ -116,6 +116,14 @@ def validate_suite(doc):
         verify = entry.get("verify")
         if not isinstance(verify, Mapping) or verify.get("kind") not in VERIFY_KINDS:
             raise SuiteValidationError("%s.verify.kind is invalid" % entry_id)
+        claim_pattern = verify.get("claim_pattern")
+        if claim_pattern is not None:
+            if not isinstance(claim_pattern, str) or not claim_pattern:
+                raise SuiteValidationError("%s.verify.claim_pattern must be a non-empty regex string" % entry_id)
+            try:
+                re.compile(claim_pattern)
+            except re.error as exc:
+                raise SuiteValidationError("%s.verify.claim_pattern is invalid: %s" % (entry_id, exc)) from exc
         if not isinstance(entry.get("env", {}), Mapping):
             raise SuiteValidationError("%s.env must be an object" % entry_id)
     return doc
@@ -164,9 +172,9 @@ def project_suite(doc, *, corpus=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="python3 -m ratlib.bench_suite",
-        description="validate/project a ratbench suite without executing it",
+        description="validate/project a ratbench suite without executing benchmarks",
     )
-    parser.add_argument("suite", help="suite JSON path")
+    parser.add_argument("suite", help="benchmark suite JSON path")
     parser.add_argument("--corpus", choices=sorted(CORPORA), help="emit only this corpus")
     args = parser.parse_args(argv)
     try:
