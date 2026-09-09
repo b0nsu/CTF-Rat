@@ -1,0 +1,26 @@
+{
+  "profile": {
+    "imports": [],
+    "facts": []
+  },
+  "revq": {
+    "imports": [],
+    "strings": [
+      {"val": "Correct! Decrypting flag"},
+      {"val": "Incorrect, try again!"}
+    ],
+    "functions": [
+      {
+        "name": "checker",
+        "calls": [],
+        "strings": [
+          "Correct! Decrypting flag",
+          "Incorrect, try again!"
+        ]
+      }
+    ]
+  },
+  "interesting": [
+    {"func": "checker", "score": 8}
+  ]
+}
