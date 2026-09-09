@@ -116,8 +116,9 @@ def _primitive(root, primitive_id, input_digest, environment_digest):
         raise GateError("primitive environment/input mismatch")
     return p
 def _verify_records(root, lineage_id=None):
-    stale={e["payload"].get("verification_id") for e in Stream(root).read() if e["type"]=="verification.staled"}
-    records=[e["payload"] for e in Stream(root).read() if e["type"]=="verification.recorded" and e["payload"].get("verification_id") not in stale]
+    events=Stream(root).read()
+    stale={e["payload"].get("verification_id") for e in events if e["type"]=="verification.staled"}
+    records=[e["payload"] for e in events if e["type"]=="verification.recorded" and e["payload"].get("verification_id") not in stale]
     return records if lineage_id is None else [r for r in records if r.get("lineage_id")==lineage_id]
 def _require_active_evidence(root, evidence_ids):
     if not isinstance(evidence_ids,list) or not evidence_ids or not all(isinstance(i,str) and i for i in evidence_ids): raise GateError("evidence IDs are required")
