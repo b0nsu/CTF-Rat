@@ -33,19 +33,26 @@ def _load_rat():
     return module
 
 
+def _current_fixture(revq):
+    return {
+        "schema": revq.SCHEMA,
+        "engine": "binutils",
+        "arch": "AMD64",
+        "pie": False,
+        "stripped": False,
+        "imports": [],
+        "strings": [],
+        "functions": [],
+        "evasion_signal_schema": revq.EVASION_SIGNAL_SCHEMA,
+        "evasion_signals": [],
+        "evasion": [],
+    }
+
+
 class RevqInvocationTelemetryTests(unittest.TestCase):
     def test_miss_and_hit_are_persisted_as_tool_result_invocations(self):
         revq = _load_revq()
-        fixture = {
-            "schema": revq.SCHEMA,
-            "engine": "binutils",
-            "arch": "AMD64",
-            "pie": False,
-            "stripped": False,
-            "imports": [],
-            "strings": [],
-            "functions": [],
-        }
+        fixture = _current_fixture(revq)
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")
             with open(binary, "wb") as fh:
@@ -75,16 +82,7 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
     def test_rat_route_records_in_process_revq_miss_and_hit(self):
         rat = _load_rat()
         revq = rat._load_revq_module()
-        fixture = {
-            "schema": revq.SCHEMA,
-            "engine": "binutils",
-            "arch": "AMD64",
-            "pie": False,
-            "stripped": False,
-            "imports": [],
-            "strings": [],
-            "functions": [],
-        }
+        fixture = _current_fixture(revq)
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")
             with open(binary, "wb") as fh:
@@ -164,11 +162,7 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
 
     def test_failed_selector_is_not_recorded_as_a_successful_invocation(self):
         revq = _load_revq()
-        fixture = {
-            "schema": revq.SCHEMA, "engine": "binutils", "arch": "AMD64",
-            "pie": False, "stripped": False, "imports": [], "strings": [],
-            "functions": [],
-        }
+        fixture = _current_fixture(revq)
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")
             with open(binary, "wb") as fh:
