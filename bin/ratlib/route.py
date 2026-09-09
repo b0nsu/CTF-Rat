@@ -1,9 +1,9 @@
 """Deterministic route judgment with an explicit active-triage overlay.
 
 Combines existing rat-profile facts/signals/imports and revq
-imports/strings/evasion/interesting into a *provisional* route suggestion. No
-new analysis is performed here: every signal consumed here is already computed
-by rat-profile or revq.
+imports/strings/evasion_signals/interesting into a *provisional* route
+suggestion. No new analysis is performed here: every signal consumed here is
+already computed by rat-profile or revq.
 
 `track`/`subroute`/`confidence` remain for compatibility and ranking.  They are
 not a calibrated probability or a proof that one mutually-exclusive challenge
@@ -22,6 +22,8 @@ still singular, but the model-facing working set is not.
 from __future__ import annotations
 
 import re
+
+from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 
 HEAP_IMPORTS = {"malloc", "free", "calloc", "realloc"}
 STRONG_OVERFLOW_IMPORTS = {"gets", "strcpy", "strcat", "sprintf",
@@ -117,17 +119,33 @@ def _checker_oracle_strings(revq, function_name):
     }
 
 
-def _evasion(revq):
-    return (revq or {}).get("evasion", []) or []
+def _typed_evasion(revq):
+    """Return current typed evasion observations; legacy prose is never parsed."""
+    doc = revq or {}
+    if doc.get("evasion_signal_schema") != EVASION_SIGNAL_SCHEMA:
+        return []
+    return [
+        signal for signal in (doc.get("evasion_signals", []) or [])
+        if isinstance(signal, dict)
+        and isinstance(signal.get("kind"), str)
+        and signal.get("quality") in {"fact", "heuristic"}
+    ]
 
 
 def _packed_signal(revq):
-    for e in _evasion(revq):
-        text = e.lower()
-        if "upx" in text or "패커 섹션" in e or "packed" in text:
-            return e, "fact", 0.85
-        if "엔트로피" in e:
-            return e, "heuristic", 0.55
+    """Return the strongest typed packing observation and its route rank.
+
+    A concrete packer section outranks entropy even when both are present.
+    Human-readable `revq.evasion` text is compatibility output only and cannot
+    affect routing.
+    """
+    observations = _typed_evasion(revq)
+    for signal in observations:
+        if signal.get("kind") == "packer-section" and signal.get("quality") == "fact":
+            return signal, 0.85
+    for signal in observations:
+        if signal.get("kind") == "high-entropy" and signal.get("quality") == "heuristic":
+            return signal, 0.55
     return None
 
 
@@ -260,7 +278,7 @@ def _active_triage_overlay(result):
         # heuristic, so they select the checker route without hard-locking a skill.
         commitment = "committed" if _signal_quality(result, "compare-calls") == "fact" else "provisional"
     elif subroute == "rev-packed":
-        commitment = "committed" if _signal_quality(result, "evasion") == "fact" else "provisional"
+        commitment = "committed" if _signal_quality(result, "packer-section") == "fact" else "provisional"
 
     if any(s.get("kind") == "pe-platform" for s in result.get("signals", [])):
         _append_unique(dims["constraints"], "pe-windows")
@@ -295,8 +313,8 @@ def route(*, profile=None, revq=None, interesting=None):
 
     packed = _packed_signal(revq)
     if packed:
-        value, quality, confidence = packed
-        signals.append(_sig("evasion", value, quality))
+        observation, confidence = packed
+        signals.append(_sig(observation["kind"], observation.get("value"), observation["quality"]))
         return _finalize(_result("rev", "rev-packed", confidence, signals, capabilities), is_pe)
 
     if imports & KERNEL_IMPORTS and not is_pe:
