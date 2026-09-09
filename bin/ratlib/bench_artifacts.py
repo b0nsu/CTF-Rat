@@ -55,6 +55,11 @@ def _verify_payload(entry, payload):
         )
 
 
+def _mark_executable(path):
+    mode = os.stat(path).st_mode
+    os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def materialize_entry(entry, *, root, opener=None, timeout=60):
     """Fetch one pinned binary, or validate an already-materialized copy.
 
@@ -71,6 +76,7 @@ def materialize_entry(entry, *, root, opener=None, timeout=60):
         with open(target, "rb") as fh:
             payload = fh.read()
         _verify_payload(entry, payload)
+        _mark_executable(target)
         return "present"
 
     opener = opener or urllib.request.urlopen
@@ -96,8 +102,7 @@ def materialize_entry(entry, *, root, opener=None, timeout=60):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
-        mode = os.stat(target).st_mode
-        os.chmod(target, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        _mark_executable(target)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
