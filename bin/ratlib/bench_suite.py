@@ -15,12 +15,14 @@ import os
 import re
 import sys
 from collections.abc import Mapping
+from urllib.parse import urlparse
 
 SCHEMA = "rat.bench-suite/v1"
 CORPORA = {"synthetic", "integration", "real", "private"}
 TRACKS = {"pwn", "rev"}
 VERIFY_KINDS = {"flag-regex", "symsolve-restore", "rat-verify-pass"}
 _CAPABILITY = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_GIT_BLOB_SHA1 = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 class SuiteValidationError(ValueError):
@@ -87,6 +89,29 @@ def validate_suite(doc):
             _relative_path(binary, "binary", entry_id)
         for runtime_file in entry.get("runtime_files", []) or []:
             _relative_path(runtime_file, "runtime_files", entry_id)
+
+        fetch = entry.get("fetch")
+        if fetch is not None:
+            if not isinstance(fetch, Mapping):
+                raise SuiteValidationError("%s.fetch must be an object" % entry_id)
+            if not binary:
+                raise SuiteValidationError("%s.fetch requires a binary target" % entry_id)
+            if entry.get("redistributable") is not True:
+                raise SuiteValidationError("%s.fetch requires redistributable=true" % entry_id)
+            url = fetch.get("url")
+            parsed = urlparse(url) if isinstance(url, str) else None
+            if not parsed or parsed.scheme != "https" or not parsed.netloc:
+                raise SuiteValidationError("%s.fetch.url must be an absolute https URL" % entry_id)
+            digest = fetch.get("git_blob_sha1")
+            if not isinstance(digest, str) or not _GIT_BLOB_SHA1.fullmatch(digest):
+                raise SuiteValidationError("%s.fetch.git_blob_sha1 must be 40 hex chars" % entry_id)
+            license_id = fetch.get("license")
+            if not isinstance(license_id, str) or not license_id.strip():
+                raise SuiteValidationError("%s.fetch.license is required" % entry_id)
+            for field in ("source_repository", "source_path"):
+                value = fetch.get(field)
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    raise SuiteValidationError("%s.fetch.%s must be a non-empty string" % (entry_id, field))
 
         verify = entry.get("verify")
         if not isinstance(verify, Mapping) or verify.get("kind") not in VERIFY_KINDS:

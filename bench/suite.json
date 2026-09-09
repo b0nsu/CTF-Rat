@@ -1,6 +1,6 @@
 {
   "schema": "rat.bench-suite/v1",
-  "note": "Repo-authored synthetic fixtures (license-free). Real/private challenge binaries remain local unless redistribution rights are explicit; add manifest metadata without committing restricted artifacts.",
+  "note": "Canonical benchmark manifest. Repository-authored synthetic fixtures are committed directly; explicitly redistributable real challenge binaries may be pinned here and materialized locally before Mode B. Private/non-redistributable material remains in ignored local suites.",
   "entries": [
     {
       "id": "stack-basic-01",
@@ -127,6 +127,28 @@
       "route_fixture": "route.json",
       "verify": {"kind": "symsolve-restore", "expected": "x0rz42", "find_str": "Correct", "avoid_str": "Wrong", "stdin_len": 6},
       "env": {"needs_libc": false}
+    },
+    {
+      "id": "google-ctf-2017-inst-prof",
+      "track": "pwn",
+      "expected_route": "pwn-rop",
+      "difficulty": 3,
+      "corpus": "real",
+      "capabilities": ["jit", "short-instruction-window", "timing-side-channel", "pie"],
+      "redistributable": true,
+      "dir": "bench/artifacts/google-ctf-2017-inst-prof",
+      "binary": "inst_prof.bin",
+      "route_fixture": "route.json",
+      "fetch": {
+        "url": "https://raw.githubusercontent.com/google/google-ctf/c61f722741b8b998a402597ab01713c62a6ecbbe/2017/quals/2017-pwn-inst-prof/attachments/inst_prof",
+        "git_blob_sha1": "af7c5b1f940cf2a121936ccb525d627e9aa23ae8",
+        "license": "Apache-2.0",
+        "source_repository": "google/google-ctf",
+        "source_revision": "c61f722741b8b998a402597ab01713c62a6ecbbe",
+        "source_path": "2017/quals/2017-pwn-inst-prof/attachments/inst_prof"
+      },
+      "verify": {"kind": "rat-verify-pass"},
+      "env": {"needs_libc": true, "arch": "x86_64"}
     }
   ]
 }

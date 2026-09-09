@@ -1,0 +1,31 @@
+{
+  "profile": {
+    "imports": [
+      "alarm",
+      "exit",
+      "mmap",
+      "mprotect",
+      "munmap",
+      "read",
+      "sleep",
+      "write"
+    ],
+    "facts": [
+      {"kind": "elf.nx", "value": true},
+      {"kind": "elf.pie", "value": true}
+    ]
+  },
+  "revq": {
+    "imports": [
+      "alarm",
+      "exit",
+      "mmap",
+      "mprotect",
+      "munmap",
+      "read",
+      "sleep",
+      "write"
+    ],
+    "strings": []
+  }
+}
