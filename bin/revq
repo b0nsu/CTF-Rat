@@ -28,7 +28,7 @@ deep 추출은 angr 필요. 실행:  python3 bin/revq <bin> [...]  (venv 활성 
   revq <bin> --xrefs <name|addr> # 이 심볼/주소를 참조/호출하는 곳
   revq <bin> --json              # revmap 원본
   revq <bin> --fast              # binutils 엔진 (xref 없음, 빠른 훑기용)
-  revq <bin> --refresh           # 캐시 무시하고 재추출
+  revq <bin> --refresh           # 캐시 무시 재추출
   revq selftest                  # 네트워크·바이너리 무관 순수 로직 검증
 """
 import argparse
@@ -40,10 +40,18 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+
+from ratlib.evasion import (
+    SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA,
+    classify as classify_evasion_signals,
+    entropy as _entropy,
+    has_current_contract as _has_current_evasion_contract,
+    render_legacy as _render_legacy_evasion,
+)
 from ratlib.runner import run
 
 SCHEMA = 2
-REVQ_POLICY = "sha256:" + hashlib.sha256(b"revq-local-static-analysis-v1").hexdigest()
+REVQ_POLICY = "sha256:" + hashlib.sha256(b"revq-local-static-analysis-v2-typed-evasion").hexdigest()
 
 # ─────────────────────────── 휴리스틱 사전 ───────────────────────────
 # check-루틴을 가리키는 신호. recon 의 SINK 사전과 목적이 다르다(rev = 판별 로직).
@@ -54,8 +62,7 @@ INTERESTING_STR = re.compile(
     re.I,
 )
 FLAG_STR = re.compile(r"flag|\bctf\b|\}$|\{.*\}", re.I)
-# oracle success/failure classification — reuses the
-# same extracted strings/xrefs, no new analysis.
+# oracle success/failure classification — reuses the same extracted strings/xrefs.
 ORACLE_SUCCESS_STR = re.compile(
     r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b",
     re.I,
@@ -74,65 +81,34 @@ INPUT_FUNCS = {
 }
 CRYPTO_HINTS = re.compile(r"aes|des|rc4|md5|sha[0-9]|base64|xor|rsa|hmac|crc", re.I)
 
-# 회피/난독화 신호 — 정적 분석 신뢰를 떨어뜨리는 것 (anti-debug / packing / 런타임 복호화).
-# h4c.team "AI가 리버싱 못 푸는 이유" 실패원인 ①⑤(정적결과 과신) 대응: 감지 시 동적 교차검증 유도.
-EVASION_IMPORTS = {"ptrace", "personality", "prctl", "mprotect", "getppid"}
-EVASION_STR = re.compile(
-    r"ptrace|tracerpid|/proc/self/status|ld_preload|anti.?debug|/proc/self/maps",
-    re.I,
-)
-
-
-def _entropy(data):
-    """Shannon 엔트로피(bit/byte, 0~8). packing/암호화 판별."""
-    import math
-    if not data:
-        return 0.0
-    freq = [0] * 256
-    for b in data:
-        freq[b] += 1
-    n = len(data)
-    ent = 0.0
-    for c in freq:
-        if c:
-            p = c / n
-            ent -= p * math.log2(p)
-    return ent
-
 
 def classify_evasion(imports, strings, entropy, sections):
-    """revmap 신호로 회피 기법 후보 나열. 엔진 무관(순수) → selftest 가능."""
-    imp = set(imports)
-    out = []
-    for name in ("ptrace", "personality", "prctl", "mprotect"):
-        if name in imp:
-            out.append("import %s" % name)
-    joined = " ".join(strings)
-    m = EVASION_STR.search(joined)
-    if m:
-        out.append("문자열 '%s'" % m.group(0).lower())
-    if entropy is not None and entropy >= 7.2:
-        out.append("고엔트로피 %.2f/8 (packing/암호화 의심)" % entropy)
-    for s in sections or []:
-        su = (s or "").upper()
-        if su.startswith("UPX") or "PACKED" in su:
-            out.append("패커 섹션 %s" % s)
-    # 중복 제거(순서 유지)
-    seen, uniq = set(), []
-    for x in out:
-        if x not in seen:
-            seen.add(x); uniq.append(x)
-    return uniq
+    """Compatibility API returning the historical human-readable list.
+
+    Semantic callers must consume `evasion_signals`; this rendering exists for
+    CLI/backward compatibility only.
+    """
+    return _render_legacy_evasion(classify_evasion_signals(imports, strings, entropy, sections))
 
 
-def _file_evasion(binpath, imports, strings, sections):
-    """파일 바이트 엔트로피까지 포함해 evasion 신호 계산 (추출기 공용)."""
+def _file_evasion_projection(binpath, imports, strings, sections):
+    """Return typed evasion observations plus the one-way legacy rendering."""
     try:
         with open(binpath, "rb") as f:
             ent = _entropy(f.read())
     except Exception:
         ent = None
-    return classify_evasion(imports, [s["val"] for s in strings], ent, sections)
+    signals = classify_evasion_signals(imports, [s["val"] for s in strings], ent, sections)
+    return {
+        "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
+        "evasion_signals": signals,
+        "evasion": _render_legacy_evasion(signals),
+    }
+
+
+def _file_evasion(binpath, imports, strings, sections):
+    """Compatibility helper returning only the historical prose list."""
+    return _file_evasion_projection(binpath, imports, strings, sections)["evasion"]
 
 
 # ─────────────────────────── 유틸 ───────────────────────────
@@ -159,7 +135,6 @@ def sh(cmd):
 
 
 def sha256(path):
-    import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -176,8 +151,6 @@ def annotate_counts(rev):
     funcs = rev.get("functions", [])
     canonical, aliases = set(), {}
     for func in funcs:
-        # Prefer a concrete address; name is the stable fallback for fast/unknown
-        # entries. This prevents two aliases of one address inflating the count.
         addr = func.get("addr")
         key = ("addr", int(addr)) if addr else ("name", func.get("name", "?"))
         canonical.add(key)
@@ -229,18 +202,12 @@ def extract_angr(binpath):
         show_progressbar=False,
     )
     funcs_mgr = cfg.kb.functions
-
-    # 콜그래프 (caller 계산). networkx DiGraph, 노드=함수 addr.
     callgraph = getattr(cfg.kb, "callgraph", None)
 
-    # 문자열: .rodata/.data* 섹션 바이트에서 직접 추출 (angr string-sort 버전편차 회피).
     strings = _extract_strings_from_loader(proj)
     str_by_addr = {s["addr"]: s for s in strings}
-
-    # xref 맵: dst-addr → [ins_addr...] (kb.xrefs). 버전에 따라 API 다름 → 방어적.
     xref_dst = _angr_xrefs_by_dst(proj)
 
-    # 문자열 xref 를 함수에 귀속.
     for s in strings:
         s["xrefs"] = []
     for saddr, srec in str_by_addr.items():
@@ -258,7 +225,6 @@ def extract_angr(binpath):
         if f.is_simprocedure or f.is_plt:
             continue
         calls = _func_call_targets(f, funcs_mgr)
-        # 이 함수가 참조하는 문자열 (xref 역인덱스)
         fstrs = sorted({srec["val"] for srec in strings
                         for xr in srec["xrefs"] if xr["func"] == f.name})
         ncallers = 0
@@ -294,6 +260,7 @@ def extract_angr(binpath):
         })
 
     sec_names = [s.name for s in getattr(obj, "sections", []) if getattr(s, "name", None)]
+    evasion = _file_evasion_projection(binpath, imports, strings, sec_names)
     return {
         "schema": SCHEMA,
         "engine": "angr",
@@ -305,7 +272,7 @@ def extract_angr(binpath):
         "imports": imports,
         "analysis_complete": True,
         "functions_filtered": sum(1 for f in all_functions if f.is_simprocedure or f.is_plt),
-        "evasion": _file_evasion(binpath, imports, strings, sec_names),
+        **evasion,
         "platform": _detect_platform(sh(["file", binpath])),
     }
 
@@ -332,7 +299,7 @@ def _iter_cstrings(blob, minlen=4):
     cur = bytearray()
     start = 0
     for i, b in enumerate(blob):
-        if 0x20 <= b < 0x7f or b in (9,):  # printable + tab
+        if 0x20 <= b < 0x7f or b in (9,):
             if not cur:
                 start = i
             cur.append(b)
@@ -350,7 +317,6 @@ def _angr_xrefs_by_dst(proj):
     xm = getattr(proj.kb, "xrefs", None)
     if xm is None:
         return out
-    # 흔한 형태: xm.xrefs_by_dst (dict addr->set(XRef)), XRef.ins_addr
     by_dst = getattr(xm, "xrefs_by_dst", None)
     if isinstance(by_dst, dict):
         for dst, refs in by_dst.items():
@@ -359,7 +325,6 @@ def _angr_xrefs_by_dst(proj):
                 if ins is not None:
                     out.setdefault(dst, []).append(ins)
         return out
-    # 폴백: 전체 순회
     try:
         for r in xm.get_xrefs():  # type: ignore[attr-defined]
             dst = getattr(r, "dst", None)
@@ -420,7 +385,6 @@ def extract_binutils(binpath):
     pie = "pie executable" in ftype or "shared object" in ftype
     stripped = "not stripped" not in ftype
 
-    # 심볼(함수) — stripped 면 거의 없음.
     functions = []
     nm = sh(["nm", "-C", "--defined-only", binpath])
     for line in nm.splitlines():
@@ -431,7 +395,6 @@ def extract_binutils(binpath):
                               "nblocks": 0, "ninstr": 0, "count_quality": "unavailable",
                               "calls": [], "strings": [], "ncallers": 0})
 
-    # 문자열 (파일 오프셋; fast 티어는 정밀 vaddr/xref 미제공).
     strings = []
     for line in sh(["strings", "-t", "d", "-n", "4", binpath]).splitlines():
         m = re.match(r"\s*(\d+)\s(.*)", line)
@@ -439,7 +402,6 @@ def extract_binutils(binpath):
             strings.append({"addr": int(m.group(1)), "val": m.group(2),
                             "sec": "?", "xrefs": []})
 
-    # imports (동적 UND 심볼).
     imports = []
     for line in sh(["readelf", "-W", "--dyn-syms", binpath]).splitlines():
         if " UND " in line:
@@ -451,13 +413,14 @@ def extract_binutils(binpath):
     imports = sorted(set(imports))
 
     sec_names = re.findall(r"\]\s+(\.\S+)", sh(["readelf", "-SW", binpath]))
+    evasion = _file_evasion_projection(binpath, imports, strings, sec_names)
     return {
         "schema": SCHEMA, "engine": "binutils", "arch": arch, "pie": pie,
         "stripped": stripped, "functions": functions, "strings": strings,
         "imports": imports,
         "analysis_complete": False,
         "functions_filtered": 0,
-        "evasion": _file_evasion(binpath, imports, strings, sec_names),
+        **evasion,
         "platform": _detect_platform(sh(["file", binpath])),
     }
 
@@ -495,7 +458,6 @@ def compute_interesting(rev):
             out.append({"func": f["name"], "addr": f.get("addr", 0),
                         "size": f.get("size", 0), "score": score, "why": why})
     out.sort(key=lambda x: (-x["score"], -x["size"]))
-    # 정보성: 후보가 하나도 없고 cmp import 만 있을 때 힌트
     if not out and has_cmp:
         out.append({"func": "(미귀속)", "addr": 0, "size": 0, "score": 0,
                     "why": ["비교함수(%s) import 됨 — --xrefs 로 호출부 확인"
@@ -514,13 +476,7 @@ def _oracle_candidates(rev, pattern, kind):
 
 
 def compute_oracle(rev):
-    """success/failure 문자열의 xref BB를 symsolve 좌표로 wiring.
-
-    단일·명확(문자열 후보 1개 + xref 1개)일 때만 auto_connect=True 로
-    resolve 를 채운다. 다수면 ambiguous=True 로 후보만 나열하고 자동
-    커맨드는 만들지 않는다 — symbolic candidate 는 증거가 아니므로 실행은
-    항상 사람/에이전트가 명시적으로 한다.
-    """
+    """success/failure 문자열의 xref BB를 symsolve 좌표로 wiring."""
     success = _oracle_candidates(rev, ORACLE_SUCCESS_STR, "success")
     failure = _oracle_candidates(rev, ORACLE_FAILURE_STR, "failure")
 
@@ -570,13 +526,11 @@ def render_summary(rev):
         L.append("  ※ recon(pwn/ELF triage) 대상 아님 · .NET/Unity=ilspycmd/il2cppdumper")
         L.append("  라우팅: knowledge/GROUNDING_INDEX.md(PE/.NET 행) · 동적 스캐폴드 solve/_template/rev/qiling_trace.py")
 
-    # evasion (정적 신뢰 하향 신호)
     ev = rev.get("evasion", [])
     if ev:
         L.append("EVASION: " + "; ".join(ev))
         L.append("  ⚠️ 정적 신뢰 하향 — 동적 교차검증(ltrace/strace/gdb, symsolve --verify) 권장")
 
-    # interesting
     inter = compute_interesting(rev)
     L.append("-" * 64)
     L.append("INTERESTING (check-루틴 후보, 점수 내림차순):")
@@ -593,7 +547,6 @@ def render_summary(rev):
     else:
         L.append("  (신호 없음 — --strings/--funcs 수동 탐색 or VM 가능성)")
 
-    # 판별 문자열 하이라이트
     isr = [s for s in rev["strings"] if INTERESTING_STR.search(s["val"])]
     if isr:
         L.append("-" * 64)
@@ -602,7 +555,6 @@ def render_summary(rev):
             xf = ",".join(sorted({x["func"] for x in s.get("xrefs", [])})) or "-"
             L.append("  %-42s  ← %s" % (_q(s["val"]), xf))
 
-    # oracle→symsolve 자동연결
     oracle = compute_oracle(rev)
     L.append("-" * 64)
     if oracle["auto_connect"]:
@@ -712,12 +664,7 @@ def _capped(items):
 
 
 def compute_function_card(rev, target):
-    """--func/--interesting/--xrefs 를 한 함수 스코프로 합친 stable JSON.
-
-    facts 는 revmap 에서 그대로 뽑은 결정론적 사실만(새 분석 없음).
-    heuristics 는 점수/근거만(단정 아님). unresolved 는 이 함수 스코프에서
-    확인할 수 없는 것을 숨기지 않고 명시한다.
-    """
+    """--func/--interesting/--xrefs 를 한 함수 스코프로 합친 stable JSON."""
     f = _find_func(rev, target)
     if not f:
         return None
@@ -726,8 +673,6 @@ def compute_function_card(rev, target):
     callees, callees_truncated = _capped(f.get("calls", []))
     strings, strings_truncated = _capped(f.get("strings", []))
     input_apis = sorted(set(f.get("calls", [])) & INPUT_FUNCS)
-    # 호출부(콜사이트) 개별 주소는 revq 의 함수-단위 calls 리스트 granularity 에선 알 수 없다 —
-    # 있는 그대로: api 이름만 사실로 남기고 address/length 는 unresolved 에 명시.
     compare_sites = [{"address": None, "api": api, "length": None} for api in sorted(set(f.get("calls", [])) & CMP_FUNCS)]
     func_strings = set(f.get("strings", []))
     oracle = compute_oracle(rev)
@@ -772,7 +717,6 @@ def _find_func(rev, target):
     for f in rev["functions"]:
         if f["name"] == target or (ti is not None and f.get("addr") == ti):
             return f
-    # 부분일치
     for f in rev["functions"]:
         if target.lower() in f["name"].lower():
             return f
@@ -782,11 +726,9 @@ def _find_func(rev, target):
 def render_xrefs(rev, target):
     """target(함수명/주소/문자열)을 참조·호출하는 곳."""
     L = ["== XREFS → %s ==" % target]
-    # 1) 이 함수를 호출하는 함수
     callers = [f["name"] for f in rev["functions"] if target in f.get("calls", [])]
     if callers:
         L.append("호출자(callers): " + ", ".join(sorted(set(callers))))
-    # 2) 이 문자열을 참조하는 함수
     for s in rev["strings"]:
         if target.lower() in s["val"].lower():
             xf = sorted({x["func"] for x in s.get("xrefs", [])})
@@ -798,22 +740,17 @@ def render_xrefs(rev, target):
 
 # ─────────────────────────── 오케스트레이션 ───────────────────────────
 def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
-    """Best-effort registration in the M2 canonical cache index (bin/ratlib/cache.py).
-
-    revq's own sidecar-file validity check above remains the source of truth
-    for hit/miss; this only makes that decision observable to other tools
-    (rat-metrics, a future `rat` dispatcher) through one shared index.
-
-    `index_root`, when given, overrides the default dirname(binpath)/.rat
-    resolution -- callers that resolved a custom --store must pass it through
-    so this registration lands in the same canonical index as their other
-    tool calls instead of silently diverging.
-    """
+    """Best-effort registration in the canonical cache index."""
     try:
         from ratlib.cache import Cache, canonical_key, resolve_index_root
         idx_root = resolve_index_root(binpath, override=index_root)
-        ck = canonical_key(binary_sha256="sha256:" + cur_sha, tool_name="revq", tool_version=str(SCHEMA),
-                            params={"engine": want_engine}, dep_versions={})
+        ck = canonical_key(
+            binary_sha256="sha256:" + cur_sha,
+            tool_name="revq",
+            tool_version=str(SCHEMA),
+            params={"engine": want_engine, "evasion_signal_schema": EVASION_SIGNAL_SCHEMA},
+            dep_versions={},
+        )
         return Cache(idx_root), ck
     except Exception:
         return None, None
@@ -874,7 +811,6 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
             provenance={"producer": "revq", "invocation_id": invocation_id},
         )
     except Exception:
-        # Telemetry is observational; never turn a valid revq result into a tool failure.
         pass
 
 
@@ -885,24 +821,23 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
         try:
             with open(cp) as f:
                 rev = json.load(f)
-            # 캐시 유효: 해시 일치 + (요청 엔진과 같거나, 캐시가 정밀 angr)
             if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
+                    and _has_current_evasion_contract(rev)
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
                 idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
                 rev["cache_state"] = "hit"
                 if idx and ck:
-                    # Only (re)hash the cache file when the index entry is missing/stale;
-                    # otherwise a plain cache hit paid a full-file sha256 every call.
                     try:
                         existing = idx.get_entry(ck)
                         if not (existing and existing.get("path") == cp and existing.get("envelope_digest")):
                             idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
-                    except Exception: pass
-                rev = annotate_counts(rev)
-                return rev
+                    except Exception:
+                        pass
+                return annotate_counts(rev)
         except Exception:
             pass
+
     rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
     rev["bin"] = binpath
     rev["sha256"] = cur_sha
@@ -917,8 +852,10 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     except Exception as e:
         info("캐시 기록 실패(무시): %s" % e)
     if idx and ck:
-        try: idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
-        except Exception: pass
+        try:
+            idx.put_entry(ck, backend="revq_json", path=cp, envelope_digest="sha256:" + sha256(cp))
+        except Exception:
+            pass
     return rev
 
 
@@ -945,7 +882,6 @@ def build_parser():
 
 
 def main(argv):
-    # ctfpull 관례: 'selftest' 단어도 지원
     if argv and argv[0] == "selftest":
         return selftest()
     args = build_parser().parse_args(argv)
@@ -1002,6 +938,7 @@ def main(argv):
         print(render_xrefs(rev, args.xrefs))
     else:
         print(render_summary(rev))
+
     _, cache_key = _canonical_index(args.binary, rev.get("engine") or requested_engine,
                                     rev.get("sha256") or sha256(args.binary))
     parameters = {
@@ -1080,7 +1017,6 @@ def selftest():
     chk(top.get("score", 0) >= 5, "check 점수 >= 5 (판별문자열+비교함수)")
     chk(all(i["func"] != "helper_noise" for i in inter), "noise 함수 제외")
 
-    # Function Card v2
     check_card = compute_function_card(rev, "check")
     chk(check_card["schema"] == "rat.function-card/v2", "function-card: schema")
     chk(set(check_card) == {"schema", "function", "facts", "heuristics", "unresolved", "next", "provenance"},
@@ -1102,13 +1038,11 @@ def selftest():
     chk(len(json.dumps(check_card, ensure_ascii=False)) // 4 < 1500, "function-card: <1.5K 토큰 추정치")
     chk(compute_function_card(rev, "does-not-exist") is None, "function-card: 없는 함수는 None")
 
-    # 문자열 유틸
     chk(list(_iter_cstrings(b"ab\x00hello\x00\x01\x02worldd", 4)) ==
         [(3, "hello"), (11, "worldd")], "_iter_cstrings offset/필터")
     chk(parse_int("0x1180") == 0x1180 and parse_int("4660") == 4660
         and parse_int("nope") is None, "parse_int hex/dec/invalid")
 
-    # 렌더러 (예외 없이 + 핵심 토큰 포함)
     s = render_summary(rev)
     chk("check" in s and "INTERESTING" in s, "render_summary: check 지목")
     chk("Correct" in s, "render_summary: 판별문자열 하이라이트")
@@ -1120,11 +1054,14 @@ def selftest():
     chk("main" in render_xrefs(rev, "check"), "render_xrefs: 호출자(main→check)")
     chk("memcmp" in render_imports(rev), "render_imports: 분류")
 
-    # 캐시 유효성 판정 로직 (angr 캐시는 --fast 요청에도 유효)
     chk("__isoc99_scanf" in INPUT_FUNCS and "memcmp" in CMP_FUNCS, "사전 상수")
 
-    # evasion 분류 (Gap A: 정적 신뢰 하향 신호)
-    ev = classify_evasion(["ptrace", "memcmp"], ["please no TracerPid here"], 7.6, ["UPX0", ".text"])
+    typed = classify_evasion_signals(["ptrace", "memcmp"], ["please no TracerPid here"], 7.6, ["UPX0", ".text"])
+    ev = _render_legacy_evasion(typed)
+    chk(any(s.get("kind") == "packer-section" and s.get("quality") == "fact" for s in typed),
+        "evasion: typed packer-section fact")
+    chk(any(s.get("kind") == "high-entropy" and s.get("quality") == "heuristic" for s in typed),
+        "evasion: typed high-entropy heuristic")
     chk(any("ptrace" in x for x in ev), "evasion: ptrace import 탐지")
     chk(any("TracerPid" in x or "tracerpid" in x for x in ev), "evasion: anti-debug 문자열 탐지")
     chk(any("고엔트로피" in x for x in ev), "evasion: 고엔트로피 탐지")
@@ -1132,14 +1069,16 @@ def selftest():
     chk(classify_evasion(["memcmp"], ["hello world"], 5.0, [".text", ".data"]) == [],
         "evasion: 정상 바이너리 무신호")
     chk(_entropy(b"\x00\x00\x00\x00") == 0.0 and _entropy(bytes(range(256))) > 7.9, "_entropy 계산")
+    chk(not _has_current_evasion_contract({"schema": SCHEMA, "evasion": ["패커 섹션 UPX0"]}),
+        "evasion: legacy sidecar contract rejected")
+    chk(_has_current_evasion_contract({"evasion_signal_schema": EVASION_SIGNAL_SCHEMA, "evasion_signals": []}),
+        "evasion: current typed sidecar contract accepted")
 
-    # platform 감지 (PE/ELF 라우팅)
     chk(_detect_platform("a.exe: PE32+ executable (console) x86-64, for MS Windows") == "pe", "platform: PE 감지")
     chk(_detect_platform("chall: ELF 64-bit LSB pie executable, x86-64") == "elf", "platform: ELF 감지")
     chk("PE/Windows" in render_summary({**_fixture(), "platform": "pe"}), "render_summary: PE 배너")
     chk("PLATFORM" not in render_summary({**_fixture(), "platform": "elf"}), "render_summary: ELF 은 배너 없음")
 
-    # oracle→symsolve 자동연결
     oracle = compute_oracle(rev)
     chk(oracle["auto_connect"] is True, "oracle: 단일·명확 success/fail → auto_connect")
     chk(oracle["resolved"]["success"]["addr"] == 0x11a0 and oracle["resolved"]["failure"]["addr"] == 0x11b0,

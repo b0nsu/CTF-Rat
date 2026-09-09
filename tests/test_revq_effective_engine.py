@@ -28,6 +28,9 @@ def _minimal(engine):
         "functions": [],
         "strings": [],
         "imports": [],
+        "evasion_signal_schema": REVQ.EVASION_SIGNAL_SCHEMA,
+        "evasion_signals": [],
+        "evasion": [],
     }
 
 

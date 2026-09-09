@@ -1,13 +1,19 @@
 import os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
+from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 from ratlib.route import route
 from ratlib.schema import validate
 
 def profile(imports=(), facts=()):
     return {"imports": list(imports), "facts": [{"kind": k, "value": v} for k, v in facts]}
 
-def revq(imports=(), evasion=(), functions=(), strings=()):
-    return {"imports": list(imports), "evasion": list(evasion), "functions": list(functions),
+def evasion_signal(kind, value, quality):
+    return {"kind": kind, "value": value, "quality": quality}
+
+def revq(imports=(), evasion=(), evasion_signals=(), functions=(), strings=()):
+    return {"imports": list(imports), "evasion": list(evasion),
+            "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
+            "evasion_signals": list(evasion_signals), "functions": list(functions),
             "strings": [{"val": s} for s in strings]}
 
 class RouteFixtures(unittest.TestCase):
@@ -62,19 +68,38 @@ class RouteFixtures(unittest.TestCase):
         r = route(profile=profile(imports=["copy_from_user", "kmalloc"]))
         self.assertEqual(r["subroute"], "pwn-kernel")
 
-    def test_packed_evasion_routes_rev_packed(self):
-        r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
+    def test_packer_section_routes_rev_packed(self):
+        r = route(revq=revq(evasion_signals=[
+            evasion_signal("packer-section", {"section": "UPX0"}, "fact")]))
         self.assertEqual(r["subroute"], "rev-packed")
         self.assertEqual(r["track"], "rev")
-        self.assertEqual(r["signals"][0]["quality"], "fact")
+        self.assertEqual(r["signals"][0], {
+            "kind": "packer-section", "value": {"section": "UPX0"}, "quality": "fact"})
         self.assertEqual(r["confidence"], 0.85)
 
     def test_entropy_only_is_a_heuristic_packed_candidate(self):
-        r = route(revq=revq(evasion=["고엔트로피 7.54/8 (packing/암호화 의심)"]))
+        r = route(revq=revq(evasion_signals=[
+            evasion_signal("high-entropy", {"entropy": 7.54, "threshold": 7.2}, "heuristic")]))
         self.assertEqual(r["subroute"], "rev-packed")
         self.assertEqual(r["track"], "rev")
+        self.assertEqual(r["signals"][0]["kind"], "high-entropy")
         self.assertEqual(r["signals"][0]["quality"], "heuristic")
         self.assertEqual(r["confidence"], 0.55)
+
+    def test_human_evasion_text_cannot_force_packed_without_typed_signal(self):
+        r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
+        self.assertEqual(r["subroute"], "unknown")
+        self.assertFalse(any(s["kind"] in {"packer-section", "high-entropy"} for s in r["signals"]))
+
+    def test_packer_fact_outranks_entropy_when_both_are_present(self):
+        r = route(revq=revq(evasion_signals=[
+            evasion_signal("high-entropy", {"entropy": 7.91, "threshold": 7.2}, "heuristic"),
+            evasion_signal("packer-section", {"section": "UPX1"}, "fact"),
+        ]))
+        self.assertEqual(r["subroute"], "rev-packed")
+        self.assertEqual(r["signals"][0]["kind"], "packer-section")
+        self.assertEqual(r["confidence"], 0.85)
+        self.assertEqual(r["commitment"], "committed")
 
     def test_vm_dispatch_hint_routes_rev_vm(self):
         r = route(revq=revq(functions=[{"name": "vm_dispatch_loop"}]))
@@ -154,14 +179,16 @@ class ActiveTriageCommitment(unittest.TestCase):
         self.assertTrue(any("multiple plausible routes" in x for x in r["unresolved"]))
 
     def test_fact_grade_packing_commits_action_but_underlying_shape_stays_open(self):
-        r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
+        r = route(revq=revq(evasion_signals=[
+            evasion_signal("packer-section", {"section": "UPX0"}, "fact")]))
         self.assertEqual(r["commitment"], "committed")
         self.assertEqual(r["skill"], "rev-packed")
         self.assertIn("packing", r["dimensions"]["obstacles"])
         self.assertTrue(any("underlying" in x for x in r["unresolved"]))
 
     def test_entropy_only_packing_stays_provisional(self):
-        r = route(revq=revq(evasion=["고엔트로피 7.54/8 (packing/암호화 의심)"]))
+        r = route(revq=revq(evasion_signals=[
+            evasion_signal("high-entropy", {"entropy": 7.54, "threshold": 7.2}, "heuristic")]))
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
 
@@ -237,7 +264,8 @@ class RouteResultShape(unittest.TestCase):
     def test_route_result_validates_against_schema(self):
         for r in (
             route(profile=profile(imports=["gets"], facts=[("elf.nx", True)])),
-            route(revq=revq(evasion=["패커 섹션 UPX0"])),
+            route(revq=revq(evasion_signals=[
+                evasion_signal("packer-section", {"section": "UPX0"}, "fact")])),
             route(),
         ):
             validate(r, "rat.route-result/v1")
