@@ -47,7 +47,42 @@ class LoopSummaryUnit(unittest.TestCase):
         by_target = {r["target"]: r for r in out["recurrences"]}
         self.assertEqual(by_target["rax"]["delta"], 8)
         self.assertEqual(by_target["rcx"]["delta"], 1)
+        self.assertEqual(by_target["rax"]["register_family"], "rax")
+        self.assertEqual(by_target["rax"]["write_semantics"], "full-width")
         self.assertIn("mod 2^32", by_target["rax"]["formula"])
+
+    def test_amd64_eax_update_is_32bit_zero_extending_recurrence(self):
+        out = summarize_instruction_stream([
+            _Insn("add", "eax, 8", writes=("eax",)),
+            _Insn("cmp", "eax, 100", writes=()),
+            _Insn("jne", "0x401000", writes=()),
+        ], bit_width=64)
+        self.assertEqual(len(out["recurrences"]), 1)
+        recurrence = out["recurrences"][0]
+        self.assertEqual(recurrence["target"], "eax")
+        self.assertEqual(recurrence["register_family"], "rax")
+        self.assertEqual(recurrence["bit_width"], 32)
+        self.assertEqual(recurrence["write_semantics"], "zero-extend-to-64")
+        self.assertIn("mod 2^32", recurrence["formula"])
+        self.assertIn("zero-extends into rax", recurrence["formula"])
+
+    def test_amd64_partial_register_write_is_rejected(self):
+        for operand in ("ax", "al"):
+            with self.subTest(operand=operand):
+                out = summarize_instruction_stream([
+                    _Insn("add", "%s, 1" % operand, writes=(operand,)),
+                ], bit_width=64)
+                self.assertEqual(out["recurrences"], [])
+                self.assertIn("partial_register_write", out["unsupported"])
+                self.assertIn("no_affine_register_recurrence", out["unsupported"])
+
+    def test_mixed_eax_and_rax_updates_do_not_get_merged(self):
+        out = summarize_instruction_stream([
+            _Insn("add", "eax, 1", writes=("eax",)),
+            _Insn("add", "rax, 1", writes=("rax",)),
+        ], bit_width=64)
+        self.assertEqual(out["recurrences"], [])
+        self.assertIn("mixed_register_width", out["unsupported"])
 
     def test_clobber_prevents_false_recurrence(self):
         out = summarize_instruction_stream([
