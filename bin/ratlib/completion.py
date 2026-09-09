@@ -22,7 +22,10 @@ def completion_gate(root, verification_id=None):
     try:
         stream = Stream(root)
         events = stream.read()
-        view = stream.view()
+        # Canonical Stream can materialize the already-validated snapshot without
+        # a second full read. Minimal Stream-compatible adapters used by callers/tests
+        # may expose only read()+view(); preserve that compatibility path.
+        view = stream._materialize(events) if hasattr(stream, "_materialize") else stream.view()
     except (OSError, ValueError) as exc:
         return {"verified": False, "reason": "state-invalid", "detail": str(exc)}
 
