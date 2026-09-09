@@ -1,6 +1,8 @@
 {
   "profile": {"imports": ["read", "puts"]},
   "revq": {"imports": ["read", "puts"], "platform": "elf",
+           "functions": [{"name": "main", "calls": ["read", "puts"],
+                          "strings": ["Correct: FLAG{synthetic-xor-checker}", "Wrong"]}],
            "strings": [{"val": "Correct: FLAG{synthetic-xor-checker}"}, {"val": "Wrong"}]},
-  "interesting": [{"func": "main", "score": 8, "why": ["비교함수 호출"]}]
+  "interesting": [{"func": "main", "score": 8, "why": ["display-only"]}]
 }
