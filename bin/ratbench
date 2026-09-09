@@ -12,12 +12,12 @@ when its toolchain (gcc / angr) is missing.
 
 Mode B (model-eval) is intentionally on-demand. Each attempt receives an isolated runtime
 export of CTF-Rat plus only the challenge runtime artifact(s): benchmark source, route fixtures,
-known-good inputs, and ground truth remain outside the agent workspace. A bare `FLAG{...}` in
-agent stdout is only a claim. `solved` requires the canonical completion gate: an active typed
-primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS linked to the
-same completed exploit task. When Linux `strace` is usable, Mode B additionally records an
-observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts do not depend
-on agent-authored telemetry.
+known-good inputs, and ground truth remain outside the agent workspace. A bare flag-shaped
+string in agent stdout is only a claim. `solved` requires the canonical completion gate: an
+active typed primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS
+linked to the same completed exploit task. When Linux `strace` is usable, Mode B additionally
+records an observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts
+do not depend on agent-authored telemetry.
 
   ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
   ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
@@ -78,6 +78,18 @@ def _selected_suite_doc(entries):
 
 def _command_digest(command):
     return "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _flag_claimed(entry, agent_out):
+    """Detect a solve claim using challenge-specific syntax when declared.
+
+    This signal is telemetry only; it never satisfies the verified completion
+    gate.  Historical suites without ``verify.claim_pattern`` keep the legacy
+    ``FLAG{...}`` detector for backward compatibility.
+    """
+    verify = entry.get("verify") or {}
+    pattern = verify.get("claim_pattern") or r"FLAG\{.+\}"
+    return bool(re.search(pattern, agent_out))
 
 
 def _benchmark_provenance(args, agent_bin, entries, trace_enabled):
@@ -594,7 +606,7 @@ def cmd_eval(args):
             wall = int((time.time() - t0) * 1000)
             finished_at = datetime.now(timezone.utc).isoformat()
 
-            flag_claimed = bool(re.search(r"FLAG\{.+\}", agent_out))
+            flag_claimed = _flag_claimed(e, agent_out)
             from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics, route_assessment_metrics
             from ratlib.completion import completion_gate
             from ratlib.state_v2 import Stream

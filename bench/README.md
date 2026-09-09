@@ -14,8 +14,9 @@ Every entry declares:
 - `corpus`: one of the classes above.
 - `capabilities`: unique kebab-case tags describing the capability exercised, not a claimed exploit result.
 - `redistributable`: whether the challenge artifact itself may be committed.
+- optional `verify.claim_pattern`: a challenge-specific regex used only to classify an agent stdout flag-shaped string as a **solve claim**. It never satisfies the completion gate and never turns a claim into a verified solve.
 
-The committed suite is checked by `tests/test_bench_suite_manifest.py` using `ratlib.bench_suite.validate_suite`. Invalid IDs, duplicate entries, path escapes, invalid corpus values, malformed capability tags, and entries without a source or binary are rejected.
+The committed suite is checked by `tests/test_bench_suite_manifest.py` using `ratlib.bench_suite.validate_suite`. Invalid IDs, duplicate entries, path escapes, invalid corpus values, malformed capability tags, invalid claim regexes, and entries without a source or binary are rejected.
 
 ## Adding a held-out entry
 
@@ -58,7 +59,12 @@ PYTHONPATH=bin python3 -m ratlib.bench_artifacts \
 
 The materializer fails closed if the downloaded bytes or an already-present local binary do not match the pinned Git blob id. A measured run therefore starts from a previously materialized, content-addressed runtime artifact rather than from mutable network state.
 
-The first committed real entry is `google-ctf-2017-inst-prof`, sourced from the Apache-2.0 `google/google-ctf` repository. Its upstream revision and published attachment path are recorded directly in `bench/suite.json`. Do not materialize upstream flags, solutions, healthchecks, or answer-bearing metadata alongside the runtime binary.
+The committed public real corpus currently includes:
+
+- `google-ctf-2017-inst-prof` — Google CTF 2017 Quals pwn, pinned published attachment;
+- `google-ctf-2024-notobfuscated` — Google CTF 2024 Quals reversing crackme, pinned published attachment.
+
+Both are sourced from the Apache-2.0 `google/google-ctf` repository. Their upstream revisions and attachment paths are recorded directly in `bench/suite.json`. Do not materialize upstream flags, source trees, metadata, solutions, healthchecks, or other answer-bearing material alongside the runtime binary.
 
 ## Fail-closed preflight and corpus projection
 
@@ -132,3 +138,5 @@ Do not reuse one `benchmark_run_id` across different revisions: provenance valid
 ## Measurement rule
 
 Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v2 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
+
+Public `real` entries are reproducible competition artifacts, but they are **not automatically held out** from an internet-enabled agent: public source or writeups may be reachable outside the answer-free workspace. Use public real entries for reproducible integration/performance runs, and use a private held-out corpus (or an explicitly network-controlled agent environment) for claims about unseen solve rate.

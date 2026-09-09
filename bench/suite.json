@@ -147,8 +147,30 @@
         "source_revision": "c61f722741b8b998a402597ab01713c62a6ecbbe",
         "source_path": "2017/quals/2017-pwn-inst-prof/attachments/inst_prof"
       },
-      "verify": {"kind": "rat-verify-pass"},
+      "verify": {"kind": "rat-verify-pass", "claim_pattern": "(?i)ctf\\{[^\\r\\n{}]+\\}"},
       "env": {"needs_libc": true, "arch": "x86_64"}
+    },
+    {
+      "id": "google-ctf-2024-notobfuscated",
+      "track": "rev",
+      "expected_route": "rev-checker",
+      "difficulty": 3,
+      "corpus": "real",
+      "capabilities": ["checker", "matrix-arithmetic", "optimized", "rc4", "stripped"],
+      "redistributable": true,
+      "dir": "bench/artifacts/google-ctf-2024-notobfuscated",
+      "binary": "notobfuscated.bin",
+      "route_fixture": "route.json",
+      "fetch": {
+        "url": "https://raw.githubusercontent.com/google/google-ctf/067421eb7e918c29e39f187fac5a0f0d72a6ab83/2024/quals/rev-notobfuscated/attachments/challenge",
+        "git_blob_sha1": "b497b0df3b8bf00e3fb883c1a4accccffaceb8ec",
+        "license": "Apache-2.0",
+        "source_repository": "google/google-ctf",
+        "source_revision": "067421eb7e918c29e39f187fac5a0f0d72a6ab83",
+        "source_path": "2024/quals/rev-notobfuscated/attachments/challenge"
+      },
+      "verify": {"kind": "rat-verify-pass", "claim_pattern": "(?i)ctf\\{[^\\r\\n{}]+\\}"},
+      "env": {"needs_libc": true}
     }
   ]
 }
