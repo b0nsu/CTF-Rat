@@ -45,6 +45,21 @@ For non-redistributable material, create an ignored `bench/local-suite.json` (or
 
 Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `artifacts/**/*.bin`, local suite manifests, and inherited `.rat` state. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules.
 
+## Materializing committed real entries
+
+A committed `real` entry may include a `fetch` object only when redistribution rights are explicit. The metadata pins an HTTPS source and the exact Git blob SHA-1 of the published challenge binary. The binary itself remains ignored under `bench/artifacts/`; the fetch metadata is part of the canonical suite digest.
+
+Materialization is an explicit preflight and never occurs inside a measured `ratbench eval` run:
+
+```sh
+PYTHONPATH=bin python3 -m ratlib.bench_artifacts \
+  bench/suite.json --corpus real
+```
+
+The materializer fails closed if the downloaded bytes or an already-present local binary do not match the pinned Git blob id. A measured run therefore starts from a previously materialized, content-addressed runtime artifact rather than from mutable network state.
+
+The first committed real entry is `google-ctf-2017-inst-prof`, sourced from the Apache-2.0 `google/google-ctf` repository. Its upstream revision and published attachment path are recorded directly in `bench/suite.json`. Do not materialize upstream flags, solutions, healthchecks, or answer-bearing metadata alongside the runtime binary.
+
 ## Fail-closed preflight and corpus projection
 
 `ratbench run/eval` validates the suite and applies `--corpus` before route/oracle/agent execution. A missing requested corpus is an error, not a zero-entry benchmark.
