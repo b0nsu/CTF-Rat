@@ -12,11 +12,19 @@ def revq(imports=(), evasion=(), functions=(), strings=()):
 
 class RouteFixtures(unittest.TestCase):
     def test_memcmp_checker_routes_rev_checker(self):
-        r = route(revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        r = route(revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check", "score": 8, "why": ["renderer text may change"]}])
         self.assertEqual(r["subroute"], "rev-checker")
         self.assertEqual(r["track"], "rev")
         self.assertGreater(r["confidence"], 0.5)
+        compare = [s for s in r["signals"] if s["kind"] == "compare-calls"]
+        self.assertEqual(compare, [{"kind": "compare-calls", "value": ["memcmp"], "quality": "fact"}])
+
+    def test_human_why_text_cannot_force_checker_without_structured_call(self):
+        r = route(revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": []}]),
+                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        self.assertEqual(r["subroute"], "rev-symbolic")
+        self.assertFalse(any(s["kind"] == "compare-calls" for s in r["signals"]))
 
     def test_gets_without_nx_routes_pwn_stack(self):
         r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
@@ -96,8 +104,9 @@ class RouteMixedSignal(unittest.TestCase):
 
     def test_printf_read_plus_explicit_compare_call_still_routes_rev_checker(self):
         r = route(profile=profile(imports=["printf", "read"]),
-                  revq=revq(imports=["printf", "read", "memcmp"]),
-                  interesting=[{"func": "check_flag", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+                  revq=revq(imports=["printf", "read", "memcmp"],
+                            functions=[{"name": "check_flag", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check_flag", "score": 8, "why": ["display-only"]}])
         self.assertEqual(r["subroute"], "rev-checker")
         self.assertTrue(r["conflict"])
         self.assertEqual(r["alternatives"][0]["subroute"], "pwn-format")
@@ -128,16 +137,17 @@ class ActiveTriageCommitment(unittest.TestCase):
         self.assertIsNone(r["skill"])
 
     def test_explicit_checker_without_competitor_can_commit(self):
-        r = route(revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        r = route(revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check", "score": 8, "why": ["display-only"]}])
         self.assertEqual(r["commitment"], "committed")
         self.assertEqual(r["skill"], "rev-checker")
         self.assertIn("checker", r["dimensions"]["program_shapes"])
 
     def test_mixed_checker_and_pwn_signal_forces_provisional(self):
         r = route(profile=profile(imports=["printf", "read"]),
-                  revq=revq(imports=["printf", "read", "memcmp"]),
-                  interesting=[{"func": "check_flag", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+                  revq=revq(imports=["printf", "read", "memcmp"],
+                            functions=[{"name": "check_flag", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check_flag", "score": 8, "why": ["display-only"]}])
         self.assertTrue(r["conflict"])
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
@@ -178,8 +188,9 @@ class RouteDegradation(unittest.TestCase):
         self.assertEqual(r["subroute"], "pwn-stack")
 
     def test_missing_profile_still_routes_from_revq_alone(self):
-        r = route(profile=None, revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 5, "why": ["비교함수 호출: memcmp"]}])
+        r = route(profile=None,
+                  revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check", "score": 5, "why": ["display-only"]}])
         self.assertEqual(r["capabilities"], {"profile": False, "revq": True})
         self.assertEqual(r["subroute"], "rev-checker")
 
@@ -204,13 +215,20 @@ class RouteResultShape(unittest.TestCase):
             self.assertEqual(set(n), {"query", "target"})
 
     def test_revq_interesting_signal_carries_func_and_score_as_heuristic(self):
-        r = route(revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
+        r = route(revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}]),
+                  interesting=[{"func": "check", "score": 8, "why": ["display-only"]}])
         interesting_signals = [s for s in r["signals"] if s["kind"] == "revq-interesting"]
         self.assertEqual(len(interesting_signals), 1)
         self.assertEqual(interesting_signals[0]["quality"], "heuristic")
         self.assertEqual(interesting_signals[0]["value"]["func"], "check")
         self.assertEqual(r["next"][0]["target"], "check")
+
+    def test_versioned_compare_call_is_canonicalized_before_checker_signal(self):
+        r = route(revq=revq(functions=[{"name": "check", "calls": ["memcmp@GLIBC_2.2.5"]}]),
+                  interesting=[{"func": "check", "score": 7, "why": []}])
+        self.assertEqual(r["subroute"], "rev-checker")
+        compare = [s for s in r["signals"] if s["kind"] == "compare-calls"]
+        self.assertEqual(compare[0]["value"], ["memcmp"])
 
     def test_import_based_signals_are_facts(self):
         r = route(profile=profile(imports=["malloc", "free"]))
