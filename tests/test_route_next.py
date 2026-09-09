@@ -18,11 +18,15 @@ def revq(imports=(), functions=(), strings=()):
 class CanonicalRouteNextTests(unittest.TestCase):
     def test_checker_uses_front_door_function_query(self):
         result = route(
-            revq=revq(imports=["memcmp"]),
+            revq=revq(
+                imports=["memcmp"],
+                functions=[{"name": "check_flag", "calls": ["memcmp"], "strings": []}],
+            ),
             interesting=[{"func": "check_flag", "score": 8,
-                          "why": ["비교함수 호출: memcmp"]}],
+                          "why": ["display-only"]}],
         )
         self.assertEqual(result["subroute"], "rev-checker")
+        self.assertEqual(result["commitment"], "committed")
         self.assertEqual(result["next"], [
             {"query": "rat query func", "target": "check_flag"},
         ])
