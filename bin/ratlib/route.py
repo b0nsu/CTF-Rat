@@ -21,6 +21,8 @@ still singular, but the model-facing working set is not.
 """
 from __future__ import annotations
 
+import re
+
 HEAP_IMPORTS = {"malloc", "free", "calloc", "realloc"}
 STRONG_OVERFLOW_IMPORTS = {"gets", "strcpy", "strcat", "sprintf",
                           "scanf", "__isoc99_scanf", "__isoc99_sscanf"}
@@ -31,13 +33,25 @@ INPUT_IMPORTS = {"read", "gets", "scanf", "fgets"}
 KERNEL_IMPORTS = {"copy_from_user", "copy_to_user", "kmalloc", "kfree", "module_init", "module_exit"}
 VM_HINTS = ("vm", "opcode", "bytecode", "dispatch", "interpreter")
 CRYPTO_HINTS = ("aes", "des", "rc4", "md5", "sha", "base64", "xor", "rsa", "hmac", "crc")
-# Stable compare APIs used by revq's interesting-function scorer.  Route consumes
+# Stable compare APIs used by revq's interesting-function scorer. Route consumes
 # revq's structured functions[].calls, never the scorer's human-readable `why`
 # strings, so localization/rendering changes cannot alter routing semantics.
 CHECKER_COMPARE_CALLS = {
     "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "strstr",
     "strcoll", "bcmp", "wcscmp", "wcsncmp",
 }
+# A custom checker need not call libc compare APIs (XOR/rolling checks commonly do
+# not). Pairing success+failure strings already xref-attributed to the SAME revq
+# function is a bounded checker-shape heuristic. These regexes classify binary
+# strings, not renderer prose, and never establish checker semantics by themselves.
+CHECKER_SUCCESS_STR = re.compile(
+    r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b|flag\{",
+    re.I,
+)
+CHECKER_FAILURE_STR = re.compile(
+    r"incorrect|wrong|denied|reject(?:ed)?|invalid|fail(?:ed|ure)?|try\s*again",
+    re.I,
+)
 
 # Installed route-skill inventory. Commitment is a property of each route result,
 # not of the inventory: callers that inspect SKILLS must continue to see every
@@ -64,23 +78,43 @@ def _revq_imports(revq):
     return set((revq or {}).get("imports", []) or [])
 
 
+def _function_record(revq, function_name):
+    if not isinstance(function_name, str) or not function_name:
+        return None
+    return next((func for func in (revq or {}).get("functions", []) or []
+                 if isinstance(func, dict) and func.get("name") == function_name), None)
+
+
 def _function_calls(revq, function_name):
     """Return canonical calls recovered for one exact revq function record."""
-    if not isinstance(function_name, str) or not function_name:
+    func = _function_record(revq, function_name)
+    if func is None:
         return set()
-    for func in (revq or {}).get("functions", []) or []:
-        if not isinstance(func, dict) or func.get("name") != function_name:
-            continue
-        return {
-            call.split("@", 1)[0]
-            for call in (func.get("calls", []) or [])
-            if isinstance(call, str) and call
-        }
-    return set()
+    return {
+        call.split("@", 1)[0]
+        for call in (func.get("calls", []) or [])
+        if isinstance(call, str) and call
+    }
 
 
 def _checker_compare_calls(revq, function_name):
     return sorted(_function_calls(revq, function_name) & CHECKER_COMPARE_CALLS)
+
+
+def _checker_oracle_strings(revq, function_name):
+    """Return a bounded paired success/failure string projection for one function."""
+    func = _function_record(revq, function_name)
+    if func is None:
+        return None
+    strings = [value for value in (func.get("strings", []) or []) if isinstance(value, str)]
+    success = sorted({value for value in strings if CHECKER_SUCCESS_STR.search(value)})
+    failure = sorted({value for value in strings if CHECKER_FAILURE_STR.search(value)})
+    if not success or not failure:
+        return None
+    return {
+        "success_count": len(success), "failure_count": len(failure),
+        "success": success[:2], "failure": failure[:2],
+    }
 
 
 def _evasion(revq):
@@ -204,7 +238,7 @@ def _active_triage_overlay(result):
     """Project ranked compatibility labels into a multi-axis triage state.
 
     The primary subroute still owns compatibility ranking and the commitment
-    decision.  The model-facing dimensions, however, include every explicit
+    decision. The model-facing dimensions, however, include every explicit
     alternative so a conflict cannot silently collapse orthogonal evidence back
     to the primary label that won the ranking tie-break.
     """
@@ -218,8 +252,13 @@ def _active_triage_overlay(result):
 
     if subroute == "unknown":
         commitment = "unknown"
-    elif subroute in {"pwn-kernel", "rev-checker"}:
+    elif subroute == "pwn-kernel":
         commitment = "committed"
+    elif subroute == "rev-checker":
+        # A recovered compare-call is a deterministic first action discriminator.
+        # Paired success/failure strings are useful shape evidence but remain a
+        # heuristic, so they select the checker route without hard-locking a skill.
+        commitment = "committed" if _signal_quality(result, "compare-calls") == "fact" else "provisional"
     elif subroute == "rev-packed":
         commitment = "committed" if _signal_quality(result, "evasion") == "fact" else "provisional"
 
@@ -270,12 +309,19 @@ def route(*, profile=None, revq=None, interesting=None):
     if top:
         score = top.get("score", 0)
         compare_calls = _checker_compare_calls(revq, top.get("func"))
-        calls_cmp = bool(compare_calls)
+        oracle_strings = _checker_oracle_strings(revq, top.get("func"))
+        checker_shape = bool(compare_calls or oracle_strings)
         rev_signals = [_sig("revq-interesting", {"func": top.get("func"), "score": score}, "heuristic")]
         if compare_calls:
             rev_signals.append(_sig("compare-calls", compare_calls, "fact"))
-        if calls_cmp:
-            rev_subroute, rev_confidence, rev_target = "rev-checker", min(0.5 + score / 20.0, 0.9), top.get("func")
+        if oracle_strings:
+            rev_signals.append(_sig("checker-oracle-strings", oracle_strings, "heuristic"))
+        if checker_shape:
+            if compare_calls:
+                confidence = min(0.5 + score / 20.0, 0.9)
+            else:
+                confidence = min(0.45 + score / 30.0, 0.75)
+            rev_subroute, rev_confidence, rev_target = "rev-checker", confidence, top.get("func")
         else:
             rev_subroute, rev_confidence, rev_target = "rev-symbolic", 0.5, None
             hints = [h for h in CRYPTO_HINTS if h in _strings_blob(revq).lower()]
@@ -286,7 +332,7 @@ def route(*, profile=None, revq=None, interesting=None):
             return _finalize(_result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target), is_pe)
 
         pwn_subroute, pwn_confidence, pwn_signals = pwn
-        if calls_cmp or rev_confidence >= pwn_confidence:
+        if checker_shape or rev_confidence >= pwn_confidence:
             signals.extend(rev_signals)
             result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
             result["conflict"] = True
