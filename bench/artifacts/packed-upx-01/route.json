@@ -1,6 +1,10 @@
 {
   "profile": {"imports": ["puts", "fgets", "strcmp"], "facts": []},
   "revq": {"imports": ["puts", "fgets", "strcmp"], "platform": "elf",
+           "evasion_signal_schema": "rat.evasion-signals/v1",
+           "evasion_signals": [
+             {"kind": "packer-section", "value": {"section": "UPX0"}, "quality": "fact"}
+           ],
            "evasion": ["UPX0/UPX1 패커 섹션 발견 (upx -d 로 언팩 후 재분석)"]},
   "interesting": []
 }
