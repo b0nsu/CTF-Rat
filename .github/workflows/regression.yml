@@ -31,7 +31,7 @@ jobs:
       - run: python3 bin/pwngadget selftest
       - run: python3 bin/pwnlibc selftest
       # Mode A scripted driver: route accuracy over the synthetic suite (gcc present -> verifiers run too)
-      - run: python3 bin/ratbench run
+      - run: python3 bin/ratbench run --corpus synthetic
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 tests/e2e_artifact_handoff.py
       - run: python3 tests/e2e_analysis.py --category core
