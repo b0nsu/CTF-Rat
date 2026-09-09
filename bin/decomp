@@ -233,7 +233,7 @@ else
           fi
         fi
         # A containing function may have been decompiled under a different name.
-        if grep -q "^$(printf '%08x' "$addr")\t" "$CACHE/_index.txt" 2>/dev/null; then
+        if grep -q "^$(printf '%08x' "$addr")"$'\t' "$CACHE/_index.txt" 2>/dev/null; then
           one_name="$(awk -F '\t' -v a="$(printf '%08x' "$addr")" '$1==a {print $2}' "$CACHE/_index.txt" | tail -1)"
           if [ -n "$one_name" ] && [ -f "$CACHE/$one_name.c" ]; then
             if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$CACHE/$one_name.c"; then
