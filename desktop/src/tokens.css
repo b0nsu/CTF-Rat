@@ -1,0 +1,82 @@
+:root {
+  color-scheme: dark;
+
+  /* Typography */
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --text-50: 0.6875rem;
+  --text-75: 0.75rem;
+  --text-100: 0.8125rem;
+  --text-200: 0.875rem;
+  --text-300: 1rem;
+  --text-400: 1.125rem;
+  --line-compact: 1.25;
+  --line-default: 1.45;
+  --weight-medium: 560;
+  --weight-semibold: 640;
+  --weight-bold: 720;
+
+  /* Spacing — compact workbench scale derived from a 4/8px rhythm. */
+  --space-0: 0;
+  --space-1: 0.125rem;
+  --space-2: 0.25rem;
+  --space-3: 0.375rem;
+  --space-4: 0.5rem;
+  --space-5: 0.625rem;
+  --space-6: 0.75rem;
+  --space-8: 1rem;
+  --space-10: 1.25rem;
+  --space-12: 1.5rem;
+  --space-16: 2rem;
+
+  /* Geometry */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-pill: 999px;
+  --target-min: 1.75rem;
+  --control-height: 2rem;
+  --toolbar-height: 3.75rem;
+  --replay-height: 2.25rem;
+  --focus-height: 2.75rem;
+  --sidebar-width: 15.5rem;
+  --inspector-width: 22.5rem;
+  --terminal-height: 16.5rem;
+
+  /* Semantic color roles. Raw values stay here; component CSS consumes roles. */
+  --color-canvas: #080b10;
+  --color-surface: #0d1117;
+  --color-surface-muted: #0a0f15;
+  --color-surface-raised: #111820;
+  --color-surface-hover: #141c25;
+  --color-surface-selected: #122235;
+  --color-surface-terminal: #05080c;
+
+  --color-fg-default: #e6edf3;
+  --color-fg-muted: #a2adba;
+  --color-fg-subtle: #7d8998;
+  --color-fg-on-emphasis: #ffffff;
+
+  --color-border-default: #202a35;
+  --color-border-muted: #18212b;
+  --color-border-strong: #34404d;
+
+  --color-accent: #79b8ff;
+  --color-accent-emphasis: #2f81f7;
+  --color-accent-muted: #17365a;
+  --color-success: #56d48a;
+  --color-success-muted: #183b2a;
+  --color-warning: #e3b341;
+  --color-warning-muted: #3e3218;
+  --color-danger: #ff7b83;
+  --color-danger-muted: #451d24;
+  --color-focus: #8ac6ff;
+
+  --shadow-inset-selected: inset 2px 0 0 var(--color-accent-emphasis);
+  --shadow-focus: 0 0 0 1px var(--color-canvas);
+
+  /* Motion */
+  --duration-fast: 100ms;
+  --duration-normal: 160ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}

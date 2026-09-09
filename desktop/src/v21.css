@@ -1,0 +1,93 @@
+.completion-pill {
+  min-height: var(--target-min);
+  min-width: 76px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-muted);
+  color: var(--color-fg-muted);
+  font: var(--text-50)/1 var(--font-mono);
+  letter-spacing: .04em;
+}
+
+.completion-pill.verified {
+  border-color: var(--color-success);
+  background: var(--color-success-muted);
+  color: var(--color-success);
+}
+
+.focus-bar {
+  grid-template-columns: minmax(300px, 1fr) minmax(150px, auto) minmax(150px, auto) minmax(150px, auto);
+  gap: var(--space-8);
+}
+
+.focus-stat.attention code {
+  color: var(--color-warning);
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius-md);
+  background: var(--color-border-muted);
+}
+
+.metric-grid > div {
+  min-width: 0;
+  min-height: 40px;
+  display: grid;
+  gap: var(--space-1);
+  align-content: center;
+  padding: var(--space-3) var(--space-5);
+  background: var(--color-surface);
+}
+
+.metric-grid span {
+  overflow: hidden;
+  color: var(--color-fg-subtle);
+  font-size: var(--text-50);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-grid strong {
+  color: var(--color-fg-default);
+  font: var(--weight-semibold) var(--text-75)/1 var(--font-mono);
+}
+
+.metric-good {
+  color: var(--color-success) !important;
+}
+
+.metric-warn {
+  color: var(--color-warning) !important;
+}
+
+@media (max-width: 1280px) {
+  .focus-bar {
+    grid-template-columns: minmax(260px, 1fr) minmax(130px, auto) minmax(130px, auto) minmax(130px, auto);
+    gap: var(--space-5);
+  }
+}
+
+@media (max-width: 1140px) {
+  .focus-bar {
+    grid-template-columns: minmax(240px, 1fr) repeat(3, minmax(110px, auto));
+    gap: var(--space-4);
+  }
+
+  .focus-stat span {
+    display: none;
+  }
+
+  .completion-pill {
+    min-width: 68px;
+    padding: 0 var(--space-3);
+  }
+}

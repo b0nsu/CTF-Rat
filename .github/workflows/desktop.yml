@@ -1,0 +1,112 @@
+name: desktop-workbench
+
+on:
+  push:
+    branches: [desktop]
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'bin/rat'
+      - 'bin/ratd'
+      - 'bin/ratlib/desktop_*.py'
+      - 'bin/ratlib/artifact.py'
+      - 'bin/ratlib/cache.py'
+      - 'bin/ratlib/completion.py'
+      - 'bin/ratlib/metrics.py'
+      - 'bin/ratlib/orchestration.py'
+      - 'bin/ratlib/run_manifest.py'
+      - 'bin/ratlib/runner.py'
+      - 'bin/ratlib/schema.py'
+      - 'bin/ratlib/state_v2.py'
+      - 'tests/test_desktop_*.py'
+      - 'tests/test_artifact_*.py'
+      - 'tests/bench_desktop_*.py'
+      - '.github/workflows/desktop.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Desktop backend tests
+        run: python3 -m unittest tests.test_artifact_describe tests.test_desktop_analysis tests.test_desktop_api tests.test_desktop_session tests.test_desktop_http tests.test_desktop_e2e
+      - name: Syntax check daemon modules
+        run: python3 -m py_compile bin/ratd bin/ratlib/artifact.py bin/ratlib/desktop_analysis.py bin/ratlib/desktop_api.py bin/ratlib/desktop_session.py bin/ratlib/completion.py bin/ratlib/metrics.py tests/bench_desktop_polling.py tests/bench_desktop_artifacts.py
+      - name: Measure desktop polling baseline
+        run: python3 tests/bench_desktop_polling.py --events 100,1000,5000 --iterations 3 | tee desktop-poll-benchmark.jsonl
+      - name: Measure desktop artifact baseline
+        run: python3 tests/bench_desktop_artifacts.py --artifacts 10,100,500 --object-bytes 65536 --iterations 3 | tee desktop-artifact-benchmark.jsonl
+      - name: Upload desktop measurement baselines
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-desktop-benchmarks-${{ github.event.pull_request.head.sha }}
+          path: |
+            desktop-poll-benchmark.jsonl
+            desktop-artifact-benchmark.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+  frontend-tauri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential curl file libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+      - name: Rust compile check
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Build Linux bundles
+        if: github.event_name == 'pull_request'
+        working-directory: desktop
+        run: npm run tauri -- build --bundles deb,appimage
+      - name: Validate Linux bundles
+        if: github.event_name == 'pull_request'
+        run: |
+          debs=(desktop/src-tauri/target/release/bundle/deb/*.deb)
+          appimages=(desktop/src-tauri/target/release/bundle/appimage/*.AppImage)
+          test -s "${debs[0]}"
+          test -s "${appimages[0]}"
+          dpkg-deb --info "${debs[0]}" >/dev/null
+          chmod +x "${appimages[0]}"
+          tmp="$(mktemp -d)"
+          appimage="$GITHUB_WORKSPACE/${appimages[0]}"
+          (cd "$tmp" && "$appimage" --appimage-extract >/dev/null)
+          test -x "$tmp/squashfs-root/usr/bin/ctf-rat-desktop"
+          rm -rf "$tmp"
+      - name: Verify lockfiles unchanged
+        run: git diff --exit-code -- desktop/package-lock.json desktop/src-tauri/Cargo.lock
+      - name: Upload Linux bundles
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-desktop-linux-${{ github.event.pull_request.head.sha }}
+          path: |
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
