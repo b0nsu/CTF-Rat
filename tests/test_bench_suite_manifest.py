@@ -21,8 +21,12 @@ class BenchSuiteManifestTests(unittest.TestCase):
 
     def test_committed_suite_validates(self):
         self.assertIs(validate_suite(self.suite), self.suite)
-        self.assertTrue(all(entry["corpus"] == "synthetic" for entry in self.suite["entries"]))
+        corpora = {entry["corpus"] for entry in self.suite["entries"]}
+        self.assertEqual(corpora, {"synthetic", "real"})
         self.assertTrue(all(entry["redistributable"] is True for entry in self.suite["entries"]))
+        real = [entry for entry in self.suite["entries"] if entry["corpus"] == "real"]
+        self.assertTrue(real)
+        self.assertTrue(all(entry.get("binary") and entry.get("fetch") for entry in real))
 
     def test_suite_digest_is_stable_and_content_sensitive(self):
         first = suite_digest(self.suite)
@@ -71,6 +75,29 @@ class BenchSuiteManifestTests(unittest.TestCase):
         entry.pop("source", None)
         doc = {"schema": "rat.bench-suite/v1", "entries": [entry]}
         self.assertIs(validate_suite(doc), doc)
+
+    def test_fetch_metadata_requires_pinned_redistributable_binary(self):
+        real = copy.deepcopy(next(entry for entry in self.suite["entries"] if entry["corpus"] == "real"))
+
+        bad = copy.deepcopy(real)
+        bad["fetch"]["git_blob_sha1"] = "not-a-digest"
+        with self.assertRaisesRegex(SuiteValidationError, "git_blob_sha1"):
+            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+
+        bad = copy.deepcopy(real)
+        bad["fetch"]["url"] = "http://example.invalid/chall"
+        with self.assertRaisesRegex(SuiteValidationError, "absolute https URL"):
+            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+
+        bad = copy.deepcopy(real)
+        bad["redistributable"] = False
+        with self.assertRaisesRegex(SuiteValidationError, "redistributable=true"):
+            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+
+        bad = copy.deepcopy(real)
+        bad.pop("binary")
+        with self.assertRaisesRegex(SuiteValidationError, "requires source or binary"):
+            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
 
     def test_project_suite_selects_one_corpus_without_mutating_source(self):
         doc = copy.deepcopy(self.suite)
