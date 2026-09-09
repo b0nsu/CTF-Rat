@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -112,10 +113,43 @@ def validate(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     return manifest
 
 
-def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
-    validate(manifest)
+def _sync_state_projection(path: str, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Refresh the manifest's observer cursor from canonical STATE v2 when present.
+
+    ``Stream.append()`` writes STATE first and updates ``run.json`` afterwards.
+    Multiple writers can therefore reach the manifest in a different order than
+    their already-serialized STATE sequence. Re-derive the projection while the
+    manifest writer lock is held so an older writer can never move the cursor (or
+    checkpoint pointer) backwards.
+    """
+    payload = copy.deepcopy(dict(manifest))
+    challenge_dir = os.path.dirname(os.path.abspath(path))
+    state_path = os.path.join(challenge_dir, ".rat", "events", "STATE.v2.jsonl")
+    if not os.path.isfile(state_path):
+        return payload
+    try:
+        from .state_v2 import Stream, cursor
+        events = Stream(challenge_dir).read()
+    except (OSError, ValueError, RuntimeError):
+        # The state writer already treats run.json as an observer projection: a
+        # manifest refresh must not make an otherwise durable STATE append fail.
+        return payload
+    if not events:
+        return payload
+    latest_checkpoint = None
+    for event in events:
+        if event.get("type") == "checkpoint.created":
+            latest_checkpoint = (event.get("payload") or {}).get("checkpoint_id") or latest_checkpoint
+    payload["state"] = {
+        "stream_id": events[-1]["stream_id"],
+        "latest_event_cursor": cursor(events[-1]),
+        "latest_checkpoint_id": latest_checkpoint,
+    }
+    return payload
+
+
+def _atomic_write_unlocked(path: str, manifest: Mapping[str, Any]) -> None:
     parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".run-", suffix=".json.tmp", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -135,6 +169,28 @@ def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
+    """Atomically replace a run manifest while serializing competing writers.
+
+    The lock protects the final projection/write step. Before replacement, STATE
+    v2 (when present) is re-read as the canonical source of cursor/checkpoint truth;
+    callers may still update other manifest fields without being able to regress
+    observer state through a stale read-modify-write race.
+    """
+    validate(manifest)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    lock_path = os.path.join(parent, ".run-manifest.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            payload = _sync_state_projection(path, manifest)
+            validate(payload)
+            _atomic_write_unlocked(path, payload)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def read(path: str) -> dict[str, Any]:
