@@ -1,0 +1,128 @@
+name: bench-model-b-20260910
+
+on:
+  push:
+    branches:
+      - bench/model-b-real-20260910
+
+permissions:
+  contents: read
+
+jobs:
+  mode-b-real:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bench/model-b-real-20260910
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install CTF-Rat benchmark toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 strace binutils
+          python3 -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Install Codex CLI
+        run: |
+          npm install -g @openai/codex
+          codex --version
+
+      - name: Check noninteractive model credential
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CODEX_API_KEY:-}" ]; then
+            echo 'credential=CODEX_API_KEY'
+          elif [ -n "${OPENAI_API_KEY:-}" ]; then
+            echo 'credential=OPENAI_API_KEY (mapped to CODEX_API_KEY for codex exec)'
+          else
+            echo 'No CODEX_API_KEY or OPENAI_API_KEY repository secret is configured.' >&2
+            exit 78
+          fi
+
+      - name: Materialize pinned real corpus
+        run: |
+          PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real
+
+      - name: Create isolated Codex Mode B agent wrapper
+        run: |
+          set -euo pipefail
+          install -d /tmp/ctf-rat-mode-b
+          cat > /tmp/ctf-rat-mode-b/codex-agent <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          challenge_dir="$1"
+          cd "$challenge_dir"
+
+          export CODEX_API_KEY="${CODEX_API_KEY_SECRET:-${OPENAI_API_KEY_SECRET:-}}"
+          unset OPENAI_API_KEY
+          export CODEX_HOME="$challenge_dir/.codex-bench"
+          mkdir -p "$CODEX_HOME"
+
+          cat <<'PROMPT' | codex exec \
+            --skip-git-repo-check \
+            --ephemeral \
+            --ignore-user-config \
+            --ignore-rules \
+            --sandbox workspace-write \
+            --model gpt-5.3-codex \
+            -c 'model_reasoning_effort="high"' \
+            -
+          You are the external model agent in CTF-Rat Mode B. Solve the single authorized local CTF challenge in the current directory.
+
+          Benchmark constraints:
+          - Work only inside this isolated challenge workspace and use only the files and CTF-Rat runtime already present here.
+          - Do not use the internet, web search, writeups, source repositories, parent directories, benchmark manifests, route fixtures, known-good inputs, or prior answers.
+          - Start from local evidence. Prefer the bundled CTF-Rat bounded analysis/query tools before raw dumps.
+          - Form hypotheses, test them against the local binary, and pivot when evidence contradicts them.
+          - A textual flag guess is not a solve. Before declaring success, create the canonical typed primitive evidence required by CTF-Rat and obtain deterministic rat-verify PASS/completion-gate verification using the local runtime.
+          - Do not weaken or bypass verification. Do not modify the challenge binary to fabricate a pass.
+          - You may create exploit/analysis scripts and local artifacts in this workspace.
+          - When and only when deterministic verification succeeds, print the verified flag in your final response.
+
+          Continue autonomously until solved or until no productive local experiment remains.
+          PROMPT
+          SH
+          chmod +x /tmp/ctf-rat-mode-b/codex-agent
+
+      - name: Actual model Mode B real-corpus evaluation
+        env:
+          CODEX_API_KEY_SECRET: ${{ secrets.CODEX_API_KEY }}
+          OPENAI_API_KEY_SECRET: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 bin/ratbench eval \
+            --corpus real \
+            --run-id B-codex-real-20260910 \
+            --ablation A0 \
+            --model-id gpt-5.3-codex \
+            --reasoning-effort high \
+            --timeout 900 \
+            --agent '/tmp/ctf-rat-mode-b/codex-agent {dir}'
+          python3 bin/ratbench report --schema v2
+          cat bench/results/B-codex-real-20260910.jsonl
+          cat bench/results/B-codex-real-20260910.benchmark-v2.jsonl
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-codex-mode-b-20260910
+          path: |
+            bench/results/B-codex-real-20260910.jsonl
+            bench/results/B-codex-real-20260910.benchmark-v2.jsonl
+            bench/LEADERBOARD.v2.md
+          if-no-files-found: warn
