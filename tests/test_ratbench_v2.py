@@ -285,7 +285,8 @@ class ModeBV2RecordTests(unittest.TestCase):
                 fh.write(json.dumps({"schema": "rat.benchmark-result/v2", "benchmark_run_id": "T"}) + "\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None)), 0)
-            leaderboard = open(os.path.join(d, "bench", "LEADERBOARD.md"), encoding="utf-8").read()
+            with open(os.path.join(d, "bench", "LEADERBOARD.md"), encoding="utf-8") as fh:
+                leaderboard = fh.read()
             self.assertIn("| T | B | 1 |", leaderboard)
             self.assertNotIn("| ? |", leaderboard)
 
@@ -320,7 +321,8 @@ class ModeBV2RecordTests(unittest.TestCase):
                 fh.write(json.dumps(failed) + "\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 0)
-            leaderboard = open(os.path.join(d, "bench", "LEADERBOARD.v2.md"), encoding="utf-8").read()
+            with open(os.path.join(d, "bench", "LEADERBOARD.v2.md"), encoding="utf-8") as fh:
+                leaderboard = fh.read()
             self.assertIn("| T | A0 | 2 | 1 | 0 | 1 | 0 | 50.0% |", leaderboard)
             self.assertIn("5000ms (1/2)", leaderboard)
             self.assertIn("4 (1/2)", leaderboard)

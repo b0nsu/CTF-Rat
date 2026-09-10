@@ -633,7 +633,9 @@ class Stream:
    small["events"]=small["events"][-10:]; small["overflow_artifact"]=overflow["digest"]; raw=json.dumps(small,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
   context=put_bytes(raw,kind="state-context",media_type="application/json",logical_name="context.json",root=self.root)
   previous=[e["payload"].get("checkpoint_id") for e in events if e["type"]=="checkpoint.created"]
-  try: run_id=json.load(open(os.path.join(os.path.dirname(self.root),"run.json"),encoding="utf-8"))["run_id"]
+  try:
+   with open(os.path.join(os.path.dirname(self.root),"run.json"),encoding="utf-8") as f:
+    run_id=json.load(f)["run_id"]
   except (OSError,ValueError,KeyError): run_id="local"
   cp={"schema":"rat.checkpoint/v1","checkpoint_id":_id("checkpoint"),"run_id":run_id,"created_at":now(),"reason":reason,"phase":phase,"task_id":task_id,"role":role,"lineage_id":lineage_id,"event_cursor":cur,"active":active,"invalidation_cursor":cur,"context_artifact":context["digest"],"budgets":{},"status":"handoff","verified_findings":[i for i,x in view["findings"].items() if x.get("state") in ("confirmed","verified")],"supported_hypotheses":list(view["hypotheses"]),"ruled_out":list(view["ruled_out"]),"unresolved_unknowns":list(view["unknowns"]),"next_probes":view["next_probes"],"supersedes":previous[-1] if previous else None}
   if overflow: cp["overflow_artifact"]=overflow["digest"]
