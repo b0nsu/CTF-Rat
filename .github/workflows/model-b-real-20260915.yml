@@ -27,7 +27,7 @@ jobs:
       - name: Install Copilot CLI only
         run: npm install -g @github/copilot
 
-      - name: Probe actual accessible model via Auto
+      - name: Capture Auto model metadata
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -38,9 +38,15 @@ jobs:
             --model=auto \
             --no-ask-user \
             --disable-builtin-mcps \
-            --excluded-tools='web_fetch,web_search' \
-            | tee /tmp/model-auto-probe.txt
-          grep -q 'CTF_RAT_MODEL_READY' /tmp/model-auto-probe.txt
+            --excluded-tools='web_fetch' \
+            --output-format=json \
+            --share=/tmp/model-auto-session.md \
+            | tee /tmp/model-auto-probe.jsonl
+          grep -q 'CTF_RAT_MODEL_READY' /tmp/model-auto-probe.jsonl
+          echo '--- JSONL ---'
+          cat /tmp/model-auto-probe.jsonl
+          echo '--- SESSION ---'
+          cat /tmp/model-auto-session.md
 
       - name: Upload model probe evidence
         if: always()
@@ -51,4 +57,5 @@ jobs:
           if-no-files-found: warn
           path: |
             /tmp/copilot-version.txt
-            /tmp/model-auto-probe.txt
+            /tmp/model-auto-probe.jsonl
+            /tmp/model-auto-session.md
