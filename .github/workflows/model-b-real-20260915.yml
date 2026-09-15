@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
-      CODEX_HOME: ${{ runner.temp }}/ctf-rat-codex-home
       CTF_RAT_BASE_REVISION: 304cf273f0e5ab3fc073563922d89b8966c2119c
       BENCH_RUN_ID: B-real-gpt56sol-high-20260915
     steps:
@@ -37,7 +36,7 @@ jobs:
       - name: Verify benchmark source revision and materialize real corpus
         run: |
           set -euo pipefail
-          test "$(git rev-parse dev 2>/dev/null || git rev-parse origin/dev)" = "$CTF_RAT_BASE_REVISION"
+          test "$(git rev-parse origin/dev)" = "$CTF_RAT_BASE_REVISION"
           PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real
           find bench/artifacts -type f -name '*.bin' -print -exec file {} \;
 
@@ -60,11 +59,13 @@ jobs:
         uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY || secrets.CODEX_API_KEY }}
-          codex-home: ${{ env.CODEX_HOME }}
+          codex-home: ${{ runner.temp }}/ctf-rat-codex-home
           codex-version: '0.154.0'
           safety-strategy: drop-sudo
 
       - name: Record model runner identity
+        env:
+          CODEX_HOME: ${{ runner.temp }}/ctf-rat-codex-home
         run: |
           set -euo pipefail
           codex --version
@@ -90,6 +91,7 @@ jobs:
 
       - name: Run actual Mode B over pinned real corpus
         env:
+          CODEX_HOME: ${{ runner.temp }}/ctf-rat-codex-home
           CTF_RAT_REVISION: 304cf273f0e5ab3fc073563922d89b8966c2119c
         run: |
           set -euo pipefail
