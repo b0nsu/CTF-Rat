@@ -15,7 +15,6 @@ jobs:
     env:
       BENCH_RUN_ID: B-real-gpt56-sol-high-20260915
       COPILOT_MODEL: gpt-5.6-sol
-      COPILOT_HOME: ${{ runner.temp }}/copilot-home
     steps:
       - uses: actions/checkout@v6
         with:
