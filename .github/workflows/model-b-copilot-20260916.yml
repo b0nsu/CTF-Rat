@@ -1,0 +1,171 @@
+name: model-b-copilot-20260916
+
+on:
+  push:
+    branches:
+      - bench/model-b-copilot-20260916
+
+permissions:
+  contents: write
+  copilot-requests: write
+
+jobs:
+  model-b:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: bench/model-b-copilot-20260916
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install benchmark toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 strace binutils file
+          python3 -m pip install --disable-pip-version-check -r requirements-deep.txt
+          npm install -g @github/copilot@1.0.83
+          copilot --version
+
+      - name: Materialize pinned real corpus
+        run: |
+          PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real
+          find bench/artifacts -type f -name '*.bin' -print -exec file {} \;
+
+      - name: Prepare isolated Copilot Model B agent
+        shell: bash
+        run: |
+          cat > /tmp/ctf-rat-copilot-agent <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          WRAPPER_SHA_ARG="${1:-}"
+          if [[ "$WRAPPER_SHA_ARG" == --wrapper-sha=* ]]; then
+            shift
+          fi
+          CHAL_DIR="${1:-$PWD}"
+          cd "$CHAL_DIR"
+          KIT_ROOT="$(cd ../.. && pwd)"
+          COP_HOME="$CHAL_DIR/.copilot-model-b"
+          mkdir -p "$COP_HOME"
+          python3 - "$COP_HOME/settings.json" "$KIT_ROOT" "$CHAL_DIR" <<'PY'
+          import json, sys
+          path, kit_root, chal_dir = sys.argv[1:]
+          settings = {
+              "askUser": False,
+              "autoUpdate": False,
+              "banner": "never",
+              "sandbox": {
+                  "enabled": True,
+                  "allowBypass": False,
+                  "auth": {"git": False, "gh": False},
+                  "addCurrentWorkingDirectory": True,
+                  "allowDevToolAccess": True,
+                  "userPolicy": {
+                      "filesystem": {
+                          "readonlyPaths": [kit_root],
+                          "readwritePaths": [chal_dir],
+                          "deniedPaths": [],
+                      },
+                      "network": {
+                          "allowOutbound": False,
+                          "allowLocalNetwork": False,
+                      },
+                  },
+              },
+          }
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(settings, fh, sort_keys=True)
+          PY
+          export COPILOT_HOME="$COP_HOME"
+          export COPILOT_MODEL="gpt-5.4"
+          PROMPT=$(cat <<'PROMPT'
+          You are the sole solving model in an authorized local CTF-Rat benchmark attempt.
+
+          Goal: solve the challenge in the current working directory using only the local challenge artifact and the exported CTF-Rat runtime. Do not use the internet, GitHub, writeups, remote services, or prior answers. Do not inspect files outside the sandbox grants.
+
+          Measurement rules:
+          - Treat CTF_HOME as the canonical runtime and current directory as the only writable challenge workspace.
+          - Start FAST: use bounded CTF-Rat brief/query interfaces and direct local evidence before expensive analysis.
+          - Escalate only when evidence requires it. Avoid duplicate tool calls and raw dumps.
+          - You may create exploit/solver scripts inside the current challenge directory and execute local tooling.
+          - A flag-shaped string alone is NOT success. Before claiming success, record the required typed primitive/evidence and run the canonical deterministic verification/completion path so ratbench can independently observe VERIFIED completion.
+          - If you cannot satisfy the completion gate, report the strongest verified facts and stop without pretending the challenge is solved.
+          - Do not ask the user questions. Work autonomously until solved, disproved, or time-limited.
+
+          Begin by inspecting the local artifact and CTF-Rat front door, then solve and verify.
+          PROMPT
+          )
+          LOG="/tmp/model-b-$(basename "$CHAL_DIR").copilot.log"
+          set +e
+          copilot -p "$PROMPT" \
+            -s \
+            --model=gpt-5.4 \
+            --no-ask-user \
+            --experimental \
+            --sandbox \
+            --allow-all-tools \
+            --excluded-tools='web_fetch,web_search,task,list_agents,read_agent,write_agent' \
+            --secret-env-vars=GITHUB_TOKEN \
+            2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit "$rc"
+          SH
+          chmod +x /tmp/ctf-rat-copilot-agent
+          WRAPPER_SHA="sha256:$(sha256sum /tmp/ctf-rat-copilot-agent | awk '{print $1}')"
+          echo "MODEL_B_WRAPPER_SHA=$WRAPPER_SHA" | tee /tmp/model-b-measurement-meta.txt
+          copilot --version | tee -a /tmp/model-b-measurement-meta.txt
+          echo "CTF_RAT_REVISION=$(git rev-parse HEAD)" | tee -a /tmp/model-b-measurement-meta.txt
+
+      - name: Run actual Model B
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          WRAPPER_SHA="sha256:$(sha256sum /tmp/ctf-rat-copilot-agent | awk '{print $1}')"
+          AGENT_CMD="/tmp/ctf-rat-copilot-agent --wrapper-sha=$WRAPPER_SHA {dir}"
+          python3 bin/ratbench eval \
+            --corpus real \
+            --run-id B-copilot-gpt54-20260916 \
+            --ablation A0 \
+            --model-id 'github-copilot/gpt-5.4' \
+            --reasoning-effort 'copilot-default' \
+            --timeout 900 \
+            --agent "$AGENT_CMD"
+          python3 bin/ratbench report --schema v2
+          cat bench/results/B-copilot-gpt54-20260916.benchmark-v2.jsonl
+
+      - name: Upload Model B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-model-b-copilot-gpt54-20260916
+          if-no-files-found: warn
+          path: |
+            bench/results/B-copilot-gpt54-20260916.jsonl
+            bench/results/B-copilot-gpt54-20260916.benchmark-v2.jsonl
+            bench/LEADERBOARD.v2.md
+            /tmp/model-b-*.copilot.log
+            /tmp/model-b-measurement-meta.txt
+
+      - name: Remove one-off workflow
+        if: always()
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [ -f .github/workflows/model-b-copilot-20260916.yml ]; then
+            git rm .github/workflows/model-b-copilot-20260916.yml
+            git commit -m 'chore(bench): remove one-off Model B workflow'
+            git push origin HEAD:bench/model-b-copilot-20260916
+          fi
