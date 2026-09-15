@@ -11,9 +11,14 @@ permissions:
   copilot-requests: write
 
 jobs:
-  model-probe:
+  model-b-real:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 40
+    env:
+      CTF_RAT_BASE_REVISION: 304cf273f0e5ab3fc073563922d89b8966c2119c
+      BENCH_RUN_ID: B-real-mai-code-11-flash-medium-20260915
+      MODEL_B_MODEL: mai-code-1.1-flash
+      MODEL_B_EFFORT: medium
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,38 +29,154 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install Copilot CLI only
+      - name: Install Copilot CLI
         run: npm install -g @github/copilot
 
-      - name: Capture Auto model metadata
+      - name: Verify fixed model and reasoning configuration
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           copilot --version | tee /tmp/copilot-version.txt
           copilot \
-            -p 'This is an authentication and model-selection probe. Reply exactly: CTF_RAT_MODEL_READY' \
-            --model=auto \
+            -p 'This is a fixed-model benchmark preflight. Reply exactly: CTF_RAT_MODEL_READY' \
+            --model="$MODEL_B_MODEL" \
+            --reasoning-effort="$MODEL_B_EFFORT" \
             --no-ask-user \
             --disable-builtin-mcps \
             --excluded-tools='web_fetch' \
             --output-format=json \
-            --share=/tmp/model-auto-session.md \
-            | tee /tmp/model-auto-probe.jsonl
-          grep -q 'CTF_RAT_MODEL_READY' /tmp/model-auto-probe.jsonl
-          echo '--- JSONL ---'
-          cat /tmp/model-auto-probe.jsonl
-          echo '--- SESSION ---'
-          cat /tmp/model-auto-session.md
+            | tee /tmp/fixed-model-preflight.jsonl
+          grep -q 'CTF_RAT_MODEL_READY' /tmp/fixed-model-preflight.jsonl
+          grep -q '"model":"mai-code-1.1-flash"' /tmp/fixed-model-preflight.jsonl
 
-      - name: Upload model probe evidence
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install CTF-Rat benchmark toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 strace file binutils
+          python3 -m pip install --disable-pip-version-check -r requirements-deep.txt
+
+      - name: Verify benchmark source revision and materialize real corpus
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/dev)" = "$CTF_RAT_BASE_REVISION"
+          PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real | tee /tmp/materialize.txt
+          find bench/artifacts -type f -name '*.bin' -print -exec file {} \;
+
+      - name: Create measured fixed-model agent wrapper
+        run: |
+          cat > /tmp/ctf-rat-model-agent <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          challenge_id="$(basename "$PWD")"
+          jsonl="/tmp/copilot-${challenge_id}.jsonl"
+          transcript="/tmp/copilot-${challenge_id}.md"
+          copilot \
+            --experimental --sandbox \
+            --add-dir="$CTF_HOME" \
+            -p 'You are the sole solver in a measured CTF-Rat Mode B evaluation. Solve only the CTF challenge in the current working directory using local files and the provided CTF-Rat runtime. Do not use the network or external sources. Read and follow $CTF_HOME/AGENTS.md. Use the canonical workflow: bounded routing/analysis first, FAST unless evidence requires DEEP, maintain canonical STATE evidence, establish a real primitive, and run deterministic verification. A flag-shaped string alone is not success. Do not claim solved unless the canonical completion gate is VERIFIED. Persist useful scripts, STATE, evidence, and verification artifacts inside the challenge workspace. The per-challenge wall-clock budget is 600 seconds.' \
+            --model "$MODEL_B_MODEL" \
+            --reasoning-effort "$MODEL_B_EFFORT" \
+            --no-ask-user \
+            --allow-all-tools \
+            --disable-builtin-mcps \
+            --excluded-tools='web_fetch' \
+            --secret-env-vars=GITHUB_TOKEN \
+            --output-format=json \
+            --share="$transcript" \
+            | tee "$jsonl" \
+            | python3 -c 'import json,sys
+for line in sys.stdin:
+    try: e=json.loads(line)
+    except Exception: continue
+    if e.get("type")=="assistant.message":
+        c=(e.get("data") or {}).get("content")
+        if c: print(c)'
+          status=${PIPESTATUS[0]}
+          exit "$status"
+          SH
+          chmod +x /tmp/ctf-rat-model-agent
+
+      - name: Run actual Mode B over pinned real corpus
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CTF_RAT_REVISION: 304cf273f0e5ab3fc073563922d89b8966c2119c
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'MODEL_B wall_sec=%e user_sec=%U sys_sec=%S maxrss_kb=%M' \
+            python3 bin/ratbench eval \
+              --corpus real \
+              --run-id "$BENCH_RUN_ID" \
+              --ablation A0 \
+              --model-id "$MODEL_B_MODEL" \
+              --reasoning-effort "$MODEL_B_EFFORT" \
+              --timeout 600 \
+              --agent '/tmp/ctf-rat-model-agent' \
+            | tee /tmp/mode-b-console.txt
+
+      - name: Render and validate benchmark-v2 report
+        run: |
+          set -euo pipefail
+          python3 bin/ratbench report --schema v2 | tee /tmp/benchmark-report.txt
+          cat "bench/results/${BENCH_RUN_ID}.jsonl"
+          cat "bench/results/${BENCH_RUN_ID}.benchmark-v2.jsonl"
+          cat bench/LEADERBOARD.v2.md
+
+      - name: Summarize model-side usage evidence
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          summary = {}
+          for path in sorted(glob.glob('/tmp/copilot-google-ctf-*.jsonl')):
+              challenge = os.path.basename(path)[len('copilot-'):-len('.jsonl')]
+              model_calls = []
+              last_usage = None
+              result = None
+              with open(path, encoding='utf-8') as fh:
+                  for line in fh:
+                      try:
+                          event = json.loads(line)
+                      except Exception:
+                          continue
+                      if event.get('type') == 'model.call_start':
+                          data = event.get('data') or {}
+                          model_calls.append(data.get('model'))
+                      elif event.get('type') == 'session.usage_checkpoint':
+                          last_usage = event.get('data')
+                      elif event.get('type') == 'result':
+                          result = event
+              summary[challenge] = {
+                  'models': model_calls,
+                  'last_usage': last_usage,
+                  'result': result,
+              }
+          with open('/tmp/model-usage-summary.json', 'w', encoding='utf-8') as fh:
+              json.dump(summary, fh, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload Mode B evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ctf-rat-model-probe-20260915
+          name: ctf-rat-model-b-real-20260915
           retention-days: 90
           if-no-files-found: warn
           path: |
+            bench/results/B-real-mai-code-11-flash-medium-20260915.jsonl
+            bench/results/B-real-mai-code-11-flash-medium-20260915.benchmark-v2.jsonl
+            bench/LEADERBOARD.v2.md
             /tmp/copilot-version.txt
-            /tmp/model-auto-probe.jsonl
-            /tmp/model-auto-session.md
+            /tmp/fixed-model-preflight.jsonl
+            /tmp/materialize.txt
+            /tmp/mode-b-console.txt
+            /tmp/benchmark-report.txt
+            /tmp/model-usage-summary.json
+            /tmp/copilot-google-ctf-*.jsonl
+            /tmp/copilot-google-ctf-*.md
