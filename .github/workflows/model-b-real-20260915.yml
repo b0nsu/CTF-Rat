@@ -70,12 +70,26 @@ jobs:
 
       - name: Create measured fixed-model agent wrapper
         run: |
+          cat > /tmp/extract-assistant.py <<'PY'
+          import json
+          import sys
+          for line in sys.stdin:
+              try:
+                  event = json.loads(line)
+              except Exception:
+                  continue
+              if event.get("type") == "assistant.message":
+                  content = (event.get("data") or {}).get("content")
+                  if content:
+                      print(content)
+          PY
           cat > /tmp/ctf-rat-model-agent <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
           challenge_id="$(basename "$PWD")"
           jsonl="/tmp/copilot-${challenge_id}.jsonl"
           transcript="/tmp/copilot-${challenge_id}.md"
+          set +e
           copilot \
             --experimental --sandbox \
             --add-dir="$CTF_HOME" \
@@ -90,14 +104,9 @@ jobs:
             --output-format=json \
             --share="$transcript" \
             | tee "$jsonl" \
-            | python3 -c 'import json,sys
-for line in sys.stdin:
-    try: e=json.loads(line)
-    except Exception: continue
-    if e.get("type")=="assistant.message":
-        c=(e.get("data") or {}).get("content")
-        if c: print(c)'
+            | python3 /tmp/extract-assistant.py
           status=${PIPESTATUS[0]}
+          set -e
           exit "$status"
           SH
           chmod +x /tmp/ctf-rat-model-agent
