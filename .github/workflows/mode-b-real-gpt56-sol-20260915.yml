@@ -6,9 +6,7 @@ on:
       - bench/mode-b-real-gpt56-sol-20260915
   workflow_dispatch:
 
-permissions:
-  contents: read
-  copilot-requests: write
+permissions: write-all
 
 jobs:
   mode-b-real:
