@@ -1,0 +1,140 @@
+name: mode-b-real-gpt56-sol-20260915
+
+on:
+  push:
+    branches:
+      - bench/mode-b-real-gpt56-sol-20260915
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  copilot-requests: write
+
+jobs:
+  mode-b-real:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      BENCH_RUN_ID: B-real-gpt56-sol-high-20260915
+      COPILOT_MODEL: gpt-5.6-sol
+      COPILOT_HOME: ${{ runner.temp }}/copilot-home
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: bench/mode-b-real-gpt56-sol-20260915
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install local CTF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 strace file binutils
+          python3 -m pip install --disable-pip-version-check -r requirements-deep.txt
+
+      - name: Install Copilot CLI
+        run: |
+          npm install -g @github/copilot@latest
+          copilot --version | tee "${RUNNER_TEMP}/copilot-version.txt"
+
+      - name: Verify actual model authentication
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          copilot \
+            -p 'This is an authentication and model-selection preflight. Reply exactly: CTF_RAT_MODEL_READY' \
+            -s \
+            --model=gpt-5.6-sol \
+            --reasoning-effort=high \
+            --no-ask-user \
+            --disable-builtin-mcps \
+            --deny-tool='shell,read,write,url,memory' \
+            | tee "${RUNNER_TEMP}/copilot-preflight.txt"
+          grep -q 'CTF_RAT_MODEL_READY' "${RUNNER_TEMP}/copilot-preflight.txt"
+
+      - name: Materialize pinned real corpus
+        run: |
+          set -euo pipefail
+          PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real | tee "${RUNNER_TEMP}/materialize.txt"
+          file bench/artifacts/google-ctf-2017-inst-prof/inst_prof.bin
+          file bench/artifacts/google-ctf-2024-notobfuscated/notobfuscated.bin
+
+      - name: Build isolated Copilot agent wrapper
+        run: |
+          cat > /tmp/ctf-rat-copilot-agent <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          challenge_dir="$1"
+          challenge_id="$(basename "$challenge_dir")"
+          kit_root="$(cd "$challenge_dir/../.." && pwd)"
+          transcript="${RUNNER_TEMP}/copilot-${challenge_id}.md"
+          prompt=$(cat <<'PROMPT'
+          You are the solver under measurement in an authorized, local CTF benchmark. Work only on the challenge in the current local workspace. Do not use the network, web search, GitHub, or any external service. Do not seek or use public writeups, source, flags, or challenge metadata outside this answer-free workspace.
+
+          Use the CTF-Rat runtime already installed in CTF_HOME. Read the local CTF-Rat instructions and command help as needed. Analyze the supplied binary, choose/revise the route based on evidence, and solve the challenge locally. You may create local exploit/solver files inside the workspace and execute local analysis/debugging tools.
+
+          Measurement invariant: merely printing a flag-shaped string is NOT success. Before finishing, use the canonical CTF-Rat state/evidence/primitive/verification path and satisfy the canonical completion gate. Do not fabricate STATE, evidence, verification reports, or PASS status. Deterministic execution evidence must support any VERIFIED/SOLVED claim. If you cannot satisfy the completion gate, leave the state honest and report what blocked you.
+
+          Minimize duplicate analysis and avoid unnecessary heavy tools. Prefer bounded CTF-Rat queries first; escalate only when evidence requires it.
+          PROMPT
+          )
+          cd "$challenge_dir"
+          exec copilot \
+            -p "$prompt" \
+            -s \
+            --model=gpt-5.6-sol \
+            --reasoning-effort=high \
+            --no-ask-user \
+            --disable-builtin-mcps \
+            --add-dir "$kit_root" \
+            --allow-tool='shell,read,write' \
+            --deny-tool='url,memory' \
+            --share="$transcript"
+          SH
+          chmod +x /tmp/ctf-rat-copilot-agent
+
+      - name: Run actual Mode B real-corpus measurement
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CTF_RAT_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'MODE_B_TOTAL wall_sec=%e user_sec=%U sys_sec=%S maxrss_kb=%M' \
+            python3 bin/ratbench eval \
+              --corpus real \
+              --run-id "$BENCH_RUN_ID" \
+              --ablation A0 \
+              --model-id 'github-copilot/gpt-5.6-sol' \
+              --reasoning-effort high \
+              --timeout 600 \
+              --agent '/tmp/ctf-rat-copilot-agent {dir}' \
+            2>&1 | tee "${RUNNER_TEMP}/mode-b-console.txt"
+
+      - name: Render and inspect benchmark-v2 evidence
+        run: |
+          set -euo pipefail
+          python3 bin/ratbench report --schema v2 | tee "${RUNNER_TEMP}/benchmark-report.txt"
+          cat "bench/results/${BENCH_RUN_ID}.jsonl"
+          cat "bench/results/${BENCH_RUN_ID}.benchmark-v2.jsonl"
+
+      - name: Upload measurement evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-rat-mode-b-real-gpt56-sol-20260915
+          if-no-files-found: warn
+          retention-days: 90
+          path: |
+            bench/results/B-real-gpt56-sol-high-20260915.jsonl
+            bench/results/B-real-gpt56-sol-high-20260915.benchmark-v2.jsonl
+            bench/LEADERBOARD.v2.md
+            ${{ runner.temp }}/copilot-version.txt
+            ${{ runner.temp }}/copilot-preflight.txt
+            ${{ runner.temp }}/materialize.txt
+            ${{ runner.temp }}/mode-b-console.txt
+            ${{ runner.temp }}/benchmark-report.txt
+            ${{ runner.temp }}/copilot-*.md
