@@ -17,7 +17,7 @@ jobs:
     env:
       CTF_RAT_BASE_REVISION: 304cf273f0e5ab3fc073563922d89b8966c2119c
       BENCH_RUN_ID: B-real-mai-code-11-flash-medium-20260915
-      MODEL_B_MODEL: mai-code-1.1-flash
+      EXPECTED_MODEL: mai-code-1.1-flash
       MODEL_B_EFFORT: medium
     steps:
       - uses: actions/checkout@v4
@@ -32,23 +32,43 @@ jobs:
       - name: Install Copilot CLI
         run: npm install -g @github/copilot
 
-      - name: Verify fixed model and reasoning configuration
+      - name: Verify effective single-model Auto configuration
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           copilot --version | tee /tmp/copilot-version.txt
           copilot \
-            -p 'This is a fixed-model benchmark preflight. Reply exactly: CTF_RAT_MODEL_READY' \
-            --model="$MODEL_B_MODEL" \
-            --reasoning-effort="$MODEL_B_EFFORT" \
+            -p 'This is a benchmark model-selection preflight. Reply exactly: CTF_RAT_MODEL_READY' \
+            --model=auto \
             --no-ask-user \
             --disable-builtin-mcps \
             --excluded-tools='web_fetch' \
             --output-format=json \
-            | tee /tmp/fixed-model-preflight.jsonl
-          grep -q 'CTF_RAT_MODEL_READY' /tmp/fixed-model-preflight.jsonl
-          grep -q '"model":"mai-code-1.1-flash"' /tmp/fixed-model-preflight.jsonl
+            | tee /tmp/model-preflight.jsonl
+          python3 - <<'PY'
+          import json
+          expected = 'mai-code-1.1-flash'
+          events = []
+          with open('/tmp/model-preflight.jsonl', encoding='utf-8') as fh:
+              for line in fh:
+                  try: events.append(json.loads(line))
+                  except Exception: pass
+          resolved = [e.get('data') or {} for e in events if e.get('type') == 'session.auto_mode_resolved']
+          if len(resolved) != 1:
+              raise SystemExit('expected exactly one auto_mode_resolved event')
+          data = resolved[0]
+          if data.get('chosenModel') != expected:
+              raise SystemExit('unexpected chosenModel: %r' % data.get('chosenModel'))
+          if data.get('availableModels') != [expected]:
+              raise SystemExit('Auto is not an effective single-model environment: %r' % data.get('availableModels'))
+          if data.get('fallback') is not False:
+              raise SystemExit('unexpected Auto fallback')
+          messages = [e.get('data') or {} for e in events if e.get('type') == 'assistant.message']
+          if not any(m.get('model') == expected and m.get('content') == 'CTF_RAT_MODEL_READY' for m in messages):
+              raise SystemExit('model preflight response/model mismatch')
+          print(json.dumps({'chosenModel': expected, 'availableModels': [expected], 'routingMethod': data.get('routingMethod'), 'fallback': False}, sort_keys=True))
+          PY
 
       - uses: actions/setup-python@v5
         with:
@@ -68,7 +88,7 @@ jobs:
           PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real | tee /tmp/materialize.txt
           find bench/artifacts -type f -name '*.bin' -print -exec file {} \;
 
-      - name: Create measured fixed-model agent wrapper
+      - name: Create measured model agent wrapper
         run: |
           cat > /tmp/extract-assistant.py <<'PY'
           import json
@@ -94,8 +114,7 @@ jobs:
             --experimental --sandbox \
             --add-dir="$CTF_HOME" \
             -p 'You are the sole solver in a measured CTF-Rat Mode B evaluation. Solve only the CTF challenge in the current working directory using local files and the provided CTF-Rat runtime. Do not use the network or external sources. Read and follow $CTF_HOME/AGENTS.md. Use the canonical workflow: bounded routing/analysis first, FAST unless evidence requires DEEP, maintain canonical STATE evidence, establish a real primitive, and run deterministic verification. A flag-shaped string alone is not success. Do not claim solved unless the canonical completion gate is VERIFIED. Persist useful scripts, STATE, evidence, and verification artifacts inside the challenge workspace. The per-challenge wall-clock budget is 600 seconds.' \
-            --model "$MODEL_B_MODEL" \
-            --reasoning-effort "$MODEL_B_EFFORT" \
+            --model=auto \
             --no-ask-user \
             --allow-all-tools \
             --disable-builtin-mcps \
@@ -122,11 +141,44 @@ jobs:
               --corpus real \
               --run-id "$BENCH_RUN_ID" \
               --ablation A0 \
-              --model-id "$MODEL_B_MODEL" \
+              --model-id "$EXPECTED_MODEL" \
               --reasoning-effort "$MODEL_B_EFFORT" \
               --timeout 600 \
               --agent '/tmp/ctf-rat-model-agent' \
             | tee /tmp/mode-b-console.txt
+
+      - name: Validate actual model identity for every challenge
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, json, os
+          expected = os.environ['EXPECTED_MODEL']
+          files = sorted(glob.glob('/tmp/copilot-google-ctf-*.jsonl'))
+          if len(files) != 2:
+              raise SystemExit('expected 2 model transcripts, got %d' % len(files))
+          summary = {}
+          for path in files:
+              challenge = os.path.basename(path)[len('copilot-'):-len('.jsonl')]
+              events = []
+              with open(path, encoding='utf-8') as fh:
+                  for line in fh:
+                      try: events.append(json.loads(line))
+                      except Exception: pass
+              resolved = [e.get('data') or {} for e in events if e.get('type') == 'session.auto_mode_resolved']
+              if len(resolved) != 1:
+                  raise SystemExit('%s: expected one Auto resolution event' % challenge)
+              data = resolved[0]
+              if data.get('chosenModel') != expected or data.get('availableModels') != [expected] or data.get('fallback') is not False:
+                  raise SystemExit('%s: model identity changed: %r' % (challenge, data))
+              calls = [(e.get('data') or {}).get('model') for e in events if e.get('type') == 'model.call_start']
+              if not calls or any(model != expected for model in calls):
+                  raise SystemExit('%s: unexpected model calls: %r' % (challenge, calls))
+              usage = [(e.get('data') or {}) for e in events if e.get('type') == 'session.usage_checkpoint']
+              summary[challenge] = {'model': expected, 'model_calls': len(calls), 'last_usage': usage[-1] if usage else None}
+          with open('/tmp/model-usage-summary.json', 'w', encoding='utf-8') as fh:
+              json.dump(summary, fh, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
 
       - name: Render and validate benchmark-v2 report
         run: |
@@ -135,40 +187,6 @@ jobs:
           cat "bench/results/${BENCH_RUN_ID}.jsonl"
           cat "bench/results/${BENCH_RUN_ID}.benchmark-v2.jsonl"
           cat bench/LEADERBOARD.v2.md
-
-      - name: Summarize model-side usage evidence
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import glob, json, os
-          summary = {}
-          for path in sorted(glob.glob('/tmp/copilot-google-ctf-*.jsonl')):
-              challenge = os.path.basename(path)[len('copilot-'):-len('.jsonl')]
-              model_calls = []
-              last_usage = None
-              result = None
-              with open(path, encoding='utf-8') as fh:
-                  for line in fh:
-                      try:
-                          event = json.loads(line)
-                      except Exception:
-                          continue
-                      if event.get('type') == 'model.call_start':
-                          data = event.get('data') or {}
-                          model_calls.append(data.get('model'))
-                      elif event.get('type') == 'session.usage_checkpoint':
-                          last_usage = event.get('data')
-                      elif event.get('type') == 'result':
-                          result = event
-              summary[challenge] = {
-                  'models': model_calls,
-                  'last_usage': last_usage,
-                  'result': result,
-              }
-          with open('/tmp/model-usage-summary.json', 'w', encoding='utf-8') as fh:
-              json.dump(summary, fh, indent=2, sort_keys=True)
-          print(json.dumps(summary, indent=2, sort_keys=True))
-          PY
 
       - name: Upload Mode B evidence
         if: always()
@@ -182,7 +200,7 @@ jobs:
             bench/results/B-real-mai-code-11-flash-medium-20260915.benchmark-v2.jsonl
             bench/LEADERBOARD.v2.md
             /tmp/copilot-version.txt
-            /tmp/fixed-model-preflight.jsonl
+            /tmp/model-preflight.jsonl
             /tmp/materialize.txt
             /tmp/mode-b-console.txt
             /tmp/benchmark-report.txt
