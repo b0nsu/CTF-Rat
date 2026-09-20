@@ -25,7 +25,7 @@ RAT = _load_rat()
 class SliceTruthTests(unittest.TestCase):
     def test_completion_truth_table(self):
         cases = [
-            ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 0}}, True),
+            ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 0}}, False),
             ({"status": "ok", "summary": {"unresolved_aliases": 1, "unresolved_indirect_calls": 0}}, False),
             ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 1}}, False),
             ({"status": "ok", "summary": {"unresolved_aliases": 0, "unresolved_indirect_calls": 2}}, False),
@@ -93,7 +93,7 @@ class SliceTruthTests(unittest.TestCase):
         self.assertEqual(doc["status"], "partial")
         self.assertFalse(doc["coverage"]["complete"])
 
-    def test_clean_producer_is_complete(self):
+    def test_clean_candidate_remains_unproven_even_with_zero_reported_aliases(self):
         doc = self._project({
             "status": "ok",
             "summary": {
@@ -109,8 +109,11 @@ class SliceTruthTests(unittest.TestCase):
             "artifacts": [],
             "provenance": {"cache": {"hit": False}},
         })
-        self.assertEqual(doc["status"], "ok")
-        self.assertTrue(doc["coverage"]["complete"])
+        self.assertEqual(doc["status"], "partial")
+        self.assertFalse(doc["coverage"]["complete"])
+        self.assertFalse(doc["heuristics"]["source_to_target_proven"])
+        self.assertEqual(doc["coverage"]["omitted"]["source_to_target_proof"], "not-available")
+        self.assertTrue(any("not been proven" in d["message"] for d in doc["diagnostics"]))
 
     def test_loop_candidate_stays_heuristic(self):
         loop_analysis = {
@@ -141,6 +144,8 @@ class SliceTruthTests(unittest.TestCase):
         self.assertEqual(doc["facts"]["within_function"]["registers_read"], ["rax"])
         self.assertEqual(doc["heuristics"]["claim"], "dependency-candidate")
         self.assertEqual(doc["heuristics"]["loop_analysis"], loop_analysis)
+        self.assertFalse(doc["heuristics"]["source_to_target_proven"])
+        self.assertFalse(doc["coverage"]["complete"])
 
 
 if __name__ == "__main__":
