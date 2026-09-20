@@ -297,6 +297,50 @@ def _active_triage_overlay(result):
     return result
 
 
+def _early_route_context(result, imports, profile, revq, interesting, *, is_pe=False):
+    """Keep independent evidence visible when an obstacle or kernel hint routes first.
+
+    A confirmed packer section commits an *unpacking action*, not the underlying
+    program shape.  A kernel-import hint with competing program/surface evidence,
+    on the other hand, must not lock the kernel skill before discrimination.
+    Only re-project existing, deterministic inputs; never run new analysis here.
+    """
+    secondary = []
+    if not is_pe:
+        if result["subroute"] != "pwn-kernel" and imports & KERNEL_IMPORTS:
+            secondary.append({"track": "pwn", "subroute": "pwn-kernel", "confidence": 0.8})
+        secondary.extend(
+            {"track": "pwn", "subroute": subroute, "confidence": confidence}
+            for subroute, confidence in _pwn_all_candidates(imports, profile)
+            if subroute != result["subroute"]
+        )
+    top = (interesting or [None])[0] if interesting else None
+    if top:
+        func = top.get("func")
+        checker = bool(_checker_compare_calls(revq, func) or _checker_oracle_strings(revq, func))
+        secondary.append({"track": "rev", "subroute": "rev-checker" if checker else "rev-symbolic",
+                          "confidence": 0.5})
+    functions = (revq or {}).get("functions") or []
+    fn_names = " ".join(f.get("name", "") for f in functions if isinstance(f, dict)).lower()
+    if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
+        secondary.append({"track": "rev", "subroute": "rev-vm", "confidence": 0.5})
+    secondary = [candidate for candidate in secondary if candidate["subroute"] != result["subroute"]]
+
+    if result["subroute"] == "pwn-kernel" and secondary:
+        # These routes compete with the initial kernel classification.  Preserve
+        # the compatibility primary while withholding the route-specific skill.
+        result["conflict"] = True
+        result["alternatives"] = secondary
+    result = _finalize(result, is_pe)
+    if result["subroute"] == "rev-packed":
+        # Packing is an orthogonal obstacle, not an exclusive problem class.
+        # Do not downgrade a fact-grade unpacking action just because the
+        # still-unpacked program also has candidate vulnerability surfaces.
+        for candidate in secondary:
+            _project_subroute_dimension(candidate["subroute"], result["dimensions"], result["unresolved"])
+    return result
+
+
 def _finalize(result, is_pe=False):
     result = _active_triage_overlay(result)
     return _pe_next(result, is_pe)
@@ -315,12 +359,14 @@ def route(*, profile=None, revq=None, interesting=None):
     if packed:
         observation, confidence = packed
         signals.append(_sig(observation["kind"], observation.get("value"), observation["quality"]))
-        return _finalize(_result("rev", "rev-packed", confidence, signals, capabilities), is_pe)
+        return _early_route_context(_result("rev", "rev-packed", confidence, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
 
     if imports & KERNEL_IMPORTS and not is_pe:
         hit = sorted(imports & KERNEL_IMPORTS)
         signals.append(_sig("kernel-imports", hit, "fact"))
-        return _finalize(_result("pwn", "pwn-kernel", 0.8, signals, capabilities))
+        return _early_route_context(_result("pwn", "pwn-kernel", 0.8, signals, capabilities),
+                                    imports, profile, revq, interesting)
 
     pwn = None if is_pe else _pwn_candidate(imports, profile)
     top = (interesting or [None])[0] if interesting else None
