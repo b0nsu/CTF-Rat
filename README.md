@@ -129,7 +129,7 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <br>
 
 `rat route <bin>` decides track/subroute/skill (a thin composition of rat-doctor + rat-profile + revq,
-no new analysis), and `rat query {func,oracle,slice}` · `rat dyn|verify` · `rat state compact` ·
+no new analysis), and `rat query {graph,func,oracle,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
 
