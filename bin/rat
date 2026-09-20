@@ -74,6 +74,9 @@ def _render_route_text(doc):
     unresolved = doc.get("unresolved") or []
     if unresolved:
         lines += ["", "UNRESOLVED"] + ["  - %s" % item for item in unresolved]
+    leads = doc.get("leads") or []
+    if leads:
+        lines += ["", "COEXISTING LEADS"] + ["  %s" % name for name in leads]
     alternatives = doc.get("alternatives") or []
     if alternatives:
         lines += ["", "ALTERNATIVES"] + ["  %s (confidence=%.2f)" % (a.get("subroute"), a.get("confidence") or 0.0)
@@ -251,6 +254,7 @@ def _record_route_assessment(state_dir, source, result):
         "confidence": result.get("confidence"), "commitment": result.get("commitment"),
         "conflict": bool(result.get("conflict")),
         "alternatives": [a.get("subroute") for a in result.get("alternatives", []) or []],
+        "leads": result.get("leads", []),
         "skill": result.get("skill"), "dimensions": result.get("dimensions", {}),
     }
     fingerprint = _canonical_digest(core)
@@ -416,6 +420,8 @@ def _render_brief_text(card):
         L.append("SKILL       %s" % card["skill_path"])
     if r.get("conflict"):
         L.append("CONFLICT    yes -> %s" % ", ".join(a.get("subroute") for a in r.get("alternatives", [])))
+    if r.get("leads"):
+        L.append("LEADS       " + ", ".join(r["leads"]))
     unresolved = r.get("unresolved") or []
     if unresolved:
         L.append("UNRESOLVED  " + " | ".join(unresolved[:3]))
