@@ -685,11 +685,14 @@ def cmd_query_oracle(args):
     return _emit(doc, EXIT_OK, args.format)
 
 def _slice_complete(slice_doc):
-    s = slice_doc.get("summary", {})
-    counters = (s.get("unresolved_aliases"), s.get("unresolved_indirect_calls"))
-    return (slice_doc.get("status") == "ok"
-            and all(isinstance(value, int) and not isinstance(value, bool) and value == 0
-                    for value in counters))
+    """No current data-slice producer proves source-to-target value flow.
+
+    Zero *observed* alias/indirect counts only describe a bounded VEX/CFG
+    survey.  They cannot establish absence of unresolved dependencies, nor
+    authenticate a source-to-target proof.  Keep this gate fail-closed until a
+    verified dependency artifact and its validator are implemented.
+    """
+    return False
 
 def cmd_query_slice(args):
     binary = args.binary
@@ -723,7 +726,7 @@ def cmd_query_slice(args):
     within_function = dict(s.get("within_function") or {})
     loop_analysis = within_function.pop("loop_analysis", None)
     facts = {"target": s.get("target"), "within_function": within_function, "interproc": s.get("interproc")}
-    heuristics = {"claim": s.get("claim")}
+    heuristics = {"claim": s.get("claim"), "source_to_target_proven": False}
     if loop_analysis is not None:
         heuristics["loop_analysis"] = loop_analysis
     diagnostics = []
@@ -731,12 +734,16 @@ def cmd_query_slice(args):
         msg = d.get("message", "")
         code_tag = "dependency_missing" if "angr dependency missing" in msg else "partial"
         diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
+    if slice_doc.get("status") == "ok":
+        diagnostics.append({"code": "partial", "severity": "warning",
+                            "message": "bounded VEX/CFG survey only; source-to-target value flow has not been proven"})
     doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
                            artifacts=slice_doc.get("artifacts", []),
                            coverage={"complete": complete,
-                                     "scope": "backward-data-slice depth=%s" % (s.get("interproc") or {}).get("depth"),
+                                     "scope": "backward-data-dependency depth=%s (bounded VEX/CFG survey)" % (s.get("interproc") or {}).get("depth"),
                                      "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
-                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls")}},
+                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls"),
+                                                 "source_to_target_proof": "not-available"}},
                            diagnostics=diagnostics,
                            provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
                                        "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
