@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import copy
+import sys
 
 from . import analysis
 from .artifact import put_bytes
@@ -39,7 +40,12 @@ def _persist_invocation(doc, args):
         name = (doc.get("tool", {}) or {}).get("name") or "rat-analysis"
         put_bytes(raw, kind="tool-result", media_type="application/json",
                   logical_name=name + "-invocation.json", root=store)
-    except Exception:
+    except Exception as exc:
+        # Analysis success must not depend on telemetry, but losing a session
+        # record silently makes downstream metrics indistinguishable from zero
+        # work.  stderr is diagnostic only; preserve stdout and exit status.
+        print("[rat-telemetry:warn] invocation was not persisted (%s)" %
+              type(exc).__name__, file=sys.stderr)
         return
 
 
