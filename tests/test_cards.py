@@ -37,7 +37,8 @@ class PwnCapabilityCard(unittest.TestCase):
         ))
         routes = card["heuristics"]["candidate_routes"]
         self.assertEqual(routes[0]["subroute"], "pwn-format")
-        self.assertTrue(routes[0]["primary"])
+        self.assertFalse(any(item["primary"] for item in routes))
+        self.assertTrue(all("confidence" not in item for item in routes))
         self.assertIn("pwn-rop", {r["subroute"] for r in routes[1:]})
         self.assertEqual(card["facts"]["sinks"]["format"], ["printf"])
         self.assertEqual(card["facts"]["sinks"]["overflow_bounded"], ["read"])
