@@ -4,6 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
+from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 from ratlib.route import route
 from ratlib.schema import validate
 
@@ -79,6 +80,67 @@ class RouteConflictDimensions(unittest.TestCase):
         self.assertEqual(r["dimensions"]["program_shapes"], ["symbolic-candidate"])
         self.assertEqual(r["unresolved"][0],
                          "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill")
+        validate(r, "rat.route-result/v1")
+
+
+    def test_fact_packing_preserves_underlying_pwn_and_checker_dimensions(self):
+        rv = revq(
+            imports=["malloc", "free", "memcmp"],
+            functions=[{"name": "check", "calls": ["memcmp"]}],
+        )
+        rv["evasion_signal_schema"] = EVASION_SIGNAL_SCHEMA
+        rv["evasion_signals"] = [
+            {"kind": "packer-section", "value": {"section": "UPX0"}, "quality": "fact"},
+        ]
+        r = route(
+            profile=profile(imports=["malloc", "free"]), revq=rv,
+            interesting=[{"func": "check", "score": 8, "why": ["display-only"]}],
+        )
+
+        # An unpacking action may be committed while the underlying program
+        # shape and vulnerability surfaces remain explicit, unresolved leads.
+        self.assertEqual(r["subroute"], "rev-packed")
+        self.assertEqual(r["commitment"], "committed")
+        self.assertEqual(r["skill"], "rev-packed")
+        self.assertIn("packing", r["dimensions"]["obstacles"])
+        self.assertIn("heap-lifetime-candidate", r["dimensions"]["vulnerability_surfaces"])
+        self.assertIn("checker", r["dimensions"]["program_shapes"])
+        self.assertTrue(any("allocator imports" in x for x in r["unresolved"]))
+        self.assertTrue(any("checker semantics" in x for x in r["unresolved"]))
+        validate(r, "rat.route-result/v1")
+
+    def test_kernel_priority_does_not_commit_with_competing_pwn_and_rev_leads(self):
+        r = route(
+            profile=profile(imports=["copy_from_user", "kmalloc", "malloc", "free"]),
+            revq=revq(
+                imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}],
+            ),
+            interesting=[{"func": "check", "score": 8, "why": ["display-only"]}],
+        )
+
+        self.assertEqual(r["subroute"], "pwn-kernel")
+        self.assertTrue(r["conflict"])
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+        self.assertEqual(
+            {a["subroute"] for a in r["alternatives"]},
+            {"pwn-heap", "rev-checker"},
+        )
+        self.assertIn("kernel-module", r["dimensions"]["program_shapes"])
+        self.assertIn("checker", r["dimensions"]["program_shapes"])
+        self.assertIn("heap-lifetime-candidate", r["dimensions"]["vulnerability_surfaces"])
+        validate(r, "rat.route-result/v1")
+
+    def test_packed_vm_hint_remains_visible_without_an_interesting_function(self):
+        rv = revq(functions=[{"name": "vm_dispatch", "calls": []}])
+        rv["evasion_signal_schema"] = EVASION_SIGNAL_SCHEMA
+        rv["evasion_signals"] = [
+            {"kind": "packer-section", "value": {"section": "UPX1"}, "quality": "fact"},
+        ]
+        r = route(revq=rv)
+        self.assertEqual(r["subroute"], "rev-packed")
+        self.assertIn("vm-candidate", r["dimensions"]["program_shapes"])
+        self.assertIn("packing", r["dimensions"]["obstacles"])
         validate(r, "rat.route-result/v1")
 
 
