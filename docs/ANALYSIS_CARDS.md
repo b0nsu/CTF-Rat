@@ -27,6 +27,12 @@ The route (`pwn-stack`, `pwn-format`, `pwn-heap`, `pwn-rop`, `pwn-kernel`) stays
 
 The projection MUST NOT claim RIP/PC control, arbitrary read/write, a stable leak, heap overlap/reuse, or a kernel object primitive. Those are runtime primitive claims and remain canonical in STATE v2, where PASS promotion requires deterministic direct evidence.
 
+## Route and slice evidence boundaries
+
+High-priority packing observations select an unpacking action, not an exclusive underlying problem class. `rat route` retains independently recovered PWN/checker/VM candidates in `dimensions` and `unresolved`. Kernel-import hints with competing PWN/REV candidates remain `provisional` instead of locking a kernel-specific skill.
+
+`rat query slice` reports a bounded VEX/CFG survey, not a complete def-use proof. Its `heuristics.claim` is `dependency-candidate`, `heuristics.source_to_target_proven` is `false`, and the query stays `partial` / `coverage.complete=false` even when the observed unresolved counters happen to be zero. `--source` is a search hint, not authenticated source-to-target provenance. Use a separate deterministic oracle before promoting a dependency hypothesis to a verified claim.
+
 ## Intended canonical flow
 
 ```text
