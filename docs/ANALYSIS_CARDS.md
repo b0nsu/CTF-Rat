@@ -31,7 +31,7 @@ The projection MUST NOT claim RIP/PC control, arbitrary read/write, a stable lea
 
 High-priority packing observations select an unpacking action, not an exclusive underlying problem class. `rat route` retains independently recovered PWN/checker/VM candidates in `dimensions` and `unresolved`. Kernel-import hints with competing PWN/REV candidates remain `provisional` instead of locking a kernel-specific skill.
 
-`rat query slice` reports a bounded VEX/CFG survey, not a complete def-use proof. Its `heuristics.claim` is `dependency-candidate`, `heuristics.source_to_target_proven` is `false`, and the query stays `partial` / `coverage.complete=false` even when the observed unresolved counters happen to be zero. `--source` is a search hint, not authenticated source-to-target provenance. Use a separate deterministic oracle before promoting a dependency hypothesis to a verified claim.
+`rat query slice` reports a bounded VEX/CFG survey, not a complete def-use proof. Its `heuristics.claim` is `dependency-candidate`, `heuristics.source_to_target_proven` is `false`, and the query stays `partial` / `coverage.complete=false` even when the observed unresolved counters happen to be zero. `--source` is currently recorded as a requested source label by the producer; it does not constrain the VEX scan or establish source-to-target provenance. Use a separate deterministic oracle before promoting a dependency hypothesis to a verified claim.
 
 ## Intended canonical flow
 
