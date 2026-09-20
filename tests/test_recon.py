@@ -150,6 +150,8 @@ class ReconTests(unittest.TestCase):
         self.assertEqual(doc["schema"], "rat.recon/v1")
         self.assertEqual(doc["status"], "ok")
         self.assertIn(doc["triage"]["tier"], {"fast", "standard", "hard"})
+        self.assertTrue(doc["triage"]["prior_only"])
+        self.assertEqual(doc["triage"]["canonical_router"], "rat route")
         # language-agnostic keys let a machine consumer branch without parsing Korean
         self.assertIn(doc["triage"]["confidence_key"], {"low", "mid", "high"})
         self.assertIn(doc["triage"]["recommendation_key"], {"solve", "deprioritize"})
