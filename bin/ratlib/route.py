@@ -236,8 +236,8 @@ def _project_subroute_dimension(subroute, dims, unresolved):
             _append_unique(dims["constraints"], "nx")
             _append_unique(unresolved, "ROP is only an exploitation strategy candidate after control-flow influence is measured")
     elif subroute == "pwn-kernel":
-        _append_unique(dims["program_shapes"], "kernel-module")
-        _append_unique(unresolved, "kernel object lifetime and copy_to/from_user semantics still require direct measurement")
+        _append_unique(dims["program_shapes"], "kernel-candidate")
+        _append_unique(unresolved, "kernel imports do not prove a kernel module/target environment; inspect the supplied artifact and boot setup")
     elif subroute == "rev-checker":
         _append_unique(dims["program_shapes"], "checker")
         _append_unique(unresolved, "checker semantics and success/failure oracle remain unverified")
@@ -270,13 +270,11 @@ def _active_triage_overlay(result):
 
     if subroute == "unknown":
         commitment = "unknown"
-    elif subroute == "pwn-kernel":
-        commitment = "committed"
-    elif subroute == "rev-checker":
-        # A recovered compare-call is a deterministic first action discriminator.
-        # Paired success/failure strings are useful shape evidence but remain a
-        # heuristic, so they select the checker route without hard-locking a skill.
-        commitment = "committed" if _signal_quality(result, "compare-calls") == "fact" else "provisional"
+    elif subroute in {"pwn-kernel", "rev-checker"}:
+        # Imports and a recovered comparison CALL are facts about the binary,
+        # not proof of the kernel environment or checker semantics. Do not
+        # lock a route-specific skill before a discriminating experiment.
+        commitment = "provisional"
     elif subroute == "rev-packed":
         commitment = "committed" if _signal_quality(result, "packer-section") == "fact" else "provisional"
 
@@ -298,48 +296,35 @@ def _active_triage_overlay(result):
 
 
 def _early_route_context(result, imports, profile, revq, interesting, *, is_pe=False):
-    """Keep independent evidence visible when an obstacle or kernel hint routes first.
+    """Project independent observed leads without inventing secondary scores.
 
-    A confirmed packer section commits an *unpacking action*, not the underlying
-    program shape.  A kernel-import hint with competing program/surface evidence,
-    on the other hand, must not lock the kernel skill before discrimination.
-    Only re-project existing, deterministic inputs; never run new analysis here.
+    Packer detection is an action/obstacle; kernel imports describe a possible
+    program shape. Neither is evidence that all other analysis dimensions are
+    false. Compatibility primary/subroute remain stable, but only genuine
+    competing *interpretations* belong in alternatives/conflict.
     """
-    secondary = []
+    result = _finalize(result, is_pe)
+    observed = []
     if not is_pe:
-        if result["subroute"] != "pwn-kernel" and imports & KERNEL_IMPORTS:
-            secondary.append({"track": "pwn", "subroute": "pwn-kernel", "confidence": 0.8})
-        secondary.extend(
-            {"track": "pwn", "subroute": subroute, "confidence": confidence}
-            for subroute, confidence in _pwn_all_candidates(imports, profile)
-            if subroute != result["subroute"]
-        )
-    top = (interesting or [None])[0] if interesting else None
-    if top:
-        func = top.get("func")
-        checker = bool(_checker_compare_calls(revq, func) or _checker_oracle_strings(revq, func))
-        secondary.append({"track": "rev", "subroute": "rev-checker" if checker else "rev-symbolic",
-                          "confidence": 0.5})
+        if imports & KERNEL_IMPORTS:
+            observed.append("pwn-kernel")
+        observed.extend(subroute for subroute, _ in _pwn_all_candidates(imports, profile))
+    for item in interesting or []:
+        func = item.get("func")
+        if not func or _function_record(revq, func) is None:
+            continue
+        if _checker_compare_calls(revq, func) or _checker_oracle_strings(revq, func):
+            observed.append("rev-checker")
+        else:
+            observed.append("rev-symbolic")
     functions = (revq or {}).get("functions") or []
     fn_names = " ".join(f.get("name", "") for f in functions if isinstance(f, dict)).lower()
     if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
-        secondary.append({"track": "rev", "subroute": "rev-vm", "confidence": 0.5})
-    secondary = [candidate for candidate in secondary if candidate["subroute"] != result["subroute"]]
-
-    if result["subroute"] == "pwn-kernel" and secondary:
-        # These routes compete with the initial kernel classification.  Preserve
-        # the compatibility primary while withholding the route-specific skill.
-        result["conflict"] = True
-        result["alternatives"] = secondary
-    result = _finalize(result, is_pe)
-    if result["subroute"] == "rev-packed":
-        # Packing is an orthogonal obstacle, not an exclusive problem class.
-        # Do not downgrade a fact-grade unpacking action just because the
-        # still-unpacked program also has candidate vulnerability surfaces.
-        for candidate in secondary:
-            _project_subroute_dimension(candidate["subroute"], result["dimensions"], result["unresolved"])
+        observed.append("rev-vm")
+    for subroute in observed:
+        if subroute != result["subroute"]:
+            _project_subroute_dimension(subroute, result["dimensions"], result["unresolved"])
     return result
-
 
 def _finalize(result, is_pe=False):
     result = _active_triage_overlay(result)
@@ -369,7 +354,13 @@ def route(*, profile=None, revq=None, interesting=None):
                                     imports, profile, revq, interesting)
 
     pwn = None if is_pe else _pwn_candidate(imports, profile)
-    top = (interesting or [None])[0] if interesting else None
+    # A high interesting-function score only orders inspection; it cannot
+    # suppress a lower-ranked function with structured checker evidence.
+    ranked = [item for item in (interesting or []) if isinstance(item, dict)]
+    top = next((item for item in ranked
+                if _checker_compare_calls(revq, item.get("func"))
+                or _checker_oracle_strings(revq, item.get("func"))),
+               ranked[0] if ranked else None)
     if top:
         score = top.get("score", 0)
         compare_calls = _checker_compare_calls(revq, top.get("func"))
@@ -396,7 +387,9 @@ def route(*, profile=None, revq=None, interesting=None):
             return _finalize(_result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target), is_pe)
 
         pwn_subroute, pwn_confidence, pwn_signals = pwn
-        if checker_shape or rev_confidence >= pwn_confidence:
+        # Structured checker evidence warrants an early bounded function query;
+        # an unrelated REV score must never outrank PWN by numeric comparison.
+        if checker_shape:
             signals.extend(rev_signals)
             result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
             result["conflict"] = True
@@ -414,8 +407,11 @@ def route(*, profile=None, revq=None, interesting=None):
         result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
         siblings = [(sr, conf) for sr, conf in _pwn_all_candidates(imports, profile) if sr != pwn_subroute]
         if siblings:
-            result["conflict"] = True
+            # Coexisting heap/format/stack surfaces are NOT mutually exclusive.
+            # Legacy alternatives are preserved for consumers; they do not
+            # imply a contradiction or license to lock a skill.
             result["alternatives"] = [{"track": "pwn", "subroute": sr, "confidence": conf} for sr, conf in siblings]
+            result["conflict"] = True  # v1 schema couples alternatives to conflict
         return _finalize(result, is_pe)
 
     functions = (revq or {}).get("functions") or []
