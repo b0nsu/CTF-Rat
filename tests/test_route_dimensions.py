@@ -21,14 +21,14 @@ def revq(imports=(), functions=()):
 
 
 class RouteConflictDimensions(unittest.TestCase):
-    def test_pwn_sibling_conflict_projects_every_surface(self):
+    def test_pwn_sibling_leads_project_every_surface_without_false_conflict(self):
         r = route(profile=profile(
             imports=["malloc", "free", "printf", "read", "gets"],
             facts=[("elf.nx", True)],
         ))
 
         self.assertEqual(r["subroute"], "pwn-heap")
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
         self.assertEqual(
@@ -41,7 +41,7 @@ class RouteConflictDimensions(unittest.TestCase):
         self.assertTrue(any("PC-control" in item for item in r["unresolved"]))
         validate(r, "rat.route-result/v1")
 
-    def test_rev_primary_conflict_keeps_pwn_surface_visible(self):
+    def test_rev_primary_keeps_nonexclusive_pwn_surface_visible(self):
         r = route(
             profile=profile(imports=["printf", "read"]),
             revq=revq(imports=["printf", "read", "memcmp"],
@@ -54,7 +54,7 @@ class RouteConflictDimensions(unittest.TestCase):
         )
 
         self.assertEqual(r["subroute"], "rev-checker")
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
         self.assertEqual(r["dimensions"]["program_shapes"], ["checker"])
@@ -64,7 +64,7 @@ class RouteConflictDimensions(unittest.TestCase):
         self.assertTrue(any("format argument" in item for item in r["unresolved"]))
         validate(r, "rat.route-result/v1")
 
-    def test_pwn_primary_conflict_keeps_rev_shape_visible(self):
+    def test_pwn_primary_does_not_invent_rev_shape_from_unattributed_score(self):
         r = route(
             profile=profile(imports=["malloc", "free"]),
             revq=revq(imports=["malloc", "free", "memcmp"]),
@@ -97,7 +97,7 @@ class RouteConflictDimensions(unittest.TestCase):
             interesting=[{"func": "check", "score": 8, "why": ["display-only"]}],
         )
 
-        # An unpacking action may be committed while the underlying program
+        # A packing observation stays provisional while the underlying
         # shape and vulnerability surfaces remain explicit, unresolved leads.
         self.assertEqual(r["subroute"], "rev-packed")
         self.assertEqual(r["commitment"], "provisional")
