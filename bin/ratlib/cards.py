@@ -16,7 +16,7 @@ from .route import (
     KERNEL_IMPORTS,
     STRONG_OVERFLOW_IMPORTS,
     WEAK_OVERFLOW_IMPORTS,
-    route as route_fn,
+    _pwn_all_candidates,
 )
 
 PROTECTION_FACTS = ("elf.nx", "elf.pie", "elf.canary", "elf.relro")
@@ -69,16 +69,21 @@ def _discriminating_next(candidate_routes):
     the primary candidate's missing premise instead.  These are experiment
     suggestions, not proof and not automatic execution.
     """
-    primary = next((item.get("subroute") for item in candidate_routes if item.get("primary")), None)
     probes = {
         "pwn-stack": {"query": "pwncrash", "target": "reproduce-overwrite-and-measure-control-offset"},
         "pwn-rop": {"query": "pwncrash", "target": "prove-PC-control-before-ROP-gadget-inventory"},
         "pwn-format": {"query": "decomp", "target": "printf-family-callsite: prove-format-argument-user-control"},
         "pwn-heap": {"query": "decomp", "target": "allocator/menu-callsite: map-object-lifetime-before-heap-technique"},
-        "pwn-kernel": {"query": "k_dump_heap", "target": "kernel-object-lifetime-and-copy-user-surface"},
+        "pwn-kernel": {"query": "decomp", "target": "confirm-kernel-module-and-copy-user-callsite-before-kernel-tooling"},
     }
-    probe = probes.get(primary)
-    return [probe] if probe else []
+    # A candidate is an inspection lead, not an exclusive diagnosis. Surface
+    # distinct inexpensive experiments; the agent picks based on live evidence.
+    next_queries = []
+    for item in candidate_routes:
+        probe = probes.get(item.get("subroute"))
+        if probe and probe not in next_queries:
+            next_queries.append(probe)
+    return next_queries[:3]
 
 
 def project_pwn_capability(profile):
@@ -108,25 +113,17 @@ def project_pwn_capability(profile):
     }
     sink_counts = {kind: len(values) for kind, values in sinks.items()}
 
-    routing_profile = dict(profile)
-    routing_profile["imports"] = sorted(imports)
-    routed = route_fn(profile=routing_profile)
-    candidate_routes = []
-    if routed.get("track") == "pwn":
-        candidate_routes.append({
-            "track": "pwn",
-            "subroute": routed.get("subroute"),
-            "confidence": routed.get("confidence"),
-            "primary": True,
-        })
-    for alt in routed.get("alternatives", []) or []:
-        if isinstance(alt, Mapping) and alt.get("track") == "pwn":
-            candidate_routes.append({
-                "track": "pwn",
-                "subroute": alt.get("subroute"),
-                "confidence": alt.get("confidence"),
-                "primary": False,
-            })
+    # Do not call route() again on a profile-only subset. The main route
+    # consumed profile + REV evidence; re-running it here can fabricate a
+    # different "primary". Reuse only the router's existing import vocabulary
+    # to enumerate independent attention leads, without selecting a winner.
+    labels = [label for label, _ in _pwn_all_candidates(imports, profile)]
+    if imports & KERNEL_IMPORTS:
+        labels.append("pwn-kernel")
+    candidate_routes = [
+        {"track": "pwn", "subroute": label, "confidence": 0.0, "primary": False}
+        for label in labels
+    ]
 
     limitations = [
         "import presence identifies attention targets; it does not prove unsafe callsite arguments",
@@ -153,7 +150,7 @@ def project_pwn_capability(profile):
         },
         "heuristics": {
             "candidate_routes": candidate_routes,
-            "signals": list(routed.get("signals", []) or []),
+            "signals": [],
             "next": _discriminating_next(candidate_routes),
             "limitations": limitations,
         },
