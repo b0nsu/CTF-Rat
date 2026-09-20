@@ -5,7 +5,7 @@ imports/strings/evasion_signals/interesting into a *provisional* route
 suggestion. No new analysis is performed here: every signal consumed here is
 already computed by rat-profile or revq.
 
-`track`/`subroute`/`confidence` remain for compatibility and ranking.  They are
+`track`/`subroute`/`confidence` remain for compatibility ONLY. They are
 not a calibrated probability or a proof that one mutually-exclusive challenge
 class has been identified.  The model-facing commitment gate is:
 
@@ -270,19 +270,15 @@ def _active_triage_overlay(result):
 
     if subroute == "unknown":
         commitment = "unknown"
-    elif subroute in {"pwn-kernel", "rev-checker"}:
-        # Imports and a recovered comparison CALL are facts about the binary,
-        # not proof of the kernel environment or checker semantics. Do not
-        # lock a route-specific skill before a discriminating experiment.
-        commitment = "provisional"
-    elif subroute == "rev-packed":
-        commitment = "committed" if _signal_quality(result, "packer-section") == "fact" else "provisional"
+    # Static packer-section names, imports and compare calls are observations,
+    # not proofs of the underlying class or a validated unpacking procedure.
+    # No static-only route is eligible to lock a route-specific skill.
 
     if any(s.get("kind") == "pe-platform" for s in result.get("signals", [])):
         _append_unique(dims["constraints"], "pe-windows")
     if result.get("conflict"):
         commitment = "provisional"
-        conflict_note = "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill"
+        conflict_note = "contradictory evidence requires a discriminating probe before any skill lock"
         if conflict_note in unresolved:
             unresolved.remove(conflict_note)
         unresolved.insert(0, conflict_note)
@@ -321,9 +317,20 @@ def _early_route_context(result, imports, profile, revq, interesting, *, is_pe=F
     fn_names = " ".join(f.get("name", "") for f in functions if isinstance(f, dict)).lower()
     if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
         observed.append("rev-vm")
+    # 'leads' are independent, potentially coexisting analysis surfaces. Do
+    # not misrepresent them as conflicting or give them fabricated confidence.
+    result["leads"] = []
     for subroute in observed:
-        if subroute != result["subroute"]:
+        if subroute != result["subroute"] and subroute not in result["leads"]:
+            result["leads"].append(subroute)
             _project_subroute_dimension(subroute, result["dimensions"], result["unresolved"])
+    # Preserve bounded, executable next-probe suggestions for independent
+    # leads, but do not issue an instruction to run every one in this order.
+    for subroute in result["leads"]:
+        for hint in _next_hint(subroute):
+            if hint not in result["next"]:
+                result["next"].append(hint)
+    result["next"] = result["next"][:4]
     return result
 
 def _finalize(result, is_pe=False):
@@ -384,7 +391,9 @@ def route(*, profile=None, revq=None, interesting=None):
                 rev_signals.append(_sig("crypto-hint", hints, "heuristic"))
         if pwn is None:
             signals.extend(rev_signals)
-            return _finalize(_result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target), is_pe)
+            return _early_route_context(
+                _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target),
+                imports, profile, revq, interesting, is_pe=is_pe)
 
         pwn_subroute, pwn_confidence, pwn_signals = pwn
         # Structured checker evidence warrants an early bounded function query;
@@ -392,37 +401,33 @@ def route(*, profile=None, revq=None, interesting=None):
         if checker_shape:
             signals.extend(rev_signals)
             result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
-            result["conflict"] = True
-            result["alternatives"] = [{"track": "pwn", "subroute": pwn_subroute, "confidence": pwn_confidence}]
+            # A checker shape and PWN import may coexist. They are distinct
+            # leads, not mutually-exclusive route evidence.
         else:
             signals.extend(pwn_signals)
             result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
-            result["conflict"] = True
-            result["alternatives"] = [{"track": "rev", "subroute": rev_subroute, "confidence": rev_confidence}]
-        return _finalize(result, is_pe)
+            # A generic REV attention score does not refute the PWN lead.
+        return _early_route_context(result, imports, profile, revq, interesting, is_pe=is_pe)
 
     if pwn is not None:
         pwn_subroute, pwn_confidence, pwn_signals = pwn
         signals.extend(pwn_signals)
         result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
-        siblings = [(sr, conf) for sr, conf in _pwn_all_candidates(imports, profile) if sr != pwn_subroute]
-        if siblings:
-            # Coexisting heap/format/stack surfaces are NOT mutually exclusive.
-            # Legacy alternatives are preserved for consumers; they do not
-            # imply a contradiction or license to lock a skill.
-            result["alternatives"] = [{"track": "pwn", "subroute": sr, "confidence": conf} for sr, conf in siblings]
-            result["conflict"] = True  # v1 schema couples alternatives to conflict
-        return _finalize(result, is_pe)
+        # All coexisting surface leads are added by the common projection.
+        return _early_route_context(result, imports, profile, revq, interesting, is_pe=is_pe)
 
     functions = (revq or {}).get("functions") or []
     fn_names = " ".join(f.get("name", "") for f in functions).lower()
     if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
         signals.append(_sig("vm-dispatch-hint", [h for h in VM_HINTS if h in fn_names or h in _strings_blob(revq).lower()], "heuristic"))
-        return _finalize(_result("rev", "rev-vm", 0.5, signals, capabilities), is_pe)
+        return _early_route_context(_result("rev", "rev-vm", 0.5, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
 
     if is_pe:
-        return _finalize(_result("rev", "rev-symbolic", 0.4, signals, capabilities), is_pe)
-    return _finalize(_result("unknown", "unknown", 0.0, signals, capabilities))
+        return _early_route_context(_result("rev", "rev-symbolic", 0.4, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
+    return _early_route_context(_result("unknown", "unknown", 0.0, signals, capabilities),
+                                imports, profile, revq, interesting, is_pe=is_pe)
 
 
 def _result(track, subroute, confidence, signals, capabilities, next_target=None):
@@ -447,20 +452,20 @@ _NEXT_QUERY = {
     "pwn-format": "rat query pwn",
     "pwn-heap": "rat query pwn",
     "pwn-rop": "rat query pwn",
-    "pwn-kernel": "k_dump_heap",
+    "pwn-kernel": "rat query pwn",
     "unknown": "revq/recon",
 }
 
 _NEXT_TARGET = {
     "rev-checker": "bounded-checker-function-before-commit",
     "rev-symbolic": "success-failure-oracle-before-symbolic",
-    "rev-packed": "dynamic-unpack-trace-before-static-re-analysis",
+    "rev-packed": "verify-packer-and-unpack-need-before-dynamic-tracing",
     "rev-vm": "prove-dispatch-loop-before-vm-lift",
     "pwn-stack": "static-capability-then-measure-overwrite",
     "pwn-format": "static-capability-then-prove-format-argument-control",
     "pwn-heap": "static-capability-then-measure-object-lifetime",
     "pwn-rop": "static-capability-then-measure-pc-control-before-gadgets",
-    "pwn-kernel": "kernel-tooling",
+    "pwn-kernel": "confirm-kernel-artifact-and-environment-before-kernel-tooling",
     "unknown": "more-signal-before-routing",
 }
 
