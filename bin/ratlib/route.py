@@ -158,30 +158,27 @@ def _sig(kind, value, quality):
 
 
 def _pwn_candidate(imports, profile):
-    """Rank import-derived PWN attention candidates.
+    """Legacy display label from the canonical PWN-lead inventory.
 
-    These candidates are intentionally provisional. Import presence can select
-    the cheapest next probe, but it never establishes an unsafe callsite or a
-    runtime primitive by itself.
+    The first label is *not* a verified vulnerability or a skill commitment.
+    No separate, duplicate recognition rules live in this adapter.
     """
-    if imports & HEAP_IMPORTS:
-        hit = sorted(imports & HEAP_IMPORTS)
-        return "pwn-heap", 0.55, [_sig("heap-imports", hit, "fact")]
-    if (imports & FORMAT_IMPORTS) and (imports & INPUT_IMPORTS):
-        hit = sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS))
-        return "pwn-format", 0.55, [_sig("format-input-imports", hit, "fact")]
-    if imports & OVERFLOW_IMPORTS:
+    candidates = _pwn_all_candidates(imports, profile)
+    if not candidates:
+        return None
+    subroute, confidence = candidates[0]
+    if subroute == "pwn-heap":
+        signals = [_sig("heap-imports", sorted(imports & HEAP_IMPORTS), "fact")]
+    elif subroute == "pwn-format":
+        signals = [_sig("format-input-imports",
+                        sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS)), "fact")]
+    else:
         hit = sorted(imports & OVERFLOW_IMPORTS)
-        strong = bool(imports & STRONG_OVERFLOW_IMPORTS)
-        quality = "fact" if strong else "heuristic"
-        confidence = 0.6 if strong else 0.5
-        sigs = [_sig("overflow-imports", hit, quality)]
-        nx = _fact(profile, "elf.nx")
-        if nx is True:
-            sigs.append(_sig("elf-nx", True, "fact"))
-            return "pwn-rop", confidence, sigs
-        return "pwn-stack", confidence, sigs
-    return None
+        signals = [_sig("overflow-imports", hit,
+                        "fact" if imports & STRONG_OVERFLOW_IMPORTS else "heuristic")]
+        if _fact(profile, "elf.nx") is True:
+            signals.append(_sig("elf-nx", True, "fact"))
+    return subroute, confidence, signals
 
 
 def _pwn_all_candidates(imports, profile):
@@ -327,8 +324,23 @@ def _early_route_context(result, imports, profile, revq, interesting, *, is_pe=F
     # Preserve bounded, executable next-probe suggestions for independent
     # leads, but do not issue an instruction to run every one in this order.
     for subroute in result["leads"]:
-        for hint in _next_hint(subroute):
-            if hint not in result["next"]:
+        if subroute == "rev-checker":
+            # A function query needs an actual recovered target; a label
+            # placeholder is not an executable argument.
+            target = next((item.get("func") for item in interesting or []
+                           if _function_record(revq, item.get("func"))
+                           and (_checker_compare_calls(revq, item.get("func"))
+                                or _checker_oracle_strings(revq, item.get("func")))), None)
+            if not target:
+                continue
+            hints = _next_hint(subroute, target)
+        else:
+            hints = _next_hint(subroute)
+        for hint in hints:
+            if hint not in result["next"] and not (
+                hint["query"] == "rat query pwn"
+                and any(existing["query"] == hint["query"] for existing in result["next"])
+            ):
                 result["next"].append(hint)
     result["next"] = result["next"][:4]
     return result
