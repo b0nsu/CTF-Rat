@@ -33,4 +33,4 @@ print("%d\t%-28s %-14s %-8s %s" % (key, os.path.basename(b), label, tr.get("conf
 done
 sort -n "$tmp" | cut -f2-
 rm -f "$tmp"
-echo "→ 🟢/🟡 부터 풀고 🟠 는 후순위. 개별: cd solve && newchal <name> <bin>"
+echo "→ LEGACY STATIC PRIOR ONLY: tier는 정적 관측에 따른 검토 순서일 뿐 분류·풀이 가능성·스킵 판정이 아님. 개별 증거 검증: rat route <bin>"
