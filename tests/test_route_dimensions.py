@@ -143,5 +143,56 @@ class RouteConflictDimensions(unittest.TestCase):
         validate(r, "rat.route-result/v1")
 
 
+    def test_low_ranked_structural_checker_is_not_hidden_by_high_interest_score(self):
+        rv = revq(functions=[
+            {"name": "noisy", "calls": []},
+            {"name": "checker", "calls": ["memcmp"]},
+        ])
+        r = route(revq=rv, interesting=[
+            {"func": "noisy", "score": 100, "why": ["display"]},
+            {"func": "checker", "score": 1, "why": ["display"]},
+        ])
+        self.assertEqual(r["subroute"], "rev-checker")
+        self.assertEqual(r["next"][0], {"query": "rat query func", "target": "checker"})
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
+        validate(r, "rat.route-result/v1")
+
+    def test_unrelated_interest_score_cannot_change_pwn_route_or_next_probe(self):
+        rv = revq(functions=[{"name": "noise", "calls": []}])
+        outputs = [
+            route(profile=profile(imports=["malloc", "free"]),
+                  revq=rv, interesting=[{"func": "noise", "score": n, "why": []}])
+            for n in (1, 1000)
+        ]
+        for result in outputs:
+            self.assertEqual(result["subroute"], "pwn-heap")
+            self.assertEqual(result["commitment"], "provisional")
+            self.assertIsNone(result["skill"])
+            self.assertIn("rev-symbolic", result["leads"])
+        self.assertEqual(outputs[0]["next"], outputs[1]["next"])
+        self.assertEqual(outputs[0]["dimensions"], outputs[1]["dimensions"])
+        self.assertEqual(outputs[0]["leads"], outputs[1]["leads"])
+
+    def test_packed_kernel_and_heap_are_unranked_coexisting_leads(self):
+        rv = revq(functions=[{"name": "check", "calls": ["memcmp"]}])
+        rv["evasion_signal_schema"] = EVASION_SIGNAL_SCHEMA
+        rv["evasion_signals"] = [
+            {"kind": "packer-section", "value": {"section": "UPX0"}, "quality": "fact"},
+        ]
+        r = route(profile=profile(imports=["copy_from_user", "malloc", "free"]),
+                  revq=rv, interesting=[{"func": "check", "score": 5, "why": []}])
+        self.assertEqual(r["subroute"], "rev-packed")  # compatibility label
+        self.assertEqual(set(r["leads"]), {"pwn-kernel", "pwn-heap", "rev-checker"})
+        self.assertFalse(r.get("conflict", False))
+        self.assertNotIn("alternatives", r)
+        self.assertTrue(all(isinstance(lead, str) for lead in r["leads"]))
+        self.assertIsNone(r["skill"])
+        self.assertEqual(
+            sum(next_probe["query"] == "rat query pwn" for next_probe in r["next"]), 1
+        )
+        validate(r, "rat.route-result/v1")
+
+
 if __name__ == "__main__":
     unittest.main()
