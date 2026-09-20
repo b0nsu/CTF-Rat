@@ -132,6 +132,7 @@ def main():
                         "syscall": has_syscall, "binsh": binsh, "seccomp": seccomp,
                         "catflag": catflag, "vmish": vmish},
             "triage": {"tier": tier_key, "confidence": conf, "confidence_key": confidence_key,
+                       "prior_only": True, "canonical_router": "rat route",
                        "recommendation": rec, "recommendation_key": recommendation_key,
                        "techniques": techs, "why": list(dict.fromkeys(why))},
         }, ensure_ascii=False)); return 0
