@@ -20,6 +20,18 @@ class AnalysisInvocationTelemetryTests(unittest.TestCase):
             analysis_cli._persist_invocation(doc, args)
             self.assertEqual(list(iter_tool_results(d)), [])
 
+    def test_storage_failure_is_reported_without_failing_analysis(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = type("Args", (), {"store": d, "binary": None})()
+            doc = analysis.envelope("rat-profile", None, args, {}, status="ok")
+            stderr = io.StringIO()
+            with patch.object(analysis_cli, "put_bytes", side_effect=OSError("disk full")), \
+                 contextlib.redirect_stderr(stderr):
+                self.assertIsNone(analysis_cli._persist_invocation(doc, args))
+            self.assertIn("[rat-telemetry:warn] invocation was not persisted (OSError)",
+                          stderr.getvalue())
+            self.assertEqual(list(iter_tool_results(d)), [])
+
     def _fake_command(self, argv, timeout, stdin=None, cwd=None, env=None):
         name = argv[0]
         if name == "file":
