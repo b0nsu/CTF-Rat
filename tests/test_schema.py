@@ -64,6 +64,13 @@ class RouteResultSchema(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(route_result(next=[{"query": "x"}]))
 
+    def test_coexisting_leads_are_unranked_and_do_not_require_conflict(self):
+        validate(active_route(leads=["pwn-heap", "rev-checker"], conflict=False))
+        for invalid in (["pwn-heap", "pwn-heap"], [1], "pwn-heap"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValidationError):
+                    validate(active_route(leads=invalid))
+
     def test_alternatives_field_allowed_with_valid_shape(self):
         d = route_result(); d["conflict"] = True
         d["alternatives"] = [{"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6}]
