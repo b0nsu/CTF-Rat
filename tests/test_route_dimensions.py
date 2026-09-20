@@ -59,6 +59,7 @@ class RouteConflictDimensions(unittest.TestCase):
         self.assertIsNone(r["skill"])
         self.assertEqual(r["dimensions"]["program_shapes"], ["checker"])
         self.assertEqual(r["dimensions"]["vulnerability_surfaces"], ["format-string-candidate"])
+        self.assertIn("pwn-format", r["leads"])
         self.assertTrue(any("checker semantics" in item for item in r["unresolved"]))
         self.assertTrue(any("format argument" in item for item in r["unresolved"]))
         validate(r, "rat.route-result/v1")
@@ -75,11 +76,10 @@ class RouteConflictDimensions(unittest.TestCase):
         )
 
         self.assertEqual(r["subroute"], "pwn-heap")
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
         self.assertEqual(r["dimensions"]["vulnerability_surfaces"], ["heap-lifetime-candidate"])
-        self.assertEqual(r["dimensions"]["program_shapes"], ["symbolic-candidate"])
-        self.assertEqual(r["unresolved"][0],
-                         "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill")
+        self.assertEqual(r["dimensions"]["program_shapes"], [])  # ungrounded interesting score has no function evidence
+        self.assertFalse(r["leads"])
         validate(r, "rat.route-result/v1")
 
 
@@ -100,11 +100,12 @@ class RouteConflictDimensions(unittest.TestCase):
         # An unpacking action may be committed while the underlying program
         # shape and vulnerability surfaces remain explicit, unresolved leads.
         self.assertEqual(r["subroute"], "rev-packed")
-        self.assertEqual(r["commitment"], "committed")
-        self.assertEqual(r["skill"], "rev-packed")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
         self.assertIn("packing", r["dimensions"]["obstacles"])
         self.assertIn("heap-lifetime-candidate", r["dimensions"]["vulnerability_surfaces"])
         self.assertIn("checker", r["dimensions"]["program_shapes"])
+        self.assertEqual(set(r["leads"]), {"pwn-heap", "rev-checker"})
         self.assertTrue(any("allocator imports" in x for x in r["unresolved"]))
         self.assertTrue(any("checker semantics" in x for x in r["unresolved"]))
         validate(r, "rat.route-result/v1")
@@ -119,14 +120,11 @@ class RouteConflictDimensions(unittest.TestCase):
         )
 
         self.assertEqual(r["subroute"], "pwn-kernel")
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
-        self.assertEqual(
-            {a["subroute"] for a in r["alternatives"]},
-            {"pwn-heap", "rev-checker"},
-        )
-        self.assertIn("kernel-module", r["dimensions"]["program_shapes"])
+        self.assertEqual(set(r["leads"]), {"pwn-heap", "rev-checker"})
+        self.assertIn("kernel-candidate", r["dimensions"]["program_shapes"])
         self.assertIn("checker", r["dimensions"]["program_shapes"])
         self.assertIn("heap-lifetime-candidate", r["dimensions"]["vulnerability_surfaces"])
         validate(r, "rat.route-result/v1")
