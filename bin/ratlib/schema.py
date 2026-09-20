@@ -174,6 +174,10 @@ def route_result(d):
     if not isinstance(d["next"],list) or any(
         not isinstance(n,Mapping) or {"query","target"} - set(n) for n in d["next"]): raise ValidationError("invalid next")
     if "conflict" in d and not isinstance(d["conflict"],bool): raise ValidationError("invalid conflict")
+    if "leads" in d and (not isinstance(d["leads"],list)
+                         or any(not isinstance(x,str) or not x for x in d["leads"])
+                         or len(set(d["leads"])) != len(d["leads"])):
+        raise ValidationError("invalid non-exclusive route leads")
     if "alternatives" in d:
         if not isinstance(d["alternatives"],list): raise ValidationError("invalid alternatives")
         for alt in d["alternatives"]:
