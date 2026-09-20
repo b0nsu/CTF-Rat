@@ -121,7 +121,7 @@ def project_pwn_capability(profile):
     if imports & KERNEL_IMPORTS:
         labels.append("pwn-kernel")
     candidate_routes = [
-        {"track": "pwn", "subroute": label, "confidence": 0.0, "primary": False}
+        {"track": "pwn", "subroute": label, "primary": False}
         for label in labels
     ]
 
