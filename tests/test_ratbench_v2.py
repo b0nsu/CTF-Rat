@@ -119,6 +119,42 @@ class CorpusGateTests(unittest.TestCase):
                     suite=path, corpus="private", id="synthetic-01"))
 
 
+
+class ModeBLocalSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
+                         "local python interpreter required")
+    def test_real_mode_b_exec_without_completion_remains_unverified(self):
+        # Execute the actual Mode B workspace/export + external process path.
+        # This is a negative-gate smoke, NOT a model-solving benchmark.
+        with tempfile.TemporaryDirectory() as scratch:
+            run_id = "B-smoke-" + os.path.basename(scratch)
+            result_dir = os.path.join(ROOT, "bench", "results")
+            legacy = os.path.join(result_dir, run_id + ".jsonl")
+            canonical = os.path.join(result_dir, run_id + ".benchmark-v3.jsonl")
+            args = SimpleNamespace(
+                agent=sys.executable + " -c 'print(\"FLAG{smoke-no-proof}\")' {dir}",
+                suite=None, corpus="synthetic", id="stack-basic-01",
+                run_id=run_id, ablation="A0", timeout=20,
+                model_id="python-negative-smoke", reasoning_effort="none",
+            )
+            try:
+                with mock.patch.object(RATBENCH, "_strace_usable", return_value=False):
+                    self.assertEqual(RATBENCH.cmd_eval(args), 0)
+                with open(canonical, encoding="utf-8") as fh:
+                    row = json.loads(fh.readline())
+                RATBENCH.validate(row, "rat.benchmark-result/v3")
+                self.assertEqual(row["outcome"], "solve-claimed")
+                self.assertEqual(row["oracle"]["failure_class"], "claim-without-completion")
+                self.assertFalse(row["metrics"]["correctness"]["verified_solve"])
+                self.assertTrue(row["metrics"]["correctness"]["false_solved"])
+                self.assertIsNone(row["metrics"]["context"]["input_tokens"])
+                self.assertIsNone(row["metrics"]["tools"]["tool_calls"])
+            finally:
+                for filename in (legacy, canonical):
+                    if os.path.exists(filename):
+                        os.unlink(filename)
+
+
 class BenchmarkProvenanceTests(unittest.TestCase):
     def test_provenance_hashes_exact_execution_set_and_agent_template(self):
         entries = [_suite_entry("heldout-01", "private")]
