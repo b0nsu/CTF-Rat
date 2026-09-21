@@ -120,6 +120,28 @@ An attempt that never ran the routing front door reports `route_assessment_count
 
 Detailed routing metrics are available on revisions that emit STATE `route-assessment` notes and project them into benchmark-v3. Uninstrumented attempts leave routing fields null rather than inferring historical route events.
 
+## Mode B envelope-scoped observations (P0-1, incremental)
+
+When the isolated challenge workspace contains one or more canonical
+`rat.tool-result/v1` artifacts, Mode B attaches an optional
+`observations.tool_result_envelopes` object to its benchmark-v3 record.
+It reports observed envelope count, eligible cache requests, successful cache
+hits, unusable hits, hit ratio (null with zero requests), and captured
+stdout+stderr byte counts (null if any observed envelope lacks the necessary
+byte measurements). Values come from the existing immutable artifact store and
+the same effective-hit semantics as `rat-metrics`; no second cache or state
+database is introduced.
+
+**Scope boundary:** These are measurements of *tool-result envelopes only*,
+not the entire agent run. Tools that write to other canonical caches without
+emitting envelopes are excluded. Absence of envelopes leaves `observations`
+absent rather than manufacturing zero usage. Captured stdout/stderr bytes are
+not the bytes actually presented to the model; these observations do not fill
+run-wide `metrics.cache.*`, `metrics.context.tool_output_bytes`, or model
+token counters. The existing report's median run-wide cache-hit column
+therefore remains n/a until end-to-end cache coverage can be verified.
+Compare envelope-scoped numbers only with matching producer coverage.
+
 ## Architecture ablation rule
 
 `--ablation A0|A1|...` is a **measurement label only**. It does not secretly change router behavior, prompts, model configuration, or runtime policy. An architecture ablation must change one real implementation/configuration variable and be reproduced under otherwise identical conditions.
