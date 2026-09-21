@@ -174,6 +174,22 @@ def benchmark_envelope_observations(store_root):
     if not docs:
         return None
     session = aggregate(docs)
+    grouped = {}
+    for doc in docs:
+        name = doc.get("tool_name") or (doc.get("tool") or {}).get("name")
+        if not isinstance(name, str) or not name:
+            name = "(unattributed)"
+        grouped.setdefault(name, []).append(doc)
+    by_tool = {}
+    for name in sorted(grouped):
+        observed = aggregate(grouped[name])
+        by_tool[name] = {
+            "envelope_count": len(grouped[name]),
+            "cache_requests": observed["cache_requests"],
+            "cache_hits": observed["cache_hits"],
+            "cache_unusable_hits": observed["cache_unusable_hits"],
+            "cache_hit_ratio": observed["cache_hit_ratio"],
+        }
     captured_bytes = 0
     for doc in docs:
         summary = doc.get("summary") or {}
@@ -186,6 +202,7 @@ def benchmark_envelope_observations(store_root):
     return {
         "scope": "tool-result-envelopes-only",
         "envelope_count": len(docs),
+        "by_tool": by_tool,
         "cache_requests": session["cache_requests"],
         "cache_hits": session["cache_hits"],
         "cache_unusable_hits": session["cache_unusable_hits"],
