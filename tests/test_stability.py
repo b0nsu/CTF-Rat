@@ -190,10 +190,30 @@ class RunnerTests(unittest.TestCase):
         result = run([sys.executable, "-c", "import os,signal;os.kill(os.getpid(),signal.SIGTERM)"])
         self.assertEqual((result.signal, result.exit_code), (15, 143))
 
-    def test_cpu_resource_limit_uses_timeout_exit(self):
-        result = run([sys.executable, "-c", "while True: pass"], timeout_seconds=5,
+    @unittest.skipUnless(os.name == "posix", "RLIMIT_CPU requires POSIX")
+    def test_cpu_resource_limit_is_applied_to_child(self):
+        # Inspect the child's CPU rlimit directly: a busy loop can hit the wall
+        # timeout first when a shared CI runner throttles its CPU allocation.
+        import resource
+        parent_hard = resource.getrlimit(resource.RLIMIT_CPU)[1]
+        expected_hard = 2 if parent_hard == resource.RLIM_INFINITY else min(2, parent_hard)
+        result = run([sys.executable, "-c",
+                      "import resource;print(*resource.getrlimit(resource.RLIMIT_CPU))"],
                      limits=ResourceLimits(cpu_seconds=1))
+        self.assertEqual(result.exit_code, 0, result.stderr.preview)
+        self.assertEqual(tuple(map(int, result.stdout.preview.split())),
+                         (min(1, expected_hard), expected_hard))
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(signal, "SIGXCPU"),
+                         "SIGXCPU requires POSIX")
+    def test_cpu_resource_signal_uses_timeout_exit(self):
+        # Test the SIGXCPU -> resource_limited/EXIT_TIMEOUT contract without
+        # racing the separate wall-clock deadline on a loaded CI runner.
+        result = run([sys.executable, "-c",
+                      "import os,signal;os.kill(os.getpid(),signal.SIGXCPU)"])
+        self.assertEqual(result.signal, signal.SIGXCPU)
         self.assertTrue(result.resource_limited)
+        self.assertFalse(result.timed_out)
         self.assertEqual(result.exit_code, EXIT_TIMEOUT)
 
     def test_open_files_limit_is_applied_to_child(self):
