@@ -41,3 +41,44 @@ binary
 ```
 
 Do not automatically inject every card into context. The router/query front door should request the minimum card needed for the current hypothesis.
+
+
+## Global REV call graph (bounded projection)
+
+`rat query graph <binary>` gives the model a compact **whole-binary call-map view**
+without passing `objdump -d` or every Ghidra decompilation through its context.
+It reuses the same `revq` extracted function map and cache as `rat query func`;
+it does **not** run a second graph-analysis backend.
+
+```bash
+rat query graph ./chall
+rat query graph ./chall --max-nodes 32 --budget-bytes 8192
+rat query graph ./chall --format json
+rat query graph ./chall --fast  # ELF/binutils: missing call edges are explicitly partial
+rat query func ./chall check_password
+decomp ./chall check_password
+```
+
+The first invocation may run angr CFGFast; subsequent calls reuse revq's existing
+cache for the same binary/analysis engine. `--max-nodes` and
+`--budget-bytes` bound the model-visible **node projection**, not the
+on-disk full revq map. The byte budget is approximate and reserves space for
+metadata; it is not a hard cap on the entire JSON/text response. Nodes are
+never cut mid-record. If functions or edges are omitted, `coverage.complete`
+is false and `coverage.omitted` describes omitted recovered functions and
+internal edges from visible nodes. Increase the budget or query one function
+for detail; never equate the visible subgraph with the whole binary.
+
+Node IDs are recovered function addresses. Named callees are resolved to
+internal edges only when exactly one recovered function has that name.
+`named_targets` may include imports, PLT stubs, or functions not recovered
+in this map: they are **not** asserted to be external. Ambiguous same-name
+callees are reported, not linked arbitrarily. `--fast` produces only
+symbol-level information. Indirect calls cannot currently be enumerated
+from revq's function-name list.
+
+This output is a **recovered call map**, not a basic-block CFG, a value-flow
+proof, or a feasible execution-path proof. Function ordering uses existing
+revq interesting-function scores to prioritize the visible graph; these
+scores are selection heuristics, not vulnerability findings. Exact
+assembly/decompilation remains available through existing tools.

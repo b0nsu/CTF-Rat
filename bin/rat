@@ -17,6 +17,7 @@ sys.path.insert(0, BIN)
 from ratlib.artifact import get as artifact_get
 from ratlib.cache import Cache, resolve_index_root
 from ratlib.cards import project_pwn_capability
+from ratlib.graph_projection import project_graph
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
 from ratlib.governor import check_progress
 from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
@@ -85,6 +86,31 @@ def _render_route_text(doc):
         lines += ["", "GOVERNOR    stuck (%s)" % doc["governor"].get("action")]
     return "\n".join(lines)
 
+def _render_graph_text(doc):
+    facts = doc.get("facts") or {}
+    coverage = doc.get("coverage") or {}
+    omitted = coverage.get("omitted") or {}
+    lines = ["GRAPH       %s (%s)" % (facts.get("engine", "unknown"), doc.get("status")),
+             "RECOVERED   %s functions" % facts.get("recovered_functions", 0),
+             "VISIBLE     %s functions, %s internal edges" %
+             (facts.get("visible_functions", 0), facts.get("visible_internal_edges", 0))]
+    for node in facts.get("graph") or []:
+        lines.append("%s@%s [size=%s blocks=%s]" %
+                     (node["name"], node["address"], node["size"], node["blocks"]))
+        if node["calls"]:
+            lines.append("  -> " + ", ".join(node["calls"]))
+        if node["named_targets"]:
+            lines.append("  named targets (not resolved to functions): " + ", ".join(node["named_targets"]))
+        if node["hidden_calls"] or node["ambiguous_calls"]:
+            lines.append("  hidden internal=%d ambiguous=%d" %
+                         (node["hidden_calls"], node["ambiguous_calls"]))
+    lines.extend(["OMITTED     functions=%s, internal edges from visible nodes=%s" %
+                  (omitted.get("functions", 0), omitted.get("internal_edges_from_visible_nodes", 0)),
+                  "SCOPE       %s" % coverage.get("scope", "")])
+    if doc.get("diagnostics"):
+        lines.extend("WARNING     %s" % d["message"] for d in doc["diagnostics"])
+    return "\n".join(lines)
+
 def _render_query_text(doc):
     lines = ["QUERY       %s" % doc.get("query"), "STATUS      %s" % doc.get("status")]
     facts = doc.get("facts") or {}
@@ -109,7 +135,7 @@ def _print(doc, fmt):
     if schema == "rat.route-result/v1":
         print(_render_route_text(doc))
     elif schema == "rat.query-result/v1":
-        print(_render_query_text(doc))
+        print(_render_graph_text(doc) if doc.get("query") == "graph" and doc.get("status") != "error" else _render_query_text(doc))
     else:
         label = doc.get("query") or doc.get("subroute") or doc.get("schema")
         status = doc.get("status") or ("stuck" if doc.get("governor", {}).get("stuck") else "ok")
@@ -563,6 +589,44 @@ def cmd_brief(args):
         print(_render_brief_text(card))
     return EXIT_OK
 
+def cmd_query_graph(args):
+    binary = args.binary
+    query = "graph"
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
+    if args.budget_bytes < 1 or args.max_nodes < 1:
+        return _emit(*_query_error(query, "input_invalid",
+                                   "--budget-bytes and --max-nodes must be positive", EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
+    try:
+        mod, rev = _gather_revq(binary, args.fast, store)
+        # The ranking is heuristic; only recovered names/addresses/edges are facts.
+        graph = project_graph(rev, interesting=mod.compute_interesting(rev),
+                              budget_bytes=args.budget_bytes, max_nodes=args.max_nodes)
+    except Exception as exc:
+        return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            started_at, started_monotonic, "graph",
+                            requested={"budget_bytes": args.budget_bytes, "max_nodes": args.max_nodes})
+    doc = _query_envelope(
+        query, status="ok" if graph["coverage"]["complete"] else "partial",
+        facts=graph["facts"],
+        heuristics={"selection": "main/_start, revq interesting score, call degree; ranking is not proof"},
+        artifacts=[], coverage=graph["coverage"],
+        diagnostics=[{"code": "partial", "severity": "warning", "message": reason}
+                     for reason in graph["diagnostics"]],
+        provenance={"binary_sha256": rev.get("sha256"), "engine": rev.get("engine"),
+                    "cache": {"hit": rev.get("cache_state") == "hit"}},
+        budget_bytes=args.budget_bytes,
+    )
+    doc = _governor_wrap(_state_dir(binary), "query:graph",
+                         {"digest": rev.get("sha256"), "visible": [n["address"] for n in graph["facts"]["graph"]]}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+
 def cmd_query_func(args):
     binary, name = args.binary, args.name
     query = "func:%s" % name
@@ -814,8 +878,13 @@ def build_parser():
     pb.add_argument("--libc"); pb.add_argument("--budget-tokens", type=int, default=1500)
     pb.add_argument("--format", choices=("text", "json"), default="text")
 
-    pq = sub.add_parser("query", help="bounded read-only queries (func|oracle|pwn|slice) over cached artifacts")
+    pq = sub.add_parser("query", help="bounded read-only queries (graph|func|oracle|pwn|slice) over cached artifacts")
     qsub = pq.add_subparsers(dest="subcommand")
+    pg = qsub.add_parser("graph", help="global, bounded projection of revq's recovered function call map")
+    pg.add_argument("binary"); pg.add_argument("--store"); pg.add_argument("--fast", action="store_true")
+    pg.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pg.add_argument("--max-nodes", type=int, default=64)
+    pg.add_argument("--format", choices=("text", "json"), default="text")
     pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
     pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
@@ -863,6 +932,7 @@ def main(argv=None):
     if args.command == "route": return cmd_route(args)
     if args.command == "brief": return cmd_brief(args)
     if args.command == "query":
+        if args.subcommand == "graph": return cmd_query_graph(args)
         if args.subcommand == "func": return cmd_query_func(args)
         if args.subcommand == "oracle": return cmd_query_oracle(args)
         if args.subcommand == "pwn": return cmd_query_pwn(args)

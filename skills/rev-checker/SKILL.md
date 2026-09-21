@@ -9,6 +9,7 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-ctf.md
 ## FIRST ACTION
 - PE/DLL이면(`revq` 배너에 `PLATFORM: PE/Windows`) 정적은 `decomp`/`revq` 그대로, 동적은 `solve/_template/rev/qiling_trace.py`(Qiling, rootfs 필요 — SETUP §8) — gdbq/symsolve 직행 금지.
 - `revq <bin> --func <interesting-top>` for the neighbor card (calls/callers/strings, no full decompile).
+- If multiple candidate functions require a whole-binary overview, use `rat query graph <bin>` instead of paging through full `objdump -d`; the recovered call map is a navigation aid, not branch/data-flow proof.
 - If the literal is short and directly compared: read it, no solver needed.
 
 ## PIVOT
