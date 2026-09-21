@@ -214,11 +214,12 @@ def route_assessment_metrics(state_dir):
         previous = current
     first_skill = next((row.get("skill") for row in rows if row.get("skill")), None)
     alternatives = first.get("alternatives") or []
+    leads = first.get("leads") or []
     return {
         "first_route": first.get("subroute"),
         "first_route_commitment": first.get("commitment"),
         "first_route_conflict": bool(first.get("conflict")),
-        "first_route_candidate_count": 1 + len(alternatives),
+        "first_route_candidate_count": 1 + len(set(alternatives) | set(leads)),
         "route_assessment_count": len(rows),
         "route_revision_count": revisions,
         "first_skill": first_skill,

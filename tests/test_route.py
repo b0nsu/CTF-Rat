@@ -57,12 +57,9 @@ class RouteFixtures(unittest.TestCase):
         # the other two must appear as pwn-track alternatives with conflict=true.
         r = route(profile=profile(imports=["malloc", "free", "printf", "read", "gets"]))
         self.assertEqual(r["subroute"], "pwn-heap")
-        self.assertTrue(r["conflict"])
-        alt_subroutes = {a["subroute"] for a in r["alternatives"]}
-        self.assertIn("pwn-format", alt_subroutes)
-        self.assertTrue({"pwn-stack", "pwn-rop"} & alt_subroutes)
-        for a in r["alternatives"]:
-            self.assertEqual(r["track"], "pwn")
+        self.assertFalse(r.get("conflict", False))
+        self.assertIn("pwn-format", r["leads"])
+        self.assertTrue({"pwn-stack", "pwn-rop"} & set(r["leads"]))
 
     def test_kernel_imports_route_pwn_kernel(self):
         r = route(profile=profile(imports=["copy_from_user", "kmalloc"]))
@@ -99,7 +96,7 @@ class RouteFixtures(unittest.TestCase):
         self.assertEqual(r["subroute"], "rev-packed")
         self.assertEqual(r["signals"][0]["kind"], "packer-section")
         self.assertEqual(r["confidence"], 0.85)
-        self.assertEqual(r["commitment"], "committed")
+        self.assertEqual(r["commitment"], "provisional")
 
     def test_vm_dispatch_hint_routes_rev_vm(self):
         r = route(revq=revq(functions=[{"name": "vm_dispatch_loop"}]))
@@ -117,15 +114,15 @@ class RouteMixedSignal(unittest.TestCase):
                   revq=revq(imports=["malloc", "free", "memcmp"]),
                   interesting=[{"func": "wrong", "score": 3, "why": ["문자열 상수 비교 대상"]}])
         self.assertEqual(r["subroute"], "pwn-heap")
-        self.assertTrue(r["conflict"])
-        self.assertEqual(r["alternatives"][0]["subroute"], "rev-symbolic")
+        self.assertFalse(r.get("conflict", False))
+        self.assertNotIn("rev-symbolic", r["leads"])  # no structured function record to support this hint
 
     def test_gets_plus_generic_interesting_routes_pwn_stack_not_rev(self):
         r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]),
                   revq=revq(imports=["gets", "memcmp"]),
                   interesting=[{"func": "success", "score": 2, "why": ["문자열 상수 비교 대상"]}])
         self.assertEqual(r["subroute"], "pwn-stack")
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
 
     def test_printf_read_plus_explicit_compare_call_still_routes_rev_checker(self):
         r = route(profile=profile(imports=["printf", "read"]),
@@ -133,8 +130,8 @@ class RouteMixedSignal(unittest.TestCase):
                             functions=[{"name": "check_flag", "calls": ["memcmp"]}]),
                   interesting=[{"func": "check_flag", "score": 8, "why": ["display-only"]}])
         self.assertEqual(r["subroute"], "rev-checker")
-        self.assertTrue(r["conflict"])
-        self.assertEqual(r["alternatives"][0]["subroute"], "pwn-format")
+        self.assertFalse(r.get("conflict", False))
+        self.assertIn("pwn-format", r["leads"])
 
 class ActiveTriageCommitment(unittest.TestCase):
     def test_heap_imports_are_provisional_not_skill_lock(self):
@@ -161,11 +158,11 @@ class ActiveTriageCommitment(unittest.TestCase):
         self.assertIn("nx", r["dimensions"]["constraints"])
         self.assertIsNone(r["skill"])
 
-    def test_explicit_checker_without_competitor_can_commit(self):
+    def test_explicit_checker_without_runtime_proof_remains_provisional(self):
         r = route(revq=revq(imports=["memcmp"], functions=[{"name": "check", "calls": ["memcmp"]}]),
                   interesting=[{"func": "check", "score": 8, "why": ["display-only"]}])
-        self.assertEqual(r["commitment"], "committed")
-        self.assertEqual(r["skill"], "rev-checker")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
         self.assertIn("checker", r["dimensions"]["program_shapes"])
 
     def test_mixed_checker_and_pwn_signal_forces_provisional(self):
@@ -173,16 +170,16 @@ class ActiveTriageCommitment(unittest.TestCase):
                   revq=revq(imports=["printf", "read", "memcmp"],
                             functions=[{"name": "check_flag", "calls": ["memcmp"]}]),
                   interesting=[{"func": "check_flag", "score": 8, "why": ["display-only"]}])
-        self.assertTrue(r["conflict"])
+        self.assertFalse(r.get("conflict", False))
         self.assertEqual(r["commitment"], "provisional")
         self.assertIsNone(r["skill"])
-        self.assertTrue(any("multiple plausible routes" in x for x in r["unresolved"]))
+        self.assertIn("pwn-format", r["leads"])
 
     def test_fact_grade_packing_commits_action_but_underlying_shape_stays_open(self):
         r = route(revq=revq(evasion_signals=[
             evasion_signal("packer-section", {"section": "UPX0"}, "fact")]))
-        self.assertEqual(r["commitment"], "committed")
-        self.assertEqual(r["skill"], "rev-packed")
+        self.assertEqual(r["commitment"], "provisional")
+        self.assertIsNone(r["skill"])
         self.assertIn("packing", r["dimensions"]["obstacles"])
         self.assertTrue(any("underlying" in x for x in r["unresolved"]))
 

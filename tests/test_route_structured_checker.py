@@ -36,7 +36,7 @@ class StructuredCheckerShape(unittest.TestCase):
             revq=revq(["Correct: FLAG{fixture}"]),
             interesting=[{"func": "main", "score": 8, "why": ["비교함수 호출: memcmp"]}],
         )
-        self.assertEqual(result["subroute"], "rev-symbolic")
+        self.assertEqual(result["subroute"], "pwn-stack")  # a read import is an attention lead, not checker proof
         self.assertFalse(any(signal["kind"] == "checker-oracle-strings" for signal in result["signals"]))
 
 

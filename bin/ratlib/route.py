@@ -5,7 +5,7 @@ imports/strings/evasion_signals/interesting into a *provisional* route
 suggestion. No new analysis is performed here: every signal consumed here is
 already computed by rat-profile or revq.
 
-`track`/`subroute`/`confidence` remain for compatibility and ranking.  They are
+`track`/`subroute`/`confidence` remain for compatibility ONLY. They are
 not a calibrated probability or a proof that one mutually-exclusive challenge
 class has been identified.  The model-facing commitment gate is:
 
@@ -158,30 +158,27 @@ def _sig(kind, value, quality):
 
 
 def _pwn_candidate(imports, profile):
-    """Rank import-derived PWN attention candidates.
+    """Legacy display label from the canonical PWN-lead inventory.
 
-    These candidates are intentionally provisional. Import presence can select
-    the cheapest next probe, but it never establishes an unsafe callsite or a
-    runtime primitive by itself.
+    The first label is *not* a verified vulnerability or a skill commitment.
+    No separate, duplicate recognition rules live in this adapter.
     """
-    if imports & HEAP_IMPORTS:
-        hit = sorted(imports & HEAP_IMPORTS)
-        return "pwn-heap", 0.55, [_sig("heap-imports", hit, "fact")]
-    if (imports & FORMAT_IMPORTS) and (imports & INPUT_IMPORTS):
-        hit = sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS))
-        return "pwn-format", 0.55, [_sig("format-input-imports", hit, "fact")]
-    if imports & OVERFLOW_IMPORTS:
+    candidates = _pwn_all_candidates(imports, profile)
+    if not candidates:
+        return None
+    subroute, confidence = candidates[0]
+    if subroute == "pwn-heap":
+        signals = [_sig("heap-imports", sorted(imports & HEAP_IMPORTS), "fact")]
+    elif subroute == "pwn-format":
+        signals = [_sig("format-input-imports",
+                        sorted(imports & (FORMAT_IMPORTS | INPUT_IMPORTS)), "fact")]
+    else:
         hit = sorted(imports & OVERFLOW_IMPORTS)
-        strong = bool(imports & STRONG_OVERFLOW_IMPORTS)
-        quality = "fact" if strong else "heuristic"
-        confidence = 0.6 if strong else 0.5
-        sigs = [_sig("overflow-imports", hit, quality)]
-        nx = _fact(profile, "elf.nx")
-        if nx is True:
-            sigs.append(_sig("elf-nx", True, "fact"))
-            return "pwn-rop", confidence, sigs
-        return "pwn-stack", confidence, sigs
-    return None
+        signals = [_sig("overflow-imports", hit,
+                        "fact" if imports & STRONG_OVERFLOW_IMPORTS else "heuristic")]
+        if _fact(profile, "elf.nx") is True:
+            signals.append(_sig("elf-nx", True, "fact"))
+    return subroute, confidence, signals
 
 
 def _pwn_all_candidates(imports, profile):
@@ -236,8 +233,8 @@ def _project_subroute_dimension(subroute, dims, unresolved):
             _append_unique(dims["constraints"], "nx")
             _append_unique(unresolved, "ROP is only an exploitation strategy candidate after control-flow influence is measured")
     elif subroute == "pwn-kernel":
-        _append_unique(dims["program_shapes"], "kernel-module")
-        _append_unique(unresolved, "kernel object lifetime and copy_to/from_user semantics still require direct measurement")
+        _append_unique(dims["program_shapes"], "kernel-candidate")
+        _append_unique(unresolved, "kernel imports do not prove a kernel module/target environment; inspect the supplied artifact and boot setup")
     elif subroute == "rev-checker":
         _append_unique(dims["program_shapes"], "checker")
         _append_unique(unresolved, "checker semantics and success/failure oracle remain unverified")
@@ -270,21 +267,15 @@ def _active_triage_overlay(result):
 
     if subroute == "unknown":
         commitment = "unknown"
-    elif subroute == "pwn-kernel":
-        commitment = "committed"
-    elif subroute == "rev-checker":
-        # A recovered compare-call is a deterministic first action discriminator.
-        # Paired success/failure strings are useful shape evidence but remain a
-        # heuristic, so they select the checker route without hard-locking a skill.
-        commitment = "committed" if _signal_quality(result, "compare-calls") == "fact" else "provisional"
-    elif subroute == "rev-packed":
-        commitment = "committed" if _signal_quality(result, "packer-section") == "fact" else "provisional"
+    # Static packer-section names, imports and compare calls are observations,
+    # not proofs of the underlying class or a validated unpacking procedure.
+    # No static-only route is eligible to lock a route-specific skill.
 
     if any(s.get("kind") == "pe-platform" for s in result.get("signals", [])):
         _append_unique(dims["constraints"], "pe-windows")
     if result.get("conflict"):
         commitment = "provisional"
-        conflict_note = "multiple plausible routes remain; run one cheap discriminating probe before loading a route-specific skill"
+        conflict_note = "contradictory evidence requires a discriminating probe before any skill lock"
         if conflict_note in unresolved:
             unresolved.remove(conflict_note)
         unresolved.insert(0, conflict_note)
@@ -296,6 +287,63 @@ def _active_triage_overlay(result):
     result["skill"] = subroute if commitment == "committed" and subroute in SKILLS else None
     return result
 
+
+def _early_route_context(result, imports, profile, revq, interesting, *, is_pe=False):
+    """Project independent observed leads without inventing secondary scores.
+
+    Packer detection is an action/obstacle; kernel imports describe a possible
+    program shape. Neither is evidence that all other analysis dimensions are
+    false. Compatibility primary/subroute remain stable, but only genuine
+    competing *interpretations* belong in alternatives/conflict.
+    """
+    result = _finalize(result, is_pe)
+    observed = []
+    if not is_pe:
+        if imports & KERNEL_IMPORTS:
+            observed.append("pwn-kernel")
+        observed.extend(subroute for subroute, _ in _pwn_all_candidates(imports, profile))
+    for item in interesting or []:
+        func = item.get("func")
+        if not func or _function_record(revq, func) is None:
+            continue
+        if _checker_compare_calls(revq, func) or _checker_oracle_strings(revq, func):
+            observed.append("rev-checker")
+        else:
+            observed.append("rev-symbolic")
+    functions = (revq or {}).get("functions") or []
+    fn_names = " ".join(f.get("name", "") for f in functions if isinstance(f, dict)).lower()
+    if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
+        observed.append("rev-vm")
+    # 'leads' are independent, potentially coexisting analysis surfaces. Do
+    # not misrepresent them as conflicting or give them fabricated confidence.
+    result["leads"] = []
+    for subroute in observed:
+        if subroute != result["subroute"] and subroute not in result["leads"]:
+            result["leads"].append(subroute)
+            _project_subroute_dimension(subroute, result["dimensions"], result["unresolved"])
+    # Preserve bounded, executable next-probe suggestions for independent
+    # leads, but do not issue an instruction to run every one in this order.
+    for subroute in result["leads"]:
+        if subroute == "rev-checker":
+            # A function query needs an actual recovered target; a label
+            # placeholder is not an executable argument.
+            target = next((item.get("func") for item in interesting or []
+                           if _function_record(revq, item.get("func"))
+                           and (_checker_compare_calls(revq, item.get("func"))
+                                or _checker_oracle_strings(revq, item.get("func")))), None)
+            if not target:
+                continue
+            hints = _next_hint(subroute, target)
+        else:
+            hints = _next_hint(subroute)
+        for hint in hints:
+            if hint not in result["next"] and not (
+                hint["query"] == "rat query pwn"
+                and any(existing["query"] == hint["query"] for existing in result["next"])
+            ):
+                result["next"].append(hint)
+    result["next"] = result["next"][:4]
+    return result
 
 def _finalize(result, is_pe=False):
     result = _active_triage_overlay(result)
@@ -315,15 +363,23 @@ def route(*, profile=None, revq=None, interesting=None):
     if packed:
         observation, confidence = packed
         signals.append(_sig(observation["kind"], observation.get("value"), observation["quality"]))
-        return _finalize(_result("rev", "rev-packed", confidence, signals, capabilities), is_pe)
+        return _early_route_context(_result("rev", "rev-packed", confidence, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
 
     if imports & KERNEL_IMPORTS and not is_pe:
         hit = sorted(imports & KERNEL_IMPORTS)
         signals.append(_sig("kernel-imports", hit, "fact"))
-        return _finalize(_result("pwn", "pwn-kernel", 0.8, signals, capabilities))
+        return _early_route_context(_result("pwn", "pwn-kernel", 0.8, signals, capabilities),
+                                    imports, profile, revq, interesting)
 
     pwn = None if is_pe else _pwn_candidate(imports, profile)
-    top = (interesting or [None])[0] if interesting else None
+    # A high interesting-function score only orders inspection; it cannot
+    # suppress a lower-ranked function with structured checker evidence.
+    ranked = [item for item in (interesting or []) if isinstance(item, dict)]
+    top = next((item for item in ranked
+                if _checker_compare_calls(revq, item.get("func"))
+                or _checker_oracle_strings(revq, item.get("func"))),
+               ranked[0] if ranked else None)
     if top:
         score = top.get("score", 0)
         compare_calls = _checker_compare_calls(revq, top.get("func"))
@@ -347,40 +403,43 @@ def route(*, profile=None, revq=None, interesting=None):
                 rev_signals.append(_sig("crypto-hint", hints, "heuristic"))
         if pwn is None:
             signals.extend(rev_signals)
-            return _finalize(_result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target), is_pe)
+            return _early_route_context(
+                _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target),
+                imports, profile, revq, interesting, is_pe=is_pe)
 
         pwn_subroute, pwn_confidence, pwn_signals = pwn
-        if checker_shape or rev_confidence >= pwn_confidence:
+        # Structured checker evidence warrants an early bounded function query;
+        # an unrelated REV score must never outrank PWN by numeric comparison.
+        if checker_shape:
             signals.extend(rev_signals)
             result = _result("rev", rev_subroute, rev_confidence, signals, capabilities, next_target=rev_target)
-            result["conflict"] = True
-            result["alternatives"] = [{"track": "pwn", "subroute": pwn_subroute, "confidence": pwn_confidence}]
+            # A checker shape and PWN import may coexist. They are distinct
+            # leads, not mutually-exclusive route evidence.
         else:
             signals.extend(pwn_signals)
             result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
-            result["conflict"] = True
-            result["alternatives"] = [{"track": "rev", "subroute": rev_subroute, "confidence": rev_confidence}]
-        return _finalize(result, is_pe)
+            # A generic REV attention score does not refute the PWN lead.
+        return _early_route_context(result, imports, profile, revq, interesting, is_pe=is_pe)
 
     if pwn is not None:
         pwn_subroute, pwn_confidence, pwn_signals = pwn
         signals.extend(pwn_signals)
         result = _result("pwn", pwn_subroute, pwn_confidence, signals, capabilities)
-        siblings = [(sr, conf) for sr, conf in _pwn_all_candidates(imports, profile) if sr != pwn_subroute]
-        if siblings:
-            result["conflict"] = True
-            result["alternatives"] = [{"track": "pwn", "subroute": sr, "confidence": conf} for sr, conf in siblings]
-        return _finalize(result, is_pe)
+        # All coexisting surface leads are added by the common projection.
+        return _early_route_context(result, imports, profile, revq, interesting, is_pe=is_pe)
 
     functions = (revq or {}).get("functions") or []
     fn_names = " ".join(f.get("name", "") for f in functions).lower()
     if any(h in fn_names or h in _strings_blob(revq).lower() for h in VM_HINTS):
         signals.append(_sig("vm-dispatch-hint", [h for h in VM_HINTS if h in fn_names or h in _strings_blob(revq).lower()], "heuristic"))
-        return _finalize(_result("rev", "rev-vm", 0.5, signals, capabilities), is_pe)
+        return _early_route_context(_result("rev", "rev-vm", 0.5, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
 
     if is_pe:
-        return _finalize(_result("rev", "rev-symbolic", 0.4, signals, capabilities), is_pe)
-    return _finalize(_result("unknown", "unknown", 0.0, signals, capabilities))
+        return _early_route_context(_result("rev", "rev-symbolic", 0.4, signals, capabilities),
+                                    imports, profile, revq, interesting, is_pe=is_pe)
+    return _early_route_context(_result("unknown", "unknown", 0.0, signals, capabilities),
+                                imports, profile, revq, interesting, is_pe=is_pe)
 
 
 def _result(track, subroute, confidence, signals, capabilities, next_target=None):
@@ -405,20 +464,20 @@ _NEXT_QUERY = {
     "pwn-format": "rat query pwn",
     "pwn-heap": "rat query pwn",
     "pwn-rop": "rat query pwn",
-    "pwn-kernel": "k_dump_heap",
+    "pwn-kernel": "rat query pwn",
     "unknown": "revq/recon",
 }
 
 _NEXT_TARGET = {
     "rev-checker": "bounded-checker-function-before-commit",
     "rev-symbolic": "success-failure-oracle-before-symbolic",
-    "rev-packed": "dynamic-unpack-trace-before-static-re-analysis",
+    "rev-packed": "verify-packer-and-unpack-need-before-dynamic-tracing",
     "rev-vm": "prove-dispatch-loop-before-vm-lift",
     "pwn-stack": "static-capability-then-measure-overwrite",
     "pwn-format": "static-capability-then-prove-format-argument-control",
     "pwn-heap": "static-capability-then-measure-object-lifetime",
     "pwn-rop": "static-capability-then-measure-pc-control-before-gadgets",
-    "pwn-kernel": "kernel-tooling",
+    "pwn-kernel": "confirm-kernel-artifact-and-environment-before-kernel-tooling",
     "unknown": "more-signal-before-routing",
 }
 

@@ -26,7 +26,8 @@ class CanonicalRouteNextTests(unittest.TestCase):
                           "why": ["display-only"]}],
         )
         self.assertEqual(result["subroute"], "rev-checker")
-        self.assertEqual(result["commitment"], "committed")
+        self.assertEqual(result["commitment"], "provisional")
+        self.assertIsNone(result["skill"])
         self.assertEqual(result["next"], [
             {"query": "rat query func", "target": "check_flag"},
         ])
