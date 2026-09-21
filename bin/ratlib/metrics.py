@@ -161,6 +161,38 @@ def process_trace_metrics(path, kit_root, challenge_dir=None):
         "tool_name_counts": name_counts,
     }
 
+
+def benchmark_envelope_observations(store_root):
+    """Observed, *envelope-scoped* Mode B cache/output counters.
+
+    The artifact store covers only CTF-Rat tools that emit tool-result envelopes;
+    standalone tool caches, native agent usage, and CLI output delivered to the
+    model are outside this scope. Never promote these counts to run-wide metrics.
+    A fresh Mode B workspace with no envelopes has unknown coverage, not zero.
+    """
+    docs = list(iter_tool_results(store_root))
+    if not docs:
+        return None
+    session = aggregate(docs)
+    captured_bytes = 0
+    for doc in docs:
+        summary = doc.get("summary") or {}
+        stdout_bytes, stderr_bytes = summary.get("stdout_bytes"), summary.get("stderr_bytes")
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 0
+               for n in (stdout_bytes, stderr_bytes)):
+            captured_bytes = None
+            break
+        captured_bytes += stdout_bytes + stderr_bytes
+    return {
+        "scope": "tool-result-envelopes-only",
+        "envelope_count": len(docs),
+        "cache_requests": session["cache_requests"],
+        "cache_hits": session["cache_hits"],
+        "cache_unusable_hits": session["cache_unusable_hits"],
+        "cache_hit_ratio": session["cache_hit_ratio"],
+        "captured_stdout_stderr_bytes": captured_bytes,
+    }
+
 def guard_started_at(ctf_home, chal=None):
     try:
         with open(os.path.join(ctf_home, "ACTIVE.json"), encoding="utf-8") as f:
