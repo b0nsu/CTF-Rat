@@ -24,10 +24,13 @@ def project_graph(rev, *, interesting=(), budget_bytes=16384, max_nodes=64):
         raise ValueError("budget_bytes and max_nodes must be positive")
 
     functions = {}
+    non_addressed = 0
     for func in rev.get("functions", ()):
         address = func.get("addr")
         if isinstance(address, int) and not isinstance(address, bool) and address > 0:
             functions.setdefault(address, func)
+        else:
+            non_addressed += 1
 
     by_name = {}
     for addr, func in functions.items():
@@ -77,7 +80,7 @@ def project_graph(rev, *, interesting=(), budget_bytes=16384, max_nodes=64):
         # Charge the complete target list so an exceptionally large node cannot
         # silently bypass the output budget. Convert to hex after selection.
         if _size(node) > remaining:
-            break
+            continue
         selected.append(node)
         remaining -= _size(node)
 
@@ -98,12 +101,17 @@ def project_graph(rev, *, interesting=(), budget_bytes=16384, max_nodes=64):
     total = len(functions)
     missing = total - len(selected)
     engine_complete = rev.get("engine") == "angr" and rev.get("analysis_complete") is True
-    complete = engine_complete and not missing and not ambiguous_calls
+    complete = engine_complete and not missing and not ambiguous_calls and not non_addressed
     reasons = []
     if not engine_complete:
         reasons.append("revq engine did not certify a complete recovered function map")
     if missing:
         reasons.append("%d recovered functions omitted by node/byte budget" % missing)
+    if non_addressed:
+        suffix = "" if non_addressed == 1 else "s"
+        subject = "it has" if non_addressed == 1 else "they have"
+        reasons.append("%d recovered function record%s omitted because %s no valid address" %
+                       (non_addressed, suffix, subject))
     if ambiguous_calls:
         reasons.append("%d call names resolve to multiple recovered functions" % ambiguous_calls)
 
@@ -122,7 +130,7 @@ def project_graph(rev, *, interesting=(), budget_bytes=16384, max_nodes=64):
                 "functions": missing,
                 "internal_edges_from_visible_nodes": hidden_edges,
                 "ambiguous_calls_from_visible_nodes": ambiguous_calls,
-                "non_addressed_functions": len(rev.get("functions", ())) - total,
+                "non_addressed_functions": non_addressed,
                 "indirect_calls": "unknown (revq does not enumerate them)",
             },
         },

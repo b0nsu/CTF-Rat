@@ -90,6 +90,35 @@ class ProjectionTests(unittest.TestCase):
         rev["functions"].append({"name": "unknown", "addr": 0, "calls": []})
         out = project_graph(rev)
         self.assertEqual(out["coverage"]["omitted"]["non_addressed_functions"], 1)
+        self.assertFalse(out["coverage"]["complete"])
+        self.assertIn("1 recovered function record omitted because it has no valid address",
+                      out["diagnostics"])
+
+    def test_same_address_alias_does_not_reduce_coverage(self):
+        rev = sample()
+        rev["functions"].append({"name": "main_alias", "addr": 0x1200, "calls": []})
+        out = project_graph(rev)
+        self.assertTrue(out["coverage"]["complete"])
+        self.assertEqual(out["facts"]["recovered_functions"], 3)
+        self.assertEqual(out["coverage"]["omitted"]["non_addressed_functions"], 0)
+
+    def test_budget_skips_large_node_and_selects_later_small_node(self):
+        rev = {
+            "engine": "angr", "analysis_complete": True,
+            "functions": [
+                {"name": "main", "addr": 0x1200, "size": 400, "nblocks": 1,
+                 "ncallers": 0, "calls": ["external_" + "x" * 300]},
+                {"name": "worker", "addr": 0x1300, "size": 4, "nblocks": 1,
+                 "ncallers": 0, "calls": ["main"]},
+            ],
+        }
+        out = project_graph(rev, budget_bytes=1280, max_nodes=2)
+        self.assertFalse(out["coverage"]["complete"])
+        self.assertEqual(out["coverage"]["omitted"]["functions"], 1)
+        self.assertEqual([node["name"] for node in out["facts"]["graph"]], ["worker"])
+        worker = out["facts"]["graph"][0]
+        self.assertEqual(worker["calls"], [])
+        self.assertEqual(worker["hidden_calls"], 1)
 
     def test_rejects_invalid_budget_and_max_nodes(self):
         for params in ({"budget_bytes": 0}, {"max_nodes": 0}):
@@ -138,6 +167,37 @@ class FrontDoorTests(unittest.TestCase):
         self.assertEqual(doc["status"], "partial")
         self.assertEqual(doc["facts"]["visible_functions"], 2)
         self.assertEqual(doc["coverage"]["omitted"]["functions"], 1)
+
+    def test_graph_subcommand_reports_non_addressed_functions_as_partial(self):
+        loader = importlib.machinery.SourceFileLoader("_rat_graph_non_addressed_test", str(BIN / "rat"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        rat = importlib.util.module_from_spec(spec)
+        loader.exec_module(rat)
+
+        class FakeRevq:
+            @staticmethod
+            def compute_interesting(_rev):
+                return []
+
+        rev = sample()
+        rev["functions"].append({"name": "unknown", "addr": None, "calls": []})
+        with tempfile.TemporaryDirectory() as work:
+            binary = pathlib.Path(work) / "chall"
+            binary.write_bytes(b"fixture")
+            args = rat.build_parser().parse_args(
+                ["query", "graph", str(binary), "--format", "json", "--max-nodes", "10"])
+            capture = io.StringIO()
+            with (patch.object(rat, "_gather_revq", return_value=(FakeRevq(), rev)),
+                  patch.object(rat, "_record_revq_invocation"),
+                  patch.object(rat, "_governor_wrap", side_effect=lambda _p, _k, _v, doc: doc),
+                  contextlib.redirect_stdout(capture)):
+                code = rat.cmd_query_graph(args)
+        self.assertEqual(code, 0)
+        doc = json.loads(capture.getvalue())
+        validate(doc, "rat.query-result/v1")
+        self.assertEqual(doc["status"], "partial")
+        self.assertEqual(doc["coverage"]["omitted"]["non_addressed_functions"], 1)
+        self.assertIn("no valid address", doc["diagnostics"][0]["message"])
 
 
 if __name__ == "__main__":
