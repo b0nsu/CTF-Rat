@@ -13,7 +13,7 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/rop-and-shellcod
 - Identify PIE/RELRO/canary state first (`recon`) — it decides whether a leak stage is required before the ROP chain.
 
 ## PIVOT
-- If `rat route` set `conflict: true`, a sibling pwn subroute matched the imports too — check its `alternatives` before committing (heap/format/overflow sinks can coexist).
+- Inspect every relevant entry in Router v2 `dimensions.vulnerability_surfaces` and `leads`; heap, format, and overwrite evidence may coexist without implying a conflict or rank.
 - A leak is needed first and the primitive for getting it is format-string based → `pwn-format` for that stage, then return here for the chain.
 - NX turns out to be off after re-measurement → `pwn-stack` (shellcode is simpler than a chain when available).
 

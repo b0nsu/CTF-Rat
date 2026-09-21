@@ -1,0 +1,21 @@
+FROM --platform=linux/amd64 python:3.12-bookworm
+
+WORKDIR /work
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binutils build-essential coreutils file gdb git patchelf sqlite3 xxd \
+    libc6-dbg && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements-deep.txt ./
+RUN pip install --no-cache-dir -r requirements-deep.txt
+
+COPY . .
+ENV PATH=/work/bin:${PATH} PYTHONPATH=/work/bin
+
+# Team-state tests exercise an unwritable-directory failure path; it must run
+# as an ordinary user for that permission boundary to be meaningful.
+RUN useradd --create-home --uid 1000 ctf && chown -R ctf:ctf /work
+USER ctf
+
+CMD ["python3", "-m", "unittest", "discover", "-s", "tests"]

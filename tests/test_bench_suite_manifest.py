@@ -73,7 +73,7 @@ class BenchSuiteManifestTests(unittest.TestCase):
             "binary": "chall.bin",
         })
         entry.pop("source", None)
-        doc = {"schema": "rat.bench-suite/v1", "entries": [entry]}
+        doc = {"schema": "rat.bench-suite/v2", "entries": [entry]}
         self.assertIs(validate_suite(doc), doc)
 
     def test_fetch_metadata_requires_pinned_redistributable_binary(self):
@@ -82,22 +82,22 @@ class BenchSuiteManifestTests(unittest.TestCase):
         bad = copy.deepcopy(real)
         bad["fetch"]["git_blob_sha1"] = "not-a-digest"
         with self.assertRaisesRegex(SuiteValidationError, "git_blob_sha1"):
-            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad]})
 
         bad = copy.deepcopy(real)
         bad["fetch"]["url"] = "http://example.invalid/chall"
         with self.assertRaisesRegex(SuiteValidationError, "absolute https URL"):
-            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad]})
 
         bad = copy.deepcopy(real)
         bad["redistributable"] = False
         with self.assertRaisesRegex(SuiteValidationError, "redistributable=true"):
-            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad]})
 
         bad = copy.deepcopy(real)
         bad.pop("binary")
         with self.assertRaisesRegex(SuiteValidationError, "requires source or binary"):
-            validate_suite({"schema": "rat.bench-suite/v1", "entries": [bad]})
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad]})
 
     def test_project_suite_selects_one_corpus_without_mutating_source(self):
         doc = copy.deepcopy(self.suite)

@@ -24,12 +24,11 @@ For non-redistributable material, create an ignored `bench/local-suite.json` (or
 
 ```json
 {
-  "schema": "rat.bench-suite/v1",
+  "schema": "rat.bench-suite/v2",
   "entries": [
     {
       "id": "heldout-example-01",
-      "track": "rev",
-      "expected_route": "rev-checker",
+      "expected": {"dimensions": {"program_shapes": ["checker"]}, "leads": ["checker"], "action": "rat query func"},
       "difficulty": 3,
       "corpus": "private",
       "capabilities": ["checker", "stripped"],
@@ -95,7 +94,7 @@ Use a separate run ID when measurement conditions change. Do not mix synthetic f
 
 ## Benchmark-v2 provenance
 
-Current Mode B producers attach a `provenance` object to every `rat.benchmark-result/v2` row. It records:
+Current Mode B producers attach a `provenance` object to every `rat.benchmark-result/v3` row. It records:
 
 - SHA-256 of the exact validated post-filter suite execution set;
 - selected corpus class(es);
@@ -105,22 +104,21 @@ Current Mode B producers attach a `provenance` object to every `rat.benchmark-re
 - OS, architecture, and Python runtime identity;
 - CTF-Rat revision and schema-bundle identity.
 
-If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. Historical benchmark-v2 rows without provenance remain readable for compatibility. `ratbench report --schema v2` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
+If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. `ratbench report --schema v3` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
 
-## Benchmark-v2 routing projection
+## Benchmark-v3 routing projection
 
-Live Mode B rows also attach an optional top-level `routing` object derived from the existing STATE `route-assessment` notes. It is observer-readable telemetry, not ground truth and not a reconstructed classification. Historical benchmark-v2 rows without this projection remain valid.
+Live Mode B rows attach an optional top-level `routing` object derived from the existing STATE `route-assessment` notes. It is observer-readable telemetry, not ground truth and not a reconstructed classification.
 
 The projection records:
 
-- `first_route` and `first_route_commitment`;
-- whether the first assessment had a conflict and how many primary/alternative candidates were visible;
-- total route assessments and actual route revisions;
+- `first_dimensions`, `first_action`, and `first_commitment`;
+- total route assessments and actual decision revisions;
 - the first route-specific skill that was locked, if any.
 
 An attempt that never ran the routing front door reports `route_assessment_count=0` and leaves all first-route fields `null`; it must not fabricate an `unknown` route after the fact. This makes instrumented routing runs directly inspectable without treating a route label as solve correctness.
 
-Detailed routing metrics are available only on revisions that emit STATE `route-assessment` notes and project them into benchmark-v2. Pre-instrumentation hard-route revisions can still be compared on verified solve/latency/tool metrics, but their route revision/conflict/skill-lock fields do not exist. If routing-level A/B is required against the old behavior, use a measurement-only backport of this telemetry to the hard-route implementation; do not infer historical route events from current code.
+Detailed routing metrics are available on revisions that emit STATE `route-assessment` notes and project them into benchmark-v3. Uninstrumented attempts leave routing fields null rather than inferring historical route events.
 
 ## Architecture ablation rule
 
@@ -131,12 +129,12 @@ For routing studies, prefer revision-based ablation over hidden runtime switches
 1. run the hard-route baseline revision on one held-out corpus with a unique `benchmark_run_id`;
 2. run the active-triage revision on the same corpus/model/reasoning effort/environment/timeout/toolchain except for the intended CTF-Rat revision;
 3. label the rows consistently (for example baseline `A0`, active-triage `A1`) while relying on `provenance.toolchain.ctf_rat_revision` as the authoritative implementation identity;
-4. compare `verified_solve` and latency/tool metrics on both runs; compare the detailed `routing` projection (`first_route_commitment`, conflict rate, route revisions, first skill lock) only when both revisions carry the instrumentation described above.
+4. compare `verified_solve` and latency/tool metrics on both runs; compare the detailed `routing` projection (`first_dimensions`, `first_action`, commitment, decision revisions, first skill lock) only when both revisions carry the instrumentation described above.
 
 Do not reuse one `benchmark_run_id` across different revisions: provenance validation intentionally fails closed on mixed measurement conditions. Synthetic Mode A route accuracy may guard compatibility, but it is not evidence that one routing architecture solves real challenges better.
 
 ## Measurement rule
 
-Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v2 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
+Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v3 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
 
 Public `real` entries are reproducible competition artifacts, but they are **not automatically held out** from an internet-enabled agent: public source or writeups may be reachable outside the answer-free workspace. Use public real entries for reproducible integration/performance runs, and use a private held-out corpus (or an explicitly network-controlled agent environment) for claims about unseen solve rate.

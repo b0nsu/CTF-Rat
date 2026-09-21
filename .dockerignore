@@ -1,0 +1,6 @@
+.git
+.venv
+.rat
+bench/results
+__pycache__
+*.pyc

@@ -4,7 +4,7 @@ CTF-Rat keeps long-lived truth in deterministic artifacts and STATE. Model conte
 
 ## Existing REV card
 
-`revq` already emits `rat.function-card/v2`, and `rat query func` projects one function's callers, callees, strings, compare/oracle hints, unresolved items, and provenance through the canonical `rat.query-result/v1` envelope.
+`revq` emits `rat.function-card/v4`, and `rat query func` projects one function's callers, callees, strings, call-site records, compare/oracle hints, unresolved items, and provenance through the canonical `rat.query-result/v1` envelope. Angr-backed call-site records distinguish the CFG block address from the actual call instruction address, retain repeated calls to the same API, identify the loader virtual-address space and analysis source, and report unresolved decoding/targets explicitly. For direct comparison calls, v4 recovers a length only on ELF AMD64 System V when the last same-basic-block definition of `rdx`/`edx` is a supported literal. Each comparison reports `constant`, `not_applicable`, `value_unresolved`, or `unsupported_abi`; an address may therefore be recovered while its length remains unresolved. Query-budget omissions include exact `call_sites` and `compare_sites` counts.
 
 ## PWN capability projection
 

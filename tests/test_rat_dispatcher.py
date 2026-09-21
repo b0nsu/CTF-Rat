@@ -43,7 +43,7 @@ class InputValidation(unittest.TestCase):
         code, out, _ = run_rat("route", "/definitely/missing", "--format", "json")
         self.assertEqual(code, 4)
         doc = json.loads(out)
-        validate(doc, "rat.route-result/v1")
+        validate(doc, "rat.route-result/v2")
         self.assertEqual(doc["error"]["code"], "input_invalid")
 
     def test_query_func_missing_binary_is_input_error(self):
@@ -117,7 +117,7 @@ class GovernorWiring(unittest.TestCase):
             self.assertEqual(code, 0, err)
             docs.append(json.loads(out))
         for d in docs:
-            validate(d, "rat.route-result/v1")
+            validate(d, "rat.route-result/v2")
         self.assertNotIn("governor", docs[0])
         self.assertIn("governor", docs[-1])
         self.assertTrue(docs[-1]["governor"]["stuck"])
@@ -141,7 +141,7 @@ class GovernorWiring(unittest.TestCase):
 class FrontDoorTextRendering(unittest.TestCase):
     """Default text output must surface the route-result's essential fields,
     not collapse to a bare `label: status` line."""
-    def test_route_text_output_shows_track_confidence_skill_next(self):
+    def test_route_text_output_shows_decision_commitment_and_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = os.path.join(tmp, "silent")
             with open(binary, "wb") as f:
@@ -149,10 +149,9 @@ class FrontDoorTextRendering(unittest.TestCase):
             os.chmod(binary, 0o755)
             code, out, err = run_rat("route", binary)
             self.assertEqual(code, 0, err)
-            self.assertIn("ROUTE", out)
-            self.assertIn("CONFIDENCE", out)
+            self.assertIn("DECISION", out)
+            self.assertIn("COMMITMENT", out)
             self.assertIn("SKILL", out)
-            self.assertIn("NEXT", out)
 
 class DynVerifyStateCompactPassthrough(unittest.TestCase):
     """Pure argv-forwarding -- exercised against a legacy CLI's own usage/
@@ -197,6 +196,18 @@ class FullEngineDependent(unittest.TestCase):
         doc = json.loads(out)
         validate(doc, "rat.query-result/v1")
         self.assertIn(doc["status"], ("ok", "partial"))
+
+    def test_query_func_budget_reports_omitted_call_sites(self):
+        code, out, err = run_rat("query", "func", str(self.exe), "main", "--store", self.store,
+                                 "--budget-bytes", "1", "--format", "json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        validate(doc, "rat.query-result/v1")
+        self.assertEqual(doc["status"], "partial")
+        counts = doc["coverage"]["omitted"]["truncated_counts"]
+        self.assertIn("call_sites", counts)
+        self.assertIn("compare_sites", counts)
+        self.assertGreater(counts["call_sites"], 0)
 
     def test_query_func_not_found_is_input_invalid(self):
         code, out, err = run_rat("query", "func", str(self.exe), "no_such_function", "--store", self.store, "--format", "json")

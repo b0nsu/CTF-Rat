@@ -11,7 +11,7 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/heap-techniques.
 - Identify the libc version in play against the in-repo `reference/glibc/` version table (primary gate) — tcache/safe-linking behavior is version-gated. how2heap is an optional external clone, not required.
 
 ## PIVOT
-- If `rat route` set `conflict: true`, a sibling pwn subroute matched the imports too — check its `alternatives` before committing (heap/format/overflow sinks can coexist).
+- Inspect every relevant entry in Router v2 `dimensions.vulnerability_surfaces` and `leads`; heap, format, and overwrite evidence may coexist without implying a conflict or rank.
 - No real heap bug (allocator calls present but no UAF/double-free/overflow reachable) → re-route from `rat-profile`/`revq` signals to the actual primitive.
 - Bug is really a stack overflow inside a heap-allocated struct copy → `pwn-stack` primitive mechanics still apply once the vuln is pinned down.
 

@@ -24,7 +24,7 @@ class PwnCapabilityCard(unittest.TestCase):
         self.assertEqual(card["kind"], "pwn-capability")
         self.assertEqual(card["facts"]["sinks"]["overflow_unbounded"], ["gets"])
         self.assertEqual(card["facts"]["protections"]["elf.nx"], True)
-        self.assertEqual(card["heuristics"]["candidate_routes"][0]["subroute"], "pwn-rop")
+        self.assertIn("pwn-rop", card["heuristics"]["leads"])
         self.assertNotIn("verified_primitive", card["facts"])
         self.assertTrue(any("does not prove RIP/PC control" in x for x in card["heuristics"]["limitations"]))
         self.assertEqual(card["heuristics"]["next"][0]["query"], "pwncrash")
@@ -35,11 +35,8 @@ class PwnCapabilityCard(unittest.TestCase):
             imports=("printf", "read"),
             facts=(("elf.nx", True),),
         ))
-        routes = card["heuristics"]["candidate_routes"]
-        self.assertEqual(routes[0]["subroute"], "pwn-format")
-        self.assertFalse(any(item["primary"] for item in routes))
-        self.assertTrue(all("confidence" not in item for item in routes))
-        self.assertIn("pwn-rop", {r["subroute"] for r in routes[1:]})
+        routes = card["heuristics"]["leads"]
+        self.assertEqual(set(routes), {"pwn-format", "pwn-rop"})
         self.assertEqual(card["facts"]["sinks"]["format"], ["printf"])
         self.assertEqual(card["facts"]["sinks"]["overflow_bounded"], ["read"])
         self.assertEqual(card["heuristics"]["next"][0]["query"], "decomp")
@@ -53,13 +50,12 @@ class PwnCapabilityCard(unittest.TestCase):
         self.assertEqual(card["facts"]["sinks"]["format"], ["printf"])
         self.assertEqual(card["facts"]["sinks"]["overflow_bounded"], ["read"])
         self.assertEqual(card["facts"]["imports_total"], 2)
-        routes = card["heuristics"]["candidate_routes"]
-        self.assertEqual(routes[0]["subroute"], "pwn-format")
-        self.assertIn("pwn-rop", {r["subroute"] for r in routes[1:]})
+        routes = card["heuristics"]["leads"]
+        self.assertEqual(set(routes), {"pwn-format", "pwn-rop"})
 
     def test_heap_capability_advances_to_lifetime_probe_not_self_loop(self):
         card = project_pwn_capability(profile(imports=("malloc", "free")))
-        self.assertEqual(card["heuristics"]["candidate_routes"][0]["subroute"], "pwn-heap")
+        self.assertIn("pwn-heap", card["heuristics"]["leads"])
         self.assertEqual(card["heuristics"]["next"][0]["query"], "decomp")
         self.assertIn("object-lifetime", card["heuristics"]["next"][0]["target"])
         self.assertNotEqual(card["heuristics"]["next"][0]["query"], "rat query pwn")
@@ -67,7 +63,7 @@ class PwnCapabilityCard(unittest.TestCase):
     def test_command_import_is_attention_fact_not_a_vulnerability_route(self):
         card = project_pwn_capability(profile(imports=("system",)))
         self.assertEqual(card["facts"]["sinks"]["command_exec"], ["system"])
-        self.assertEqual(card["heuristics"]["candidate_routes"], [])
+        self.assertEqual(card["heuristics"]["leads"], [])
         self.assertEqual(card["heuristics"]["next"], [])
 
     def test_projection_is_deterministic_and_deduplicates_imports(self):
