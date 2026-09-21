@@ -176,6 +176,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["outcome"], "verified")
         self.assertTrue(doc["metrics"]["correctness"]["verified_solve"])
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
+        self.assertIsNone(doc["oracle"]["failure_class"])
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_query_ms"], 1250)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_hypothesis_ms"], 2500)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_valid_primitive_ms"], 3000)
@@ -250,6 +251,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["outcome"], "solve-claimed")
         self.assertFalse(doc["metrics"]["correctness"]["verified_solve"])
         self.assertTrue(doc["metrics"]["correctness"]["false_solved"])
+        self.assertEqual(doc["oracle"]["failure_class"], "claim-without-completion")
         self.assertIsNone(doc["metrics"]["latency"]["time_to_verified_solve_ms"])
 
     def test_timeout_without_verified_solve_is_censored(self):
@@ -264,9 +266,31 @@ class ModeBV2RecordTests(unittest.TestCase):
         RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertEqual(doc["status"], "timeout")
         self.assertEqual(doc["outcome"], "censored")
+        self.assertEqual(doc["oracle"]["failure_class"], "agent-timeout")
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
         self.assertIsNone(doc["metrics"]["tools"]["tool_calls"])
         self.assertIsNone(doc["metrics"]["tools"]["duplicate_tool_calls"])
+
+    def test_nonzero_agent_and_missing_completion_have_distinct_observed_failure_classes(self):
+        base = dict(
+            run_id="B-test", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+        )
+        nonzero = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=2, **base)
+        no_gate = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=0, **base)
+        timed_out_claim = RATBENCH._mode_b_v2_record(
+            ENTRY, agent_rc=124, **{**base, "flag_claimed": True})
+        for row in (nonzero, no_gate, timed_out_claim):
+            RATBENCH.validate(row, "rat.benchmark-result/v3")
+            self.assertFalse(row["metrics"]["correctness"]["verified_solve"])
+        self.assertEqual(nonzero["oracle"]["failure_class"], "agent-nonzero-exit")
+        self.assertEqual(no_gate["oracle"]["failure_class"], "no-verified-completion")
+        self.assertEqual(timed_out_claim["oracle"]["failure_class"], "agent-timeout")
+        self.assertTrue(timed_out_claim["metrics"]["correctness"]["false_solved"])
 
     def test_legacy_report_ignores_v2_companion(self):
         with tempfile.TemporaryDirectory() as d:

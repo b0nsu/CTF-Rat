@@ -106,6 +106,8 @@ Current Mode B producers attach a `provenance` object to every `rat.benchmark-re
 
 If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. `ratbench report --schema v3` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
 
+Live benchmark-v3 rows also record `oracle.failure_class` as an observer-derived, coarse outcome category: `agent-timeout`, `claim-without-completion`, `agent-nonzero-exit`, `no-verified-completion`, or `null` on verified completion. This is **not** an exploit root-cause diagnosis; the canonical completion gate and `oracle.reason` remain authoritative. This additive field does not change the benchmark schema, CLI, or solve criteria.
+
 ## Benchmark-v3 routing projection
 
 Live Mode B rows attach an optional top-level `routing` object derived from the existing STATE `route-assessment` notes. It is observer-readable telemetry, not ground truth and not a reconstructed classification.
