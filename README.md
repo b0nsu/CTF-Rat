@@ -54,7 +54,7 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 # 0. One-time environment setup (venv+angr+pwntools, Ghidra, glibc-fetch)  →  SETUP.md
 # 1. Lock the target engagement (allowlist / active lock)
 ctfguard begin <challenge> [target]
-# 2. Route — decide track/subroute/skill (thin composition, no new analysis)
+# 2. Route — project evidence dimensions and choose a bounded action
 rat route <bin>
 # 3. Detailed triage
 revq <bin>        # rev
@@ -67,10 +67,9 @@ recon <bin>       # pwn
 
 ```mermaid
 flowchart LR
-    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>decide track · subroute · skill"]
-    B --> C{"track?"}
-    C -->|pwn| D["🎯 recon → pwnkit/pwnstage<br/>primitives → payload"]
-    C -->|rev| E["🔍 revq → decomp<br/>symsolve / vmlift"]
+    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>signals · dimensions · decision"]
+    B --> D["🎯 run one evidence-linked bounded action"]
+    B --> E["🔍 preserve coexisting leads and unresolved premises"]
     D --> F["🧪 rat-verify / concrete-verify"]
     E --> F
     F --> G{"PASS?"}
@@ -128,7 +127,7 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <summary><code>rat</code> — the single front-door dispatcher</summary>
 <br>
 
-`rat route <bin>` decides track/subroute/skill (a thin composition of rat-doctor + rat-profile + revq,
+`rat route <bin>` projects observations into independent dimensions and selects one evidence-linked bounded action (a thin composition of rat-doctor + rat-profile + revq,
 no new analysis), and `rat query {graph,func,oracle,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.

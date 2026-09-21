@@ -10,7 +10,7 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/overflow-basics.
 - Confirm the overflow's controlled length with a cyclic pattern locally (`pwncrash`) — do not assume the source-read length.
 
 ## PIVOT
-- If `rat route` set `conflict: true`, a sibling pwn subroute matched the imports too — check its `alternatives` before committing (heap/format/overflow sinks can coexist).
+- Inspect every relevant entry in Router v2 `dimensions.vulnerability_surfaces` and `leads`; heap, format, and overwrite evidence may coexist without implying a conflict or rank.
 - `elf.nx == true` → shellcode is blocked, switch to `pwn-rop`.
 - The overflow is heap-allocated (buffer inside a malloc'd struct), not a stack frame → `pwn-heap`.
 - The primitive turns out to be format-string driven, not a raw overflow → `pwn-format`.

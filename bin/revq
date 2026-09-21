@@ -50,8 +50,10 @@ from ratlib.evasion import (
 )
 from ratlib.runner import run
 
-SCHEMA = 2
-REVQ_POLICY = "sha256:" + hashlib.sha256(b"revq-local-static-analysis-v2-typed-evasion").hexdigest()
+SCHEMA = 5
+REVQ_POLICY = "sha256:" + hashlib.sha256(
+    b"revq-local-static-analysis-v5-capstone-register-effects-and-direct-calls"
+).hexdigest()
 
 # ─────────────────────────── 휴리스틱 사전 ───────────────────────────
 # check-루틴을 가리키는 신호. recon 의 SINK 사전과 목적이 다르다(rev = 판별 로직).
@@ -75,6 +77,7 @@ CMP_FUNCS = {
     "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp", "strstr",
     "strcoll", "bcmp", "wcscmp", "wcsncmp",
 }
+LENGTH_CMP_FUNCS = {"strncmp", "memcmp", "strncasecmp", "bcmp", "wcsncmp"}
 INPUT_FUNCS = {
     "scanf", "__isoc99_scanf", "sscanf", "__isoc99_sscanf", "read", "fgets",
     "gets", "getline", "fread", "getchar", "fgetc", "recv", "getenv",
@@ -203,6 +206,7 @@ def extract_angr(binpath):
     )
     funcs_mgr = cfg.kb.functions
     callgraph = getattr(cfg.kb, "callgraph", None)
+    platform = _detect_platform(sh(["file", binpath]))
 
     strings = _extract_strings_from_loader(proj)
     str_by_addr = {s["addr"]: s for s in strings}
@@ -224,7 +228,8 @@ def extract_angr(binpath):
     for f in all_functions:
         if f.is_simprocedure or f.is_plt:
             continue
-        calls = _func_call_targets(f, funcs_mgr)
+        call_sites = _func_call_sites(proj, f, funcs_mgr, obj.arch.name, platform)
+        calls = sorted({site["api"] for site in call_sites if site.get("api")})
         fstrs = sorted({srec["val"] for srec in strings
                         for xr in srec["xrefs"] if xr["func"] == f.name})
         ncallers = 0
@@ -255,6 +260,7 @@ def extract_angr(binpath):
             "ninstr": instruction_count,
             "count_quality": "cfg",
             "calls": calls,
+            "call_sites": call_sites,
             "strings": fstrs,
             "ncallers": ncallers,
         })
@@ -273,7 +279,7 @@ def extract_angr(binpath):
         "analysis_complete": True,
         "functions_filtered": sum(1 for f in all_functions if f.is_simprocedure or f.is_plt),
         **evasion,
-        "platform": _detect_platform(sh(["file", binpath])),
+        "platform": platform,
     }
 
 
@@ -345,6 +351,7 @@ def _floor_func_name(funcs_mgr, addr):
 
 
 def _func_call_targets(f, funcs_mgr):
+    """Compatibility projection for consumers that only need distinct callees."""
     names = []
     try:
         for site in f.get_call_sites():
@@ -356,6 +363,140 @@ def _func_call_targets(f, funcs_mgr):
     except Exception:
         pass
     return sorted(set(names))
+
+
+def _immediate(text):
+    """Parse one assembler immediate without treating symbols/registers as constants."""
+    value = text.strip().lower().lstrip("#")
+    if value.startswith("$"):
+        value = value[1:]
+    if not re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", value):
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
+
+
+def _capstone_detail(insn):
+    """Return the underlying capstone instruction used by angr's wrapper."""
+    return getattr(insn, "insn", insn)
+
+
+def _register_writes(insn):
+    """Return normalized register names written by an instruction, or None.
+
+    ``regs_access`` includes both explicit and implicit effects (for example
+    CQO/MUL/DIV writing RDX).  Failure is deliberately not replaced with an
+    opcode-name guess: callers must treat unavailable semantics as unresolved.
+    """
+    detail = _capstone_detail(insn)
+    try:
+        _reads, writes = detail.regs_access()
+        names = {str(detail.reg_name(reg)).lower() for reg in writes}
+    except Exception:
+        return None
+    return names
+
+
+def _is_immediate_call(insn):
+    """Accept only a decoded x86 CALL whose sole operand is immediate."""
+    detail = _capstone_detail(insn)
+    if str(getattr(detail, "mnemonic", "")).lower() not in {"call", "callq"}:
+        return False
+    try:
+        operands = list(detail.operands)
+    except Exception:
+        return False
+    try:
+        from capstone import CS_OP_IMM
+    except ImportError:
+        CS_OP_IMM = 2  # Capstone's stable public operand-type value.
+    return len(operands) == 1 and operands[0].type == CS_OP_IMM
+
+
+def _x86_64_length_argument(insns, api, supported_abi=True):
+    """Conservatively recover a SysV x86-64 compare count from the call block.
+
+    The last write to RDX/EDX before the call must itself establish a literal.
+    This deliberately does not perform cross-block reaching-definition guesses.
+    """
+    if api not in LENGTH_CMP_FUNCS:
+        return {"status": "not_applicable", "reason": "comparison API has no length argument"}
+    if not supported_abi:
+        return {"status": "unsupported_abi", "reason": "length recovery supports ELF AMD64 System V only"}
+    for insn in reversed(list(insns)[:-1]):
+        mnemonic = str(getattr(insn, "mnemonic", "")).lower()
+        operands = [x.strip().lower() for x in str(getattr(insn, "op_str", "")).split(",")]
+        writes = _register_writes(insn)
+        if writes is None:
+            return {"status": "value_unresolved",
+                    "reason": "capstone register-write semantics are unavailable"}
+        aliases = {"rdx", "edx", "dx", "dl", "dh"}
+        if not writes.intersection(aliases):
+            continue
+        dst = operands[0] if operands and operands[0] else None
+        evidence = {"instruction_address": int(insn.address), "register": dst,
+                    "instruction": (mnemonic + " " + str(getattr(insn, "op_str", ""))).strip(),
+                    "analysis_source": "capstone-register-effects"}
+        if mnemonic == "mov" and dst in {"rdx", "edx"} and len(operands) == 2:
+            value = _immediate(operands[1])
+            if value is not None:
+                return {"status": "constant", "value": value, "evidence": evidence}
+        if mnemonic == "xor" and dst in {"rdx", "edx"} and len(operands) == 2 and operands[0] == operands[1]:
+            return {"status": "constant", "value": 0, "evidence": evidence}
+        return {"status": "value_unresolved", "reason": "last length-register definition is not a supported literal",
+                "evidence": evidence}
+    return {"status": "value_unresolved", "reason": "no same-block definition of the length register was found"}
+
+
+def _func_call_sites(proj, f, funcs_mgr, arch=None, platform=None):
+    """Preserve every angr call edge and distinguish block from instruction address."""
+    records = []
+    try:
+        sites = sorted(f.get_call_sites())
+    except Exception:
+        return records
+    for block_addr in sites:
+        target = None
+        try:
+            target = f.get_call_target(block_addr)
+        except Exception:
+            pass
+        callee = funcs_mgr.get(target) if target is not None and hasattr(funcs_mgr, "get") else None
+        api = callee.name if callee is not None else (hex(target) if target is not None else None)
+        insn_addr = None
+        reason = None
+        insns = []
+        try:
+            block = proj.factory.block(block_addr)
+            insns = list(block.capstone.insns)
+            if str(getattr(block.vex, "jumpkind", "")).startswith("Ijk_Call") and insns:
+                insn_addr = int(insns[-1].address)
+            else:
+                reason = "CFG call block has no decodable terminal call instruction"
+        except Exception:
+            reason = "call instruction could not be decoded from CFG block"
+        record = {
+            "block_address": int(block_addr),
+            "instruction_address": insn_addr,
+            "target_address": int(target) if target is not None else None,
+            "api": api,
+            "target_kind": "resolved" if target is not None else "unresolved",
+            "analysis_source": "angr.CFGFast",
+            "address_space": "loader-virtual-address",
+        }
+        if api in CMP_FUNCS:
+            supported_abi = arch == "AMD64" and platform == "elf"
+            direct_call = bool(insns and _is_immediate_call(insns[-1]))
+            record["length_argument"] = (_x86_64_length_argument(insns, api, supported_abi)
+                                         if direct_call else
+                                         {"status": "value_unresolved",
+                                          "reason": "length recovery is limited to direct comparison calls"})
+        if reason:
+            record["unresolved_reason"] = reason
+        records.append(record)
+    return records
 
 
 def _is_stripped(binpath):
@@ -652,8 +793,8 @@ def render_func(rev, target):
     return "\n".join(L)
 
 
-# ─────────────────────────── Function Card v2 (rat.function-card/v2) ───────────────────────────
-FUNCTION_CARD_SCHEMA = "rat.function-card/v2"
+# ─────────────────────────── Function Card v4 (rat.function-card/v4) ───────────────────────────
+FUNCTION_CARD_SCHEMA = "rat.function-card/v4"
 INTERESTING_DETECTOR_VERSION = "interesting-score/v1"
 _CAP = 30
 
@@ -673,7 +814,21 @@ def compute_function_card(rev, target):
     callees, callees_truncated = _capped(f.get("calls", []))
     strings, strings_truncated = _capped(f.get("strings", []))
     input_apis = sorted(set(f.get("calls", [])) & INPUT_FUNCS)
-    compare_sites = [{"address": None, "api": api, "length": None} for api in sorted(set(f.get("calls", [])) & CMP_FUNCS)]
+    call_sites = list(f.get("call_sites", []))
+    compare_sites = []
+    for site in call_sites:
+        if site.get("api") not in CMP_FUNCS:
+            continue
+        length = site.get("length_argument") or {
+            "status": "value_unresolved", "reason": "revmap lacks call-time length evidence; regenerate the revq cache"
+        }
+        compare_sites.append({
+            "address": site.get("instruction_address"), "block_address": site.get("block_address"),
+            "api": site.get("api"), "length": length.get("value") if length.get("status") == "constant" else None,
+            "length_status": length.get("status"), "length_evidence": length.get("evidence"),
+            "length_unresolved_reason": length.get("reason"),
+            "address_space": site.get("address_space"), "analysis_source": site.get("analysis_source"),
+        })
     func_strings = set(f.get("strings", []))
     oracle = compute_oracle(rev)
     oracle_candidates = []
@@ -686,8 +841,16 @@ def compute_function_card(rev, target):
                     oracle_candidates.append({"kind": kind, "xref": xr["addr"], "string": c["string"]})
     interesting_hit = next((it for it in compute_interesting(rev) if it["func"] == name), None)
     unresolved = []
-    if compare_sites:
-        unresolved.append({"kind": "compare_site_address", "detail": "call-site address/length not tracked at function-call-list granularity; use --xrefs or decomp for site-level detail"})
+    missing_addresses = sum(1 for site in call_sites if site.get("instruction_address") is None)
+    unresolved_targets = sum(1 for site in call_sites if site.get("target_kind") == "unresolved")
+    if missing_addresses:
+        unresolved.append({"kind": "call_instruction_address", "detail": "%d recovered call blocks lack a decoded call instruction address" % missing_addresses})
+    if unresolved_targets:
+        unresolved.append({"kind": "call_target", "detail": "%d call targets remain unresolved" % unresolved_targets})
+    unresolved_lengths = [site for site in compare_sites
+                          if site["length_status"] in {"value_unresolved", "unsupported_abi"}]
+    if unresolved_lengths:
+        unresolved.append({"kind": "compare_length", "detail": "%d comparison lengths remain unresolved" % len(unresolved_lengths)})
     if rev.get("engine") != "angr":
         unresolved.append({"kind": "engine_limited", "detail": "binutils engine: calls/xrefs may be incomplete"})
     if callers_truncated or callees_truncated or strings_truncated:
@@ -698,7 +861,7 @@ def compute_function_card(rev, target):
                      "nblocks": f.get("nblocks", 0), "ninstr": f.get("ninstr", 0)},
         "facts": {
             "callers": callers, "callees": callees, "strings": strings,
-            "input_apis": input_apis, "compare_sites": compare_sites,
+            "input_apis": input_apis, "call_sites": call_sites, "compare_sites": compare_sites,
             "oracle_candidates": oracle_candidates,
         },
         "heuristics": {
@@ -982,6 +1145,18 @@ def _fixture():
             {"name": "check", "addr": 0x1180, "size": 90, "nblocks": 4, "ninstr": 24,
              "count_quality": "cfg",
              "calls": ["memcmp", "strlen"],
+             "call_sites": [
+                 {"block_address": 0x1190, "instruction_address": 0x119b,
+                  "target_address": 0x1040, "api": "memcmp", "target_kind": "resolved",
+                  "analysis_source": "angr.CFGFast", "address_space": "loader-virtual-address",
+                  "length_argument": {"status": "constant", "value": 16,
+                                      "evidence": {"instruction_address": 0x1195, "register": "edx",
+                                                   "instruction": "mov edx, 0x10",
+                                                   "analysis_source": "capstone-basic-block"}}},
+                 {"block_address": 0x11a0, "instruction_address": 0x11a8,
+                  "target_address": 0x1050, "api": "strlen", "target_kind": "resolved",
+                  "analysis_source": "angr.CFGFast", "address_space": "loader-virtual-address"},
+             ],
              "strings": ["Correct! The flag is here", "Wrong password, try again"],
              "ncallers": 1},
             {"name": "helper_noise", "addr": 0x1300, "size": 40, "nblocks": 2, "ninstr": 12,
@@ -1009,7 +1184,7 @@ def selftest():
         "function aliases preserved without inflating total")
     chk("truncated=2" in render_funcs(rev, limit=1), "visible/truncated count")
     chk(all("nblocks" in f and "ninstr" in f and f["ninstr"] >= f["nblocks"]
-            for f in rev["functions"]), "schema v2 separates instruction and block counts")
+            for f in rev["functions"]), "revmap schema separates instruction and block counts")
     chk("5 blocks, 30 instr" in render_func(rev, "main"), "function card labels block/instruction counts")
     inter = compute_interesting(rev)
     top = inter[0] if inter else {}
@@ -1018,7 +1193,7 @@ def selftest():
     chk(all(i["func"] != "helper_noise" for i in inter), "noise 함수 제외")
 
     check_card = compute_function_card(rev, "check")
-    chk(check_card["schema"] == "rat.function-card/v2", "function-card: schema")
+    chk(check_card["schema"] == "rat.function-card/v4", "function-card: schema")
     chk(set(check_card) == {"schema", "function", "facts", "heuristics", "unresolved", "next", "provenance"},
         "function-card: top-level facts/heuristics/unresolved 분리")
     chk(check_card["facts"]["callers"] == ["main"] and check_card["facts"]["callees"] == ["memcmp", "strlen"],
@@ -1026,10 +1201,16 @@ def selftest():
     chk({c["kind"] for c in check_card["facts"]["oracle_candidates"]} == {"success", "failure"} and
         all(c["xref"] in (0x11a0, 0x11b0) for c in check_card["facts"]["oracle_candidates"]),
         "function-card: oracle_candidates 이 함수 스코프로 정확")
-    chk(check_card["facts"]["compare_sites"] == [{"address": None, "api": "memcmp", "length": None}],
-        "function-card: compare_sites 는 사실(api)만, 없는 정보(address)는 조작 안 함")
-    chk(any(u["kind"] == "compare_site_address" for u in check_card["unresolved"]),
-        "function-card: 콜사이트 주소 미해결을 unresolved 에 명시(숨기지 않음)")
+    chk(check_card["facts"]["compare_sites"] == [
+        {"address": 0x119b, "block_address": 0x1190, "api": "memcmp", "length": 16,
+         "length_status": "constant",
+         "length_evidence": {"instruction_address": 0x1195, "register": "edx",
+                             "instruction": "mov edx, 0x10", "analysis_source": "capstone-basic-block"},
+         "length_unresolved_reason": None,
+         "address_space": "loader-virtual-address", "analysis_source": "angr.CFGFast"}],
+        "function-card: call 주소와 근거가 확인된 비교 길이를 함께 보존")
+    chk(not any(u["kind"] == "compare_length" for u in check_card["unresolved"]),
+        "function-card: 확인된 상수 길이를 unresolved 로 남기지 않음")
     chk(check_card["heuristics"]["check_routine_score"] == top.get("score", 0) and check_card["heuristics"]["reasons"],
         "function-card: heuristics 는 점수+근거(단정 아님)")
     main_card = compute_function_card(rev, "main")

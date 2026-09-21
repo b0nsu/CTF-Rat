@@ -10,13 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .route import (
-    FORMAT_IMPORTS,
-    HEAP_IMPORTS,
-    INPUT_IMPORTS,
-    KERNEL_IMPORTS,
-    STRONG_OVERFLOW_IMPORTS,
-    WEAK_OVERFLOW_IMPORTS,
-    _pwn_all_candidates,
+    FORMAT as FORMAT_IMPORTS, HEAP as HEAP_IMPORTS, INPUT as INPUT_IMPORTS,
+    KERNEL as KERNEL_IMPORTS, STRONG as STRONG_OVERFLOW_IMPORTS,
+    OVERFLOW,
 )
 
 PROTECTION_FACTS = ("elf.nx", "elf.pie", "elf.canary", "elf.relro")
@@ -59,7 +55,7 @@ def _canonical_imports(profile):
     return out
 
 
-def _discriminating_next(candidate_routes):
+def _discriminating_next(leads):
     """Choose one bounded *post-capability* probe, never another PWN card.
 
     `rat route` intentionally points provisional PWN classifications at
@@ -79,8 +75,8 @@ def _discriminating_next(candidate_routes):
     # A candidate is an inspection lead, not an exclusive diagnosis. Surface
     # distinct inexpensive experiments; the agent picks based on live evidence.
     next_queries = []
-    for item in candidate_routes:
-        probe = probes.get(item.get("subroute"))
+    for item in leads:
+        probe = probes.get(item)
         if probe and probe not in next_queries:
             next_queries.append(probe)
     return next_queries[:3]
@@ -104,7 +100,7 @@ def project_pwn_capability(profile):
     protections = {kind: facts[kind] for kind in PROTECTION_FACTS if kind in facts}
     sinks = {
         "overflow_unbounded": sorted(imports & STRONG_OVERFLOW_IMPORTS),
-        "overflow_bounded": sorted(imports & WEAK_OVERFLOW_IMPORTS),
+        "overflow_bounded": sorted(imports & (OVERFLOW - STRONG_OVERFLOW_IMPORTS)),
         "format": sorted(imports & FORMAT_IMPORTS),
         "heap": sorted(imports & HEAP_IMPORTS),
         "kernel": sorted(imports & KERNEL_IMPORTS),
@@ -117,20 +113,20 @@ def project_pwn_capability(profile):
     # consumed profile + REV evidence; re-running it here can fabricate a
     # different "primary". Reuse only the router's existing import vocabulary
     # to enumerate independent attention leads, without selecting a winner.
-    labels = [label for label, _ in _pwn_all_candidates(imports, profile)]
+    labels = []
+    if imports & HEAP_IMPORTS: labels.append("pwn-heap")
+    if imports & FORMAT_IMPORTS and imports & INPUT_IMPORTS: labels.append("pwn-format")
+    if imports & OVERFLOW: labels.append("pwn-rop" if facts.get("elf.nx") is True else "pwn-stack")
     if imports & KERNEL_IMPORTS:
         labels.append("pwn-kernel")
-    candidate_routes = [
-        {"track": "pwn", "subroute": label, "primary": False}
-        for label in labels
-    ]
+    leads = sorted(set(labels))
 
     limitations = [
         "import presence identifies attention targets; it does not prove unsafe callsite arguments",
         "static profile data does not prove RIP/PC control, arbitrary read/write, leak stability, heap overlap, or kernel object reuse",
         "verified primitive PASS remains canonical in STATE v2 and requires deterministic direct evidence",
     ]
-    subroutes = {item.get("subroute") for item in candidate_routes}
+    subroutes = set(leads)
     if "pwn-rop" in subroutes:
         limitations.append("ROP gadget/register-loading capability is unresolved until PC control is measured and pwnropcheck inventory is justified")
     if "pwn-format" in subroutes:
@@ -149,9 +145,9 @@ def project_pwn_capability(profile):
             "imports_total": len(imports),
         },
         "heuristics": {
-            "candidate_routes": candidate_routes,
+            "leads": leads,
             "signals": [],
-            "next": _discriminating_next(candidate_routes),
+            "next": _discriminating_next(leads),
             "limitations": limitations,
         },
         "provenance": {

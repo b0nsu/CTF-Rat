@@ -25,17 +25,19 @@ def _strict(doc: Mapping[str, Any], allowed: set[str]):
 def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str, Any]:
     if not isinstance(doc, Mapping): raise ValidationError("document must be an object")
     schema = doc.get("schema")
+    if schema == "rat.route-result/v1":
+        raise ValidationError("rat.route-result/v1 is obsolete; regenerate with `rat route <bin>`")
     if expected and schema != expected: raise ValidationError("expected %s" % expected)
-    if not isinstance(schema, str) or not schema.startswith("rat.") or not (schema.endswith("/v1") or schema.endswith("/v2")):
+    if not isinstance(schema, str) or not schema.startswith("rat.") or not schema.rsplit("/v",1)[-1].isdigit():
         raise ValidationError("unsupported schema")
     dispatch = {"rat.tool-result/v1": tool_result, "rat.observation/v1": observation,
       "rat.finding/v1": finding, "rat.checkpoint/v1": checkpoint, "rat.primitive/v1": primitive,
       "rat.run/v1": run, "rat.role-contract/v1": role_contract,
       "rat.task-output/v1": task_output, "rat.skeptic-report/v1": skeptic_report,
-      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2,
-      "rat.route-result/v1": route_result, "rat.query-result/v1": query_result,
+      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v3": benchmark_result_v2,
+      "rat.route-result/v2": route_result, "rat.query-result/v1": query_result,
       "rat.cache-stats/v1": cache_stats, "rat.brief-card/v1": brief_card,
-      "rat.bench-result/v1": bench_result}
+      "rat.bench-result/v2": bench_result}
     try: dispatch[schema](doc)
     except KeyError: raise ValidationError("unknown schema %s" % schema)
     return doc
@@ -114,26 +116,23 @@ def _benchmark_provenance(d):
 def _benchmark_routing(d):
     """Validate optional observer-owned route/commitment telemetry.
 
-    The projection is optional so historical benchmark-v2 rows remain readable.
+    The projection is optional when an attempt never invoked the routing front door.
     Live Mode B producers populate it from the canonical STATE route-assessment
     notes; no route is inferred retroactively from the current router.
     """
-    fields={"first_route","first_route_commitment","first_route_conflict","first_route_candidate_count","route_assessment_count","route_revision_count","first_skill"}
+    fields={"first_dimensions","first_action","first_commitment","route_assessment_count","decision_revision_count","first_skill"}
     if not isinstance(d,Mapping) or set(d)!=fields: raise ValidationError("invalid benchmark routing fields")
-    if d["first_route"] is not None and (not isinstance(d["first_route"],str) or not d["first_route"]): raise ValidationError("invalid benchmark first_route")
-    if d["first_route_commitment"] not in {None,"committed","provisional","unknown"}: raise ValidationError("invalid benchmark first_route_commitment")
-    if d["first_route_conflict"] is not None and not isinstance(d["first_route_conflict"],bool): raise ValidationError("invalid benchmark first_route_conflict")
-    count=d["first_route_candidate_count"]
-    if count is not None and (not isinstance(count,int) or isinstance(count,bool) or count < 1): raise ValidationError("invalid benchmark first_route_candidate_count")
-    for key in ("route_assessment_count","route_revision_count"):
+    if d["first_dimensions"] is not None and not isinstance(d["first_dimensions"],Mapping): raise ValidationError("invalid benchmark first_dimensions")
+    if d["first_action"] is not None and not isinstance(d["first_action"],Mapping): raise ValidationError("invalid benchmark first_action")
+    if d["first_commitment"] not in {None,"committed","provisional","unknown"}: raise ValidationError("invalid benchmark first_commitment")
+    for key in ("route_assessment_count","decision_revision_count"):
         value=d[key]
         if not isinstance(value,int) or isinstance(value,bool) or value < 0: raise ValidationError("invalid benchmark %s" % key)
-    if d["route_revision_count"] > max(0,d["route_assessment_count"]-1): raise ValidationError("route revisions exceed assessments")
+    if d["decision_revision_count"] > max(0,d["route_assessment_count"]-1): raise ValidationError("decision revisions exceed assessments")
     if d["first_skill"] is not None and (not isinstance(d["first_skill"],str) or not d["first_skill"]): raise ValidationError("invalid benchmark first_skill")
     if d["route_assessment_count"] == 0:
-        if any(d[key] is not None for key in ("first_route","first_route_commitment","first_route_conflict","first_route_candidate_count","first_skill")): raise ValidationError("empty routing assessment cannot report first-route fields")
-    elif d["first_route"] is None or d["first_route_commitment"] is None or d["first_route_conflict"] is None or d["first_route_candidate_count"] is None:
-        raise ValidationError("routing assessment requires first-route fields")
+        if any(d[key] is not None for key in ("first_dimensions","first_action","first_commitment","first_skill")): raise ValidationError("empty routing assessment cannot report first fields")
+    elif d["first_dimensions"] is None or d["first_commitment"] is None: raise ValidationError("routing assessment requires first fields")
 def benchmark_result_v2(d):
     _need(d,("schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"))
     _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance","routing"})
@@ -163,8 +162,9 @@ def benchmark_result_v2(d):
     if ratio is not None and not (isinstance(ratio,(int,float)) and 0 <= ratio <= 1): raise ValidationError("invalid metrics.cache.cache_hit_ratio")
 
 def route_result(d):
-    _need(d,("schema","track","subroute","confidence","signals","capabilities","skill","next"))
-    if not isinstance(d["confidence"],(int,float)) or not 0 <= d["confidence"] <= 1: raise ValidationError("invalid confidence")
+    _need(d,("schema","signals","dimensions","unresolved","next","capabilities","leads","decision","commitment","skill"))
+    forbidden={"track","subroute","confidence","alternatives","score_semantics","conflict"}&set(d)
+    if forbidden: raise ValidationError("obsolete route v1 fields: %s; regenerate with `rat route <bin>`" % ", ".join(sorted(forbidden)))
     if not isinstance(d["signals"],list) or any(
         not isinstance(s,Mapping) or {"kind","value","quality"} - set(s) or s["quality"] not in {"fact","heuristic"}
         for s in d["signals"]): raise ValidationError("invalid signals")
@@ -173,49 +173,21 @@ def route_result(d):
     if d["skill"] is not None and not isinstance(d["skill"],str): raise ValidationError("invalid skill")
     if not isinstance(d["next"],list) or any(
         not isinstance(n,Mapping) or {"query","target"} - set(n) for n in d["next"]): raise ValidationError("invalid next")
-    if "conflict" in d and not isinstance(d["conflict"],bool): raise ValidationError("invalid conflict")
-    if "leads" in d and (not isinstance(d["leads"],list)
-                         or any(not isinstance(x,str) or not x for x in d["leads"])
-                         or len(set(d["leads"])) != len(d["leads"])):
+    if (not isinstance(d["leads"],list) or any(not isinstance(x,str) or not x for x in d["leads"])
+        or len(set(d["leads"])) != len(d["leads"])):
         raise ValidationError("invalid non-exclusive route leads")
-    if "alternatives" in d:
-        if not isinstance(d["alternatives"],list): raise ValidationError("invalid alternatives")
-        for alt in d["alternatives"]:
-            if not isinstance(alt,Mapping) or {"track","subroute","confidence"} - set(alt):
-                raise ValidationError("invalid alternative shape")
-            if not isinstance(alt["confidence"],(int,float)) or not 0 <= alt["confidence"] <= 1:
-                raise ValidationError("invalid alternative confidence")
-    has_alts = bool(d.get("alternatives"))
-    if d.get("conflict") is True and not has_alts:
-        raise ValidationError("conflict requires non-empty alternatives")
-    if has_alts and d.get("conflict") is not True:
-        raise ValidationError("alternatives require conflict true")
-
-    # Active-triage fields are optional so historical rat.route-result/v1 rows
-    # remain readable. Once a producer emits the overlay, validate it as a
-    # coherent commitment gate rather than accepting arbitrary extra metadata.
-    if "commitment" in d:
-        if d["commitment"] not in {"committed","provisional","unknown"}:
-            raise ValidationError("invalid route commitment")
-        if d["commitment"] != "committed" and d["skill"] is not None:
-            raise ValidationError("non-committed route cannot lock a skill")
-        if d.get("conflict") is True and d["commitment"] != "provisional":
-            raise ValidationError("conflicting route must remain provisional")
-    if "dimensions" in d:
-        dims = d["dimensions"]
-        fields = {"vulnerability_surfaces","program_shapes","obstacles","constraints"}
-        if not isinstance(dims,Mapping) or set(dims) != fields:
-            raise ValidationError("invalid route dimensions")
-        if any(not isinstance(dims[name],list) or any(not isinstance(v,str) for v in dims[name]) for name in fields):
-            raise ValidationError("invalid route dimension values")
-    if "unresolved" in d and (not isinstance(d["unresolved"],list) or any(not isinstance(v,str) for v in d["unresolved"])):
+    if d["commitment"] not in {"committed","provisional","unknown"}: raise ValidationError("invalid route commitment")
+    if d["commitment"] != "committed" and d["skill"] is not None: raise ValidationError("non-committed route cannot lock a skill")
+    dims=d["dimensions"]; fields={"vulnerability_surfaces","program_shapes","obstacles","constraints"}
+    if not isinstance(dims,Mapping) or set(dims)!=fields: raise ValidationError("invalid route dimensions")
+    if any(not isinstance(dims[n],list) or any(not isinstance(v,str) for v in dims[n]) for n in fields): raise ValidationError("invalid route dimension values")
+    if not isinstance(d["unresolved"],list) or any(not isinstance(v,str) for v in d["unresolved"]):
         raise ValidationError("invalid route unresolved")
-    if "score_semantics" in d and d["score_semantics"] != "heuristic-rank-not-probability":
-        raise ValidationError("invalid route score semantics")
-    overlay_fields = {"commitment","dimensions","unresolved","score_semantics"}
-    present = overlay_fields & set(d)
-    if present and present != overlay_fields:
-        raise ValidationError("active-triage route overlay must be complete")
+    for action in d["next"]:
+        if not isinstance(action,Mapping) or {"query","target","evidence","rule"}-set(action): raise ValidationError("invalid route action")
+    decision=d["decision"]
+    if decision is not None and (not isinstance(decision,Mapping) or {"action","target","evidence","rule"}-set(decision)): raise ValidationError("invalid route decision")
+    if decision is None and d["commitment"]!="unknown": raise ValidationError("missing decision requires unknown commitment")
 
 _QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
 def query_result(d):
@@ -245,7 +217,7 @@ def brief_card(d):
 
 _BENCH_OUTCOMES = {"route-miss","solved","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
 def bench_result(d):
-    _need(d,("schema","mode","run_id","id","track","outcome","wall_ms"))
+    _need(d,("schema","mode","run_id","id","outcome","wall_ms"))
     if d["mode"] not in {"A","B"}: raise ValidationError("invalid bench mode")
     if d["outcome"] not in _BENCH_OUTCOMES: raise ValidationError("invalid bench outcome")
     if not isinstance(d["wall_ms"],int) or d["wall_ms"] < 0: raise ValidationError("invalid wall_ms")

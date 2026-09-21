@@ -56,12 +56,9 @@ def _render_route_text(doc):
         return "ROUTE       error (%s)" % doc["error"].get("message")
     skill = doc.get("skill")
     skill_line = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else (skill or "-")
-    lines = ["ROUTE       %s" % doc.get("subroute"),
-              "COMMITMENT  %s" % doc.get("commitment", "legacy"),
-              "CONFIDENCE  %.2f (%s)" % ((doc.get("confidence") or 0.0), doc.get("score_semantics", "legacy")),
-              "SKILL       %s" % skill_line]
-    if doc.get("conflict"):
-        lines.append("CONFLICT    yes")
+    decision = doc.get("decision") or {}
+    lines = ["DECISION    %s %s" % (decision.get("action", "-"), decision.get("target", "")),
+             "COMMITMENT  %s" % doc.get("commitment", "unknown"), "SKILL       %s" % skill_line]
     dimensions = doc.get("dimensions") or {}
     if dimensions:
         lines += ["", "DIMENSIONS"]
@@ -78,10 +75,6 @@ def _render_route_text(doc):
     leads = doc.get("leads") or []
     if leads:
         lines += ["", "COEXISTING LEADS"] + ["  %s" % name for name in leads]
-    alternatives = doc.get("alternatives") or []
-    if alternatives:
-        lines += ["", "ALTERNATIVES"] + ["  %s (confidence=%.2f)" % (a.get("subroute"), a.get("confidence") or 0.0)
-                                          for a in alternatives]
     nxt = doc.get("next") or []
     if nxt:
         lines += ["", "NEXT"] + _render_next(nxt)
@@ -135,12 +128,12 @@ def _print(doc, fmt):
         print(json.dumps(doc, sort_keys=True, ensure_ascii=False))
         return
     schema = doc.get("schema")
-    if schema == "rat.route-result/v1":
+    if schema == "rat.route-result/v2":
         print(_render_route_text(doc))
     elif schema == "rat.query-result/v1":
         print(_render_graph_text(doc) if doc.get("query") == "graph" and doc.get("status") != "error" else _render_query_text(doc))
     else:
-        label = doc.get("query") or doc.get("subroute") or doc.get("schema")
+        label = doc.get("query") or doc.get("schema")
         status = doc.get("status") or ("stuck" if doc.get("governor", {}).get("stuck") else "ok")
         print("%s: %s" % (label, status))
 
@@ -275,14 +268,9 @@ def _record_route_assessment(state_dir, source, result):
     The fingerprint excludes timing and capabilities so repeated identical
     assessments collapse cleanly when metrics count route revisions.
     """
-    core = {
-        "track": result.get("track"), "subroute": result.get("subroute"),
-        "confidence": result.get("confidence"), "commitment": result.get("commitment"),
-        "conflict": bool(result.get("conflict")),
-        "alternatives": [a.get("subroute") for a in result.get("alternatives", []) or []],
-        "leads": result.get("leads", []),
-        "skill": result.get("skill"), "dimensions": result.get("dimensions", {}),
-    }
+    core = {"decision": result.get("decision"), "commitment": result.get("commitment"),
+            "leads": result.get("leads", []), "skill": result.get("skill"),
+            "dimensions": result.get("dimensions", {}), "unresolved": result.get("unresolved", [])}
     fingerprint = _canonical_digest(core)
     Stream(state_dir).append("note.recorded", {
         "note_id": "route-assessment-" + fingerprint.split(":", 1)[1][:16],
@@ -325,9 +313,7 @@ def cmd_route(args):
     binary = args.binary
     bad = _check_binary(binary)
     if bad:
-        # Still a fully schema-conformant rat.route-result/v1 document -- the
-        # "error" field carries the diagnostic without leaving the required
-        # track/subroute/confidence/signals/capabilities/skill/next fields out.
+        # Keep errors in the v2 envelope so callers never need a second shape.
         result = route_fn()
         result["error"] = bad
         return _emit(result, EXIT_INPUT, args.format)
@@ -353,7 +339,7 @@ def cmd_route(args):
     result["capabilities"] = {**result["capabilities"], **caps}
     state_dir = _state_dir(binary)
     _record_route_assessment(state_dir, "route", result)
-    novelty_key = {"track": result["track"], "subroute": result["subroute"],
+    novelty_key = {"decision": result.get("decision"), "dimensions": result.get("dimensions"),
                    "commitment": result.get("commitment"),
                    "signals": [s["value"] for s in result["signals"]]}
     result = _governor_wrap(state_dir, "route", novelty_key, result)
@@ -440,12 +426,11 @@ def _render_brief_text(card):
     caps = card["capabilities"]
     L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
     r = card["route"]
-    L += ["", "ROUTE       %s / %s (conf %.2f)" % (r.get("track"), r.get("subroute"), r.get("confidence") or 0.0),
-          "COMMITMENT  %s" % r.get("commitment", "legacy")]
+    decision = r.get("decision") or {}
+    L += ["", "DECISION    %s %s" % (decision.get("action", "-"), decision.get("target", "")),
+          "COMMITMENT  %s" % r.get("commitment", "unknown")]
     if card.get("skill_path"):
         L.append("SKILL       %s" % card["skill_path"])
-    if r.get("conflict"):
-        L.append("CONFLICT    yes -> %s" % ", ".join(a.get("subroute") for a in r.get("alternatives", [])))
     if r.get("leads"):
         L.append("LEADS       " + ", ".join(r["leads"]))
     unresolved = r.get("unresolved") or []
@@ -455,17 +440,19 @@ def _render_brief_text(card):
     if nxt:
         L += ["NEXT        " + "; ".join("%s %s" % (n.get("query", ""), n.get("target") or "") for n in nxt)]
     ts = card["track_summary"]
-    if "protections" in ts:
-        L += ["", "PROTECTIONS " + (", ".join("%s=%s" % (k, v) for k, v in ts["protections"].items()) or "-"),
-              "SINKS       " + (", ".join(ts["sinks"]) or "-")]
-    if "top_interesting" in ts:
+    pwn = ts.get("pwn") or {}
+    rev = ts.get("rev") or {}
+    if pwn:
+        L += ["", "PROTECTIONS " + (", ".join("%s=%s" % (k, v) for k, v in pwn.get("protections", {}).items()) or "-"),
+              "SINKS       " + (", ".join(pwn.get("sinks", [])) or "-")]
+    if rev:
         L += ["", "INTERESTING"]
-        for it in ts["top_interesting"]:
+        for it in rev.get("top_interesting", []):
             L.append("  %-20s score=%s" % (it.get("func"), it.get("score")))
-        if ts.get("evasion"):
-            L.append("EVASION     " + "; ".join(ts["evasion"]))
-        if ts.get("platform") and ts["platform"] != "elf":
-            L.append("PLATFORM    %s" % ts["platform"])
+        if rev.get("evasion"):
+            L.append("EVASION     " + "; ".join(rev["evasion"]))
+        if rev.get("platform"):
+            L.append("PLATFORM    %s" % rev["platform"])
     libc = card["libc"]
     if libc.get("supplied"):
         if libc.get("reference_match"):
@@ -551,13 +538,13 @@ def cmd_brief(args):
     route["capabilities"] = {**route.get("capabilities", {}), **caps}
     state_dir = _state_dir(binary)
     _record_route_assessment(state_dir, "brief", route)
-    novelty_key = {"track": route["track"], "subroute": route["subroute"],
+    novelty_key = {"decision": route.get("decision"), "dimensions": route.get("dimensions"),
                    "commitment": route.get("commitment"),
                    "signals": [s["value"] for s in route["signals"]]}
     route = _governor_wrap(state_dir, "brief", novelty_key, route)
     skill = route.get("skill")
     skill_path = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else None
-    track_summary = _pwn_summary(profile) if route.get("track") == "pwn" else _rev_summary(rev, interesting)
+    track_summary = {"pwn": _pwn_summary(profile), "rev": _rev_summary(rev, interesting)}
     libc = _libc_match(os.path.dirname(os.path.realpath(binary)), args.libc)
     card = {
         "schema": "rat.brief-card/v1", "binary": os.path.relpath(binary) if not os.path.isabs(binary) else binary,
@@ -587,7 +574,7 @@ def cmd_brief(args):
         json_render = lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         _bound_brief_to_budget(card, args.budget_tokens,
                                render=json_render if args.format == "json" else _render_brief_text)
-    validate(card["route"], "rat.route-result/v1")
+    validate(card["route"], "rat.route-result/v2")
     validate(card, "rat.brief-card/v1")
     if args.format == "json":
         print(json.dumps(card, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
@@ -654,7 +641,8 @@ def cmd_query_func(args):
     budget = args.budget_bytes
     kept, truncated, omit = truncate_lists_sharing_budget(
         [("callers", card["facts"]["callers"]), ("callees", card["facts"]["callees"]),
-         ("strings", card["facts"]["strings"])], budget)
+         ("strings", card["facts"]["strings"]), ("call_sites", card["facts"]["call_sites"]),
+         ("compare_sites", card["facts"]["compare_sites"])], budget)
     callers_omit, callees_omit, strings_omit = omit["callers"], omit["callees"], omit["strings"]
     facts = {**card["facts"], **kept}
     unresolved = card["unresolved"]
@@ -667,7 +655,8 @@ def cmd_query_func(args):
                            heuristics={**card["heuristics"], "next": card["next"]}, artifacts=[],
                            coverage={"complete": not (unresolved or truncated), "scope": query,
                                      "omitted": {"unresolved": [u["kind"] for u in unresolved],
-                                                 "truncated_counts": {"callers": callers_omit, "callees": callees_omit, "strings": strings_omit}}},
+                                                 "truncated_counts": {"callers": callers_omit, "callees": callees_omit, "strings": strings_omit,
+                                                                      "call_sites": omit["call_sites"], "compare_sites": omit["compare_sites"]}}},
                            diagnostics=diagnostics,
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
@@ -843,11 +832,11 @@ def cmd_cache_stats(args):
 
 def cmd_selftest(_args=None):
     r = route_fn(profile={"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
-    assert r["subroute"] == "pwn-rop", r
+    assert "stack-overwrite-candidate" in r["dimensions"]["vulnerability_surfaces"], r
     assert r["commitment"] == "provisional" and r["skill"] is None, r
-    validate(r, "rat.route-result/v1")
+    validate(r, "rat.route-result/v2")
     pwn_card = project_pwn_capability({"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
-    assert pwn_card["heuristics"]["candidate_routes"][0]["subroute"] == "pwn-rop", pwn_card
+    assert "pwn-rop" in pwn_card["heuristics"]["leads"], pwn_card
     assert "verified_primitive" not in pwn_card["facts"], pwn_card
     q = _query_envelope("selftest", status="ok", facts={}, heuristics={}, artifacts=[],
                          coverage={"complete": True, "scope": "selftest", "omitted": None},
@@ -857,8 +846,10 @@ def cmd_selftest(_args=None):
          "oldest_produced_at": None, "newest_produced_at": None}
     validate(c, "rat.cache-stats/v1")
     b = {"schema": "rat.brief-card/v1", "binary": "x", "binary_sha256": None,
-         "capabilities": {"angr": False}, "route": {"track": "pwn", "subroute": "pwn-stack", "confidence": 0.6},
-         "skill_path": None, "track_summary": {"protections": {}, "sinks": []},
+         "capabilities": {"angr": False}, "route": r,
+         "skill_path": None,
+         "track_summary": {"pwn": {"protections": {}, "sinks": []},
+                           "rev": {"top_interesting": [], "evasion": [], "platform": "elf"}},
          "libc": {"supplied": None}, "budget_tokens": 1500, "truncated": [],
          "side_effects": ["route-assessment + governor.checked appended"]}
     validate(b, "rat.brief-card/v1")

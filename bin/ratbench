@@ -22,7 +22,7 @@ do not depend on agent-authored telemetry.
   ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
   ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
                 [--model-id ID] [--reasoning-effort LABEL]
-  ratbench report [--schema legacy|v2]
+  ratbench report [--schema legacy|v3]
   ratbench selftest
 """
 import argparse
@@ -73,7 +73,7 @@ def _select_entries(args):
 
 def _selected_suite_doc(entries):
     """Canonical identity document for the exact post-filter execution set."""
-    return {"schema": "rat.bench-suite/v1", "entries": list(entries)}
+    return {"schema": "rat.bench-suite/v2", "entries": list(entries)}
 
 
 def _command_digest(command):
@@ -162,8 +162,16 @@ def _check_route(entry):
         fx = json.load(fh)
     result = route_mod.route(profile=fx.get("profile"), revq=fx.get("revq"),
                              interesting=fx.get("interesting"))
-    got = result.get("subroute")
-    return got == entry["expected_route"], got, result.get("track")
+    expected = entry["expected"]
+    checks = []
+    for name, values in (expected.get("dimensions") or {}).items():
+        checks.append(set(values) <= set((result.get("dimensions") or {}).get(name, [])))
+    if "leads" in expected: checks.append(set(expected["leads"]) <= set(result.get("leads", [])))
+    if "action" in expected: checks.append((result.get("decision") or {}).get("action") == expected["action"])
+    if "commitment" in expected: checks.append(result.get("commitment") == expected["commitment"])
+    observed = {"dimensions": result.get("dimensions"), "leads": result.get("leads"),
+                "action": (result.get("decision") or {}).get("action"), "commitment": result.get("commitment")}
+    return all(checks), observed
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +260,7 @@ def cmd_run(args):
     print("== ratbench Mode A: %s (%d entries) ==" % (run_id, len(entries)))
     for e in entries:
         t0 = time.time()
-        route_ok, got_route, got_track = _check_route(e)
+        route_ok, observed = _check_route(e)
         binpath = _compile(e, workdir)
         vstatus, vdetail = _verify(e, binpath)
         elapsed_ms = int((time.time() - t0) * 1000)
@@ -267,10 +275,10 @@ def cmd_run(args):
         if outcome in ("route-miss", "verify-fail"):
             n_fail += 1
         rec = {
-            "schema": "rat.bench-result/v1", "mode": "A", "run_id": run_id,
-            "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+            "schema": "rat.bench-result/v2", "mode": "A", "run_id": run_id,
+            "id": e["id"], "difficulty": e.get("difficulty"),
             "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
-            "expected_route": e["expected_route"], "got_route": got_route, "got_track": got_track,
+            "expected": e["expected"], "observed": observed,
             "route_ok": route_ok, "verify": {"kind": e["verify"]["kind"], "status": vstatus, "detail": vdetail},
             "outcome": outcome, "wall_ms": elapsed_ms,
         }
@@ -278,11 +286,11 @@ def cmd_run(args):
         mark = {"solved": "OK  ", "route-ok-verify-skipped": "~   ",
                 "route-miss": "MISS", "verify-fail": "FAIL"}[outcome]
         print("  [%s] %-18s route=%s%s verify=%s (%s)" % (
-            mark, e["id"], got_route,
-            "" if route_ok else "!=%s" % e["expected_route"],
+            mark, e["id"], observed.get("action"),
+            "" if route_ok else "!=expected-conditions",
             vstatus, vdetail if vstatus != "pass" else "ok"))
     for rec in lines:
-        validate(rec, "rat.bench-result/v1")
+        validate(rec, "rat.bench-result/v2")
     with open(out_path, "w", encoding="utf-8") as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -456,7 +464,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
                       primitive_pass_at, artifact_count, process_metrics=None,
                       provenance=None, runtime_input_digest=None, routing_metrics=None):
-    """Build one honest Mode B `rat.benchmark-result/v2` record.
+    """Build one honest Mode B `rat.benchmark-result/v3` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
     metrics are populated only when an observer-owned execve trace was actually
@@ -518,7 +526,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       "compressed_output_size": None, "artifact_count": artifact_count},
     }
     doc = {
-        "schema": "rat.benchmark-result/v2",
+        "schema": "rat.benchmark-result/v3",
         "benchmark_run_id": run_id,
         "ablation_id": ablation_id,
         "challenge_id": entry["id"],
@@ -531,8 +539,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         "metrics": metrics,
         "oracle": {"kind": "completion-gate", "reason": completion.get("reason"),
                    "verification_id": verification_id},
-        "ground_truth": {"track": entry.get("track"), "difficulty": entry.get("difficulty"),
-                         "expected_route": entry.get("expected_route"),
+        "ground_truth": {"difficulty": entry.get("difficulty"), "expected": entry.get("expected"),
                          "verify_kind": (entry.get("verify") or {}).get("kind"),
                          "corpus": entry.get("corpus"),
                          "capabilities": entry.get("capabilities", []),
@@ -571,7 +578,7 @@ def cmd_eval(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, run_id + ".jsonl")
-    v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v2.jsonl")
+    v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v3.jsonl")
     lines = []
     v2_lines = []
     trace_enabled = _strace_usable()
@@ -620,8 +627,8 @@ def cmd_eval(args):
                 outcome = "solve-claimed"
             else:
                 outcome = "fail"
-            rec = {"schema": "rat.bench-result/v1", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
-                   "id": e["id"], "track": e["track"], "difficulty": e.get("difficulty"),
+            rec = {"schema": "rat.bench-result/v2", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
+                   "id": e["id"], "difficulty": e.get("difficulty"),
                    "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
                    "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
                    "typed_primitive_pass": typed_pass, "verified_solve": verified,
@@ -653,9 +660,9 @@ def cmd_eval(args):
         finally:
             shutil.rmtree(sandbox, ignore_errors=True)
     for rec in lines:
-        validate(rec, "rat.bench-result/v1")
+        validate(rec, "rat.bench-result/v2")
     for rec in v2_lines:
-        validate(rec, "rat.benchmark-result/v2")
+        validate(rec, "rat.benchmark-result/v3")
     with open(out_path, "w", encoding="utf-8") as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -663,7 +670,7 @@ def cmd_eval(args):
         for rec in v2_lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
     print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
-    print("-- benchmark v2 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
+    print("-- benchmark v3 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
     return 0
 
 
@@ -675,7 +682,7 @@ def _read_legacy_results(results_dir):
     if not os.path.isdir(results_dir):
         return rows
     for fn in sorted(os.listdir(results_dir)):
-        if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v2.jsonl"):
+        if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v3.jsonl"):
             continue
         with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
             for line in fh:
@@ -689,8 +696,8 @@ def _read_legacy_results(results_dir):
     return rows
 
 
-def _read_v2_results(results_dir):
-    """Read canonical v2 benchmark rows fail-closed.
+def _read_v3_results(results_dir):
+    """Read canonical v3 benchmark rows fail-closed.
 
     Measurement output is an evidence artifact: malformed JSON or a schema-invalid
     row must stop the report instead of being silently dropped and biasing rates.
@@ -699,7 +706,7 @@ def _read_v2_results(results_dir):
     if not os.path.isdir(results_dir):
         return rows
     for fn in sorted(os.listdir(results_dir)):
-        if not fn.endswith(".benchmark-v2.jsonl"):
+        if not fn.endswith(".benchmark-v3.jsonl"):
             continue
         path = os.path.join(results_dir, fn)
         with open(path, encoding="utf-8") as fh:
@@ -712,9 +719,9 @@ def _read_v2_results(results_dir):
                 except json.JSONDecodeError as exc:
                     raise ValueError("%s:%d invalid JSON: %s" % (fn, lineno, exc)) from exc
                 try:
-                    validate(row, "rat.benchmark-result/v2")
+                    validate(row, "rat.benchmark-result/v3")
                 except Exception as exc:
-                    raise ValueError("%s:%d invalid benchmark-v2 row: %s" % (fn, lineno, exc)) from exc
+                    raise ValueError("%s:%d invalid benchmark-v3 row: %s" % (fn, lineno, exc)) from exc
                 rows.append(row)
     return rows
 
@@ -735,15 +742,15 @@ def _assert_v2_run_provenance(rows):
 def cmd_report(args):
     results_dir = os.path.join(ctf_home(), "bench", "results")
     schema = getattr(args, "schema", "legacy")
-    if schema == "v2":
+    if schema == "v3":
         try:
-            rows = _read_v2_results(results_dir)
+            rows = _read_v3_results(results_dir)
             _assert_v2_run_provenance(rows)
         except (OSError, ValueError) as exc:
             print("[ratbench:err] %s" % exc, file=sys.stderr)
             return 3
         lb = _render_v2_leaderboard(rows)
-        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.v2.md")
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.v3.md")
     else:
         rows = _read_legacy_results(results_dir)
         lb = _render_leaderboard(rows)
@@ -815,12 +822,12 @@ def _metric_median(rows, group, name, *, suffix=""):
 
 
 def _render_v2_leaderboard(rows):
-    L = ["# ratbench benchmark-v2 leaderboard", "",
-         "> Generated by `ratbench report --schema v2` from `bench/results/*.benchmark-v2.jsonl`.",
+    L = ["# ratbench benchmark-v3 leaderboard", "",
+         "> Generated by `ratbench report --schema v3` from `bench/results/*.benchmark-v3.jsonl`.",
          "> Only `eligible=true` attempts enter solve-rate and metric medians. Metric cells include",
          "> measured coverage `(non-null/eligible)` so unavailable telemetry is never treated as zero.", ""]
     if not rows:
-        L.append("_(no benchmark-v2 results yet — run `ratbench eval ...`)_")
+        L.append("_(no benchmark-v3 results yet — run `ratbench eval ...`)_")
         return "\n".join(L) + "\n"
     runs = {}
     for row in rows:
@@ -861,10 +868,10 @@ def _selftest():
     ids = {e["id"] for e in suite["entries"]}
     chk({"stack-basic-01", "fmt-basic-01", "checker-basic-01"} <= ids, "suite: synthetic entries present")
     for e in suite["entries"]:
-        ok, got, _track = _check_route(e)
-        chk(ok, "route: %s -> %s (expected %s)" % (e["id"], got, e["expected_route"]))
-    bad = dict(suite["entries"][0]); bad["expected_route"] = "pwn-heap"
-    ok, _got, _t = _check_route(bad)
+        ok, got = _check_route(e)
+        chk(ok, "route: %s -> %s" % (e["id"], got))
+    bad = dict(suite["entries"][0]); bad["expected"] = {"leads":["impossible"]}
+    ok, _got = _check_route(bad)
     chk(not ok, "route: misassignment detected (negative test)")
     chk("bench" not in _RUNTIME_DIRS and "tests" not in _RUNTIME_DIRS and "fixtures" not in _RUNTIME_DIRS,
         "eval: runtime export allowlist excludes benchmark/test fixture trees")
@@ -892,9 +899,9 @@ def main(argv=None):
     ev.add_argument("--reasoning-effort", help="optional declarative reasoning-effort label recorded in provenance")
     ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
     ev.add_argument("--timeout", type=int, default=600)
-    rep = sub.add_parser("report", help="render a legacy or benchmark-v2 leaderboard from results")
+    rep = sub.add_parser("report", help="render a legacy or benchmark-v3 leaderboard from results")
     rep.add_argument("--suite")
-    rep.add_argument("--schema", choices=("legacy", "v2"), default="legacy")
+    rep.add_argument("--schema", choices=("legacy", "v3"), default="legacy")
     sub.add_parser("selftest", help="pure-logic regression")
     args = ap.parse_args(argv)
     if args.cmd == "run":

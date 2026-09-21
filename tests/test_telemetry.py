@@ -37,7 +37,7 @@ class ToolResultSchema(unittest.TestCase):
 class BenchmarkResultV2Schema(unittest.TestCase):
     def _valid(self):
         return {
-            "schema": "rat.benchmark-result/v2", "benchmark_run_id": "r1", "ablation_id": "A0",
+            "schema": "rat.benchmark-result/v3", "benchmark_run_id": "r1", "ablation_id": "A0",
             "challenge_id": "c1", "attempt": 1, "status": "completed", "eligible": True, "outcome": "verified",
             "started_at": "2026-08-23T00:00:00Z", "finished_at": "2026-08-23T00:01:00Z", "oracle": {}, "ground_truth": {},
             "metrics": {
@@ -227,33 +227,26 @@ class Aggregate(unittest.TestCase):
             self.assertEqual(m["indexed_artifacts_by_backend"].get("pwngadget"), 1)
 
     def test_route_metrics_surface_without_changing_existing_callers(self):
-        m = aggregate([], route_metrics={"first_route": "pwn-format",
-                                         "first_route_commitment": "provisional",
-                                         "first_route_conflict": True,
-                                         "first_route_candidate_count": 2,
+        m = aggregate([], route_metrics={"first_dimensions": {"vulnerability_surfaces":["format-string-candidate"]},
+                                         "first_action": {"action":"decomp"},
+                                         "first_commitment": "provisional",
                                          "route_assessment_count": 3,
-                                         "route_revision_count": 1,
+                                         "decision_revision_count": 1,
                                          "first_skill": "rev-checker"})
-        self.assertEqual(m["first_route"], "pwn-format")
-        self.assertEqual(m["first_route_commitment"], "provisional")
-        self.assertTrue(m["first_route_conflict"])
-        self.assertEqual(m["route_revision_count"], 1)
+        self.assertEqual(m["first_action"]["action"], "decomp")
+        self.assertEqual(m["first_commitment"], "provisional")
+        self.assertEqual(m["decision_revision_count"], 1)
         self.assertEqual(m["first_skill"], "rev-checker")
 
 class RouteAssessmentMetrics(unittest.TestCase):
-    def _append(self, stream, fingerprint, subroute, commitment, *, conflict=False,
-                alternatives=(), skill=None, source="route"):
+    def _append(self, stream, fingerprint, action, commitment, *, skill=None, source="route"):
         stream.append("note.recorded", {
             "note_id": "route-assessment-" + fingerprint,
             "kind": "route-assessment",
             "source": source,
             "fingerprint": "sha256:" + fingerprint * 64,
-            "track": "pwn" if subroute.startswith("pwn-") else "rev",
-            "subroute": subroute,
-            "confidence": 0.55,
             "commitment": commitment,
-            "conflict": conflict,
-            "alternatives": list(alternatives),
+            "decision": {"action": action, "target":"x","evidence":[],"rule":"test"},
             "skill": skill,
             "dimensions": {},
         })
@@ -261,37 +254,32 @@ class RouteAssessmentMetrics(unittest.TestCase):
     def test_empty_state_is_explicitly_unmeasured(self):
         with tempfile.TemporaryDirectory() as d:
             m = route_assessment_metrics(d)
-            self.assertIsNone(m["first_route"])
-            self.assertIsNone(m["first_route_commitment"])
+            self.assertIsNone(m["first_action"])
+            self.assertIsNone(m["first_commitment"])
             self.assertEqual(m["route_assessment_count"], 0)
-            self.assertEqual(m["route_revision_count"], 0)
+            self.assertEqual(m["decision_revision_count"], 0)
 
     def test_identical_reassessment_is_not_revision(self):
         with tempfile.TemporaryDirectory() as d:
             s = Stream(d)
-            self._append(s, "a", "pwn-format", "provisional", conflict=True,
-                         alternatives=["rev-checker"])
-            self._append(s, "a", "pwn-format", "provisional", conflict=True,
-                         alternatives=["rev-checker"], source="brief")
+            self._append(s, "a", "decomp", "provisional")
+            self._append(s, "a", "decomp", "provisional", source="brief")
             m = route_assessment_metrics(d)
-            self.assertEqual(m["first_route"], "pwn-format")
-            self.assertEqual(m["first_route_commitment"], "provisional")
-            self.assertTrue(m["first_route_conflict"])
-            self.assertEqual(m["first_route_candidate_count"], 2)
+            self.assertEqual(m["first_action"]["action"], "decomp")
+            self.assertEqual(m["first_commitment"], "provisional")
             self.assertEqual(m["route_assessment_count"], 2)
-            self.assertEqual(m["route_revision_count"], 0)
+            self.assertEqual(m["decision_revision_count"], 0)
             self.assertIsNone(m["first_skill"])
 
     def test_changed_fingerprint_counts_revision_and_first_committed_skill(self):
         with tempfile.TemporaryDirectory() as d:
             s = Stream(d)
-            self._append(s, "a", "pwn-format", "provisional", conflict=True,
-                         alternatives=["rev-checker"])
-            self._append(s, "b", "rev-checker", "committed", skill="rev-checker")
-            self._append(s, "b", "rev-checker", "committed", skill="rev-checker", source="brief")
+            self._append(s, "a", "decomp", "provisional")
+            self._append(s, "b", "rat query func", "committed", skill="rev-checker")
+            self._append(s, "b", "rat query func", "committed", skill="rev-checker", source="brief")
             m = route_assessment_metrics(d)
             self.assertEqual(m["route_assessment_count"], 3)
-            self.assertEqual(m["route_revision_count"], 1)
+            self.assertEqual(m["decision_revision_count"], 1)
             self.assertEqual(m["first_skill"], "rev-checker")
 
 class FirstPrimitivePassTs(unittest.TestCase):

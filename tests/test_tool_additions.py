@@ -64,10 +64,13 @@ class BriefGeneration(unittest.TestCase):
             "schema": "rat.brief-card/v1", "binary": "t",
             "binary_sha256": "sha256:" + "0" * 64,
             "capabilities": {"angr": True},
-            "route": {"track": "pwn", "subroute": "stack", "confidence": 0.9,
-                      "signals": [], "next": []},
-            "skill_path": "skills/pwn-stack/SKILL.md",
-            "track_summary": {"protections": {"elf.nx": True}, "sinks": ["gets"]},
+            "route": self.rat.route_fn(profile={"imports":["gets"]}),
+            "skill_path": None,
+            "track_summary": {
+                "pwn": {"protections": {"elf.nx": True}, "sinks": ["gets"]},
+                "rev": {"top_interesting": [{"func": "check", "score": 7}],
+                        "evasion": [], "platform": "elf"},
+            },
             "libc": {"supplied": None, "sha256": None, "reference_match": None, "match_method": None},
             "budget_tokens": None, "truncated": [], "side_effects": [],
         }
@@ -124,19 +127,39 @@ class BriefGeneration(unittest.TestCase):
         self.assertIn("unknown", txt)
         self.assertIn("pwnlibc", txt)
 
-    def test_render_conflict_lists_alternatives(self):
+    def test_render_lists_coexisting_leads(self):
         card = self._base_card()
-        card["route"]["conflict"] = True
-        card["route"]["alternatives"] = [{"track": "pwn", "subroute": "heap", "confidence": 0.6}]
+        card["route"]["leads"] = ["heap-lifetime", "stack-overwrite"]
         txt = self.rat._render_brief_text(card)
-        self.assertIn("CONFLICT", txt)
-        self.assertIn("heap", txt)
+        self.assertIn("LEADS", txt)
+        self.assertIn("heap-lifetime", txt)
+
+    def test_render_uses_nested_track_summaries(self):
+        txt = self.rat._render_brief_text(self._base_card())
+        self.assertIn("PROTECTIONS", txt)
+        self.assertIn("SINKS       gets", txt)
+        self.assertIn("INTERESTING", txt)
+        self.assertIn("check", txt)
+        self.assertIn("PLATFORM    elf", txt)
 
     # --- budget truncation: honest, re-checked --------------------------------
     def test_budget_large_no_truncation(self):
         card = self._base_card()
         self.rat._bound_brief_to_budget(card, 100000)
         self.assertEqual(card["truncated"], [])
+
+    def test_json_budget_preserves_nested_summaries_when_they_fit(self):
+        card = self._base_card()
+        render = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+        self.rat._bound_brief_to_budget(card, 100000, render=render)
+        encoded = json.loads(render(card))
+        self.assertEqual(encoded["track_summary"]["pwn"]["sinks"], ["gets"])
+        self.assertEqual(encoded["track_summary"]["rev"]["top_interesting"][0]["func"], "check")
+
+        tiny = self._base_card()
+        self.rat._bound_brief_to_budget(tiny, 1, render=render)
+        self.assertIn("track_summary", tiny["truncated"])
+        self.assertEqual(tiny["track_summary"], {"note": "trimmed for budget"})
 
     def test_budget_tiny_marks_over_budget(self):
         card = self._base_card()

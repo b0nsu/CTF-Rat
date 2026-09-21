@@ -1,11 +1,10 @@
 {
-  "schema": "rat.bench-suite/v1",
+  "schema": "rat.bench-suite/v2",
   "note": "Canonical benchmark manifest. Repository-authored synthetic fixtures are committed directly; explicitly redistributable real challenge binaries may be pinned here and materialized locally before Mode B. Private/non-redistributable material remains in ignored local suites.",
   "entries": [
     {
       "id": "stack-basic-01",
-      "track": "pwn",
-      "expected_route": "pwn-stack",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["stack-overwrite-candidate"]}, "leads": ["stack-overwrite"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 1,
       "corpus": "synthetic",
       "capabilities": ["stack-overflow", "no-canary"],
@@ -18,8 +17,7 @@
     },
     {
       "id": "fmt-basic-01",
-      "track": "pwn",
-      "expected_route": "pwn-format",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["format-string-candidate"]}, "leads": ["format-string"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 1,
       "corpus": "synthetic",
       "capabilities": ["format-string"],
@@ -32,8 +30,7 @@
     },
     {
       "id": "checker-basic-01",
-      "track": "rev",
-      "expected_route": "rev-checker",
+      "expected": {"dimensions": {"program_shapes": ["checker"]}, "leads": ["checker"], "action": "rat query func", "commitment": "provisional"},
       "difficulty": 1,
       "corpus": "synthetic",
       "capabilities": ["checker", "symbolic"],
@@ -46,8 +43,7 @@
     },
     {
       "id": "rop-nx-01",
-      "track": "pwn",
-      "expected_route": "pwn-rop",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["stack-overwrite-candidate"], "constraints": ["nx"]}, "leads": ["stack-overwrite"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 2,
       "corpus": "synthetic",
       "capabilities": ["stack-overflow", "nx", "rop"],
@@ -60,8 +56,7 @@
     },
     {
       "id": "heap-uaf-01",
-      "track": "pwn",
-      "expected_route": "pwn-heap",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["heap-lifetime-candidate"]}, "leads": ["heap-lifetime"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 2,
       "corpus": "synthetic",
       "capabilities": ["heap", "uaf"],
@@ -74,8 +69,7 @@
     },
     {
       "id": "heap-house-02",
-      "track": "pwn",
-      "expected_route": "pwn-heap",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["heap-lifetime-candidate"]}, "leads": ["heap-lifetime"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 3,
       "corpus": "synthetic",
       "capabilities": ["heap", "house-technique"],
@@ -88,8 +82,7 @@
     },
     {
       "id": "packed-upx-01",
-      "track": "rev",
-      "expected_route": "rev-packed",
+      "expected": {"dimensions": {"obstacles": ["packing"]}, "leads": ["packing"], "action": "gdbq", "commitment": "provisional"},
       "difficulty": 2,
       "corpus": "synthetic",
       "capabilities": ["packed", "upx"],
@@ -102,8 +95,7 @@
     },
     {
       "id": "vm-basic-01",
-      "track": "rev",
-      "expected_route": "rev-vm",
+      "expected": {"dimensions": {"program_shapes": ["vm-candidate"]}, "leads": ["vm"], "action": "solve/_template/rev/vmlift.py --disasm", "commitment": "provisional"},
       "difficulty": 2,
       "corpus": "synthetic",
       "capabilities": ["vm", "interpreter"],
@@ -116,8 +108,7 @@
     },
     {
       "id": "checker-xor-02",
-      "track": "rev",
-      "expected_route": "rev-checker",
+      "expected": {"dimensions": {"program_shapes": ["checker"]}, "leads": ["checker"], "action": "rat query func", "commitment": "provisional"},
       "difficulty": 2,
       "corpus": "synthetic",
       "capabilities": ["checker", "xor", "symbolic"],
@@ -130,8 +121,7 @@
     },
     {
       "id": "google-ctf-2017-inst-prof",
-      "track": "pwn",
-      "expected_route": "pwn-rop",
+      "expected": {"dimensions": {"vulnerability_surfaces": ["stack-overwrite-candidate"]}, "leads": ["stack-overwrite"], "action": "rat query pwn", "commitment": "provisional"},
       "difficulty": 3,
       "corpus": "real",
       "capabilities": ["jit", "short-instruction-window", "timing-side-channel", "pie"],
@@ -152,8 +142,7 @@
     },
     {
       "id": "google-ctf-2024-notobfuscated",
-      "track": "rev",
-      "expected_route": "rev-checker",
+      "expected": {"dimensions": {"program_shapes": ["checker"]}, "leads": ["checker"], "action": "rat query func", "commitment": "provisional"},
       "difficulty": 3,
       "corpus": "real",
       "capabilities": ["checker", "matrix-arithmetic", "optimized", "rc4", "stripped"],

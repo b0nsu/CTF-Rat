@@ -25,9 +25,8 @@ RATBENCH = _load_ratbench()
 
 ENTRY = {
     "id": "fixture-01",
-    "track": "pwn",
     "difficulty": 1,
-    "expected_route": "pwn-stack",
+    "expected": {"leads": ["stack-overwrite"], "action": "rat query pwn"},
     "corpus": "private",
     "capabilities": ["stack-overflow"],
     "redistributable": False,
@@ -38,8 +37,7 @@ ENTRY = {
 def _suite_entry(entry_id, corpus):
     return {
         "id": entry_id,
-        "track": "pwn",
-        "expected_route": "pwn-stack",
+        "expected": {"leads": ["stack-overwrite"], "action": "rat query pwn"},
         "difficulty": 1,
         "corpus": corpus,
         "capabilities": ["stack-overflow"],
@@ -67,12 +65,11 @@ def _provenance(*, timeout=600, command_digest=None):
 
 def _routing(**overrides):
     doc = {
-        "first_route": "pwn-stack",
-        "first_route_commitment": "provisional",
-        "first_route_conflict": False,
-        "first_route_candidate_count": 1,
+        "first_dimensions": {"vulnerability_surfaces": ["stack-overwrite-candidate"], "program_shapes": [], "obstacles": [], "constraints": []},
+        "first_action": {"action": "rat query pwn", "target": "x", "evidence": ["overflow-imports"], "rule": "x"},
+        "first_commitment": "provisional",
         "route_assessment_count": 2,
-        "route_revision_count": 1,
+        "decision_revision_count": 1,
         "first_skill": "pwn-stack",
     }
     doc.update(overrides)
@@ -83,7 +80,7 @@ class CorpusGateTests(unittest.TestCase):
     def _write_suite(self, directory, entries):
         path = os.path.join(directory, "suite.json")
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"schema": "rat.bench-suite/v1", "entries": entries}, fh)
+            json.dump({"schema": "rat.bench-suite/v2", "entries": entries}, fh)
         return path
 
     def test_select_entries_projects_one_corpus_before_execution(self):
@@ -151,7 +148,7 @@ class BenchmarkProvenanceTests(unittest.TestCase):
                 completion={"verified": False, "reason": "no-active-verification"},
                 events=[], primitive_pass_at=None, artifact_count=0, provenance=doc,
             )
-        }, "rat.benchmark-result/v2")
+        }, "rat.benchmark-result/v3")
 
 
 class ModeBV2RecordTests(unittest.TestCase):
@@ -174,8 +171,8 @@ class ModeBV2RecordTests(unittest.TestCase):
                              "ghidra_runs": 1, "symbolic_runs": 1},
             provenance=_provenance(), routing_metrics=_routing(),
         )
-        RATBENCH.validate(doc, "rat.benchmark-result/v2")
-        self.assertEqual(doc["schema"], "rat.benchmark-result/v2")
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertEqual(doc["schema"], "rat.benchmark-result/v3")
         self.assertEqual(doc["outcome"], "verified")
         self.assertTrue(doc["metrics"]["correctness"]["verified_solve"])
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
@@ -207,7 +204,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         )
         self.assertNotIn("provenance", doc)
         self.assertNotIn("routing", doc)
-        RATBENCH.validate(doc, "rat.benchmark-result/v2")
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
 
     def test_routing_projection_rejects_incoherent_revision_count(self):
         doc = RATBENCH._mode_b_v2_record(
@@ -217,16 +214,15 @@ class ModeBV2RecordTests(unittest.TestCase):
             agent_rc=1, flag_claimed=False,
             completion={"verified": False, "reason": "no-active-verification"},
             events=[], primitive_pass_at=None, artifact_count=0,
-            routing_metrics=_routing(route_assessment_count=1, route_revision_count=1),
+            routing_metrics=_routing(route_assessment_count=1, decision_revision_count=1),
         )
         with self.assertRaises(Exception):
-            RATBENCH.validate(doc, "rat.benchmark-result/v2")
+            RATBENCH.validate(doc, "rat.benchmark-result/v3")
 
     def test_empty_routing_projection_is_valid_and_does_not_fabricate_a_route(self):
         empty = {
-            "first_route": None, "first_route_commitment": None,
-            "first_route_conflict": None, "first_route_candidate_count": None,
-            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_dimensions": None, "first_action": None, "first_commitment": None,
+            "route_assessment_count": 0, "decision_revision_count": 0,
             "first_skill": None,
         }
         doc = RATBENCH._mode_b_v2_record(
@@ -238,7 +234,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             events=[], primitive_pass_at=None, artifact_count=0,
             routing_metrics=empty,
         )
-        RATBENCH.validate(doc, "rat.benchmark-result/v2")
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertEqual(doc["routing"], empty)
 
     def test_flag_without_completion_is_only_solve_claimed(self):
@@ -250,7 +246,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             completion={"verified": False, "reason": "no-active-verification"},
             events=[], primitive_pass_at=1787961604, artifact_count=0,
         )
-        RATBENCH.validate(doc, "rat.benchmark-result/v2")
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertEqual(doc["outcome"], "solve-claimed")
         self.assertFalse(doc["metrics"]["correctness"]["verified_solve"])
         self.assertTrue(doc["metrics"]["correctness"]["false_solved"])
@@ -265,7 +261,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             completion={"verified": False, "reason": "no-active-verification"},
             events=[], primitive_pass_at=None, artifact_count=0,
         )
-        RATBENCH.validate(doc, "rat.benchmark-result/v2")
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertEqual(doc["status"], "timeout")
         self.assertEqual(doc["outcome"], "censored")
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
@@ -278,11 +274,11 @@ class ModeBV2RecordTests(unittest.TestCase):
             os.makedirs(results)
             with open(os.path.join(results, "T.jsonl"), "w", encoding="utf-8") as fh:
                 fh.write(json.dumps({
-                    "schema": "rat.bench-result/v1", "run_id": "T", "mode": "B",
+                    "schema": "rat.bench-result/v2", "run_id": "T", "mode": "B",
                     "id": "fixture-01", "difficulty": 1, "route_ok": False, "outcome": "fail"
                 }) + "\n")
-            with open(os.path.join(results, "T.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
-                fh.write(json.dumps({"schema": "rat.benchmark-result/v2", "benchmark_run_id": "T"}) + "\n")
+            with open(os.path.join(results, "T.benchmark-v3.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"schema": "rat.benchmark-result/v3", "benchmark_run_id": "T"}) + "\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None)), 0)
             with open(os.path.join(d, "bench", "LEADERBOARD.md"), encoding="utf-8") as fh:
@@ -316,12 +312,12 @@ class ModeBV2RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "bench", "results")
             os.makedirs(results)
-            with open(os.path.join(results, "T.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+            with open(os.path.join(results, "T.benchmark-v3.jsonl"), "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(verified) + "\n")
                 fh.write(json.dumps(failed) + "\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
-                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 0)
-            with open(os.path.join(d, "bench", "LEADERBOARD.v2.md"), encoding="utf-8") as fh:
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v3")), 0)
+            with open(os.path.join(d, "bench", "LEADERBOARD.v3.md"), encoding="utf-8") as fh:
                 leaderboard = fh.read()
             self.assertIn("| T | A0 | 2 | 1 | 0 | 1 | 0 | 50.0% |", leaderboard)
             self.assertIn("5000ms (1/2)", leaderboard)
@@ -347,12 +343,12 @@ class ModeBV2RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "bench", "results")
             os.makedirs(results)
-            with open(os.path.join(results, "T.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+            with open(os.path.join(results, "T.benchmark-v3.jsonl"), "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(first) + "\n")
                 fh.write(json.dumps(second) + "\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
-                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 3)
-            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v2.md")))
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v3")), 3)
+            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v3.md")))
 
     def test_v2_report_rejects_mixed_provenance_across_ablations(self):
         first = RATBENCH._mode_b_v2_record(
@@ -378,11 +374,11 @@ class ModeBV2RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "bench", "results")
             os.makedirs(results)
-            with open(os.path.join(results, "bad.benchmark-v2.jsonl"), "w", encoding="utf-8") as fh:
+            with open(os.path.join(results, "bad.benchmark-v3.jsonl"), "w", encoding="utf-8") as fh:
                 fh.write("{}\n")
             with mock.patch.object(RATBENCH, "ctf_home", return_value=d), mock.patch("builtins.print"):
-                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v2")), 3)
-            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v2.md")))
+                self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v3")), 3)
+            self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v3.md")))
 
 
 if __name__ == "__main__":

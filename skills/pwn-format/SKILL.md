@@ -11,7 +11,7 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/format-string.md
 - Once a libc pointer is leaked, `pwnlibc identify --leak <sym>=0x...` to pin the libc + offsets deterministically (unknown → leak another symbol, do not guess).
 
 ## PIVOT
-- If `rat route` set `conflict: true`, a sibling pwn subroute matched the imports too — check its `alternatives` before committing (heap/format/overflow sinks can coexist).
+- Inspect every relevant entry in Router v2 `dimensions.vulnerability_surfaces` and `leads`; heap, format, and overwrite evidence may coexist without implying a conflict or rank.
 - The format argument is fixed/hardcoded (no actual injection) → re-route via `rat-profile`/`revq` signals to whatever the real primitive is (often `pwn-stack` or `pwn-heap`).
 - Leak succeeds but overwrite path needs a stack-smash instead of `%n` → `pwn-stack`.
 

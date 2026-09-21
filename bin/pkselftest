@@ -87,9 +87,14 @@ pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
 # T4 pwnkit snapscript + pwnclean --kv filter
 $VENV -c "import pwnkit;print(pwnkit.snapscript([('a','0x1')]).strip())" 2>/dev/null | grep -q 'SNAP a=' && ok "pwnkit.snapscript" || no "pwnkit.snapscript"
 printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/dev/null | grep -q 'SNAP r=0x401234' && ok "pwnclean --kv filter" || no "pwnclean --kv filter"
-# T5 pwnkit.run_batch (headless gdb 플러밍) — 심볼불요, 상수 SNAP
-B=$CTF_HOME/solve/heapnote_G/main
-if [ -f "$B" ]; then cp "$B" ./m; $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"; else skip "run_batch (테스트 바이너리 없음)"; fi
+# T5 pwnkit.run_batch (headless gdb plumbing) uses a stable repository fixture
+# rather than depending on an optional challenge binary.
+B=$CTF_HOME/tests/fixtures/pwn/stack_overflow.c
+if command -v cc >/dev/null 2>&1 && cc -fno-stack-protector -no-pie -O0 -o ./m "$B" 2>/dev/null; then
+  $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"
+else
+  skip "run_batch (cc/fixture dependency 없음)"
+fi
 # T6 pkshare HANDOFF 생성 + strict 구조 검사
 mkdir -p artifact
 printf 'fixture\n' > artifact/input.bin
@@ -122,7 +127,14 @@ printf 'from pwn import *\nio = process("./m")\n' > ./solve_local.py
 # T12 local cyclic crash/core collection; it remains candidate evidence, never a primitive PASS.
 if command -v cc >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1; then
   cc -fno-stack-protector -no-pie -O0 -o ./crash_fixture "$CTF_HOME/tests/fixtures/pwn/stack_overflow.c" 2>/dev/null
-  "$CTF_HOME/bin/pwncrash" ./crash_fixture --pattern-length 128 --repetitions 1 --json 2>/dev/null | grep -q '"verdict": "crash-reproduced"' && ok "pwncrash local core" || no "pwncrash local core"
+  PCRASH_OUT=$("$CTF_HOME/bin/pwncrash" ./crash_fixture --pattern-length 128 --repetitions 1 --json 2>&1)
+  if printf '%s' "$PCRASH_OUT" | grep -q '"verdict": "crash-reproduced"'; then
+    ok "pwncrash local core"
+  elif printf '%s' "$PCRASH_OUT" | grep -Eq 'PTRACE_GETREGS|ptrace.*Operation not permitted'; then
+    skip "pwncrash (container ptrace unavailable)"
+  else
+    no "pwncrash local core"
+  fi
 else
   skip "pwncrash (cc/gdb dependency 없음)"
 fi

@@ -28,8 +28,7 @@ def _entry(claim_pattern=None):
         verify["claim_pattern"] = claim_pattern
     return {
         "id": "claim-pattern-01",
-        "track": "rev",
-        "expected_route": "rev-checker",
+        "expected": {"dimensions":{"program_shapes":["checker"]},"leads":["checker"],"action":"rat query func"},
         "difficulty": 1,
         "corpus": "private",
         "capabilities": ["checker"],
@@ -55,7 +54,7 @@ class ClaimPatternTests(unittest.TestCase):
         self.assertFalse(RATBENCH._flag_claimed(entry, "FLAG{different-format}"))
 
     def test_invalid_claim_pattern_fails_suite_preflight(self):
-        doc = {"schema": "rat.bench-suite/v1", "entries": [_entry("[")]}
+        doc = {"schema": "rat.bench-suite/v2", "entries": [_entry("[")]}
         with self.assertRaisesRegex(SuiteValidationError, "verify.claim_pattern is invalid"):
             validate_suite(doc)
 

@@ -76,7 +76,7 @@ class PwnQueryRealElf(unittest.TestCase):
             self.assertIn(doc["status"], ("ok", "partial"))
             self.assertIn("read", doc["facts"]["sinks"]["overflow_bounded"])
             self.assertIn("printf", doc["facts"]["sinks"]["format"])
-            self.assertIn("candidate_routes", doc["heuristics"])
+            self.assertIn("leads", doc["heuristics"])
             self.assertNotIn("verified_primitive", doc["facts"])
             self.assertEqual(doc["facts"]["sink_counts"]["format"], 1)
 

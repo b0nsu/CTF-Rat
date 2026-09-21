@@ -17,9 +17,8 @@ import sys
 from collections.abc import Mapping
 from urllib.parse import urlparse
 
-SCHEMA = "rat.bench-suite/v1"
+SCHEMA = "rat.bench-suite/v2"
 CORPORA = {"synthetic", "integration", "real", "private"}
-TRACKS = {"pwn", "rev"}
 VERIFY_KINDS = {"flag-regex", "symsolve-restore", "rat-verify-pass"}
 _CAPABILITY = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _GIT_BLOB_SHA1 = re.compile(r"[0-9a-fA-F]{40}\Z")
@@ -58,10 +57,19 @@ def validate_suite(doc):
             raise SuiteValidationError("duplicate benchmark entry id: %s" % entry_id)
         seen.add(entry_id)
 
-        if entry.get("track") not in TRACKS:
-            raise SuiteValidationError("%s.track must be pwn or rev" % entry_id)
-        if not isinstance(entry.get("expected_route"), str) or not entry["expected_route"]:
-            raise SuiteValidationError("%s.expected_route is required" % entry_id)
+        expected = entry.get("expected")
+        if not isinstance(expected, Mapping):
+            raise SuiteValidationError("%s.expected is required" % entry_id)
+        allowed = {"dimensions", "leads", "action", "commitment"}
+        if set(expected) - allowed or not expected:
+            raise SuiteValidationError("%s.expected has unsupported or empty conditions" % entry_id)
+        if "dimensions" in expected and (not isinstance(expected["dimensions"], Mapping)
+                or any(not isinstance(v, list) or any(not isinstance(x, str) for x in v)
+                       for v in expected["dimensions"].values())):
+            raise SuiteValidationError("%s.expected.dimensions is invalid" % entry_id)
+        if "leads" in expected and (not isinstance(expected["leads"], list)
+                or any(not isinstance(x, str) for x in expected["leads"])):
+            raise SuiteValidationError("%s.expected.leads is invalid" % entry_id)
         difficulty = entry.get("difficulty")
         if not isinstance(difficulty, int) or isinstance(difficulty, bool) or difficulty < 1:
             raise SuiteValidationError("%s.difficulty must be a positive integer" % entry_id)

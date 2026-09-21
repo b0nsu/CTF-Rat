@@ -184,9 +184,8 @@ def route_assessment_metrics(state_dir):
         events = Stream(state_dir).read()
     except (OSError, ValueError):
         return {
-            "first_route": None, "first_route_commitment": None,
-            "first_route_conflict": None, "first_route_candidate_count": None,
-            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_dimensions": None, "first_action": None, "first_commitment": None,
+            "route_assessment_count": 0, "decision_revision_count": 0,
             "first_skill": None,
         }
     rows = []
@@ -199,9 +198,8 @@ def route_assessment_metrics(state_dir):
         rows.append(payload)
     if not rows:
         return {
-            "first_route": None, "first_route_commitment": None,
-            "first_route_conflict": None, "first_route_candidate_count": None,
-            "route_assessment_count": 0, "route_revision_count": 0,
+            "first_dimensions": None, "first_action": None, "first_commitment": None,
+            "route_assessment_count": 0, "decision_revision_count": 0,
             "first_skill": None,
         }
     first = rows[0]
@@ -213,15 +211,12 @@ def route_assessment_metrics(state_dir):
             revisions += 1
         previous = current
     first_skill = next((row.get("skill") for row in rows if row.get("skill")), None)
-    alternatives = first.get("alternatives") or []
-    leads = first.get("leads") or []
     return {
-        "first_route": first.get("subroute"),
-        "first_route_commitment": first.get("commitment"),
-        "first_route_conflict": bool(first.get("conflict")),
-        "first_route_candidate_count": 1 + len(set(alternatives) | set(leads)),
+        "first_dimensions": first.get("dimensions"),
+        "first_action": first.get("decision"),
+        "first_commitment": first.get("commitment"),
         "route_assessment_count": len(rows),
-        "route_revision_count": revisions,
+        "decision_revision_count": revisions,
         "first_skill": first_skill,
     }
 
@@ -382,12 +377,11 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
         "revq_runs": revq_runs,
         "duration_ms_total": duration_total,
         "indexed_artifacts_by_backend": dict(index_backend_counts) if index_backend_counts else {},
-        "first_route": route_metrics.get("first_route"),
-        "first_route_commitment": route_metrics.get("first_route_commitment"),
-        "first_route_conflict": route_metrics.get("first_route_conflict"),
-        "first_route_candidate_count": route_metrics.get("first_route_candidate_count"),
+        "first_dimensions": route_metrics.get("first_dimensions"),
+        "first_action": route_metrics.get("first_action"),
+        "first_commitment": route_metrics.get("first_commitment"),
         "route_assessment_count": route_metrics.get("route_assessment_count", 0),
-        "route_revision_count": route_metrics.get("route_revision_count", 0),
+        "decision_revision_count": route_metrics.get("decision_revision_count", 0),
         "first_skill": route_metrics.get("first_skill"),
     }
 
