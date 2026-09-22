@@ -384,7 +384,7 @@ class ModeBV2RecordTests(unittest.TestCase):
             ENTRY, run_id="B-test", ablation_id="A2",
             started_at="2026-08-29T00:00:00+00:00",
             finished_at="2026-08-29T00:10:00+00:00",
-            agent_rc=124, flag_claimed=False,
+            agent_rc=124, timed_out=True, flag_claimed=False,
             completion={"verified": False, "reason": "no-active-verification"},
             events=[], primitive_pass_at=None, artifact_count=0,
         )
@@ -408,7 +408,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         nonzero = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=2, **base)
         no_gate = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=0, **base)
         timed_out_claim = RATBENCH._mode_b_v2_record(
-            ENTRY, agent_rc=124, **{**base, "flag_claimed": True})
+            ENTRY, agent_rc=124, timed_out=True, **{**base, "flag_claimed": True})
         for row in (nonzero, no_gate, timed_out_claim):
             RATBENCH.validate(row, "rat.benchmark-result/v3")
             self.assertFalse(row["metrics"]["correctness"]["verified_solve"])

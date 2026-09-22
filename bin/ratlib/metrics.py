@@ -13,6 +13,41 @@ from .artifact import get as artifact_get
 from .completion import completion_gate
 from .state_v2 import Stream
 
+def _readable_tool_result(doc):
+    """Check fields consumed by telemetry; retain historical partial envelopes.
+
+    This is a reader boundary, not current-schema validation. In particular,
+    summary may be any JSON value and old tool_name-only records remain readable.
+    """
+    if not isinstance(doc, dict) or doc.get("schema") != "rat.tool-result/v1":
+        return False
+    for key in ("tool", "provenance", "parameters"):
+        if key in doc and not isinstance(doc[key], dict):
+            return False
+    tool = doc.get("tool", {})
+    if "name" in tool and not isinstance(tool["name"], str):
+        return False
+    if "tool_name" in doc and not isinstance(doc["tool_name"], str):
+        return False
+    provenance = doc.get("provenance", {})
+    for key in ("cache", "dependency_versions"):
+        if key in provenance and not isinstance(provenance[key], dict):
+            return False
+    inputs = doc.get("inputs", [])
+    if not isinstance(inputs, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("digest", ""), str)
+            for item in inputs):
+        return False
+    duration = doc.get("duration_ms", 0)
+    return isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0
+
+
+def _tool_name(doc):
+    """tool.name is canonical; tool_name is a legacy projection fallback."""
+    name = (doc.get("tool") or {}).get("name") or doc.get("tool_name")
+    return name if isinstance(name, str) and name else "(unattributed)"
+
+
 def iter_tool_results(root):
     meta_base = os.path.join(root, "metadata", "sha256")
     if not os.path.isdir(meta_base):
@@ -29,13 +64,13 @@ def iter_tool_results(root):
                     rec = json.load(f)
             except (OSError, ValueError):
                 continue
-            if rec.get("kind") != "tool-result":
+            if not isinstance(rec, dict) or rec.get("kind") != "tool-result":
                 continue
             try:
                 doc = json.loads(artifact_get(rec["digest"], root=root))
             except Exception:
                 continue
-            if doc.get("schema") == "rat.tool-result/v1":
+            if _readable_tool_result(doc):
                 yield doc
 
 def operation_fingerprint(doc):
@@ -176,9 +211,7 @@ def benchmark_envelope_observations(store_root):
     session = aggregate(docs)
     grouped = {}
     for doc in docs:
-        name = doc.get("tool_name") or (doc.get("tool") or {}).get("name")
-        if not isinstance(name, str) or not name:
-            name = "(unattributed)"
+        name = _tool_name(doc)
         grouped.setdefault(name, []).append(doc)
     by_tool = {}
     for name in sorted(grouped):
@@ -192,7 +225,10 @@ def benchmark_envelope_observations(store_root):
         }
     captured_bytes = 0
     for doc in docs:
-        summary = doc.get("summary") or {}
+        summary = doc.get("summary")
+        if not isinstance(summary, dict):
+            captured_bytes = None
+            break
         stdout_bytes, stderr_bytes = summary.get("stdout_bytes"), summary.get("stderr_bytes")
         if any(not isinstance(n, int) or isinstance(n, bool) or n < 0
                for n in (stdout_bytes, stderr_bytes)):
@@ -397,7 +433,7 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
             if fp in seen_fingerprints:
                 duplicate += 1
             seen_fingerprints[fp] = seen_fingerprints.get(fp, 0) + 1
-        name = doc.get("tool_name") or (doc.get("tool", {}) or {}).get("name", "")
+        name = _tool_name(doc)
         tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
         duration_total += doc.get("duration_ms", 0) or 0
     cache_requests = cache_hits + cache_misses

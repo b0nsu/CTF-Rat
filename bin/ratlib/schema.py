@@ -53,6 +53,7 @@ def tool_result(d):
     if not isinstance(d["provenance"],Mapping) or set(d["provenance"]) != {"platform","dependency_versions","policy_digest","cache"}: raise ValidationError("invalid provenance")
     _digest(d["provenance"]["policy_digest"])
     if "tool_name" in d and not isinstance(d["tool_name"],str): raise ValidationError("invalid tool_name")
+    if "tool_name" in d and d["tool_name"] != d["tool"]["name"]: raise ValidationError("tool_name must match tool.name")
     if "params_digest" in d and not isinstance(d["params_digest"],str): raise ValidationError("invalid params_digest")
     if "cache_state" in d and d["cache_state"] not in {"hit","miss","bypass"}: raise ValidationError("invalid cache_state")
 def observation(d):

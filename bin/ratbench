@@ -464,7 +464,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
                       primitive_pass_at, artifact_count, process_metrics=None,
                       provenance=None, runtime_input_digest=None, routing_metrics=None,
-                      envelope_observations=None):
+                      envelope_observations=None, timed_out=False):
     """Build one honest Mode B `rat.benchmark-result/v3` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
@@ -498,14 +498,14 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         outcome = "verified"
     elif flag_claimed:
         outcome = "solve-claimed"
-    elif agent_rc == 124:
+    elif timed_out:
         outcome = "censored"
     else:
         outcome = "failed"
     # Observed outcome category, not an exploit/model root-cause diagnosis.
     if verified:
         failure_class = None
-    elif agent_rc == 124:
+    elif timed_out:
         failure_class = "agent-timeout"
     elif flag_claimed:
         failure_class = "claim-without-completion"
@@ -543,7 +543,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         "ablation_id": ablation_id,
         "challenge_id": entry["id"],
         "attempt": 1,
-        "status": "timeout" if agent_rc == 124 else "completed",
+        "status": "timeout" if timed_out else "completed",
         "eligible": True,
         "outcome": outcome,
         "started_at": started_at,
@@ -615,12 +615,14 @@ def cmd_eval(args):
             trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
             started_at = datetime.now(timezone.utc).isoformat()
             t0 = time.time()
+            timed_out = False
             try:
                 p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
                                timeout=args.timeout, trace_path=trace_path)
                 agent_out = p.stdout.decode(errors="replace")
                 agent_rc = p.returncode
             except subprocess.TimeoutExpired as exc:
+                timed_out = True
                 partial = exc.stdout or b""
                 agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
                 agent_rc = 124
@@ -658,7 +660,7 @@ def cmd_eval(args):
             v2_lines.append(_mode_b_v2_record(
                 e, run_id=run_id, ablation_id=args.ablation,
                 started_at=started_at, finished_at=finished_at,
-                agent_rc=agent_rc, flag_claimed=flag_claimed,
+                agent_rc=agent_rc, timed_out=timed_out, flag_claimed=flag_claimed,
                 completion=completion, events=events,
                 primitive_pass_at=primitive_pass_at,
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
