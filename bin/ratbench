@@ -501,6 +501,17 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         outcome = "censored"
     else:
         outcome = "failed"
+    # Observed outcome category, not an exploit/model root-cause diagnosis.
+    if verified:
+        failure_class = None
+    elif agent_rc == 124:
+        failure_class = "agent-timeout"
+    elif flag_claimed:
+        failure_class = "claim-without-completion"
+    elif agent_rc != 0:
+        failure_class = "agent-nonzero-exit"
+    else:
+        failure_class = "no-verified-completion"
     metrics = {
         "correctness": {"verified_solve": verified,
                         "false_solved": bool(flag_claimed and not verified),
@@ -538,7 +549,7 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         "finished_at": finished_at,
         "metrics": metrics,
         "oracle": {"kind": "completion-gate", "reason": completion.get("reason"),
-                   "verification_id": verification_id},
+                   "verification_id": verification_id, "failure_class": failure_class},
         "ground_truth": {"difficulty": entry.get("difficulty"), "expected": entry.get("expected"),
                          "verify_kind": (entry.get("verify") or {}).get("kind"),
                          "corpus": entry.get("corpus"),

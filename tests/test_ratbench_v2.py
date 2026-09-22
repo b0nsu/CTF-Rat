@@ -119,6 +119,42 @@ class CorpusGateTests(unittest.TestCase):
                     suite=path, corpus="private", id="synthetic-01"))
 
 
+
+class ModeBLocalSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
+                         "local python interpreter required")
+    def test_real_mode_b_exec_without_completion_remains_unverified(self):
+        # Execute the actual Mode B workspace/export + external process path.
+        # This is a negative-gate smoke, NOT a model-solving benchmark.
+        with tempfile.TemporaryDirectory() as scratch:
+            run_id = "B-smoke-" + os.path.basename(scratch)
+            result_dir = os.path.join(ROOT, "bench", "results")
+            legacy = os.path.join(result_dir, run_id + ".jsonl")
+            canonical = os.path.join(result_dir, run_id + ".benchmark-v3.jsonl")
+            args = SimpleNamespace(
+                agent=sys.executable + " -c 'print(\"FLAG{smoke-no-proof}\")' {dir}",
+                suite=None, corpus="synthetic", id="stack-basic-01",
+                run_id=run_id, ablation="A0", timeout=20,
+                model_id="python-negative-smoke", reasoning_effort="none",
+            )
+            try:
+                with mock.patch.object(RATBENCH, "_strace_usable", return_value=False):
+                    self.assertEqual(RATBENCH.cmd_eval(args), 0)
+                with open(canonical, encoding="utf-8") as fh:
+                    row = json.loads(fh.readline())
+                RATBENCH.validate(row, "rat.benchmark-result/v3")
+                self.assertEqual(row["outcome"], "solve-claimed")
+                self.assertEqual(row["oracle"]["failure_class"], "claim-without-completion")
+                self.assertFalse(row["metrics"]["correctness"]["verified_solve"])
+                self.assertTrue(row["metrics"]["correctness"]["false_solved"])
+                self.assertIsNone(row["metrics"]["context"]["input_tokens"])
+                self.assertIsNone(row["metrics"]["tools"]["tool_calls"])
+            finally:
+                for filename in (legacy, canonical):
+                    if os.path.exists(filename):
+                        os.unlink(filename)
+
+
 class BenchmarkProvenanceTests(unittest.TestCase):
     def test_provenance_hashes_exact_execution_set_and_agent_template(self):
         entries = [_suite_entry("heldout-01", "private")]
@@ -176,6 +212,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["outcome"], "verified")
         self.assertTrue(doc["metrics"]["correctness"]["verified_solve"])
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
+        self.assertIsNone(doc["oracle"]["failure_class"])
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_query_ms"], 1250)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_hypothesis_ms"], 2500)
         self.assertEqual(doc["metrics"]["latency"]["time_to_first_valid_primitive_ms"], 3000)
@@ -250,6 +287,7 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["outcome"], "solve-claimed")
         self.assertFalse(doc["metrics"]["correctness"]["verified_solve"])
         self.assertTrue(doc["metrics"]["correctness"]["false_solved"])
+        self.assertEqual(doc["oracle"]["failure_class"], "claim-without-completion")
         self.assertIsNone(doc["metrics"]["latency"]["time_to_verified_solve_ms"])
 
     def test_timeout_without_verified_solve_is_censored(self):
@@ -264,9 +302,31 @@ class ModeBV2RecordTests(unittest.TestCase):
         RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertEqual(doc["status"], "timeout")
         self.assertEqual(doc["outcome"], "censored")
+        self.assertEqual(doc["oracle"]["failure_class"], "agent-timeout")
         self.assertFalse(doc["metrics"]["correctness"]["false_solved"])
         self.assertIsNone(doc["metrics"]["tools"]["tool_calls"])
         self.assertIsNone(doc["metrics"]["tools"]["duplicate_tool_calls"])
+
+    def test_nonzero_agent_and_missing_completion_have_distinct_observed_failure_classes(self):
+        base = dict(
+            run_id="B-test", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+        )
+        nonzero = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=2, **base)
+        no_gate = RATBENCH._mode_b_v2_record(ENTRY, agent_rc=0, **base)
+        timed_out_claim = RATBENCH._mode_b_v2_record(
+            ENTRY, agent_rc=124, **{**base, "flag_claimed": True})
+        for row in (nonzero, no_gate, timed_out_claim):
+            RATBENCH.validate(row, "rat.benchmark-result/v3")
+            self.assertFalse(row["metrics"]["correctness"]["verified_solve"])
+        self.assertEqual(nonzero["oracle"]["failure_class"], "agent-nonzero-exit")
+        self.assertEqual(no_gate["oracle"]["failure_class"], "no-verified-completion")
+        self.assertEqual(timed_out_claim["oracle"]["failure_class"], "agent-timeout")
+        self.assertTrue(timed_out_claim["metrics"]["correctness"]["false_solved"])
 
     def test_legacy_report_ignores_v2_companion(self):
         with tempfile.TemporaryDirectory() as d:
