@@ -1,6 +1,6 @@
 """Small, dependency-free validators for the P1 data contracts."""
 from __future__ import annotations
-import json, re
+import json, math, re
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -157,7 +157,8 @@ def _benchmark_observations(d):
     if requests == 0:
         if ratio is not None:
             raise ValidationError("zero cache requests cannot have a hit ratio")
-    elif isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or abs(ratio - hits / requests) > 1e-9:
+    elif (isinstance(ratio, bool) or not isinstance(ratio, (int, float))
+          or not math.isfinite(ratio) or abs(ratio - hits / requests) > 1e-9):
         raise ValidationError("incoherent benchmark envelope hit ratio")
     size = row["captured_stdout_stderr_bytes"]
     if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):

@@ -232,6 +232,9 @@ class ModeBV2RecordTests(unittest.TestCase):
             envelope_observations=good,
         )
         for changes in ({"cache_hits": 3}, {"cache_hit_ratio": 0.0},
+                        {"cache_hit_ratio": float("nan")},
+                        {"cache_hit_ratio": float("inf")},
+                        {"cache_hit_ratio": float("-inf")},
                         {"captured_stdout_stderr_bytes": -1},
                         {"scope": "run-wide"}, {"cache_requests": 3},
                         {"envelope_count": 0}):
