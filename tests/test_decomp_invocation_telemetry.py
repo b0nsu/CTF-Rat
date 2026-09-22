@@ -10,7 +10,7 @@ BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
 ROOT = os.path.abspath(os.path.join(BIN, ".."))
 sys.path.insert(0, BIN)
 
-from ratlib.metrics import aggregate, iter_tool_results
+from ratlib.metrics import aggregate, iter_tool_results, benchmark_envelope_observations
 
 
 class DecompInvocationTelemetryTests(unittest.TestCase):
@@ -80,6 +80,12 @@ class DecompInvocationTelemetryTests(unittest.TestCase):
             self.assertEqual(metrics["cache_hits"], 1)
             self.assertEqual(metrics["cache_misses"], 1)
             self.assertEqual(metrics["duplicate_tool_calls"], 0)
+            scoped = benchmark_envelope_observations(os.path.join(d, ".rat"))
+            self.assertEqual(scoped["by_tool"]["decomp"]["envelope_count"], 2)
+            self.assertEqual(scoped["by_tool"]["decomp"]["cache_requests"], 2)
+            self.assertEqual(scoped["by_tool"]["decomp"]["cache_hits"], 1)
+            self.assertEqual(scoped["cache_requests"], 2)
+            self.assertEqual(scoped["cache_hits"], 1)
 
 
 if __name__ == "__main__":

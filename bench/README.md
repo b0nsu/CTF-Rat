@@ -144,6 +144,18 @@ token counters. The existing report's median run-wide cache-hit column
 therefore remains n/a until end-to-end cache coverage can be verified.
 Compare envelope-scoped numbers only with matching producer coverage.
 
+The optional `observations.tool_result_envelopes.by_tool` breakdown counts
+envelopes and effective cache requests/hits/unusable hits separately for each
+recorded tool name. Existing benchmark-v3 observations without `by_tool`
+remain valid. The current successful `revq` and `decomp` cache paths
+(including in-process `revq` through `rat route/query`) already emit these
+envelopes; they do **not** require a second index or counter. Failed
+`revq` selectors, unsuccessful `decomp` CLI exits, direct index-only cache
+activity, and agent-native operations are not guaranteed to emit an envelope.
+Therefore the breakdown describes observed producers, not complete process
+coverage or how many actual model tool outputs were consumed. The canonical
+cache index's entry inventory is not a cache-request or cache-hit counter.
+
 ## Architecture ablation rule
 
 `--ablation A0|A1|...` is a **measurement label only**. It does not secretly change router behavior, prompts, model configuration, or runtime policy. An architecture ablation must change one real implementation/configuration variable and be reproduced under otherwise identical conditions.

@@ -12,7 +12,7 @@ from unittest.mock import patch
 BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
 sys.path.insert(0, BIN)
 
-from ratlib.metrics import aggregate, iter_tool_results
+from ratlib.metrics import aggregate, iter_tool_results, benchmark_envelope_observations
 
 
 def _load_revq():
@@ -78,6 +78,12 @@ class RevqInvocationTelemetryTests(unittest.TestCase):
             self.assertEqual(metrics["cache_hits"], 1)
             self.assertEqual(metrics["cache_misses"], 1)
             self.assertEqual(metrics["duplicate_tool_calls"], 0)
+            scoped = benchmark_envelope_observations(root)
+            self.assertEqual(scoped["by_tool"]["revq"]["envelope_count"], 2)
+            self.assertEqual(scoped["by_tool"]["revq"]["cache_requests"], 2)
+            self.assertEqual(scoped["by_tool"]["revq"]["cache_hits"], 1)
+            self.assertEqual(scoped["cache_requests"], 2)
+            self.assertEqual(scoped["cache_hits"], 1)
 
     def test_rat_route_records_in_process_revq_miss_and_hit(self):
         rat = _load_rat()

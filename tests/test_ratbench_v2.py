@@ -280,6 +280,45 @@ class ModeBV2RecordTests(unittest.TestCase):
                 with self.assertRaises(Exception):
                     RATBENCH.validate(doc, "rat.benchmark-result/v3")
 
+    def test_optional_by_tool_cache_breakdown_maintains_legacy_compatibility(self):
+        older = {
+            "scope": "tool-result-envelopes-only", "envelope_count": 2,
+            "cache_requests": 2, "cache_hits": 1, "cache_unusable_hits": 0,
+            "cache_hit_ratio": 0.5, "captured_stdout_stderr_bytes": None,
+        }
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-breakdown", ablation_id="A1",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=2,
+            envelope_observations=older,
+        )
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertNotIn("by_tool", doc["observations"]["tool_result_envelopes"])
+        doc["observations"]["tool_result_envelopes"]["by_tool"] = {
+            "revq": {"envelope_count": 1, "cache_requests": 1, "cache_hits": 1,
+                     "cache_unusable_hits": 0, "cache_hit_ratio": 1.0},
+            "decomp": {"envelope_count": 1, "cache_requests": 1, "cache_hits": 0,
+                       "cache_unusable_hits": 0, "cache_hit_ratio": 0.0},
+        }
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertIsNone(doc["metrics"]["cache"]["cache_hit_ratio"])
+        row = doc["observations"]["tool_result_envelopes"]
+        for by_tool in (
+            None,
+            {},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hits": 0}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("nan")}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("inf")}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("-inf")}},
+        ):
+            with self.subTest(by_tool=by_tool):
+                row["by_tool"] = by_tool
+                with self.assertRaises(Exception):
+                    RATBENCH.validate(doc, "rat.benchmark-result/v3")
+
     def test_old_v2_record_without_provenance_or_routing_remains_valid(self):
         doc = RATBENCH._mode_b_v2_record(
             ENTRY, run_id="B-old", ablation_id="A0",

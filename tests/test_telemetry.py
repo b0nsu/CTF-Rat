@@ -150,6 +150,38 @@ class BenchmarkEnvelopeObservations(unittest.TestCase):
             self.assertEqual(observed["cache_unusable_hits"], 0)
             self.assertEqual(observed["cache_hit_ratio"], 0.5)
             self.assertEqual(observed["captured_stdout_stderr_bytes"], 21)
+            self.assertEqual(observed["by_tool"]["x"], {
+                "envelope_count": 3, "cache_requests": 2, "cache_hits": 1,
+                "cache_unusable_hits": 0, "cache_hit_ratio": 0.5,
+            })
+
+    def test_by_tool_coverage_distinguishes_producers_and_bypassed_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            for name, invocation_id, state, status in (
+                ("revq", "revq-miss", "miss", "ok"),
+                ("revq", "revq-hit", "hit", "ok"),
+                ("decomp", "decomp-hit-partial", "hit", "partial"),
+                ("decomp", "decomp-bypass", "bypass", "partial"),
+            ):
+                self._store(root, envelope(
+                    tool={"name": name}, tool_name=name, invocation_id=invocation_id,
+                    cache_state=state, status=status,
+                    summary={"stdout_bytes": 0, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["envelope_count"], 4)
+            self.assertEqual(observed["cache_requests"], 3)
+            self.assertEqual(observed["cache_hits"], 1)
+            self.assertEqual(observed["cache_unusable_hits"], 1)
+            self.assertAlmostEqual(observed["cache_hit_ratio"], 1 / 3)
+            self.assertEqual(observed["by_tool"], {
+                "decomp": {"envelope_count": 2, "cache_requests": 1,
+                           "cache_hits": 0, "cache_unusable_hits": 1,
+                           "cache_hit_ratio": 0.0},
+                "revq": {"envelope_count": 2, "cache_requests": 2,
+                         "cache_hits": 1, "cache_unusable_hits": 0,
+                         "cache_hit_ratio": 0.5},
+            })
 
     def test_missing_capture_size_remains_unknown_without_dropping_cache_facts(self):
         with tempfile.TemporaryDirectory() as d:
