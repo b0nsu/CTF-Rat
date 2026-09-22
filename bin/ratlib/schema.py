@@ -1,6 +1,6 @@
 """Small, dependency-free validators for the P1 data contracts."""
 from __future__ import annotations
-import json, re
+import json, math, re
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -133,9 +133,40 @@ def _benchmark_routing(d):
     if d["route_assessment_count"] == 0:
         if any(d[key] is not None for key in ("first_dimensions","first_action","first_commitment","first_skill")): raise ValidationError("empty routing assessment cannot report first fields")
     elif d["first_dimensions"] is None or d["first_commitment"] is None: raise ValidationError("routing assessment requires first fields")
+def _benchmark_observations(d):
+    """Validate optional envelope-scoped counters without implying run-wide coverage."""
+    if not isinstance(d, Mapping) or set(d) != {"tool_result_envelopes"}:
+        raise ValidationError("invalid benchmark observations")
+    row = d["tool_result_envelopes"]
+    fields = {"scope", "envelope_count", "cache_requests", "cache_hits",
+              "cache_unusable_hits", "cache_hit_ratio", "captured_stdout_stderr_bytes"}
+    if not isinstance(row, Mapping) or set(row) != fields:
+        raise ValidationError("invalid benchmark envelope observation fields")
+    if row["scope"] != "tool-result-envelopes-only":
+        raise ValidationError("invalid benchmark observation scope")
+    for key in ("envelope_count", "cache_requests", "cache_hits", "cache_unusable_hits"):
+        n = row[key]
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise ValidationError("invalid benchmark observation %s" % key)
+    total, requests, hits, unusable = (
+        row["envelope_count"], row["cache_requests"],
+        row["cache_hits"], row["cache_unusable_hits"])
+    if total == 0 or requests > total or hits + unusable > requests:
+        raise ValidationError("incoherent benchmark envelope counts")
+    ratio = row["cache_hit_ratio"]
+    if requests == 0:
+        if ratio is not None:
+            raise ValidationError("zero cache requests cannot have a hit ratio")
+    elif (isinstance(ratio, bool) or not isinstance(ratio, (int, float))
+          or not math.isfinite(ratio) or abs(ratio - hits / requests) > 1e-9):
+        raise ValidationError("incoherent benchmark envelope hit ratio")
+    size = row["captured_stdout_stderr_bytes"]
+    if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+        raise ValidationError("invalid benchmark envelope output size")
+
 def benchmark_result_v2(d):
     _need(d,("schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth"))
-    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance","routing"})
+    _strict(d,{"schema","benchmark_run_id","ablation_id","challenge_id","attempt","status","eligible","outcome","started_at","finished_at","metrics","oracle","ground_truth","provenance","routing","observations"})
     if d["ablation_id"] not in {"A0","A1","A2","A3","A4","A5"}: raise ValidationError("invalid ablation")
     if not isinstance(d["attempt"],int) or d["attempt"] < 1: raise ValidationError("invalid attempt")
     if d["status"] not in {"completed","timeout","partial","infra-failure","skipped"}: raise ValidationError("invalid benchmark status")
@@ -143,6 +174,7 @@ def benchmark_result_v2(d):
     _iso(d["started_at"]); _iso(d["finished_at"])
     if "provenance" in d: _benchmark_provenance(d["provenance"])
     if "routing" in d: _benchmark_routing(d["routing"])
+    if "observations" in d: _benchmark_observations(d["observations"])
     groups = {
         "correctness": {"verified_solve","false_solved","oracle_pass"},
         "latency": {"time_to_first_query_ms","time_to_first_hypothesis_ms","time_to_first_valid_primitive_ms","time_to_verified_solve_ms"},

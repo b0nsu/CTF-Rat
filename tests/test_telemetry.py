@@ -3,7 +3,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 from ratlib.contracts import execute
 from ratlib.metrics import (aggregate, operation_fingerprint, first_primitive_pass_ts,
-                            process_trace_metrics, route_assessment_metrics)
+                            process_trace_metrics, route_assessment_metrics,
+                            benchmark_envelope_observations)
+from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
 
 D = "sha256:" + "a" * 64
@@ -124,6 +126,51 @@ class ProcessTraceMetrics(unittest.TestCase):
     def test_missing_trace_is_unknown_not_zero(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(process_trace_metrics(os.path.join(d, "missing.log"), os.path.join(d, "kit")))
+
+class BenchmarkEnvelopeObservations(unittest.TestCase):
+    def _store(self, root, doc):
+        put_bytes(json.dumps(doc, sort_keys=True).encode(), kind="tool-result",
+                  media_type="application/json", logical_name="result.json", root=root)
+
+    def test_scoped_cache_and_capture_measurements_use_immutable_envelopes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self.assertIsNone(benchmark_envelope_observations(root))
+            self._store(root, envelope(invocation_id="one", cache_state="miss",
+                                       summary={"stdout_bytes": 7, "stderr_bytes": 2}))
+            self._store(root, envelope(invocation_id="two", cache_state="hit",
+                                       summary={"stdout_bytes": 7, "stderr_bytes": 2}))
+            self._store(root, envelope(invocation_id="three", cache_state="bypass",
+                                       summary={"stdout_bytes": 3, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["scope"], "tool-result-envelopes-only")
+            self.assertEqual(observed["envelope_count"], 3)
+            self.assertEqual(observed["cache_requests"], 2)
+            self.assertEqual(observed["cache_hits"], 1)
+            self.assertEqual(observed["cache_unusable_hits"], 0)
+            self.assertEqual(observed["cache_hit_ratio"], 0.5)
+            self.assertEqual(observed["captured_stdout_stderr_bytes"], 21)
+
+    def test_missing_capture_size_remains_unknown_without_dropping_cache_facts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self._store(root, envelope(invocation_id="no-bytes", cache_state="miss",
+                                       summary={"stdout_bytes": 5}))
+            observed = benchmark_envelope_observations(root)
+            self.assertIsNone(observed["captured_stdout_stderr_bytes"])
+            self.assertEqual(observed["cache_requests"], 1)
+            self.assertEqual(observed["cache_hits"], 0)
+            self.assertEqual(observed["cache_hit_ratio"], 0.0)
+
+    def test_no_cache_lookup_is_not_a_zero_hit_ratio(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self._store(root, envelope(invocation_id="bypass", cache_state="bypass",
+                                       summary={"stdout_bytes": 0, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["cache_requests"], 0)
+            self.assertIsNone(observed["cache_hit_ratio"])
+
 
 class Aggregate(unittest.TestCase):
     def test_bypass_and_unknown_states_are_not_cache_requests(self):

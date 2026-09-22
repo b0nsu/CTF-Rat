@@ -230,6 +230,56 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["provenance"], _provenance())
         self.assertEqual(doc["routing"], _routing())
 
+    def test_envelope_observations_are_scoped_and_do_not_invent_run_wide_metrics(self):
+        observed = {
+            "scope": "tool-result-envelopes-only", "envelope_count": 3,
+            "cache_requests": 2, "cache_hits": 1, "cache_unusable_hits": 0,
+            "cache_hit_ratio": 0.5, "captured_stdout_stderr_bytes": 21,
+        }
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-scoped", ablation_id="A1",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=3,
+            envelope_observations=observed,
+        )
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertEqual(doc["observations"]["tool_result_envelopes"], observed)
+        self.assertIsNone(doc["metrics"]["cache"]["cache_requests"])
+        self.assertIsNone(doc["metrics"]["cache"]["cache_hits"])
+        self.assertIsNone(doc["metrics"]["cache"]["cache_hit_ratio"])
+        self.assertIsNone(doc["metrics"]["context"]["tool_output_bytes"])
+        self.assertIsNone(doc["metrics"]["context"]["input_tokens"])
+
+    def test_envelope_observations_reject_incoherent_counts_and_ratios(self):
+        good = {
+            "scope": "tool-result-envelopes-only", "envelope_count": 2,
+            "cache_requests": 2, "cache_hits": 1, "cache_unusable_hits": 0,
+            "cache_hit_ratio": 0.5, "captured_stdout_stderr_bytes": 5,
+        }
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-scoped", ablation_id="A1",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=1, flag_claimed=False,
+            completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=2,
+            envelope_observations=good,
+        )
+        for changes in ({"cache_hits": 3}, {"cache_hit_ratio": 0.0},
+                        {"cache_hit_ratio": float("nan")},
+                        {"cache_hit_ratio": float("inf")},
+                        {"cache_hit_ratio": float("-inf")},
+                        {"captured_stdout_stderr_bytes": -1},
+                        {"scope": "run-wide"}, {"cache_requests": 3},
+                        {"envelope_count": 0}):
+            with self.subTest(changes=changes):
+                doc["observations"]["tool_result_envelopes"] = {**good, **changes}
+                with self.assertRaises(Exception):
+                    RATBENCH.validate(doc, "rat.benchmark-result/v3")
+
     def test_old_v2_record_without_provenance_or_routing_remains_valid(self):
         doc = RATBENCH._mode_b_v2_record(
             ENTRY, run_id="B-old", ablation_id="A0",

@@ -463,7 +463,8 @@ def _runtime_input_digest(chal_dir):
 def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
                       agent_rc, flag_claimed, completion, events,
                       primitive_pass_at, artifact_count, process_metrics=None,
-                      provenance=None, runtime_input_digest=None, routing_metrics=None):
+                      provenance=None, runtime_input_digest=None, routing_metrics=None,
+                      envelope_observations=None):
     """Build one honest Mode B `rat.benchmark-result/v3` record.
 
     Unknown instrumentation is encoded as null, never fabricated as zero. Process
@@ -561,6 +562,8 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
         doc["provenance"] = provenance
     if routing_metrics is not None:
         doc["routing"] = dict(routing_metrics)
+    if envelope_observations is not None:
+        doc["observations"] = {"tool_result_envelopes": dict(envelope_observations)}
     return doc
 
 
@@ -625,7 +628,8 @@ def cmd_eval(args):
             finished_at = datetime.now(timezone.utc).isoformat()
 
             flag_claimed = _flag_claimed(e, agent_out)
-            from ratlib.metrics import first_primitive_pass_ts, process_trace_metrics, route_assessment_metrics
+            from ratlib.metrics import (first_primitive_pass_ts, process_trace_metrics,
+                                    route_assessment_metrics, benchmark_envelope_observations)
             from ratlib.completion import completion_gate
             from ratlib.state_v2 import Stream
             primitive_pass_at = first_primitive_pass_ts(chal_dir)
@@ -660,6 +664,7 @@ def cmd_eval(args):
                 artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
                 process_metrics=process_metrics, provenance=run_provenance,
                 runtime_input_digest=runtime_input_digest, routing_metrics=routing_metrics,
+                envelope_observations=benchmark_envelope_observations(os.path.join(chal_dir, ".rat")),
             ))
             mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
             detail = ""
