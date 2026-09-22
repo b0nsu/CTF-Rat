@@ -164,8 +164,8 @@ def _benchmark_observations(d):
     if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
         raise ValidationError("invalid benchmark envelope output size")
 
-    by_tool = row.get("by_tool")
-    if by_tool is not None:
+    if "by_tool" in row:
+        by_tool = row["by_tool"]
         if not isinstance(by_tool, Mapping) or not by_tool:
             raise ValidationError("invalid benchmark envelope tool coverage")
         group_fields = {"envelope_count", "cache_requests", "cache_hits",
@@ -190,7 +190,7 @@ def _benchmark_observations(d):
                 if group_ratio is not None:
                     raise ValidationError("zero tool cache requests cannot have a hit ratio")
             elif (isinstance(group_ratio, bool) or not isinstance(group_ratio, (int, float))
-                  or abs(group_ratio - hit / req) > 1e-9):
+                  or not math.isfinite(group_ratio) or abs(group_ratio - hit / req) > 1e-9):
                 raise ValidationError("incoherent benchmark envelope tool hit ratio")
         if any(sums[name] != row[name] for name in sums):
             raise ValidationError("benchmark envelope tool totals do not match observations")

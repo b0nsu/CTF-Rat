@@ -305,9 +305,19 @@ class ModeBV2RecordTests(unittest.TestCase):
         }
         RATBENCH.validate(doc, "rat.benchmark-result/v3")
         self.assertIsNone(doc["metrics"]["cache"]["cache_hit_ratio"])
-        doc["observations"]["tool_result_envelopes"]["by_tool"]["revq"]["cache_hits"] = 0
-        with self.assertRaises(Exception):
-            RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        row = doc["observations"]["tool_result_envelopes"]
+        for by_tool in (
+            None,
+            {},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hits": 0}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("nan")}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("inf")}},
+            {**row["by_tool"], "revq": {**row["by_tool"]["revq"], "cache_hit_ratio": float("-inf")}},
+        ):
+            with self.subTest(by_tool=by_tool):
+                row["by_tool"] = by_tool
+                with self.assertRaises(Exception):
+                    RATBENCH.validate(doc, "rat.benchmark-result/v3")
 
     def test_old_v2_record_without_provenance_or_routing_remains_valid(self):
         doc = RATBENCH._mode_b_v2_record(
