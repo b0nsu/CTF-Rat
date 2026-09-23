@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -257,15 +258,19 @@ class RealGdbSession(unittest.TestCase):
                 started = gdb_session.start(binary, scenario, action_timeout=15, idle_timeout=20)
                 sid = started["session_id"]
                 try:
-                    self.assertEqual(gdb_session.request(binary, sid, "break", target="stage")["status"], "ok")
+                    breakpoint = gdb_session.request(binary, sid, "break", target="stage")
+                    self.assertEqual(breakpoint["status"], "ok", breakpoint)
+                    address = re.search(r'addr="(0x[0-9a-fA-F]+)"',
+                                        breakpoint["observation"]["result"]["mi_result"])
+                    self.assertIsNotNone(address, breakpoint)
                     first = gdb_session.request(binary, sid, "continue")
                     self.assertEqual(first["status"], "ok")
                     self.assertIn("breakpoint-hit", first["observation"]["result"]["stop"])
                     registers = gdb_session.request(binary, sid, "registers")
                     self.assertEqual(registers["status"], "ok", registers)
                     values = registers["observation"]["result"]["registers"]
-                    self.assertIn("32", values)  # AArch64 PC in this native test image
-                    memory = gdb_session.request(binary, sid, "memory", address=values["32"], count=4)
+                    self.assertTrue(values)
+                    memory = gdb_session.request(binary, sid, "memory", address=address.group(1), count=4)
                     self.assertEqual(memory["status"], "ok", memory)
                     self.assertTrue(memory["observation"]["result"]["memory_hex"])
                     second = gdb_session.request(binary, sid, "continue")
