@@ -178,6 +178,38 @@ def _minimal_environment() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in allow}
 
 
+def spawn_owned(argv: Sequence[str], *, cwd: Optional[str] = None,
+                env: Optional[Mapping[str, str]] = None,
+                limits: ResourceLimits = ResourceLimits()) -> subprocess.Popen:
+    """Spawn a long-lived local tool with the same argv/environment/limit policy as run().
+
+    The caller owns the returned process group and must call terminate_owned().
+    """
+    if not argv or not all(isinstance(arg, str) and arg for arg in argv):
+        raise ValueError("argv must be non-empty strings")
+    child_env = _minimal_environment()
+    if env is not None:
+        child_env.update(env)
+    return subprocess.Popen(list(argv), cwd=cwd, env=child_env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                            start_new_session=True,
+                            preexec_fn=_limit_preexec(limits, _user_process_count()) if os.name == "posix" else None)
+
+
+def terminate_owned(proc: subprocess.Popen, grace_seconds: float = 1.0) -> None:
+    _terminate_group(proc, grace_seconds)
+    try:
+        proc.wait(timeout=grace_seconds + 1)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
 def _guard_target(target: Sequence[str], ctf_home: Optional[str]) -> None:
     if not target:
         raise RunnerPolicyError("ctfguard-target requires a target tuple")

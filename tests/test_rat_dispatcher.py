@@ -138,6 +138,18 @@ class GovernorWiring(unittest.TestCase):
         doc = json.loads(out)
         self.assertNotIn("governor", doc)
 
+    def test_notes_do_not_keep_repeated_route_alive(self):
+        from ratlib.state_v2 import Stream
+        for i in range(6):
+            Stream(self.tmp.name).append("hypothesis.recorded", {"hypothesis_id": "h%d" % i})
+            Stream(self.tmp.name).append("unknown.recorded", {"unknown_id": "u%d" % i})
+            Stream(self.tmp.name).append("next.recorded", {"probe": "again-%d" % i})
+            code, out, err = run_rat("route", self.binary, "--format", "json")
+            self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertTrue(doc["governor"]["stuck"])
+        self.assertEqual(doc["governor"]["basis"], [])
+
 class FrontDoorTextRendering(unittest.TestCase):
     """Default text output must surface the route-result's essential fields,
     not collapse to a bare `label: status` line."""

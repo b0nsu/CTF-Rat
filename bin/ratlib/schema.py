@@ -37,7 +37,8 @@ def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str
       "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v3": benchmark_result_v2,
       "rat.route-result/v2": route_result, "rat.query-result/v1": query_result,
       "rat.cache-stats/v1": cache_stats, "rat.brief-card/v1": brief_card,
-      "rat.bench-result/v2": bench_result}
+      "rat.bench-result/v2": bench_result,
+      "rat.gdb-session-candidate/v1": gdb_session_candidate}
     try: dispatch[schema](doc)
     except KeyError: raise ValidationError("unknown schema %s" % schema)
     return doc
@@ -253,7 +254,8 @@ def route_result(d):
     if decision is not None and (not isinstance(decision,Mapping) or {"action","target","evidence","rule"}-set(decision)): raise ValidationError("invalid route decision")
     if decision is None and d["commitment"]!="unknown": raise ValidationError("missing decision requires unknown commitment")
 
-_QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail"}
+_QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail",
+                           "source_invalid","source_stale","budget_omitted","budget_too_small","analysis_unavailable","card_limit"}
 def query_result(d):
     _need(d,("schema","query","status","facts","heuristics","artifacts","coverage","diagnostics","provenance"))
     if d["status"] not in {"ok","partial","error"}: raise ValidationError("invalid query status")
@@ -269,6 +271,31 @@ def query_result(d):
     if not isinstance(d["artifacts"],list): raise ValidationError("invalid artifacts")
     if not isinstance(d["facts"],Mapping): raise ValidationError("invalid facts")
     if not isinstance(d["heuristics"],Mapping): raise ValidationError("invalid heuristics")
+
+def gdb_session_candidate(d):
+    _need(d,("schema","kind","direct_evidence","session_id","run_id","process_identity",
+             "binary_digest","environment_digest","scenario_digest","tool_version","observations"))
+    _strict(d,{"schema","kind","direct_evidence","session_id","run_id","process_identity",
+               "binary_digest","environment_digest","scenario_digest","tool_version","observations"})
+    if d["kind"]!="candidate" or d["direct_evidence"] is not False:
+        raise ValidationError("GDB session records must remain candidate evidence")
+    for name in ("binary_digest","environment_digest","scenario_digest"):
+        _digest(d[name])
+    if not isinstance(d["session_id"],str) or not d["session_id"].startswith("gdb_"):
+        raise ValidationError("invalid GDB session ID")
+    if not isinstance(d["run_id"],str) or not d["run_id"] or not isinstance(d["tool_version"],str):
+        raise ValidationError("invalid GDB session provenance")
+    process=d["process_identity"]
+    if not isinstance(process,Mapping) or set(process)!={"gdb_pid","inferior_pid"} or not all(isinstance(v,int) and v>0 for v in process.values()):
+        raise ValidationError("invalid GDB process identity")
+    if not isinstance(d["observations"],list): raise ValidationError("invalid GDB observations")
+    for index,item in enumerate(d["observations"],1):
+        if not isinstance(item,Mapping) or item.get("sequence")!=index or not isinstance(item.get("result"),Mapping):
+            raise ValidationError("GDB observation sequence is invalid")
+        if item["result"].get("status") not in {"ok","partial","timeout","error"}:
+            raise ValidationError("invalid GDB observation status")
+        if item.get("process_identity")!=process:
+            raise ValidationError("GDB observation process identity changed")
 
 def brief_card(d):
     _need(d,("schema","binary","capabilities","route","track_summary","libc","truncated","side_effects"))

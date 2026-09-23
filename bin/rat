@@ -8,7 +8,7 @@ rat-verify, state, ratlib.cache). Legacy CLIs are unchanged and still work
 standalone -- this is an additional canonical entrypoint, not a replacement.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.machinery, importlib.util, json, os, subprocess, sys, time
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
 from datetime import datetime, timezone
 
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -17,15 +17,16 @@ sys.path.insert(0, BIN)
 from ratlib.artifact import get as artifact_get
 from ratlib.cache import Cache, resolve_index_root
 from ratlib.cards import project_pwn_capability
+from ratlib.patterns import project_patterns
 from ratlib.graph_projection import project_graph
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
-from ratlib.governor import check_progress
+from ratlib.governor import check_progress, snapshot_digest, recommend
 from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
                           STRONG_OVERFLOW_IMPORTS as route_mod_STRONG,
                           WEAK_OVERFLOW_IMPORTS as route_mod_WEAK)
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
-from ratlib.state_v2 import Stream, cursor as event_cursor
+from ratlib.state_v2 import Stream
 
 DEFAULT_BUDGET_BYTES = 16384
 
@@ -110,6 +111,24 @@ def _render_graph_text(doc):
 def _render_query_text(doc):
     lines = ["QUERY       %s" % doc.get("query"), "STATUS      %s" % doc.get("status")]
     facts = doc.get("facts") or {}
+    if doc.get("query") == "pattern":
+        for card in facts.get("cards") or []:
+            src = card["source"]
+            lines += ["", "CARD        %s (%s)" % (card["id"], card["kind"]),
+                      "SOURCE      %s %s" % (src["path"], src["digest"]),
+                      "SELECTED    %s" % card["selection"],
+                      "PREMISE     %s" % card["premise"],
+                      "REFUTE      %s" % card["refutation"],
+                      "NEXT        %s" % card["next_experiment"]]
+            for heading, body in card["excerpt"].items():
+                lines += [heading.upper(), body]
+            if card.get("knowledge"):
+                ref = card["knowledge"]
+                lines += ["KNOWLEDGE   %s#%s %s" % (ref["path"], ref["section"], ref["digest"]),
+                          ref["excerpt"]]
+        for d in doc.get("diagnostics") or []:
+            lines.append("WARNING     %s" % d["message"])
+        return "\n".join(lines)
     if facts:
         lines += ["", "FACTS"] + ["  %s: %s" % (k, _brief(v)) for k, v in facts.items()]
     heuristics = doc.get("heuristics") or {}
@@ -243,15 +262,7 @@ def _gather_profile(binary, store):
     except Exception:
         return None
 
-# ---- Progress Novelty Governor wiring -- route/query plus STATE progress ----
-# Events that represent real solving progress (new observation, finding/primitive
-# revision, ruled-out route, ...) as opposed to this governor's own bookkeeping
-# (`governor.checked`, which must not count as progress against itself). Route
-# assessments use note.recorded and are intentionally absent from this set too.
-_STATE_PROGRESS_EVENT_TYPES = {
-    "observation.recorded", "finding.revised", "primitive.revised", "primitive.consumed",
-    "evidence.invalidated", "hypothesis.recorded", "unknown.recorded", "route.ruled_out", "next.recorded",
-}
+# ---- Progress Novelty Governor wiring -- route/query plus canonical STATE evidence ----
 # The solving STATE lives next to the challenge binary (dirname(binary)/.rat),
 # NOT under the cache/index store. Those coincide by default because the default
 # index root is dirname(binary)/.rat, but `--store /elsewhere` overrides only the
@@ -280,16 +291,16 @@ def _record_route_assessment(state_dir, source, result):
 def _governor_wrap(state_dir, action, novelty_key, doc):
     stream = Stream(state_dir)
     events = stream.read()
-    progress = [e for e in events if e["type"] in _STATE_PROGRESS_EVENT_TYPES]
-    state_cursor = event_cursor(progress[-1]) if progress else None
-    digest = _canonical_digest({**novelty_key, "state_cursor": state_cursor})
+    digest = _canonical_digest({"result": novelty_key, "evidence": snapshot_digest(events)})
     checked = [e for e in events if e["type"] == "governor.checked"]
     novel = digest not in {e["payload"]["digest"] for e in checked}
     history = [e["payload"]["novel"] for e in checked] + [novel]
     stream.append("governor.checked", {"action": action, "novel": novel, "digest": digest})
     check = check_progress(history)
     if check["stuck"]:
-        doc["governor"] = {"stuck": True, "action": check["action"], "reason": check["reason"]}
+        advice = recommend(events)
+        doc["governor"] = {"stuck": True, "action": advice["action"],
+                           "reason": check["reason"], "basis": advice["basis"]}
     return doc
 
 # ---- rat.query-result/v1 envelope ----
@@ -698,6 +709,63 @@ def cmd_query_pwn(args):
     doc = _governor_wrap(_state_dir(binary), "query:pwn", {"facts": facts, "heuristics": card["heuristics"]}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
+
+def cmd_query_pattern(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("pattern", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    if args.budget_bytes < 512 or not 1 <= args.max_cards <= 3:
+        return _emit(*_query_error("pattern", "input_invalid", "budget >=512 and max_cards 1..3 required", EXIT_INPUT), args.format)
+    expected = {}
+    for item in args.expect_source:
+        if "=sha256:" not in item:
+            return _emit(*_query_error("pattern", "input_invalid", "--expect-source requires path=sha256:digest", EXIT_INPUT), args.format)
+        path, digest = item.split("=", 1)
+        if not path.startswith(("skills/", "knowledge/")) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return _emit(*_query_error("pattern", "input_invalid", "invalid expected source path/digest", EXIT_INPUT), args.format)
+        expected[path] = digest
+    store = resolve_index_root(binary, override=args.store)
+    profile = _gather_profile(binary, store)
+    caps = _doctor_capabilities(binary)
+    fast = args.fast or not caps.get("angr", False)
+    rev, interesting, diagnostics = None, None, []
+    try:
+        mod, rev = _gather_revq(binary, fast, store)
+        interesting = mod.compute_interesting(rev)
+    except Exception as exc:
+        diagnostics.append({"code": "analysis_unavailable", "severity": "warning", "message": str(exc)})
+    route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    try:
+        cards, issues = project_patterns(route["leads"], route["signals"],
+                                         root=os.path.dirname(BIN), budget_bytes=args.budget_bytes,
+                                         max_cards=args.max_cards, expected_digests=expected)
+    except ValueError as exc:
+        return _emit(*_query_error("pattern", "input_invalid", str(exc), EXIT_INPUT), args.format)
+    diagnostics.extend(issues)
+    doc = _query_envelope("pattern", status="partial" if diagnostics else "ok",
+                          facts={"cards": cards, "kind": "hypothesis-aid", "direct_evidence": False},
+                          heuristics={"selection": "exact Router v2 leads in lexical order; no probability rank"},
+                          artifacts=[], coverage={"complete": not diagnostics,
+                                                  "scope": "selected Skill sections only", "omitted": [d["code"] for d in diagnostics]},
+                          diagnostics=diagnostics,
+                          provenance={"binary_sha256": _file_sha256(binary), "route_leads": route["leads"],
+                                      "cache": {"hit": None}}, budget_bytes=args.budget_bytes)
+    doc = _governor_wrap(_state_dir(binary), "query:pattern",
+                         {"cards": [c["id"] + c["source"]["digest"] for c in cards]}, doc)
+    render = (lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False)) if args.format == "json" else _render_query_text
+    while cards and len(render(doc).encode()) + 1 > args.budget_bytes:
+        removed = cards.pop()
+        diagnostics.append({"code": "budget_omitted", "severity": "warning", "message": "%s omitted: total output budget" % removed["id"]})
+        doc["status"] = "partial"; doc["coverage"]["complete"] = False
+        doc["coverage"]["omitted"].append("budget_omitted")
+    while len(render(doc).encode()) + 1 > args.budget_bytes and len(diagnostics) > 1:
+        diagnostics.pop()
+    if len(render(doc).encode()) + 1 > args.budget_bytes:
+        return _emit(*_query_error("pattern", "budget_too_small",
+                                   "pattern envelope and diagnostics exceed budget", EXIT_INPUT), args.format)
+    return _emit(doc, EXIT_OK, args.format)
+
 def cmd_query_oracle(args):
     binary = args.binary
     bad = _check_binary(binary)
@@ -810,6 +878,9 @@ def cmd_query_slice(args):
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_dyn(rest):
+    if rest and rest[0] == "session":
+        from ratlib.gdb_session import main as session_main
+        return session_main(rest[1:])
     code, out, err = _run_subprocess([os.path.join(BIN, "rat-dyn")] + rest)
     sys.stdout.write(out); sys.stderr.write(err)
     return code
@@ -882,7 +953,7 @@ def build_parser():
     pb.add_argument("--libc"); pb.add_argument("--budget-tokens", type=int, default=1500)
     pb.add_argument("--format", choices=("text", "json"), default="text")
 
-    pq = sub.add_parser("query", help="bounded read-only queries (graph|func|oracle|pwn|slice) over cached artifacts")
+    pq = sub.add_parser("query", help="bounded read-only queries (graph|func|oracle|pwn|pattern|slice) over cached artifacts")
     qsub = pq.add_subparsers(dest="subcommand")
     pg = qsub.add_parser("graph", help="global, bounded projection of revq's recovered function call map")
     pg.add_argument("binary"); pg.add_argument("--store"); pg.add_argument("--fast", action="store_true")
@@ -900,12 +971,17 @@ def build_parser():
     pp = qsub.add_parser("pwn", help="static PWN capability card from profile facts; never claims runtime primitive PASS")
     pp.add_argument("binary"); pp.add_argument("--store"); pp.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     pp.add_argument("--format", choices=("text", "json"), default="text")
+    pt = qsub.add_parser("pattern", help="source-bound hypothesis aids for provisional Router v2 leads")
+    pt.add_argument("binary"); pt.add_argument("--store"); pt.add_argument("--fast", action="store_true")
+    pt.add_argument("--budget-bytes", type=int, default=8192); pt.add_argument("--max-cards", type=int, default=3)
+    pt.add_argument("--expect-source", action="append", default=[], metavar="PATH=SHA256")
+    pt.add_argument("--format", choices=("text", "json"), default="text")
     ps = qsub.add_parser("slice", help="backward data slice to an input sink (delegates rat-slice)")
     ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--source", default="stdin"); ps.add_argument("--store")
     ps.add_argument("--format", choices=("text", "json"), default="text")
 
-    sub.add_parser("dyn", add_help=False, help="forward argv to rat-dyn (dynamic exec trace)")
+    sub.add_parser("dyn", add_help=False, help="rat-dyn trace; `rat dyn session` opens optional local GDB/MI session")
     sub.add_parser("verify", add_help=False, help="forward argv to rat-verify (deterministic verification)")
     sub.add_parser("state", add_help=False, help="`rat state compact ...` -> state compact (token-bounded view)")
 
@@ -940,6 +1016,7 @@ def main(argv=None):
         if args.subcommand == "func": return cmd_query_func(args)
         if args.subcommand == "oracle": return cmd_query_oracle(args)
         if args.subcommand == "pwn": return cmd_query_pwn(args)
+        if args.subcommand == "pattern": return cmd_query_pattern(args)
         if args.subcommand == "slice": return cmd_query_slice(args)
         p.parse_args(["query", "--help"]); return EXIT_USAGE
     if args.command == "cache":

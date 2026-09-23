@@ -128,9 +128,13 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <br>
 
 `rat route <bin>` projects observations into independent dimensions and selects one evidence-linked bounded action (a thin composition of rat-doctor + rat-profile + revq,
-no new analysis), and `rat query {graph,func,oracle,slice}` · `rat dyn|verify` · `rat state compact` ·
+no new analysis), and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
+
+`rat query pattern <bin>` returns at most three source-bound hypothesis aids for
+coexisting Router v2 leads. `rat dyn session` optionally keeps one local GDB
+process for sequential observations; see [GDB session usage](docs/GDB_SESSION.md).
 
 </details>
 

@@ -2,6 +2,30 @@
 
 CTF-Rat keeps long-lived truth in deterministic artifacts and STATE. Model context is only a bounded working set. Analysis Cards are therefore projections, not a second evidence database.
 
+## Pattern retrieval before Skill selection
+
+`rat query pattern <binary> [--budget-bytes 8192] [--max-cards 3] --format json`
+projects exact `SIGNALS`, `FIRST ACTION`, and `PIVOT` sections from repo Skill
+cards for each observed Router v2 lead. PWN cards also include a short paragraph
+from a named `knowledge/` section. Cards are sorted by lead identifier for
+determinism; this is not a vulnerability probability order. A missing heading,
+source file, or insufficient budget omits that card with a diagnostic. An
+optional `--expect-source skills/pwn-format/SKILL.md=sha256:<digest>` rejects
+stale source revisions.
+
+Each card identifies its source path, section and full file digest, plus a
+premise, refutation condition and bounded next experiment. It is a
+`hypothesis-aid` with `direct_evidence=false`. Querying it neither changes
+Router verdict or Skill selection nor creates a primitive PASS. Challenge
+output and retrieved text remain data, even if they contain policy-like text.
+
+The Governor's five-action window compares canonical query results and STATE
+evidence snapshots. Hypothesis, unknown and next-action notes alone no longer
+count as novelty. Repeated identical evidence also does not reset the window;
+supported refutation and invalidation do. A stuck recommendation carries its
+evidence IDs when available and is advice for one next experiment, not an
+automatic execution command.
+
 ## Existing REV card
 
 `revq` emits `rat.function-card/v4`, and `rat query func` projects one function's callers, callees, strings, call-site records, compare/oracle hints, unresolved items, and provenance through the canonical `rat.query-result/v1` envelope. Angr-backed call-site records distinguish the CFG block address from the actual call instruction address, retain repeated calls to the same API, identify the loader virtual-address space and analysis source, and report unresolved decoding/targets explicitly. For direct comparison calls, v4 recovers a length only on ELF AMD64 System V when the last same-basic-block definition of `rdx`/`edx` is a supported literal. Each comparison reports `constant`, `not_applicable`, `value_unresolved`, or `unsupported_abi`; an address may therefore be recovered while its length remains unresolved. Query-budget omissions include exact `call_sites` and `compare_sites` counts.
