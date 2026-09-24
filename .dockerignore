@@ -1,6 +1,15 @@
 .git
 .venv
+.venv-angr
+.claude
 .rat
 bench/results
+docs/HANDOFF-*
+solve/*
+!solve/_template/
+!solve/_template/**
+reference/glibc/libs/
+kernel/dumps/
+kernel/logs/
 __pycache__
 *.pyc

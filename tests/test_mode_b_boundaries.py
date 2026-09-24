@@ -106,8 +106,8 @@ class ObservationBoundaries(unittest.TestCase):
     def test_actual_process_exit_and_timeout_save_results_with_mixed_artifacts(self):
         for code, timeout, expected in (("raise SystemExit(124)", 5, ("completed", "failed", "agent-nonzero-exit")),
                                         ("import time; time.sleep(5)", 0.1, ("timeout", "censored", "agent-timeout"))):
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as scratch:
-                chal = Path(scratch) / "chal"
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as runtime:
+                chal = Path(runtime) / "chal"
                 chal.mkdir()
                 mixed_store(chal / ".rat")
                 args = SimpleNamespace(agent=shlex.join([sys.executable, "-c", code]),
@@ -115,7 +115,7 @@ class ObservationBoundaries(unittest.TestCase):
                                        model_id="test", reasoning_effort="none")
                 with mock.patch.object(RATBENCH, "ctf_home", return_value=scratch), \
                      mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
-                     mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(scratch, str(chal), None)), \
+                     mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(runtime, str(chal), None)), \
                      mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=None), \
                      mock.patch.object(RATBENCH, "_strace_usable", return_value=False):
                     self.assertEqual(RATBENCH.cmd_eval(args), 0)

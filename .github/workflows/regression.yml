@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb bubblewrap
       - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
       # tool selftests (pure logic, no angr — see bin/revq "Mac selftest 격리")
       - run: python3 bin/rat selftest
@@ -44,13 +44,14 @@ jobs:
   # angr-backed integration: real ELF Function Card / oracle wiring / data
   # slice / custom-store index registration + governor STATE separation, plus
   # the crackme e2e. Kept OFF the every-push fast path (heavy angr install);
-  # runs on PRs to main, nightly, and manual dispatch. The fast `regression`
+  # runs on dev pushes, PRs to main, nightly, and manual dispatch. The fast `regression`
   # job stays authoritative for pure/unit/operational coverage.
   analysis-deep:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
       (github.event_name == 'pull_request' && github.base_ref == 'main')
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +59,7 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 bubblewrap
       - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
       - run: python3 -m venv .venv-angr
       - run: .venv-angr/bin/python -m pip install --disable-pip-version-check -r requirements-deep.txt

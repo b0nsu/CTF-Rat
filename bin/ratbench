@@ -173,6 +173,14 @@ def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
         isolation += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--"]
     else:
         raise RuntimeError("Mode B requires sandbox-exec (macOS) or bwrap (Linux)")
+    try:
+        probe = subprocess.run([*isolation, "/usr/bin/true"], cwd=cwd, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Mode B filesystem sandbox preflight timed out") from exc
+    if probe.returncode != 0:
+        raise RuntimeError("Mode B filesystem sandbox failed: %s" %
+                           probe.stdout.decode(errors="replace")[:300])
     if trace_path:
         # Explicit /bin/sh preserves the previous shell-command contract while
         # making strace the observer rather than a wrapper inside the agent tree.
@@ -717,6 +725,9 @@ def cmd_eval(args):
                 partial = exc.stdout or b""
                 agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
                 agent_rc = 124
+            except (OSError, RuntimeError) as exc:
+                print("[ratbench:err] %s: agent sandbox unavailable: %s" % (e["id"], exc), file=sys.stderr)
+                return 3
             wall = int((time.time() - t0) * 1000)
             finished_at = datetime.now(timezone.utc).isoformat()
 

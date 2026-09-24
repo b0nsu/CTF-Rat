@@ -143,6 +143,17 @@ class ModeBLocalSmokeTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--tmpfs") + 1], "/operator/ctf-rat")
                 self.assertEqual(argv[-3:], ["/bin/sh", "-c", "echo ready"])
 
+    def test_unusable_sandbox_fails_before_agent_command(self):
+        failed_probe = SimpleNamespace(returncode=1, stdout=b"user namespaces unavailable")
+        with mock.patch.object(RATBENCH, "ctf_home", return_value="/operator/ctf-rat"), \
+             mock.patch.object(RATBENCH, "_have", return_value=True), \
+             mock.patch.object(RATBENCH.sys, "platform", "linux"), \
+             mock.patch.object(RATBENCH.subprocess, "run", return_value=failed_probe) as run:
+            with self.assertRaisesRegex(RuntimeError, "filesystem sandbox failed"):
+                RATBENCH._run_agent("echo should-not-run", cwd="/tmp/kit/solve/case", env={}, timeout=5)
+        run.assert_called_once()
+        self.assertNotIn("should-not-run", run.call_args.args[0])
+
     @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
                          "local python interpreter required")
     def test_real_mode_b_exec_without_completion_remains_unverified(self):

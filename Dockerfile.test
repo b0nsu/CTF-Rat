@@ -3,7 +3,7 @@ FROM --platform=linux/amd64 python:3.12-bookworm
 WORKDIR /work
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    binutils build-essential coreutils file gdb git patchelf sqlite3 xxd \
+    binutils build-essential bubblewrap coreutils file gdb git patchelf sqlite3 tini xxd \
     libc6-dbg && \
     rm -rf /var/lib/apt/lists/*
 
@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt && \
     /opt/ctf-rat-angr/bin/pip install --no-cache-dir -r requirements-deep.txt
 
 COPY . .
+RUN ln -s /opt/ctf-rat-angr /work/.venv-angr
 ENV PATH=/work/bin:${PATH} PYTHONPATH=/work/bin RAT_ANGR_PYTHON=/opt/ctf-rat-angr/bin/python
 
 # Team-state tests exercise an unwritable-directory failure path; it must run
@@ -20,4 +21,5 @@ ENV PATH=/work/bin:${PATH} PYTHONPATH=/work/bin RAT_ANGR_PYTHON=/opt/ctf-rat-ang
 RUN useradd --create-home --uid 1000 ctf && chown -R ctf:ctf /work
 USER ctf
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/bash", "-c", "python3 -m unittest discover -s tests && PATH=/opt/ctf-rat-angr/bin:$PATH /opt/ctf-rat-angr/bin/python -m unittest tests.test_loop_slice_integration tests.test_function_call_sites tests.test_rat_dispatcher && bash tests/e2e_rev.sh --require-engine"]

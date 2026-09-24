@@ -418,7 +418,13 @@ class ManifestAndQilingTests(unittest.TestCase):
             with open(path) as f: self.assertEqual(f.read(), "original\n")
 
     def test_qiling_missing_dependency_is_explicit(self):
-        if importlib.util.find_spec("qiling") is not None:
+        from ratlib.angr_runtime import configured_python
+        runtime_python = configured_python() or sys.executable
+        runtime_has_qiling = subprocess.run(
+            [runtime_python, "-c", "import importlib.util,sys; sys.exit(importlib.util.find_spec('qiling') is None)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if runtime_has_qiling:
             self.skipTest("Qiling installed; dependency-missing branch not applicable")
         with tempfile.TemporaryDirectory() as temp:
             binary = os.path.join(temp, "binary"); rootfs = os.path.join(temp, "rootfs")

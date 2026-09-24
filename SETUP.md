@@ -55,12 +55,16 @@ docker build --platform=linux/amd64 -f Dockerfile.test -t "$RAT_DEEP_IMAGE" .
 # 자동 dispatch나 ratbench의 자동 빌드는 없다. 사람이 명시해 컨테이너에서 실행할 때만 사용한다.
 docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" -e CTF_HOME="$PWD" \
   "$RAT_DEEP_IMAGE" bin/symsolve ./challenge --find-str Correct --stdin 16
+# 전체 Docker 회귀 테스트에는 bwrap mount와 GDB ptrace 권한이 필요하다.
+docker run --rm --network none --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined "$RAT_DEEP_IMAGE"
 ```
+amd64 이미지의 GDB 테스트는 native amd64 호스트/VM에서 실행한다. ARM 호스트의 x86 에뮬레이션에서는 ptrace 레지스터 접근이 실패할 수 있다.
 
 ## 3. 시스템 도구
 ```bash
 # Debian/Ubuntu 예시 (배포판에 맞게)
-sudo apt install -y gdb build-essential file binutils patchelf xxd
+sudo apt install -y gdb bubblewrap build-essential file binutils patchelf xxd
 # 강력 추천 (선택)
 sudo apt install -y ruby && sudo gem install one_gadget seccomp-tools
 # pwninit (libc 자동 patchelf) — rust 있으면
