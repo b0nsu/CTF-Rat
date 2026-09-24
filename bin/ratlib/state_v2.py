@@ -12,7 +12,8 @@ EVENT_SCHEMA="rat.state-event/v2"; TRANSITIONS={
  "consumed":{"invalidated"}, "refuted":set(), "invalidated":set(), "stale":{"supported","refuted"}}
 PRIMITIVE_TRANSITIONS={
  ("candidate","pass"), ("candidate","fail"), ("candidate","blocked"),
- ("pass","stale"), ("pass","consumed"), ("blocked","candidate"), ("stale","candidate"),
+ ("pass","pass"), ("pass","stale"), ("pass","consumed"),
+ ("blocked","candidate"), ("stale","candidate"),
 }
 # Controlled vocabulary for L1 failure classification (compounding loop). Fail-closed:
 # bin/state and the direct API reject any class outside this set.

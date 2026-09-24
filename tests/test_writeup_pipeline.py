@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "bin"))
 
 from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
+from ratlib.writeup_contract import validate_attestation
 from tests.direct_evidence_helper import direct_evidence_envelope, CANONICAL_SUBJECT, CANONICAL_ENVIRONMENT
 
 
@@ -22,6 +23,20 @@ DIGEST = "sha256:" + "a" * 64
 
 
 class WriteupPipelineTests(unittest.TestCase):
+    def test_attestation_evidence_subset_and_empty_list_boundary(self):
+        digest = "sha256:" + "a" * 64
+        attestation = {
+            "schema": "rat.writeup-attestation/v1", "operator": "reviewer",
+            "confirmed_at": "2026-09-24T00:00:00+00:00", "result": "confirmed",
+            "evidence": [digest],
+        }
+        self.assertEqual(validate_attestation(attestation, {digest}), attestation)
+        for evidence in ([], ["sha256:" + "b" * 64], ["../artifact"], [digest, digest]):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                validate_attestation({**attestation, "evidence": evidence}, {digest})
+        with self.assertRaises(ValueError):
+            validate_attestation({**attestation, "path": "../outside"}, {digest})
+
     def run_pkshare(self, directory, *args, check=True):
         return subprocess.run(
             [str(PKSHARE), *args], cwd=directory, text=True, capture_output=True, check=check
@@ -104,6 +119,26 @@ class WriteupPipelineTests(unittest.TestCase):
             # is rejected before a downstream writeup consumer can see it.
             with self.assertRaisesRegex(ValueError, "distinct active direct SELF"):
                 self.complete_v2(directory, duplicate_self_evidence=True)
+
+    def test_pass_to_pass_rechecks_evidence_and_cannot_demote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stream, _ = self.complete_v2(directory)
+            passed = stream.view()["primitives"]["control"]
+            with self.assertRaisesRegex(ValueError, "three distinct active direct SELF"):
+                stream.append("primitive.revised", {
+                    **passed, "revision": 3, "self_evidence": ["obs0"] * 3,
+                })
+            with self.assertRaisesRegex(ValueError, "illegal primitive transition"):
+                stream.append("primitive.revised", {
+                    **passed, "status": "candidate", "revision": 3,
+                })
+            self.assertEqual(stream.view()["primitives"]["control"]["revision"], 2)
+            stream.append("evidence.invalidated", {
+                "observation_ids": ["obs0"], "reason": "test invalidation",
+            })
+            self.assertEqual(stream.view()["primitives"]["control"]["status"], "stale")
+            with self.assertRaisesRegex(ValueError, "illegal primitive transition"):
+                stream.append("primitive.revised", {**passed, "revision": 3})
 
     def test_v2_invalidation_removes_publishable_pass(self):
         with tempfile.TemporaryDirectory() as directory:

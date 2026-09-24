@@ -377,6 +377,7 @@ def record_verification(root, report_digest, evidence_ids):
     """Record a verifier-produced result and promote only an authenticated PASS."""
     root=_root(root); report=_verification_report(root,report_digest); provenance=report["provenance"]
     verdict=report["verdict"]; task=None
+    primitive_revision=None
     if verdict=="pass":
         if not report["environment_match"]: raise GateError("verification PASS requires a matching environment")
         _require_active_evidence(root,list(evidence_ids))
@@ -385,8 +386,8 @@ def record_verification(root, report_digest, evidence_ids):
             raise GateError("verification must be linked to completed exploit and its primitive")
         if task.get("environment_digest")!=provenance["environment_digest"]:
             raise GateError("verification report environment does not match exploit task")
-        _primitive(root,provenance["primitive_id"],task.get("input_digest"),task.get("environment_digest"))
-    record={"verification_id":_id("verify"),"report_digest":report_digest,"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":report["environment_match"],"exploit_task_id":provenance["exploit_task_id"],"primitive_id":provenance["primitive_id"],"trace_digest":provenance["trace_digest"],"producer_build_digest":report["producer"]["build_digest"],"exploit_phase_attempt_id":task.get("phase_attempt_id") if task else None,"lineage_id":task.get("lineage_id") if task else _lineage(root)}
+        primitive_revision=_primitive(root,provenance["primitive_id"],task.get("input_digest"),task.get("environment_digest")).get("revision")
+    record={"verification_id":_id("verify"),"report_digest":report_digest,"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":report["environment_match"],"exploit_task_id":provenance["exploit_task_id"],"primitive_id":provenance["primitive_id"],"primitive_revision":primitive_revision,"trace_digest":provenance["trace_digest"],"producer_build_digest":report["producer"]["build_digest"],"exploit_phase_attempt_id":task.get("phase_attempt_id") if task else None,"lineage_id":task.get("lineage_id") if task else _lineage(root)}
     Stream(root).append("verification.recorded",record)
     return record
 def context_bundle(root, checkpoint_id, phase, budget):
