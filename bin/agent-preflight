@@ -85,10 +85,10 @@ def main() -> int:
         "objdump": check("objdump", [shutil.which("objdump"), "--version"] if shutil.which("objdump") else None),
     }
     pwn_python = ROOT / ".venv" / "bin" / "python"
-    required["pwntools"] = check("pwntools (.venv)", [str(pwn_python), "-c", "import pwn"])
+    optional_tools = {"pwntools": check("pwntools (.venv)", [str(pwn_python), "-c", "import pwn"])}
 
     angr_python = os.environ.get("RAT_ANGR_PYTHON") or str(ROOT / ".venv-angr" / "bin" / "python")
-    required["angr + native Unicorn"] = check(
+    optional_tools["angr + native Unicorn"] = check(
         "angr + native Unicorn (.venv-angr)",
         [angr_python, "-c", "import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"],
         timeout=15,
@@ -100,18 +100,21 @@ def main() -> int:
         "Ghidra": check("Ghidra (analyzeHeadless + Java)", ghidra_probe),
     }
     missing_required = [name for name, ok in required.items() if not ok]
-    missing_optional = [name for name, ok in optional.items() if not ok]
+    missing_optional = [name for name, ok in {**optional_tools, **optional}.items() if not ok]
+    strict = os.environ.get("RAT_PREFLIGHT_STRICT") == "1"
     if missing_required:
         print(f"  Required missing: {', '.join(missing_required)}", flush=True)
     if missing_optional:
         print(f"  Optional missing: {', '.join(missing_optional)}", flush=True)
+        if "pwntools" in missing_optional or "angr + native Unicorn" in missing_optional:
+            print(f"  Install missing analysis stacks using {ROOT / 'SETUP.md'}.", flush=True)
         if "GDB" in missing_optional:
             print("  GDB: install gdb and ensure it is in PATH.", flush=True)
         if "Ghidra" in missing_optional:
             print(f"  Ghidra: {ghidra_issue or 'Java failed to start'}.", flush=True)
     print(f"  Duration: {time.monotonic() - started:.2f}s", flush=True)
 
-    if missing_required:
+    if missing_required or (strict and any(not ok for ok in optional_tools.values())):
         print(f"  [BLOCKED] setup: {ROOT / 'SETUP.md'}", file=sys.stderr, flush=True)
         return 2
     print("  [PASS] core environment ready\n", flush=True)

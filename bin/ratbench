@@ -387,6 +387,11 @@ def _copy_runtime_export(dst_root):
         shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
 
 
+def _flag_named_path(path):
+    return any(part.lower() in {"flag", "flag.txt", "flag.json", "flag.bin"}
+               or part.lower().endswith(".flag") for part in path.split(os.sep))
+
+
 def _runtime_fixture_relpath(relpath):
     if not isinstance(relpath, str) or not relpath or os.path.isabs(relpath):
         raise ValueError("runtime fixture path must be relative")
@@ -395,8 +400,7 @@ def _runtime_fixture_relpath(relpath):
         raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
     if ".rat" in normalized.split(os.sep):
         raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
-    if any(part.lower() in {"flag", "flag.txt", "flag.json", "flag.bin"}
-           or part.lower().endswith(".flag") for part in normalized.split(os.sep)):
+    if _flag_named_path(normalized):
         raise ValueError("flag file cannot be exported to Mode B: %s" % relpath)
     return normalized
 
@@ -407,6 +411,8 @@ def _fixture_file(entry, relpath):
     candidate = os.path.realpath(os.path.join(base, normalized))
     if os.path.commonpath((base, candidate)) != base:
         raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if _flag_named_path(os.path.relpath(candidate, base)):
+        raise ValueError("flag file cannot be exported to Mode B: %s" % relpath)
     if not os.path.isfile(candidate):
         raise ValueError("runtime fixture file missing: %s" % relpath)
     return candidate

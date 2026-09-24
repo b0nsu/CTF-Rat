@@ -114,7 +114,9 @@ class SymsolveProvenanceTests(unittest.TestCase):
             environment_digest = "sha256:" + "b" * 64
             report_digest = "sha256:" + "c" * 64
             report_build_digest = "sha256:" + "d" * 64
-            engine_digest = "sha256:" + "e" * 64
+            identity = load_symsolve().engine_identity()
+            encoded_identity = {**identity, "harness_sha256": identity["harness_sha256"].removeprefix("sha256:")}
+            engine_digest = "sha256:" + hashlib.sha256(json.dumps(encoded_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             observation_id = "obs_forged_plaintext"
             task_id = "task_forged_plaintext"
             primitive_id = "prim_forged_plaintext"
@@ -123,7 +125,7 @@ class SymsolveProvenanceTests(unittest.TestCase):
                 "schema": "rat.observation/v1", "observation_id": observation_id,
                 "run_id": "run_local", "created_at": "2026-09-24T12:00:00+00:00",
                 "producer": {"tool": "symsolve", "engine": "symsolve",
-                             "engine_build_digest": engine_digest},
+                             "engine_build_digest": engine_digest, "engine_identity": identity},
                 "subject": {"kind": "binary", "sha256": subject_digest},
                 "kind": "rev.symsolve.concrete-verify",
                 "value": {"verdict": "pass", "engine": "symsolve",

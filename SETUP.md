@@ -95,7 +95,7 @@ python3 bin/ctfpull selftest
 angr 미설치 환경이면 revq 는 `selftest`·`--fast`(binutils) 만, symsolve 는 `selftest` 만 동작.
 
 ## 7. 사용 (진입점)
-- **터미널 표지·시작 점검**: 1절처럼 레포 `bin/`을 PATH 맨 앞에 두면, 이 레포 안에서 인자 없이 대화형으로 `claude` 또는 `codex`를 열 때 마스코트 표지와 빠른 환경 점검을 보여준다. 검사 중에는 경과 시간이 갱신되고, 결과에는 각 항목과 전체 소요 시간이 표시된다. Python 3.10+, `file`, `objdump`, `.venv`의 pwntools, `.venv-angr`의 native Unicorn은 필수이며, GDB와 Ghidra(`analyzeHeadless` + Java)는 설치 여부를 확인해 누락 시 안내한다. 필수 항목이 실패하면 `SETUP.md` 경로를 보여주고 중단한다. 레포 밖이나 비대화형 명령에는 표지·점검이 없다. 색을 끄려면 `NO_COLOR=1`을 사용한다. 전체 도구 회귀 검증은 별도로 `pkselftest`를 실행한다.
+- **터미널 표지·시작 점검**: 1절처럼 레포 `bin/`을 PATH 맨 앞에 두면, 이 레포 안에서 인자 없이 대화형으로 `claude` 또는 `codex`를 열 때 마스코트 표지와 빠른 환경 점검을 보여준다. 검사 중에는 경과 시간이 갱신되고, 결과에는 각 항목과 전체 소요 시간이 표시된다. Python 3.10+, `file`, `objdump`는 시작 필수 조건이다. `.venv`의 pwntools, `.venv-angr`의 native Unicorn, GDB, Ghidra(`analyzeHeadless` + Java)는 누락 시 안내하지만 에이전트 실행은 허용한다. pwntools와 native Unicorn까지 시작 필수 조건으로 요구하려면 `RAT_PREFLIGHT_STRICT=1`을 설정한다. 레포 밖이나 비대화형 명령에는 표지·점검이 없다. 색을 끄려면 `NO_COLOR=1`을 사용한다. 전체 도구 회귀 검증은 별도로 `pkselftest`를 실행한다.
 - **풀이 진입**: 레포 루트에서 `claude`(또는 codex) → `CLAUDE.md` 자동 로드(풀이 doctrine 진입점).
 - **수집/스캐폴드**: `ctfpull ctfd --id N` → `solve/<name>/artifact/`에 원본 수집 → `newchal <name> <bin> [libc] [host:port]`
 - **rev**: `revq <bin>` → `revq <bin> --func <후보>` → `decomp <bin> <fn>` → `symsolve … --find-str …`

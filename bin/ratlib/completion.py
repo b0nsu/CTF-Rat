@@ -7,9 +7,11 @@ rat-verify PASS linked to the same primitive and completed exploit task.
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 
 from .orchestration import GateError, _task, _verification_report
-from .state_v2 import Stream
+from .state_v2 import Stream, trusted_producer_for_build
 
 
 _ENGINE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -136,6 +138,20 @@ def _symbolic_engine_issue(primitive, view):
     if not isinstance(subject, dict):
         subject = {}
     build_digest = producer.get("engine_build_digest")
+    identity = producer.get("engine_identity")
+    identity_ok = False
+    if isinstance(identity, dict) and set(identity) == {"harness_sha256", "packages", "python", "engine"}:
+        harness_digest = identity.get("harness_sha256")
+        packages = identity.get("packages")
+        if (isinstance(harness_digest, str) and _ENGINE_DIGEST.fullmatch(harness_digest)
+                and trusted_producer_for_build(harness_digest) == "symsolve.py"
+                and isinstance(packages, dict) and set(packages) == {"angr", "unicorn"}
+                and all(value is None or isinstance(value, str) for value in packages.values())
+                and isinstance(identity.get("python"), str)
+                and identity.get("engine") == "native-unicorn"):
+            encoded_identity = {**identity, "harness_sha256": harness_digest.removeprefix("sha256:")}
+            encoded = json.dumps(encoded_identity, sort_keys=True, separators=(",", ":")).encode()
+            identity_ok = build_digest == "sha256:" + hashlib.sha256(encoded).hexdigest()
     if (observation.get("kind") == "rev.symsolve.concrete-verify"
             and observation.get("validity", {}).get("state") == "active"
             and observation.get("quality", {}).get("level") == "heuristic"
@@ -146,7 +162,8 @@ def _symbolic_engine_issue(primitive, view):
             and value.get("engine") == "symsolve"
             and value.get("engine_build_digest") == build_digest
             and isinstance(build_digest, str)
-            and _ENGINE_DIGEST.fullmatch(build_digest)):
+            and _ENGINE_DIGEST.fullmatch(build_digest)
+            and identity_ok):
         return None
     return "unsanctioned-symbolic-engine"
 

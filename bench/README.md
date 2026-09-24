@@ -45,6 +45,8 @@ For non-redistributable material, create an ignored `bench/local-suite.json` (or
 
 Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `artifacts/**/*.bin`, local suite manifests, and inherited `.rat` state. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules. Agent execution requires `sandbox-exec` on macOS or `bwrap` on Linux. The operator checkout is hidden from the agent, with only `.venv` and `.venv-angr` readable for tool execution. If neither sandbox is available, evaluation fails closed.
 
+The sandbox restricts filesystem access to the operator checkout. It does not isolate network access; the agent CLI still needs its model API connection. Use a private held-out corpus for unseen-solve claims.
+
 ## Materializing committed real entries
 
 A committed `real` entry may include a `fetch` object only when redistribution rights are explicit. The metadata pins an HTTPS source and the exact Git blob SHA-1 of the published challenge binary. The binary itself remains ignored under `bench/artifacts/`; the fetch metadata is part of the canonical suite digest.

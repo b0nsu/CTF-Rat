@@ -72,8 +72,8 @@ def parse_addr(s):
         return None
 
 
-def engine_build_digest():
-    """Digest the harness and the local solver runtime identity."""
+def engine_identity():
+    """Describe the harness and local solver runtime for portable verification."""
     with open(os.path.realpath(__file__), "rb") as source:
         harness_digest = hashlib.sha256(source.read()).hexdigest()
     packages = {}
@@ -82,13 +82,20 @@ def engine_build_digest():
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
-    identity = {
-        "harness_sha256": harness_digest,
+    return {
+        "harness_sha256": "sha256:" + harness_digest,
         "packages": packages,
         "python": "%d.%d.%d" % sys.version_info[:3],
         "engine": "native-unicorn",
     }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+
+
+def engine_build_digest(identity=None):
+    """Digest the complete solver identity, including the manifest-bound harness."""
+    identity = identity or engine_identity()
+    # Preserve the established digest encoding for existing engine records.
+    encoded_identity = {**identity, "harness_sha256": identity["harness_sha256"].removeprefix("sha256:")}
+    encoded = json.dumps(encoded_identity, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -103,7 +110,8 @@ def record_concrete_observation(state_dir, binary, output, solutions):
     from ratlib.state_v2 import Stream, environment_fingerprint
 
     root = os.path.abspath(state_dir)
-    engine_digest = engine_build_digest()
+    identity = engine_identity()
+    engine_digest = engine_build_digest(identity)
     output_bytes = output if isinstance(output, bytes) else str(output).encode()
     with open(binary, "rb") as source:
         binary_digest = "sha256:" + hashlib.sha256(source.read()).hexdigest()
@@ -128,7 +136,7 @@ def record_concrete_observation(state_dir, binary, output, solutions):
         "run_id": "run_symsolve_" + os.urandom(8).hex(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "producer": {"tool": "symsolve", "version": "1", "engine": "symsolve",
-                     "engine_build_digest": engine_digest},
+                     "engine_build_digest": engine_digest, "engine_identity": identity},
         "subject": {"kind": "binary", "sha256": binary_digest},
         "kind": "rev.symsolve.concrete-verify",
         "value": {"verdict": "pass", "engine": "symsolve",
@@ -199,7 +207,6 @@ def native_angr_ready():
     """Return whether this interpreter has angr's native Unicorn engine loaded."""
     try:
         import angr  # noqa: F401
-        from angr.engines import UberEnginePcode  # noqa: F401
         from angr.engines import unicorn as angr_unicorn
     except ImportError:
         return False

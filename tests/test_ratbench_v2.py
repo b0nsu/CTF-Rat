@@ -126,6 +126,23 @@ class ModeBLocalSmokeTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "flag file"):
                 RATBENCH._runtime_fixture_relpath(path)
 
+    def test_agent_wrapper_uses_platform_filesystem_sandbox(self):
+        with mock.patch.object(RATBENCH, "ctf_home", return_value="/operator/ctf-rat"), \
+             mock.patch.object(RATBENCH, "_have", return_value=True), \
+             mock.patch.object(RATBENCH.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            with mock.patch.object(RATBENCH.sys, "platform", "darwin"):
+                RATBENCH._run_agent("echo ready", cwd="/tmp/kit/solve/case", env={}, timeout=5)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[:2], ["sandbox-exec", "-p"])
+                self.assertIn("/operator/ctf-rat", argv[2])
+                self.assertEqual(argv[-3:], ["/bin/sh", "-c", "echo ready"])
+            with mock.patch.object(RATBENCH.sys, "platform", "linux"):
+                RATBENCH._run_agent("echo ready", cwd="/tmp/kit/solve/case", env={}, timeout=5)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[0], "bwrap")
+                self.assertEqual(argv[argv.index("--tmpfs") + 1], "/operator/ctf-rat")
+                self.assertEqual(argv[-3:], ["/bin/sh", "-c", "echo ready"])
+
     @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
                          "local python interpreter required")
     def test_real_mode_b_exec_without_completion_remains_unverified(self):

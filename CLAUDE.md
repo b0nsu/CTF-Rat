@@ -29,7 +29,9 @@ host:port. 작업자는 위 대상의 테스트 권한을 보유하며, 목표(f
 `producer.engine`이나 `solve_origin` 태그만으로 판단하지 않는다. `solution-reconstruction` 등
 허용된 복원 class, 또는 직접 측정한 PWN SELF observation이 없는 rev route-assessment가 있으면 태그 없이도 연결된 활성
 `rev.symsolve.concrete-verify` observation의 engine provenance를 확인하고, 근거가 없으면 기본
-deny한다. 뒤에 추가된 PWN route note만으로 앞선 rev 후보를 지우지 않으며, active+direct
+deny한다. 그 observation의 `engine_identity.harness_sha256`은 trusted verifier manifest와
+대조하고 합성 `engine_build_digest`와의 일치를 확인한다. 이전 형식처럼 `engine_identity`가
+없는 기록은 새 concrete-verify 또는 수동 attestation이 필요하다. 뒤에 추가된 PWN route note만으로 앞선 rev 후보를 지우지 않으며, active+direct
 `pwn.*` SELF observation은 잠정적 rev route보다 우선한다. Router v2의 rev lead와 PWN lead가
 한 note에 함께 있으면 그 note만으로 rev 분류하지 않는다.
 rev route note가 없거나 혼합 lead뿐이고 primitive class가 allowlist 밖이면 이 분류로는 잡히지 않는다.

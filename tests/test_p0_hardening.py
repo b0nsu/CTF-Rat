@@ -1,6 +1,9 @@
 import importlib.machinery
 import importlib.util
+import hashlib
+import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -136,14 +139,22 @@ class CompletionGateTests(unittest.TestCase):
         return _FakeStream(events, {"prim_1": primitive}, observations, notes)
 
     def _sanctioned_observation(self):
-        digest = "sha256:" + "f" * 64
+        harness = os.path.join(ROOT, "solve", "_template", "rev", "symsolve.py")
+        identity = {
+            "harness_sha256": "sha256:" + hashlib.sha256(Path(harness).read_bytes()).hexdigest(),
+            "packages": {"angr": "test", "unicorn": "test"},
+            "python": "3.12.0", "engine": "native-unicorn",
+        }
+        encoded = {**identity, "harness_sha256": identity["harness_sha256"].removeprefix("sha256:")}
+        digest = "sha256:" + hashlib.sha256(json.dumps(encoded, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return {
             "schema": "rat.observation/v1", "observation_id": "obs_symsolve_1",
             "kind": "rev.symsolve.concrete-verify", "quality": {"level": "heuristic"},
             "validity": {"state": "active"},
             "subject": {"kind": "binary", "sha256": self.primitive["input_digest"]},
             "value": {"verdict": "pass", "engine": "symsolve", "engine_build_digest": digest},
-            "producer": {"tool": "symsolve", "engine": "symsolve", "engine_build_digest": digest},
+            "producer": {"tool": "symsolve", "engine": "symsolve", "engine_build_digest": digest,
+                         "engine_identity": identity},
             "evidence": [self.record["report_digest"]],
         }
 
@@ -158,6 +169,26 @@ class CompletionGateTests(unittest.TestCase):
             self._symbolic_fixture(observation=self._sanctioned_observation()))
         self.assertTrue(result["verified"])
         self.assertNotIn("advisory", result)
+
+    def test_unlisted_symsolve_harness_is_denied(self):
+        observation = self._sanctioned_observation()
+        identity = observation["producer"]["engine_identity"]
+        identity["harness_sha256"] = "sha256:" + "f" * 64
+        encoded = {**identity, "harness_sha256": "f" * 64}
+        digest = "sha256:" + hashlib.sha256(json.dumps(encoded, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        observation["producer"]["engine_build_digest"] = digest
+        observation["value"]["engine_build_digest"] = digest
+        result = self._run_symbolic_gate(self._symbolic_fixture(observation=observation))
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
+
+    def test_mismatched_symsolve_engine_identity_is_denied(self):
+        observation = self._sanctioned_observation()
+        observation["producer"]["engine_build_digest"] = "sha256:" + "e" * 64
+        observation["value"]["engine_build_digest"] = "sha256:" + "e" * 64
+        result = self._run_symbolic_gate(self._symbolic_fixture(observation=observation))
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
 
     def test_rev_symbolic_without_sanctioned_observation_is_denied_by_default(self):
         result = self._run_symbolic_gate(self._symbolic_fixture())
@@ -386,6 +417,22 @@ class RatbenchIsolationTests(unittest.TestCase):
             with patch.object(ratbench, "ctf_home", return_value=root):
                 with self.assertRaisesRegex(ValueError, "ground-truth/state file"):
                     ratbench._prepare_eval_workspace(entry, sandbox)
+
+    def test_mode_b_rejects_symlink_flag_alias(self):
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            fixture = os.path.join(root, "bench", "artifacts", "case")
+            os.makedirs(fixture)
+            for name in ("chall", "flag.txt"):
+                with open(os.path.join(fixture, name), "wb") as target:
+                    target.write(b"CTF{secret}")
+            os.symlink("flag.txt", os.path.join(fixture, "data.bin"))
+            entry = {"id": "case", "dir": "bench/artifacts/case", "binary": "chall",
+                     "runtime_files": ["data.bin"]}
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                with self.assertRaisesRegex(ValueError, "flag file"):
+                    ratbench._prepare_eval_workspace(entry, sandbox)
+            self.assertFalse(os.path.exists(os.path.join(sandbox, "ctf-rat", "solve", "case", "data.bin")))
 
     def test_mode_b_rejects_symlink_alias_to_state_directory(self):
         ratbench = load_ratbench()
