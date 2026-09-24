@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Fast, read-only startup check for the interactive agent launchers."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def check(label: str, command: list[str] | None, *, timeout: int = 8) -> bool:
+    interactive = sys.stdout.isatty()
+    print(f"  [CHECK] {label}...", end="" if interactive else "\n", flush=True)
+    started = time.monotonic()
+    if command is None:
+        ok = False
+    else:
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while process.poll() is None:
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout:
+                    process.kill()
+                    process.wait()
+                    break
+                if interactive:
+                    print(f"\r  [CHECK] {label}... {elapsed:.1f}s", end="", flush=True)
+                time.sleep(0.1)
+            ok = process.returncode == 0
+        except OSError:
+            ok = False
+    if interactive:
+        print("\r\033[2K", end="", flush=True)
+    print(f"  [{'OK' if ok else 'MISSING'}] {label} ({time.monotonic() - started:.2f}s)", flush=True)
+    return ok
+
+
+def ghidra_command() -> tuple[list[str] | None, str | None]:
+    candidates = []
+    if os.environ.get("GHIDRA_HOME"):
+        candidates.append(Path(os.environ["GHIDRA_HOME"]) / "support" / "analyzeHeadless")
+    found = shutil.which("analyzeHeadless")
+    if found:
+        candidates.append(Path(found))
+    candidates.append(Path("/opt/homebrew/opt/ghidra/libexec/support/analyzeHeadless"))
+    candidates.append(Path("/usr/local/opt/ghidra/libexec/support/analyzeHeadless"))
+    candidates.append(Path("/opt/ghidra_11.2.1_PUBLIC/support/analyzeHeadless"))
+    candidates.extend(Path("/opt").glob("ghidra_*_PUBLIC/support/analyzeHeadless"))
+    candidates.extend((Path.home() / "ctf-tools").glob("ghidra_*_PUBLIC/support/analyzeHeadless"))
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            # Do not launch a full Ghidra analysis at login.
+            java_candidates = []
+            if os.environ.get("JAVA_HOME"):
+                java_candidates.append(Path(os.environ["JAVA_HOME"]) / "bin" / "java")
+            java_candidates.extend((
+                Path("/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java"),
+                Path("/usr/local/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java"),
+            ))
+            if shutil.which("java"):
+                java_candidates.append(Path(shutil.which("java")))
+            for java in java_candidates:
+                if java.is_file() and os.access(java, os.X_OK):
+                    try:
+                        result = subprocess.run([str(java), "-version"], stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL, timeout=3, check=False)
+                    except (OSError, subprocess.TimeoutExpired):
+                        continue
+                    if result.returncode == 0:
+                        return [str(java), "-version"], None
+            return None, "a working Java runtime was not found"
+    return None, "analyzeHeadless was not found; set GHIDRA_HOME to the Ghidra install directory"
+
+
+def main() -> int:
+    started = time.monotonic()
+    print("  ctf-rat // startup check", flush=True)
+    required = {
+        "Python 3.10+": check("Python 3.10+", [sys.executable, "-c", "import sys; assert sys.version_info >= (3, 10)"]),
+        "file": check("file", [shutil.which("file"), "--version"] if shutil.which("file") else None),
+        "objdump": check("objdump", [shutil.which("objdump"), "--version"] if shutil.which("objdump") else None),
+    }
+    pwn_python = ROOT / ".venv" / "bin" / "python"
+    required["pwntools"] = check("pwntools (.venv)", [str(pwn_python), "-c", "import pwn"])
+
+    angr_python = os.environ.get("RAT_ANGR_PYTHON") or str(ROOT / ".venv-angr" / "bin" / "python")
+    required["angr + native Unicorn"] = check(
+        "angr + native Unicorn (.venv-angr)",
+        [angr_python, "-c", "import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"],
+        timeout=15,
+    )
+
+    ghidra_probe, ghidra_issue = ghidra_command()
+    optional = {
+        "GDB": check("GDB (version only)", [shutil.which("gdb"), "--version"] if shutil.which("gdb") else None),
+        "Ghidra": check("Ghidra (analyzeHeadless + Java)", ghidra_probe),
+    }
+    missing_required = [name for name, ok in required.items() if not ok]
+    missing_optional = [name for name, ok in optional.items() if not ok]
+    if missing_required:
+        print(f"  Required missing: {', '.join(missing_required)}", flush=True)
+    if missing_optional:
+        print(f"  Optional missing: {', '.join(missing_optional)}", flush=True)
+        if "GDB" in missing_optional:
+            print("  GDB: install gdb and ensure it is in PATH.", flush=True)
+        if "Ghidra" in missing_optional:
+            print(f"  Ghidra: {ghidra_issue or 'Java failed to start'}.", flush=True)
+    print(f"  Duration: {time.monotonic() - started:.2f}s", flush=True)
+
+    if missing_required:
+        print(f"  [BLOCKED] setup: {ROOT / 'SETUP.md'}", file=sys.stderr, flush=True)
+        return 2
+    print("  [PASS] core environment ready\n", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

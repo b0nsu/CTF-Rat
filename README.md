@@ -178,7 +178,7 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 <summary>🎯 <b>pwn</b></summary>
 <br>
 
-`pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope`
+`pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope` / `pwnclean` / `pkflag`
 
 </details>
 
@@ -189,6 +189,7 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 - **Environment / execution plan** — `rat-doctor <bin> --format json` shows which paths (native/GDB/angr/Ghidra/QEMU/Qiling/Wine) actually work for this artifact and why others are blocked. Regression testing is handled separately by `pkselftest`.
 - **Reproducible scenarios** — `rat-scenario init|validate|show` normalizes the input/argv/env/oracle shared by `rat-dyn` / `rat-runtime` / `rat-verify`. Binary stdin is preserved via `--stdin-file`.
 - **State bus** — `state` (record confirmed / ruled-out / next) · **kernel** — `k_*` (kernel/).
+- **Internal schema test helper** — `ratlib.schema_docs` extracts validator field contracts for `tests/test_schema_docs.py`; it is not part of runtime STATE validation.
 - **Handoff & knowledge** — `pkshare` → `HANDOFF.md`; `writeupcheck` quality gate → reviewed lessons land in `knowledge/learned/`. Typed STATE v2 takes precedence; legacy PASS entries are shown only as candidates. Completion docs require an operator attestation linked to an evidence digest.
 
 </details>
@@ -205,9 +206,11 @@ python3 solve/_template/rev/vmlift.py selftest
 python3 bin/ctfpull selftest && python3 tests/e2e_mock.py
 python3 -m unittest tests.test_writeup_pipeline
 bash tests/e2e_rev.sh        # real crackme e2e if angr is installed, selftest only otherwise
+bash tests/e2e_rev.sh --require-engine  # release/CI gate: missing native angr is failure
 ```
 
-Passing means `ALL GREEN ✅` across the board.
+Release verification requires `--require-engine` and `ALL GREEN ✅`; the optional
+selftest-only run is reported as partial coverage.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 
