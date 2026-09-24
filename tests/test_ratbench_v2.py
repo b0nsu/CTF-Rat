@@ -121,6 +121,11 @@ class CorpusGateTests(unittest.TestCase):
 
 
 class ModeBLocalSmokeTests(unittest.TestCase):
+    def test_flag_paths_are_rejected(self):
+        for path in ("flag", "flag.txt", "assets/secret.flag"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "flag file"):
+                RATBENCH._runtime_fixture_relpath(path)
+
     @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
                          "local python interpreter required")
     def test_real_mode_b_exec_without_completion_remains_unverified(self):
@@ -229,6 +234,19 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertFalse(doc["ground_truth"]["redistributable"])
         self.assertEqual(doc["provenance"], _provenance())
         self.assertEqual(doc["routing"], _routing())
+
+    def test_denied_symbolic_bypass_is_telemetried_as_tooling_gap(self):
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-denied-symbolic", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=0, flag_claimed=True,
+            completion={"verified": False, "reason": "unsanctioned-symbolic-engine"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+        )
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertEqual(doc["outcome"], "solve-claimed")
+        self.assertEqual(doc["oracle"]["failure_class"], "tooling-gap:symsolve-bypass")
 
     def test_envelope_observations_are_scoped_and_do_not_invent_run_wide_metrics(self):
         observed = {

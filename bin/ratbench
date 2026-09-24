@@ -117,9 +117,17 @@ def _have(cmd):
     return which(cmd) is not None
 
 
+def _angr_python():
+    python = os.environ.get("RAT_ANGR_PYTHON")
+    if not python:
+        candidate = os.path.join(ctf_home(), ".venv-angr", "bin", "python")
+        python = candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else sys.executable
+    return python
+
+
 def _have_angr():
     try:
-        subprocess.run([sys.executable, "-c", "import angr"], check=True,
+        subprocess.run([_angr_python(), "-c", "import angr; from angr.engines import UberEnginePcode; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         return True
     except Exception:
@@ -142,14 +150,37 @@ def _strace_usable():
 
 
 def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
+    source_root = os.path.realpath(ctf_home())
+    runtime_env_dirs = [os.path.join(source_root, name) for name in (".venv", ".venv-angr")]
+    if sys.platform == "darwin" and _have("sandbox-exec"):
+        # Deny the complete operator checkout: it contains the benchmark oracle.
+        profile = '(version 1)(allow default)(deny file-read* (subpath %s))(deny file-write* (subpath %s))' % (
+            json.dumps(source_root), json.dumps(source_root))
+        if any(os.path.isdir(path) for path in runtime_env_dirs):
+            profile += '(allow file-read-metadata (subpath %s))' % json.dumps(source_root)
+            for path in runtime_env_dirs:
+                if os.path.isdir(path):
+                    profile += '(allow file-read* (subpath %s))' % json.dumps(path)
+        isolation = ["sandbox-exec", "-p", profile]
+    elif sys.platform.startswith("linux") and _have("bwrap"):
+        # The exported kit lives in /tmp. Mask the operator checkout after
+        # binding the host runtime so CLI dependencies remain available.
+        isolation = ["bwrap", "--ro-bind", "/", "/", "--bind", "/tmp", "/tmp",
+                     "--tmpfs", source_root]
+        for path in runtime_env_dirs:
+            if os.path.isdir(path):
+                isolation += ["--dir", path, "--ro-bind", path, path]
+        isolation += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--"]
+    else:
+        raise RuntimeError("Mode B requires sandbox-exec (macOS) or bwrap (Linux)")
     if trace_path:
         # Explicit /bin/sh preserves the previous shell-command contract while
         # making strace the observer rather than a wrapper inside the agent tree.
         argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-s", "4096",
-                "-o", trace_path, "/bin/sh", "-c", prompt]
+                "-o", trace_path, *isolation, "/bin/sh", "-c", prompt]
         return subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, timeout=timeout, env=env)
-    return subprocess.run(prompt, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+    return subprocess.run([*isolation, "/bin/sh", "-c", prompt], cwd=cwd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, timeout=timeout, env=env)
 
 
@@ -182,8 +213,9 @@ def _compile(entry, workdir):
     if not os.path.isfile(src) or not _have("gcc"):
         return None
     out = os.path.join(workdir, entry["id"])
-    # -no-pie + -fno-stack-protector keep the synthetic fixtures simple/deterministic.
-    cmd = ["gcc", "-w", "-O1", "-fno-stack-protector", "-no-pie", src, "-o", out]
+    # Keep fixture control flow identical across GCC/Clang host compilers. The
+    # optimization levels used for a real target are a separate environment fact.
+    cmd = ["gcc", "-w", "-O0", "-fno-stack-protector", "-no-pie", src, "-o", out]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
     except Exception:
@@ -210,13 +242,17 @@ def _verify_symsolve(entry, binpath):
     if binpath is None:
         return "skipped", "no gcc/binary"
     if not _have_angr():
-        return "skipped", "no angr"
+        return "skipped", "no angr venv"
     v = entry["verify"]
-    sym = os.path.join(ctf_home(), "solve", "_template", "rev", "symsolve.py")
-    cmd = [sys.executable, sym, binpath, "--find-str", v["find_str"],
+    python = _angr_python()
+    sym = os.path.join(ctf_home(), "bin", "symsolve")
+    cmd = [sym, binpath, "--find-str", v["find_str"],
            "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)), "--printable"]
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        env = os.environ.copy()
+        env["RAT_ANGR_PYTHON"] = python
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=180, env=env)
     except Exception as exc:
         return "error", str(exc)
     out = p.stdout.decode(errors="replace")
@@ -301,7 +337,7 @@ def cmd_run(args):
         return 1
     n_skipped = sum(1 for rec in lines if rec["verify"]["status"] == "skipped")
     if n_skipped:
-        print("-- all entries route-correct, %d/%d verifier%s skipped (missing dependency, not failed)" %
+        print("-- all entries route-correct, %d/%d verifier%s skipped (see per-entry reason; no solve claim)" %
               (n_skipped, len(lines), "" if n_skipped == 1 else "s"))
     else:
         print("-- all entries route-correct and verified")
@@ -315,6 +351,18 @@ _RUNTIME_DIRS = ("bin", "doctrine", "knowledge", "reference", "schemas", "skills
 _RUNTIME_FILES = ("CLAUDE.md", "AGENTS.md", "FLAG_FORMAT")
 
 
+def _reject_external_symlinks(src):
+    """Allow aliases inside one exported tree, never links to benchmark data."""
+    if os.path.islink(src):
+        raise ValueError("Mode B runtime export has a symlinked root: %s" % src)
+    root = os.path.realpath(src)
+    for directory, subdirs, files in os.walk(src, followlinks=False):
+        for name in subdirs + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path) and os.path.commonpath((root, os.path.realpath(path))) != root:
+                raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % path)
+
+
 def _copy_runtime_export(dst_root):
     import shutil
     src_root = ctf_home()
@@ -322,13 +370,19 @@ def _copy_runtime_export(dst_root):
     for name in _RUNTIME_FILES:
         src = os.path.join(src_root, name)
         if os.path.isfile(src):
+            if os.path.islink(src):
+                target = os.path.realpath(src)
+                if target not in {os.path.realpath(os.path.join(src_root, item)) for item in _RUNTIME_FILES}:
+                    raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % src)
             shutil.copy2(src, os.path.join(dst_root, name))
     for name in _RUNTIME_DIRS:
         src = os.path.join(src_root, name)
         if os.path.isdir(src):
+            _reject_external_symlinks(src)
             shutil.copytree(src, os.path.join(dst_root, name), symlinks=False)
     template = os.path.join(src_root, "solve", "_template")
     if os.path.isdir(template):
+        _reject_external_symlinks(template)
         os.makedirs(os.path.join(dst_root, "solve"), exist_ok=True)
         shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
 
@@ -341,6 +395,9 @@ def _runtime_fixture_relpath(relpath):
         raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
     if ".rat" in normalized.split(os.sep):
         raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+    if any(part.lower() in {"flag", "flag.txt", "flag.json", "flag.bin"}
+           or part.lower().endswith(".flag") for part in normalized.split(os.sep)):
+        raise ValueError("flag file cannot be exported to Mode B: %s" % relpath)
     return normalized
 
 
@@ -358,6 +415,10 @@ def _fixture_file(entry, relpath):
 def _prepare_eval_workspace(entry, sandbox):
     """Create a CTF-Rat runtime export plus answer-free challenge directory."""
     import shutil
+    source_root = os.path.realpath(ctf_home())
+    fixture_root = os.path.realpath(os.path.join(source_root, entry["dir"]))
+    if os.path.commonpath((source_root, fixture_root)) != source_root:
+        raise ValueError("runtime fixture directory escapes CTF_HOME: %s" % entry["dir"])
     kit_root = os.path.join(sandbox, "ctf-rat")
     _copy_runtime_export(kit_root)
     chal_dir = os.path.join(kit_root, "solve", entry["id"])
@@ -366,6 +427,10 @@ def _prepare_eval_workspace(entry, sandbox):
     binary_rel = entry.get("binary")
     if binary_rel:
         binary = _fixture_file(entry, binary_rel)
+        truth = {os.path.realpath(os.path.join(fixture_root, entry.get("source", "src.c"))),
+                 os.path.realpath(os.path.join(fixture_root, entry.get("route_fixture", "route.json")))}
+        if binary in truth:
+            raise ValueError("ground-truth file cannot be used as Mode B binary")
         target = os.path.join(chal_dir, os.path.basename(binary_rel))
         shutil.copy2(binary, target)
     else:
@@ -379,11 +444,19 @@ def _prepare_eval_workspace(entry, sandbox):
         _runtime_fixture_relpath(entry.get("source", "src.c")),
         _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
     }
+    forbidden_targets = {
+        os.path.realpath(os.path.join(fixture_root, relpath))
+        for relpath in forbidden
+    }
     for relpath in entry.get("runtime_files", []) or []:
         normalized = _runtime_fixture_relpath(relpath)
         if normalized in forbidden:
             raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
         src = _fixture_file(entry, normalized)
+        if ".rat" in os.path.relpath(src, fixture_root).split(os.sep):
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        if src in forbidden_targets:
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
         dst = os.path.realpath(os.path.join(chal_dir, normalized))
         if os.path.commonpath((os.path.realpath(chal_dir), dst)) != os.path.realpath(chal_dir):
             raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
@@ -399,9 +472,19 @@ def _prepare_eval_workspace(entry, sandbox):
 def _agent_environment(kit_root):
     env = os.environ.copy()
     env["CTF_HOME"] = kit_root
-    env["PATH"] = os.path.join(kit_root, "bin") + os.pathsep + env.get("PATH", "")
+    pwn_venv = os.path.join(ctf_home(), ".venv", "bin")
+    path_parts = [os.path.join(kit_root, "bin")]
+    if os.path.isdir(pwn_venv):
+        path_parts.append(pwn_venv)
+    path_parts.append(env.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(path_parts)
+    env.pop("PWD", None)
     for key in ("RAT_INDEX_ROOT", "STATE_PATH", "CTF_TEAM", "PYTHONPATH"):
         env.pop(key, None)
+    # Keep the challenge export answer-free while pointing the symsolve shim at
+    # the operator-provisioned host engine. No Docker/image fallback is involved.
+    if _have_angr():
+        env["RAT_ANGR_PYTHON"] = _angr_python()
     return env
 
 
@@ -503,7 +586,9 @@ def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
     else:
         outcome = "failed"
     # Observed outcome category, not an exploit/model root-cause diagnosis.
-    if verified:
+    if completion.get("reason") == "unsanctioned-symbolic-engine":
+        failure_class = "tooling-gap:symsolve-bypass"
+    elif verified:
         failure_class = None
     elif timed_out:
         failure_class = "agent-timeout"

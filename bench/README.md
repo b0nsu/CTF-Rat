@@ -43,7 +43,7 @@ For non-redistributable material, create an ignored `bench/local-suite.json` (or
 }
 ```
 
-Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `artifacts/**/*.bin`, local suite manifests, and inherited `.rat` state. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules.
+Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `artifacts/**/*.bin`, local suite manifests, and inherited `.rat` state. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules. Agent execution requires `sandbox-exec` on macOS or `bwrap` on Linux. The operator checkout is hidden from the agent, with only `.venv` and `.venv-angr` readable for tool execution. If neither sandbox is available, evaluation fails closed.
 
 ## Materializing committed real entries
 
@@ -55,6 +55,8 @@ Materialization is an explicit preflight and never occurs inside a measured `rat
 PYTHONPATH=bin python3 -m ratlib.bench_artifacts \
   bench/suite.json --corpus real
 ```
+
+`ratlib.bench_artifacts` is the explicit, networked preflight utility for materializing pinned real-corpus binaries. It is separate from `ratbench eval`, which never fetches artifacts during a measured run.
 
 The materializer fails closed if the downloaded bytes or an already-present local binary do not match the pinned Git blob id. A measured run therefore starts from a previously materialized, content-addressed runtime artifact rather than from mutable network state.
 
