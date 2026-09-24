@@ -15,8 +15,8 @@ revq — rev 정적 배치 (rev 루프).
   - **angr** (기본, 정확) — CFGFast + xrefs. 순수 Python (angr 설치 venv 사용, SETUP.md 참고).
   - **binutils** (`--fast`) — readelf/nm/strings/objdump. xref 없음(빠른 훑기용).
 
-angr 는 lazy-import → angr 없는 환경에선 `revq selftest`(순수 로직)·`--fast` 만 되고,
-deep 추출은 angr 필요. 실행:  python3 bin/revq <bin> [...]  (venv 활성 or angr 설치)
+angr 는 lazy-import. 기본 rev 분석은 `.venv-angr` 인터프리터를 자동 선택하고,
+환경이 없으면 `revq selftest`(순수 로직)·`--fast`만 된다.
 
 사용:
   revq <bin>                     # 요약 (triage 표 + interesting 지목)
@@ -26,7 +26,8 @@ deep 추출은 angr 필요. 실행:  python3 bin/revq <bin> [...]  (venv 활성 
   revq <bin> --interesting       # check-루틴 후보만
   revq <bin> --func <name|addr>  # 한 함수의 이웃(calls/callers/strings) 컨텍스트 카드
   revq <bin> --xrefs <name|addr> # 이 심볼/주소를 참조/호출하는 곳
-  revq <bin> --json              # revmap 원본
+  revq <bin> --format json       # revmap JSON (--json 별칭)
+  revq <bin> --funcs --format json  # 함수 뷰 JSON (--funcs가 뷰를 선택)
   revq <bin> --fast              # binutils 엔진 (xref 없음, 빠른 훑기용)
   revq <bin> --refresh           # 캐시 무시 재추출
   revq selftest                  # 네트워크·바이너리 무관 순수 로직 검증
@@ -40,6 +41,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from ratlib.angr_runtime import reexec_for_angr
 
 from ratlib.evasion import (
     SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA,
@@ -747,6 +749,23 @@ def render_funcs(rev, sort="size", limit=40):
     return "\n".join(L)
 
 
+def funcs_json(rev, sort="size", limit=40):
+    """Return the same bounded function view as render_funcs(), as JSON."""
+    counts = dict(annotate_counts(rev).get("counts", {}))
+    rows = _sorted_funcs(rev.get("functions", []), sort)
+    visible = min(len(rows), limit)
+    counts["functions_visible"] = visible
+    counts["functions_truncated"] = max(len(rows) - visible, 0)
+    return {
+        "schema": "rat.revq-functions/v1",
+        "binary": rev.get("bin"),
+        "binary_sha256": rev.get("sha256"),
+        "engine": rev.get("engine"),
+        "counts": counts,
+        "functions": rows[:limit],
+    }
+
+
 def render_strings(rev, grep=None, limit=200):
     rx = re.compile(grep, re.I) if grep else None
     rows = [s for s in rev["strings"] if (rx.search(s["val"]) if rx else True)]
@@ -1036,7 +1055,10 @@ def build_parser():
     g.add_argument("--oracle", action="store_true", help="success/failure 문자열→symsolve 좌표 자동연결(JSON)")
     g.add_argument("--func", metavar="NAME", help="한 함수 컨텍스트 카드")
     g.add_argument("--xrefs", metavar="TARGET", help="심볼/문자열 참조처")
-    g.add_argument("--json", action="store_true", help="revmap 원본")
+    p.add_argument("--format", choices=("text", "json"), default="text",
+                   help="출력 형식 (기본 text; --funcs와 함께면 함수 뷰를 직렬화)")
+    p.add_argument("--json", dest="format", action="store_const", const="json",
+                   help="deprecated alias for --format json")
     p.add_argument("-n", "--limit", type=int, default=40, help="목록 상한(기본 40)")
     p.add_argument("--sort", choices=["size", "xrefs", "name"], default="size")
     p.add_argument("--grep", metavar="RE", help="--strings 필터 정규식")
@@ -1063,12 +1085,15 @@ def main(argv):
     operation = "summary"
     requested = None
 
-    if args.json:
+    if args.funcs:
+        operation = "funcs"
+        if args.format == "json":
+            print(json.dumps(funcs_json(rev, args.sort, args.limit), indent=2, ensure_ascii=False))
+        else:
+            print(render_funcs(rev, args.sort, args.limit))
+    elif args.format == "json":
         operation = "json"
         print(json.dumps(rev, indent=2, ensure_ascii=False))
-    elif args.funcs:
-        operation = "funcs"
-        print(render_funcs(rev, args.sort, args.limit))
     elif args.strings:
         operation = "strings"
         print(render_strings(rev, args.grep, args.limit))
@@ -1289,4 +1314,8 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if (sys.argv[1:2] != ["selftest"] and "--selftest" not in sys.argv[1:]
+            and "--fast" not in sys.argv[1:] and "--help" not in sys.argv[1:]
+            and "-h" not in sys.argv[1:]):
+        reexec_for_angr(__file__, sys.argv[1:])
     sys.exit(main(sys.argv[1:]))

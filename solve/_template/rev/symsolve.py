@@ -24,15 +24,19 @@ revq 와 같은 angr 로드 베이스(PIE=0x400000)를 쓰므로 **revq 가 찍�
   symsolve ./crackme --find-str "Correct" --stdin 16 --printable
   symsolve ./crackme --find 0x401234 --avoid 0x4012a0 --arg 20 --charset "0-9A-Za-z_"
 
-실행:  python3 symsolve.py <bin> ...  (angr 설치 venv, SETUP.md 참고)
+실행:  symsolve <bin> ...  (native angr 환경, SETUP.md 참고)
 """
 import argparse
+import hashlib
+import importlib.metadata
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 
 # ─────────────────────────── charset 파서 (순수, selftest 대상) ───────────────────────────
@@ -68,18 +72,158 @@ def parse_addr(s):
         return None
 
 
+def engine_build_digest():
+    """Digest the harness and the local solver runtime identity."""
+    with open(os.path.realpath(__file__), "rb") as source:
+        harness_digest = hashlib.sha256(source.read()).hexdigest()
+    packages = {}
+    for name in ("angr", "unicorn"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    identity = {
+        "harness_sha256": harness_digest,
+        "packages": packages,
+        "python": "%d.%d.%d" % sys.version_info[:3],
+        "engine": "native-unicorn",
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def record_concrete_observation(state_dir, binary, output, solutions):
+    """Record a heuristic solve observation and link it to a rev-symbolic primitive."""
+    repo = os.path.abspath(os.environ.get(
+        "CTF_HOME", os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..")))
+    bin_dir = os.path.join(repo, "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    from ratlib.artifact import put_bytes
+    from ratlib.state_v2 import Stream, environment_fingerprint
+
+    root = os.path.abspath(state_dir)
+    engine_digest = engine_build_digest()
+    output_bytes = output if isinstance(output, bytes) else str(output).encode()
+    with open(binary, "rb") as source:
+        binary_digest = "sha256:" + hashlib.sha256(source.read()).hexdigest()
+    capture = {
+        "schema": "rat.symsolve-concrete-capture/v1",
+        "binary_sha256": binary_digest,
+        "output_sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        "output_hex": output_bytes.hex(),
+        "solutions": solutions,
+        "engine": "symsolve",
+        "engine_build_digest": engine_digest,
+    }
+    evidence = put_bytes(
+        json.dumps(capture, sort_keys=True, separators=(",", ":")).encode(),
+        kind="symsolve-concrete-verify", media_type="application/json",
+        logical_name="symsolve-concrete-verify.json", root=os.path.join(root, ".rat"),
+    )
+    observation_id = "obs_symsolve_" + os.urandom(12).hex()
+    document = {
+        "schema": "rat.observation/v1",
+        "observation_id": observation_id,
+        "run_id": "run_symsolve_" + os.urandom(8).hex(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "producer": {"tool": "symsolve", "version": "1", "engine": "symsolve",
+                     "engine_build_digest": engine_digest},
+        "subject": {"kind": "binary", "sha256": binary_digest},
+        "kind": "rev.symsolve.concrete-verify",
+        "value": {"verdict": "pass", "engine": "symsolve",
+                  "engine_build_digest": engine_digest},
+        "evidence": [evidence["digest"]],
+        "quality": {"level": "heuristic"},
+        "validity": {"state": "active"},
+        "extensions": {"solve_origin": "rev-symbolic"},
+    }
+    stream = Stream(root)
+    stream.append("observation.recorded", document)
+    _attach_symbolic_primitive(stream, binary_digest, environment_fingerprint(),
+                               observation_id, engine_digest)
+    return observation_id
+
+
+def _attach_symbolic_primitive(stream, binary_digest, environment_digest,
+                               observation_id, engine_digest):
+    """Attach solver provenance without promoting candidate evidence to PASS."""
+    view = stream.view()
+    primitives = view.get("primitives", {})
+    tagged = [p for p in primitives.values()
+              if p.get("input_digest") == binary_digest
+              and p.get("extensions", {}).get("solve_origin") == "rev-symbolic"
+              and p.get("status") in {"candidate", "pass"}]
+    matching = [p for p in primitives.values()
+                if p.get("input_digest") == binary_digest
+                and p.get("status") in {"candidate", "pass"}]
+    existing = tagged[0] if len(tagged) == 1 else (
+        matching[0] if not tagged and len(matching) == 1 else None)
+    if existing is None:
+        primitive_id = "prim_rev_symbolic_" + binary_digest.split(":", 1)[1][:16]
+        existing = primitives.get(primitive_id)
+    if existing:
+        document = dict(existing)
+        document["revision"] = int(existing.get("revision", 0)) + 1
+        document["extensions"] = dict(existing.get("extensions", {}))
+        document["producer"] = dict(existing.get("producer", {}))
+    else:
+        primitive_id = "prim_rev_symbolic_" + binary_digest.split(":", 1)[1][:16]
+        document = {
+            "schema": "rat.primitive/v1",
+            "primitive_id": primitive_id,
+            "name": "rev-symbolic concrete solution",
+            "class": "solution-reconstruction",
+            "status": "candidate",
+            "input_digest": binary_digest,
+            "environment_digest": environment_digest,
+            "self_evidence": [],
+            "constraints": ["Concrete verification is heuristic evidence; use three independent direct SELF observations before PASS."],
+            "side_effects": [],
+            "remote_equivalent": False,
+            "producer": {"tool": "symsolve", "version": "1"},
+            "revision": 1,
+        }
+    document.setdefault("extensions", {}).update({
+        "solve_origin": "rev-symbolic",
+        "engine_observation_id": observation_id,
+    })
+    document["producer"].update({
+        "engine": "symsolve",
+        "engine_build_digest": engine_digest,
+    })
+    stream.append("primitive.revised", document)
+
+
+def native_angr_ready():
+    """Return whether this interpreter has angr's native Unicorn engine loaded."""
+    try:
+        import angr  # noqa: F401
+        from angr.engines import UberEnginePcode  # noqa: F401
+        from angr.engines import unicorn as angr_unicorn
+    except ImportError:
+        return False
+    return getattr(angr_unicorn, "_UC_NATIVE", None) is not None
+
+
+def _native_engine_error():
+    return (
+        "[symsolve:err] angr native Unicorn engine unavailable in this interpreter.\n"
+        "  Set up .venv-angr with requirements-angr.txt as described in SETUP.md,\n"
+        "  or set RAT_ANGR_PYTHON to that environment's Python."
+    )
+
+
 # ─────────────────────────── 솔버 본체 (angr lazy-import) ───────────────────────────
 def solve(args):
     import logging
     for n in ("angr", "cle", "pyvex", "claripy"):
         logging.getLogger(n).setLevel(logging.ERROR)
-    try:
-        import angr
-        import claripy
-    except ImportError:
-        print("[symsolve:err] angr 미설치 — SETUP.md 대로 venv 세팅 후 실행:\n"
-              "  python3 symsolve.py %s ..." % args.binary, file=sys.stderr)
+    if not native_angr_ready():
+        print(_native_engine_error(), file=sys.stderr)
         return 2
+    import angr
+    import claripy
 
     load_opts = {}
     if args.base is not None:
@@ -113,6 +257,8 @@ def solve(args):
         state_kwargs["stdin"] = stdin_sym
 
     state = proj.factory.full_init_state(args=argv, **state_kwargs)
+    state.options.add(angr.options.UNICORN)
+    print("[symsolve] native Unicorn option enabled", file=sys.stderr)
 
     # ── 제약: 문자셋 ──────────────────────────────────────
     charset = None
@@ -194,6 +340,19 @@ def solve(args):
             print("  concrete-verify: ⏭  %s" % detail)
         elif ok:
             print("  concrete-verify: ✅ 실제 실행이 목표와 일치 (해 신뢰)")
+            engine_digest = engine_build_digest()
+            print("  producer: " + json.dumps({
+                "engine": "symsolve", "engine_build_digest": engine_digest,
+            }, sort_keys=True, separators=(",", ":")))
+            if args.record_state_dir:
+                solutions = {label: found.solver.eval(bv, cast_to=bytes).hex()
+                             for label, bv, _n in symbols}
+                try:
+                    observation_id = record_concrete_observation(
+                        args.record_state_dir, args.binary, detail, solutions)
+                    print("  STATE observation: %s" % observation_id)
+                except Exception as exc:
+                    print("[symsolve:warn] STATE provenance 기록 실패: %s" % exc, file=sys.stderr)
         else:
             print("  concrete-verify: ⚠️ 불일치 — angr 모델 ≠ 실제(anti-debug/환경/입력모델 의심). "
                   "실제 stdout=%r" % detail)
@@ -270,6 +429,8 @@ def build_parser():
     p.add_argument("--base", type=lambda s: int(s, 0), metavar="ADDR", help="로드 베이스 재지정")
     p.add_argument("--timeout", type=float, default=120.0, metavar="SEC", help="탐색 상한(기본 120s)")
     p.add_argument("--no-verify", action="store_true", help="복원 해의 실 바이너리 재실행 검증 생략")
+    p.add_argument("--record-state-dir", metavar="DIR",
+                   help="concrete-verify 성공과 연결된 rev-symbolic provenance를 STATE에 기록")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     return p
 
@@ -282,6 +443,9 @@ def main(argv):
         return selftest()
     if not args.binary:
         build_parser().print_help()
+        return 2
+    if not native_angr_ready():
+        sys.stderr.write(_native_engine_error() + "\n")
         return 2
     return solve(args)
 

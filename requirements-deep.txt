@@ -1,8 +1,4 @@
-# Deep analysis engine — only the CI `analysis-deep` job and local docker/dev
-# (SETUP.md) install these. The fast operational-regression job deliberately
-# stays angr-free (pure-logic selftests), so these are NOT in requirements.txt.
-#
-# Pinned to the version the deep job was confirmed green on.
--r requirements.txt
-angr==9.2.223
-qiling==1.4.6
+# Native symbolic stack for the separate .venv-angr interpreter.  pwntools
+# excludes unicorn 2.1.4, so installing both stacks into one interpreter is
+# unsatisfiable even in a CI job or container.
+-r requirements-angr.txt

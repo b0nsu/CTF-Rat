@@ -15,6 +15,7 @@ BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 
 from ratlib.artifact import get as artifact_get
+from ratlib.angr_runtime import reexec_for_angr
 from ratlib.cache import Cache, resolve_index_root
 from ratlib.cards import project_pwn_capability
 from ratlib.patterns import project_patterns
@@ -73,6 +74,9 @@ def _render_route_text(doc):
     unresolved = doc.get("unresolved") or []
     if unresolved:
         lines += ["", "UNRESOLVED"] + ["  - %s" % item for item in unresolved]
+    diagnostics = doc.get("diagnostics") or []
+    if diagnostics:
+        lines += ["", "DIAGNOSTICS"] + ["  - %s" % item.get("message", "") for item in diagnostics]
     leads = doc.get("leads") or []
     if leads:
         lines += ["", "COEXISTING LEADS"] + ["  %s" % name for name in leads]
@@ -243,7 +247,11 @@ def _detect_platform_file(binary):
     return "?"
 
 def _doctor_capabilities(binary):
-    code, out, _ = _run_subprocess([os.path.join(BIN, "rat-doctor"), binary, "--format", "json"])
+    # The front door may have re-execed into .venv-angr while the shell still
+    # resolves python3 to the pwn environment. Probe the interpreter actually
+    # running this command so a provisioned rev engine is never hidden.
+    code, out, _ = _run_subprocess([sys.executable, os.path.join(BIN, "rat-doctor"),
+                                    binary, "--format", "json"])
     if code != 0:
         return {"native": False, "angr": False, "ghidra": False}
     try:
@@ -345,8 +353,13 @@ def cmd_route(args):
         revq_error = {"code": "analysis_failed",
                       "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    if fast and not args.fast:
+        result.setdefault("diagnostics", []).append({
+            "code": "dependency_missing",
+            "message": "native angr unavailable; route used binutils only (see SETUP.md)",
+        })
     if revq_error:
-        result["diagnostics"] = [revq_error]
+        result.setdefault("diagnostics", []).append(revq_error)
     result["capabilities"] = {**result["capabilities"], **caps}
     state_dir = _state_dir(binary)
     _record_route_assessment(state_dir, "route", result)
@@ -535,6 +548,9 @@ def cmd_brief(args):
     fast = args.fast or not caps.get("angr", False)
     rev, interesting, revq_error = None, None, None
     diagnostics = []
+    if fast and not args.fast:
+        diagnostics.append({"code": "dependency_missing", "severity": "warning",
+                            "message": "native angr unavailable; brief used binutils only (see SETUP.md)"})
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
@@ -1030,4 +1046,10 @@ def main(argv=None):
     return EXIT_USAGE
 
 if __name__ == "__main__":
+    argv = sys.argv[1:]
+    rev_command = (argv[:1] in (["route"], ["brief"])
+                   or (len(argv) > 1 and argv[0] == "query"
+                       and argv[1] in {"graph", "func", "oracle", "pattern", "slice"}))
+    if rev_command and "--fast" not in argv and "--help" not in argv and "-h" not in argv:
+        reexec_for_angr(__file__, argv)
     sys.exit(main())

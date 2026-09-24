@@ -7,15 +7,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libc6-dbg && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-deep.txt ./
-RUN pip install --no-cache-dir -r requirements-deep.txt
+COPY requirements.txt requirements-angr.txt requirements-deep.txt ./
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python3 -m venv /opt/ctf-rat-angr && \
+    /opt/ctf-rat-angr/bin/pip install --no-cache-dir -r requirements-deep.txt
 
 COPY . .
-ENV PATH=/work/bin:${PATH} PYTHONPATH=/work/bin
+ENV PATH=/work/bin:${PATH} PYTHONPATH=/work/bin RAT_ANGR_PYTHON=/opt/ctf-rat-angr/bin/python
 
 # Team-state tests exercise an unwritable-directory failure path; it must run
 # as an ordinary user for that permission boundary to be meaningful.
 RUN useradd --create-home --uid 1000 ctf && chown -R ctf:ctf /work
 USER ctf
 
-CMD ["python3", "-m", "unittest", "discover", "-s", "tests"]
+CMD ["/bin/bash", "-c", "python3 -m unittest discover -s tests && PATH=/opt/ctf-rat-angr/bin:$PATH /opt/ctf-rat-angr/bin/python -m unittest tests.test_loop_slice_integration tests.test_function_call_sites tests.test_rat_dispatcher && bash tests/e2e_rev.sh --require-engine"]

@@ -59,8 +59,12 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3
-      - run: python3 -m pip install --disable-pip-version-check -r requirements-deep.txt
-      - run: python3 -c "import angr; print('angr', angr.__version__)"
-      # angr-gated cases in the suite unskip once angr+gcc+Linux are present
+      - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - run: python3 -m venv .venv-angr
+      - run: .venv-angr/bin/python -m pip install --disable-pip-version-check -r requirements-deep.txt
+      - run: .venv-angr/bin/python -c "import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"
+      # The base interpreter runs pwntools cases; the isolated interpreter runs
+      # angr integrations with the native Unicorn version it requires.
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
-      - run: bash tests/e2e_rev.sh
+      - run: PATH="$PWD/.venv-angr/bin:$PATH" .venv-angr/bin/python -m unittest tests.test_loop_slice_integration tests.test_function_call_sites tests.test_rat_dispatcher
+      - run: bash tests/e2e_rev.sh --require-engine

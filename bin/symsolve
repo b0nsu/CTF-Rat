@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-# spelling shim: `symsolve ...` == `python3 solve/_template/rev/symsolve.py ...`.
-# The harness lives under solve/_template/rev so it can be copied into a solve
-# dir and run in-place; this bin/ shim just makes the bare name resolvable on
-# PATH (same convention as pwnstage). No new behavior -- pure exec passthrough.
-import os, sys
+# Resolve the native-angr runtime independently from the pwntools environment.
+import os, shutil, sys
 CTF_HOME = os.environ.get("CTF_HOME", os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")))
 target = os.path.join(CTF_HOME, "solve", "_template", "rev", "symsolve.py")
-os.execv(sys.executable, [sys.executable, target, *sys.argv[1:]])
+override = os.environ.get("RAT_ANGR_PYTHON")
+if override:
+    python = os.path.expanduser(override)
+    if not os.path.isabs(python):
+        python = shutil.which(python) or python
+    if not os.path.isfile(python) or not os.access(python, os.X_OK):
+        print("[symsolve:err] RAT_ANGR_PYTHON is not an executable: %s" % override, file=sys.stderr)
+        raise SystemExit(2)
+else:
+    candidate = os.path.join(CTF_HOME, ".venv-angr", "bin", "python")
+    python = candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else sys.executable
+os.execv(python, [python, target, *sys.argv[1:]])
