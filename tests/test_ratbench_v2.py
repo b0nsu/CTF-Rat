@@ -23,6 +23,17 @@ def _load_ratbench():
 
 RATBENCH = _load_ratbench()
 
+
+def require_mode_b_sandbox():
+    """Skip real process smoke tests when the host forbids filesystem isolation."""
+    with tempfile.TemporaryDirectory() as cwd:
+        try:
+            result = RATBENCH._run_agent("true", cwd=cwd, env=os.environ.copy(), timeout=5)
+        except (OSError, RuntimeError) as exc:
+            raise unittest.SkipTest("Mode B filesystem sandbox unavailable: %s" % exc) from exc
+        if result.returncode != 0:
+            raise unittest.SkipTest("Mode B filesystem sandbox command failed")
+
 ENTRY = {
     "id": "fixture-01",
     "difficulty": 1,
@@ -159,6 +170,7 @@ class ModeBLocalSmokeTests(unittest.TestCase):
     def test_real_mode_b_exec_without_completion_remains_unverified(self):
         # Execute the actual Mode B workspace/export + external process path.
         # This is a negative-gate smoke, NOT a model-solving benchmark.
+        require_mode_b_sandbox()
         with tempfile.TemporaryDirectory() as scratch:
             run_id = "B-smoke-" + os.path.basename(scratch)
             result_dir = os.path.join(ROOT, "bench", "results")

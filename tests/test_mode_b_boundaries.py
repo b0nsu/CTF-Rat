@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.test_ratbench_v2 import RATBENCH, ENTRY
+from tests.test_ratbench_v2 import RATBENCH, ENTRY, require_mode_b_sandbox
 from tests.test_telemetry import envelope
 from ratlib.artifact import put_bytes
 from ratlib.metrics import aggregate, benchmark_envelope_observations
@@ -104,6 +104,7 @@ class ObservationBoundaries(unittest.TestCase):
             self.assertEqual(aggregate(docs)["decomp_invocations"], 0)
 
     def test_actual_process_exit_and_timeout_save_results_with_mixed_artifacts(self):
+        require_mode_b_sandbox()
         for code, timeout, expected in (("raise SystemExit(124)", 5, ("completed", "failed", "agent-nonzero-exit")),
                                         ("import time; time.sleep(5)", 0.1, ("timeout", "censored", "agent-timeout"))):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as runtime:
