@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from ratlib.angr_runtime import configured_python
 
 TOOLS = {
     "file": ("file",), "binutils": ("readelf", "objdump"), "gdb": ("gdb",),
@@ -45,8 +46,38 @@ def executable(names):
 
 
 def module(name, import_name):
+    if name in {"angr", "qiling"}:
+        try:
+            interpreter = configured_python()
+        except ValueError as exc:
+            return {"status": "unavailable", "version": None, "reason": str(exc)}
+        if interpreter and os.path.abspath(interpreter) != os.path.abspath(sys.executable):
+            try:
+                probe = subprocess.run(
+                    [interpreter, "-c",
+                     "import importlib,importlib.metadata,sys; importlib.import_module(sys.argv[1]); print(importlib.metadata.version(sys.argv[2]))",
+                     import_name, name], capture_output=True, text=True, timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                return {"status": "unavailable", "version": None,
+                        "reason": "native-angr environment probe failed"}
+            if probe.returncode == 0:
+                return {"status": "available", "version": probe.stdout.strip()}
+            return {"status": "unavailable", "version": None,
+                    "reason": "module unavailable in native-angr environment"}
     try:
         if importlib.util.find_spec(import_name) is None:
+            if name == "pwntools":
+                root = os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+                pwn_python = os.path.join(root, ".venv", "bin", "python")
+                if os.path.isfile(pwn_python) and os.access(pwn_python, os.X_OK):
+                    try:
+                        probe = subprocess.run(
+                            [pwn_python, "-c", "import importlib,importlib.metadata; importlib.import_module('pwn'); print(importlib.metadata.version('pwntools'))"],
+                            capture_output=True, text=True, timeout=15)
+                    except (OSError, subprocess.TimeoutExpired):
+                        probe = None
+                    if probe is not None and probe.returncode == 0:
+                        return {"status": "available", "version": probe.stdout.strip()}
             return {"status": "unavailable", "version": None, "reason": "module not installed"}
         try: version = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError: version = "unknown"

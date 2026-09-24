@@ -13,14 +13,9 @@ import sys
 
 os.environ.setdefault("TERM", "dumb")
 
-from pwn import Corefile, cyclic, cyclic_find, context
 from ratlib.runner import ResourceLimits, run
 
-context.log_level = "error"
-# pwntools' default log_console is sys.stdout -- its internal log.error()
-# calls (e.g. Corefile address-not-mapped warnings) would otherwise land
-# in the same stream as this tool's JSON contract and break the parse.
-context.log_console = sys.stderr
+Corefile = cyclic = cyclic_find = context = None
 
 
 def sha256(path: str) -> str:
@@ -56,12 +51,30 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--arg", action="append", default=[])
     result.add_argument("--timeout", type=float, default=10.0)
     result.add_argument("--repetitions", type=int, default=3)
-    result.add_argument("--json", action="store_true")
+    result.add_argument("--format", choices=("text", "json"), default="text",
+                        help="output format (default: text)")
+    result.add_argument("--json", dest="format", action="store_const", const="json",
+                        help="deprecated alias for --format json")
     return result
 
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    global Corefile, cyclic, cyclic_find, context
+    try:
+        from pwn import Corefile as _Corefile, cyclic as _cyclic, cyclic_find as _cyclic_find, context as _context
+    except ImportError as exc:
+        message = "pwntools is required; install the project dependencies from SETUP.md (%s)" % exc
+        if args.format == "json":
+            print(json.dumps({"schema": "rat.pwncrash/v1", "status": "dependency_missing",
+                              "errors": [message], "verdict": "inconclusive"}, sort_keys=True))
+        else:
+            print("pwncrash: " + message, file=sys.stderr)
+        return 2
+    Corefile, cyclic, cyclic_find, context = _Corefile, _cyclic, _cyclic_find, _context
+    context.log_level = "error"
+    # Keep pwntools diagnostics off stdout so they do not corrupt JSON output.
+    context.log_console = sys.stderr
     binary = os.path.realpath(args.binary)
     if args.repetitions < 1 or args.pattern_length < 1:
         print("pwncrash: repetitions and pattern length must be positive", file=sys.stderr)
@@ -91,7 +104,8 @@ def main(argv=None) -> int:
         input_path = os.path.join(directory, "input.bin")
         core_path = os.path.join(directory, "core")
         script_path = os.path.join(directory, "crash.gdb")
-        open(input_path, "wb").write(data)
+        with open(input_path, "wb") as input_file:
+            input_file.write(data)
         script = (
             "set pagination off\nset confirm off\nset height 0\n"
             "handle SIGSEGV stop print nopass\n"
@@ -99,7 +113,8 @@ def main(argv=None) -> int:
             "info registers\n"
             "generate-core-file %s\n" % (input_path, core_path)
         )
-        open(script_path, "w", encoding="ascii").write(script)
+        with open(script_path, "w", encoding="ascii") as script_file:
+            script_file.write(script)
         gdb = run(
             ["gdb", "-q", "-nx", "-batch", "-x", script_path, "--args", binary, *args.arg],
             timeout_seconds=args.timeout,
@@ -193,7 +208,7 @@ def main(argv=None) -> int:
         "diagnostics": diagnostics,
         "verdict": "crash-reproduced" if not errors else "inconclusive",
     }
-    if args.json:
+    if args.format == "json":
         print(json.dumps(report, sort_keys=True, indent=2))
     else:
         print("verdict=%s repetitions=%d signal=%s" % (report["verdict"], args.repetitions, report["stable_signal"]))

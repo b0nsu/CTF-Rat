@@ -4,7 +4,8 @@ CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null |
 set -euo pipefail
 GHIDRA="${GHIDRA_HOME:-}"
 if [ -z "$GHIDRA" ]; then
-  for cand in /opt/ghidra_*_PUBLIC "${HOME:-}/ctf-tools"/ghidra_*_PUBLIC; do
+  for cand in /opt/ghidra_*_PUBLIC "${HOME:-}/ctf-tools"/ghidra_*_PUBLIC \
+    /opt/homebrew/opt/ghidra/libexec /usr/local/opt/ghidra/libexec; do
     if [ -x "$cand/support/analyzeHeadless" ]; then GHIDRA="$cand"; break; fi
   done
 fi
@@ -12,6 +13,12 @@ if [ -z "$GHIDRA" ] && command -v analyzeHeadless >/dev/null 2>&1; then
   GHIDRA="$(cd -- "$(dirname -- "$(command -v analyzeHeadless)")/.." && pwd)"
 fi
 GHIDRA="${GHIDRA:-/opt/ghidra_11.2.1_PUBLIC}"
+if [ -z "${JAVA_HOME:-}" ] && ! java -version >/dev/null 2>&1; then
+  for jdk in /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+    /usr/local/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home; do
+    if [ -x "$jdk/bin/java" ]; then export JAVA_HOME="$jdk"; break; fi
+  done
+fi
 SCRIPTDIR="$CTF_HOME/bin/ghidra_scripts"
 # Ghidra persists Java discovery and tool state under XDG_CONFIG_HOME before
 # headless analysis.  Keep that disposable state out of the repo by default:

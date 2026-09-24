@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # recon <binary> [libc.so.6] [--format text|json] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
 import sys, os, re, glob, json
-from pwn import ELF, context
 from ratlib.runner import run
-context.log_level = 'error'
 def sh(argv):
     result = run(argv, timeout_seconds=15, tool_version="system-tool")
     return result.stdout.preview.decode("utf-8", errors="replace")
@@ -11,6 +9,9 @@ def sh(argv):
 def main():
     argv = sys.argv[1:]
     fmt = "text"
+    if "-h" in argv or "--help" in argv:
+        print("usage: recon <binary> [libc.so.6] [--format text|json]")
+        return 0
     if "--format" in argv:
         i = argv.index("--format")
         if i + 1 >= len(argv) or argv[i + 1] not in ("text", "json"):
@@ -19,6 +20,17 @@ def main():
     if not argv:
         print("usage: recon <binary> [libc.so.6] [--format text|json]", file=sys.stderr); return 1
     path = argv[0]; libc_path = argv[1] if len(argv) > 1 else None
+    try:
+        from pwn import ELF, context
+    except ImportError as exc:
+        message = "pwntools is required; install the project dependencies from SETUP.md (%s)" % exc
+        if fmt == "json":
+            print(json.dumps({"schema": "rat.recon/v1", "status": "dependency_missing",
+                              "binary": path, "error": message}, ensure_ascii=False))
+            return 2
+        print("recon: " + message, file=sys.stderr)
+        return 2
+    context.log_level = 'error'
     # The bounded runner accepts argv only; a shell-shaped string would make
     # it try to execute the first character and leave PE routing inoperative.
     ft0 = sh(["file", "--", path])

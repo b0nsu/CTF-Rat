@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # STATE v2 버스를 코드에서 소비 — evidence-backed 정적 오프셋 재사용 규약.
-#   from pwnstage import offsets, get, set_offset
+#   from pwnstage import offsets, get
 #   off = offsets(); system = libc_base + off["system"]     # 재계산(readelf/ROP) 금지
 # CLI: pwnstage           -> 모든 검증 오프셋 나열
 #      pwnstage get <k>    -> 단일 값(hex)
@@ -23,6 +23,7 @@ def offsets(path=F):
     return project_trusted_offsets(*trusted_offset_inputs(root))
 def get(k, default=None, path=F):
     return offsets(path).get(k, default)
+# Legacy name retained only to fail loudly; offsets are written through typed STATE observations.
 def set_offset(k, v, src="", path=F):
     raise ValueError("pwnstage.set_offset is disabled; append a typed rat.observation/v1 kind=pwn.offset via `state event append`")
 _TEMPLATE = '''# primitives.py — 이 챌린지의 검증된 primitive를 함수로 노출.

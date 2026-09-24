@@ -73,6 +73,15 @@ def checkpoint(d):
 def primitive(d):
     _need(d,("schema","primitive_id","name","class","status","input_digest","environment_digest","self_evidence","constraints","side_effects","remote_equivalent","producer","revision")); _strict(d,{"schema","primitive_id","name","class","status","input_digest","environment_digest","self_evidence","constraints","side_effects","remote_equivalent","producer","revision","extensions"})
     if d["status"] not in {"candidate","pass","fail","blocked","stale"}: raise ValidationError("invalid primitive status")
+    if not isinstance(d["producer"],Mapping): raise ValidationError("primitive producer must be an object")
+    if not isinstance(d.get("extensions",{}),Mapping): raise ValidationError("primitive extensions must be an object")
+    origin=d.get("extensions",{}).get("solve_origin")
+    if origin is not None and not isinstance(origin,str): raise ValidationError("primitive solve_origin must be a string")
+    observation_id=d.get("extensions",{}).get("engine_observation_id")
+    if observation_id is not None and (not isinstance(observation_id,str) or not observation_id): raise ValidationError("primitive engine_observation_id must be a non-empty string")
+    for field in ("engine","engine_build_digest"):
+        if field in d["producer"] and not isinstance(d["producer"][field],str): raise ValidationError("primitive producer %s must be a string" % field)
+    if "engine_build_digest" in d["producer"]: _digest(d["producer"]["engine_build_digest"])
     _digest(d["input_digest"]); _digest(d["environment_digest"])
     if d["status"] == "pass" and len(d["self_evidence"]) < 3: raise ValidationError("PASS requires SELF evidence")
     if not isinstance(d["revision"], int) or isinstance(d["revision"], bool) or d["revision"] < 1: raise ValidationError("invalid primitive revision")

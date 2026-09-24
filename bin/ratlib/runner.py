@@ -154,7 +154,10 @@ def _writer(pipe, data: bytes) -> None:
     except (BrokenPipeError, OSError):
         pass
     finally:
-        pipe.close()
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError):
+            pass
 
 
 def _terminate_group(proc: subprocess.Popen, grace_seconds: float) -> None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # analyze <binary> — decomp 캐시 기반 취약 표적 localizer
 # gnnPwn 차용: 함수 그래프 + kind 피처 + 1-hop 전파(Finding K: self kind ⊕ 1-hop 이웃 kind 합)
-import sys, os, re, glob
+import sys, os, re, glob, argparse
 IN=r'\b(fgets|gets|read|scanf|__isoc99_scanf|__isoc99_sscanf|getchar|recv|fread)\b'
 SINK=r'\b(memcpy|strcpy|strcat|sprintf|memmove|alloca)\b'
 ALLOC=r'\b(malloc|calloc|realloc|free)\b'
@@ -22,7 +22,10 @@ def feats(c):
 def sinky(f): return f['sink']*3+f['idxw']*2+f['ptrw']*2+f['alloc']*2+f['fmt']+f['gp']
 def inpy(f):  return f['inp']*3+f['gp']*2
 def main():
-    b=sys.argv[1]; cache=os.path.abspath(b)+'.decomp'
+    parser=argparse.ArgumentParser(description="decomp cache based local vulnerability target ranking")
+    parser.add_argument('binary', help='binary whose adjacent .decomp cache should be analyzed')
+    args=parser.parse_args()
+    b=args.binary; cache=os.path.abspath(b)+'.decomp'
     fs=glob.glob(cache+'/*.c')
     if not fs: print("decomp 캐시 없음 → 먼저: decomp %s"%b); return 1
     F={}

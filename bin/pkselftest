@@ -15,12 +15,15 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 VENV=python3
+ANGR_PY="${RAT_ANGR_PYTHON:-$CTF_HOME/.venv-angr/bin/python}"
+if [ ! -x "$ANGR_PY" ] && [ -z "${RAT_ANGR_PYTHON:-}" ]; then ANGR_PY="$VENV"; fi
 export PYTHONPATH="$CTF_HOME/bin${PYTHONPATH:+:$PYTHONPATH}"
 P=0; F=0; S=0
 line(){ [ "$FORMAT" = json ] || echo "$1"; }
 ok(){ line "  [PASS] $1"; P=$((P+1)); }
 no(){ line "  [FAIL] $1"; F=$((F+1)); }
 skip(){ line "  [SKIP] $1"; S=$((S+1)); }
+has_python_module(){ $VENV -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)' "$1" >/dev/null 2>&1; }
 T=$(mktemp -d); cd "$T"
 cleanup(){ cd /; rm -rf -- "$T"; }
 trap cleanup EXIT
@@ -32,7 +35,7 @@ trap 'exit 130' HUP INT TERM
 # a fabricated fake verifier no longer counts as direct (that was the whole point).
 state init st >/dev/null 2>&1
 DIRECT_OK=0
-if $VENV -c 'import angr' >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+if "$ANGR_PY" -c 'import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None' >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
   cat > fx.c <<'CEOF'
 #include <stdio.h>
 int main(void){ puts("HELLO_MARKER"); return 0; }
@@ -90,10 +93,19 @@ printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/d
 # T5 pwnkit.run_batch (headless gdb plumbing) uses a stable repository fixture
 # rather than depending on an optional challenge binary.
 B=$CTF_HOME/tests/fixtures/pwn/stack_overflow.c
-if command -v cc >/dev/null 2>&1 && cc -fno-stack-protector -no-pie -O0 -o ./m "$B" 2>/dev/null; then
-  $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"
+if ! command -v cc >/dev/null 2>&1; then
+  skip "pwnkit.run_batch (cc dependency 없음)"
+elif ! command -v gdb >/dev/null 2>&1; then
+  skip "pwnkit.run_batch (gdb dependency 없음)"
+elif ! has_python_module pwn; then
+  skip "pwnkit.run_batch (pwntools dependency 없음)"
+elif ! has_python_module elftools.elf.elffile; then
+  skip "pwnkit.run_batch (pyelftools dependency 없음)"
 else
-  skip "run_batch (cc/fixture dependency 없음)"
+  cc -fno-stack-protector -no-pie -O0 -o ./m "$B" 2>/dev/null || { no "pwnkit.run_batch fixture build"; }
+  if [ -x ./m ]; then
+    $VENV -c "import pwnkit;s,_=pwnkit.run_batch('./m', 'printf \"SNAP x=%#lx\\\\n\", 0x41\n');import sys;sys.exit(0 if s.get('x')==0x41 else 1)" 2>/dev/null && ok "pwnkit.run_batch headless" || no "pwnkit.run_batch headless"
+  fi
 fi
 # T6 pkshare HANDOFF 생성 + strict 구조 검사
 mkdir -p artifact
@@ -107,15 +119,29 @@ touch ./m
 mkdir -p ./m.decomp
 printf '00101234\tFUN_00101234\t1\n' > ./m.decomp/_index.txt
 printf 'decompiled alias ok\n' > ./m.decomp/FUN_00101234.c
-"$CTF_HOME/bin/decomp" ./m sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
-printf 'int main(){return 0;}\n' > ./m2.c
-cc ./m2.c -o ./m2 2>/dev/null
-mkdir -p ./m2.decomp
-printf '' > ./m2.decomp/_index.txt
-"$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
+if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+  skip "decomp revq/Ghidra addr alias (timeout dependency 없음)"
+else
+  "$CTF_HOME/bin/decomp" ./m sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
+fi
+if ! command -v cc >/dev/null 2>&1; then
+  skip "decomp disassembly fallback (cc dependency 없음)"
+elif ! command -v objdump >/dev/null 2>&1; then
+  skip "decomp disassembly fallback (objdump dependency 없음)"
+elif ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+  skip "decomp disassembly fallback (timeout dependency 없음)"
+else
+  printf 'int main(){return 0;}\n' > ./m2.c
+  mkdir -p ./m2.decomp
+  printf '' > ./m2.decomp/_index.txt
+  cc ./m2.c -o ./m2 2>/dev/null || { no "decomp fallback fixture build"; }
+  if [ -x ./m2 ]; then
+    "$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
+  fi
+fi
 # T9 bounded Qiling transport + optional dependency status
 "$CTF_HOME/bin/rat-qiling" --selftest >/dev/null 2>&1 && ok "rat-qiling bounded selftest" || no "rat-qiling bounded selftest"
-$VENV -c 'import qiling' >/dev/null 2>&1 && ok "qiling optional dependency" || skip "qiling optional dependency 없음"
+"$ANGR_PY" -c 'import qiling' >/dev/null 2>&1 && ok "qiling optional dependency" || skip "qiling optional dependency 없음"
 # T10 deterministic address math + local/network scope lint
 "$CTF_HOME/bin/pwncalc" base --leak 0x7f0012345000 --offset 0x12345000 2>/dev/null | grep -q 'base=0x7f0000000000' && ok "pwncalc aligned base" || no "pwncalc aligned base"
 printf 'from pwn import *\nio = process("./m")\n' > ./solve_local.py
@@ -123,10 +149,33 @@ printf 'from pwn import *\nio = process("./m")\n' > ./solve_local.py
 # T11 local pwn helpers: leak classification, payload constraint, mapped ROP address
 "$CTF_HOME/bin/pwnleak" --text 'p=0x7ffff7a5f980 marker=0x4141414141414141' 2>/dev/null | grep -Eq 'candidate 0x7ffff7a5f980 +shared-library' && ok "pwnleak classify" || no "pwnleak classify"
 "$CTF_HOME/bin/pwnpayload" --hex 41414141 --max-length 8 2>/dev/null | grep -q 'verdict=pass' && ok "pwnpayload local bytes" || no "pwnpayload local bytes"
-"$CTF_HOME/bin/pwnropcheck" --chain 0x401000 --map /bin/true@0 >/dev/null 2>&1; [ "$?" -eq 2 ] && ok "pwnropcheck rejects unmapped" || no "pwnropcheck rejects unmapped"
+if ! has_python_module elftools.elf.elffile; then
+  skip "pwnropcheck rejects unmapped (pyelftools dependency 없음)"
+elif ! "$VENV" -c 'import sys; sys.exit(0 if open("/bin/true","rb").read(4)==b"\x7fELF" else 1)' >/dev/null 2>&1; then
+  skip "pwnropcheck rejects unmapped (ELF fixture 없음)"
+else
+  ROP_RESULT=$("$CTF_HOME/bin/pwnropcheck" --chain 0x401000 --map /bin/true@0 --format json 2>/dev/null)
+  ROP_RC=$?
+  if [ "$ROP_RC" -eq 2 ] && printf '%s' "$ROP_RESULT" | "$VENV" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any("outside supplied mappings" in e for e in d.get("errors",[])) else 1)' >/dev/null 2>&1; then
+    ok "pwnropcheck rejects unmapped"
+  else
+    no "pwnropcheck rejects unmapped"
+  fi
+fi
 # T12 local cyclic crash/core collection; it remains candidate evidence, never a primitive PASS.
-if command -v cc >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1; then
-  cc -fno-stack-protector -no-pie -O0 -o ./crash_fixture "$CTF_HOME/tests/fixtures/pwn/stack_overflow.c" 2>/dev/null
+if ! command -v cc >/dev/null 2>&1; then
+  skip "pwncrash (cc dependency 없음)"
+elif ! command -v gdb >/dev/null 2>&1; then
+  skip "pwncrash (gdb dependency 없음)"
+elif ! has_python_module pwn; then
+  skip "pwncrash (pwntools dependency 없음)"
+elif ! has_python_module elftools.elf.elffile; then
+  skip "pwncrash (pyelftools dependency 없음)"
+else
+  cc -fno-stack-protector -no-pie -O0 -o ./crash_fixture "$CTF_HOME/tests/fixtures/pwn/stack_overflow.c" 2>/dev/null || { no "pwncrash fixture build"; }
+  if [ ! -x ./crash_fixture ]; then
+    :
+  else
   PCRASH_OUT=$("$CTF_HOME/bin/pwncrash" ./crash_fixture --pattern-length 128 --repetitions 1 --json 2>&1)
   if printf '%s' "$PCRASH_OUT" | grep -q '"verdict": "crash-reproduced"'; then
     ok "pwncrash local core"
@@ -135,8 +184,7 @@ if command -v cc >/dev/null 2>&1 && command -v gdb >/dev/null 2>&1; then
   else
     no "pwncrash local core"
   fi
-else
-  skip "pwncrash (cc/gdb dependency 없음)"
+  fi
 fi
 if [ "${PKSELFTEST_FORCE_FAIL:-0}" = 1 ]; then no "forced failure injection"; fi
 if [ "$FORMAT" = json ]; then

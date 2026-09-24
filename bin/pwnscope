@@ -49,8 +49,8 @@ def issue(code: str, severity: str, message: str, line: int | None = None) -> di
 
 
 def inspect_script(path: str) -> dict:
-    source = open(path, encoding="utf-8").read()
-    tree = ast.parse(source, filename=path)
+    with open(path, encoding="utf-8") as source:
+        tree = ast.parse(source.read(), filename=path)
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     aliases = {}
     for node in ast.walk(tree):
@@ -195,7 +195,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("script", help="Python solve script to inspect")
     result.add_argument("--manifest", help="run.json path; defaults to the script directory")
-    result.add_argument("--json", action="store_true")
+    result.add_argument("--format", choices=("text", "json"), default="text")
+    result.add_argument("--json", dest="format", action="store_const", const="json",
+                        help="deprecated alias for --format json")
     return result
 
 
@@ -210,7 +212,7 @@ def main(argv=None) -> int:
     manifest, manifest_findings = load_manifest(manifest_path)
     script_doc["findings"].extend(manifest_findings)
     report = evaluate(script_doc, manifest)
-    if args.json:
+    if args.format == "json":
         print(json.dumps(report, sort_keys=True, indent=2))
     else:
         summary = report["summary"]
