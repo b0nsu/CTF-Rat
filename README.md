@@ -56,9 +56,9 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 ctfguard begin <challenge> [target]
 # 2. Route — project evidence dimensions and choose a bounded action
 rat route <bin>
-# 3. Detailed triage
-revq <bin>        # rev
-recon <bin>       # pwn
+# 3. Run one bounded discriminator; use full recon/revq only when evidence says it is needed
+rat query pwn <bin>              # example pwn capability query
+rat query func <bin> <function>  # example rev function card
 ```
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
@@ -73,8 +73,8 @@ flowchart LR
     D --> F["🧪 rat-verify / concrete-verify"]
     E --> F
     F --> G{"PASS?"}
-    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>SOLVING · PRIMITIVE_GATE"]
-    H --> B
+    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>inherit STATE · cache · current evidence"]
+    H -->|next discriminator| D
     G -->|yes| I["📦 pkshare → HANDOFF.md<br/>knowledge/learned/"]
 
     style A fill:#264653,color:#fff
