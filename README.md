@@ -54,7 +54,7 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 # 0. One-time environment setup (venv+angr+pwntools, Ghidra, glibc-fetch)  →  SETUP.md
 # 1. Lock the target engagement (allowlist / active lock)
 ctfguard begin <challenge> [target]
-# 2. Route — project evidence dimensions and choose a bounded action
+# 2. Route — project evidence dimensions and bounded candidate probes
 rat route <bin>
 # 3. Detailed triage
 revq <bin>        # rev
@@ -67,8 +67,8 @@ recon <bin>       # pwn
 
 ```mermaid
 flowchart LR
-    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>signals · dimensions · decision"]
-    B --> D["🎯 run one evidence-linked bounded action"]
+    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>signals · dimensions · candidate probes"]
+    B --> D["🎯 run one bounded discriminator<br/>recommend only on clear dominance"]
     B --> E["🔍 preserve coexisting leads and unresolved premises"]
     D --> F["🧪 rat-verify / concrete-verify"]
     E --> F
@@ -127,8 +127,8 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <summary><code>rat</code> — the single front-door dispatcher</summary>
 <br>
 
-`rat route <bin>` projects observations into independent dimensions and selects one evidence-linked bounded action (a thin composition of rat-doctor + rat-profile + revq,
-no new analysis), and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
+`rat route <bin>` projects observations into independent dimensions and returns evidence-linked bounded candidate probes (a thin composition of rat-doctor + rat-profile + revq,
+no new analysis). It emits a recommendation only when one probe clearly dominates the alternatives on deterministic evidence/cost criteria, and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
 
