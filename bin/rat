@@ -59,8 +59,7 @@ def _render_route_text(doc):
     skill = doc.get("skill")
     skill_line = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else (skill or "-")
     decision = doc.get("decision") or {}
-    lines = ["DECISION    %s %s" % (decision.get("action", "-"), decision.get("target", "")),
-             "COMMITMENT  %s" % doc.get("commitment", "unknown"), "SKILL       %s" % skill_line]
+    lines = ["COMMITMENT  %s" % doc.get("commitment", "unknown"), "SKILL       %s" % skill_line]
     dimensions = doc.get("dimensions") or {}
     if dimensions:
         lines += ["", "DIMENSIONS"]
@@ -82,7 +81,9 @@ def _render_route_text(doc):
         lines += ["", "COEXISTING LEADS"] + ["  %s" % name for name in leads]
     nxt = doc.get("next") or []
     if nxt:
-        lines += ["", "NEXT"] + _render_next(nxt)
+        lines += ["", "CANDIDATE PROBES"] + _render_next(nxt)
+    if decision:
+        lines += ["", "RECOMMENDED  %s %s" % (decision.get("action", ""), decision.get("target") or "")]
     if doc.get("governor", {}).get("stuck"):
         lines += ["", "GOVERNOR    stuck (%s)" % doc["governor"].get("action")]
     return "\n".join(lines)
@@ -451,8 +452,7 @@ def _render_brief_text(card):
     L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
     r = card["route"]
     decision = r.get("decision") or {}
-    L += ["", "DECISION    %s %s" % (decision.get("action", "-"), decision.get("target", "")),
-          "COMMITMENT  %s" % r.get("commitment", "unknown")]
+    L += ["", "COMMITMENT  %s" % r.get("commitment", "unknown")]
     if card.get("skill_path"):
         L.append("SKILL       %s" % card["skill_path"])
     if r.get("leads"):
@@ -462,7 +462,9 @@ def _render_brief_text(card):
         L.append("UNRESOLVED  " + " | ".join(unresolved[:3]))
     nxt = r.get("next") or []
     if nxt:
-        L += ["NEXT        " + "; ".join("%s %s" % (n.get("query", ""), n.get("target") or "") for n in nxt)]
+        L += ["CANDIDATES   " + "; ".join("%s %s" % (n.get("query", ""), n.get("target") or "") for n in nxt)]
+    if decision:
+        L += ["RECOMMENDED  %s %s" % (decision.get("action", ""), decision.get("target") or "")]
     ts = card["track_summary"]
     pwn = ts.get("pwn") or {}
     rev = ts.get("rev") or {}
