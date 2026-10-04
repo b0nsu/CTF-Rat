@@ -198,6 +198,7 @@ def _attach_symbolic_primitive(stream, binary_digest, environment_digest,
     document.setdefault("extensions", {}).update({
         "solve_origin": "rev-symbolic",
         "engine_observation_id": observation_id,
+        "proof_contract": "solution-reconstruction/v1",
     })
     document["producer"].update({
         "engine": "symsolve",
