@@ -186,10 +186,7 @@ def _attach_symbolic_primitive(stream, binary_digest, environment_digest,
             "input_digest": binary_digest,
             "environment_digest": environment_digest,
             "self_evidence": [],
-            "constraints": [
-                "Concrete verification is heuristic evidence until re-measured as direct SELF evidence.",
-                "solution-reconstruction/v1 PASS requires recovered-input + success-oracle + concrete-replay observation kinds.",
-            ],
+            "constraints": ["Concrete verification is heuristic evidence; use three independent direct SELF observations before PASS."],
             "side_effects": [],
             "remote_equivalent": False,
             "producer": {"tool": "symsolve", "version": "1"},
@@ -198,7 +195,6 @@ def _attach_symbolic_primitive(stream, binary_digest, environment_digest,
     document.setdefault("extensions", {}).update({
         "solve_origin": "rev-symbolic",
         "engine_observation_id": observation_id,
-        "proof_contract": "solution-reconstruction/v1",
     })
     document["producer"].update({
         "engine": "symsolve",
