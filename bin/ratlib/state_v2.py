@@ -75,10 +75,20 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids):
  if missing:
   raise ValueError("PASS primitive class %s missing proof slots: %s" %
                    (payload.get("class"),", ".join(missing)))
- # Contracts currently use disjoint kind families, but keep the invariant
- # explicit so a future overlapping pattern cannot let one observation stand in
- # for multiple independent semantic facts.
- if len(set(oid for matches in matches_by_slot.values() for oid in matches)) < len(contract["slots"]):
+ # Require a real one-to-one slot -> observation assignment.  A simple union
+ # size check is insufficient once future contracts contain overlapping kind
+ # patterns (Hall's condition can fail even when the union is large enough).
+ assigned={}
+ def claim(slot,seen):
+  for oid in matches_by_slot[slot]:
+   if oid in seen: continue
+   seen.add(oid)
+   previous=assigned.get(oid)
+   if previous is None or claim(previous,seen):
+    assigned[oid]=slot
+    return True
+  return False
+ if not all(claim(slot,set()) for slot in sorted(matches_by_slot)):
   raise ValueError("PASS primitive class %s needs distinct observations across proof slots" %
                    payload.get("class"))
 # Controlled vocabulary for L1 failure classification (compounding loop). Fail-closed:
