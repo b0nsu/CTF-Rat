@@ -9,6 +9,7 @@ from ratlib.state_v2 import (
     Stream,
     revise_primitive,
     primitive_proof_contract,
+    validate_history,
 )
 from tests.direct_evidence_helper import (
     CANONICAL_ENVIRONMENT,
@@ -150,6 +151,34 @@ class PrimitiveProofContractTests(unittest.TestCase):
             passed = stream.view()["primitives"]["legacy"]
             self.assertEqual(passed["status"], "pass")
             self.assertNotIn("proof_contract", passed.get("extensions", {}))
+
+    def test_pre_contract_canonical_history_without_declaration_still_replays(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            direct_observation(stream, "obs_reg", "pwn.reg")
+            direct_observation(stream, "obs_marker", "pwn.marker")
+            direct_observation(stream, "obs_target", "pwn.control-target")
+            revise_primitive(
+                stream,
+                primitive_doc("p", "legacy-custom", "candidate", [], 1),
+            )
+            revise_primitive(
+                stream,
+                primitive_doc(
+                    "p",
+                    "legacy-custom",
+                    "pass",
+                    ["obs_reg", "obs_marker", "obs_target"],
+                    2,
+                ),
+            )
+            events = stream.read()
+            for event in events:
+                if event["type"] == "primitive.revised":
+                    event["payload"]["class"] = "control-flow"
+                    event["payload"].get("extensions", {}).pop("proof_contract", None)
+            view = validate_history(events, root, artifact_root=stream.root)
+            self.assertEqual(view["primitives"]["p"]["status"], "pass")
 
     def test_wrong_explicit_contract_version_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
