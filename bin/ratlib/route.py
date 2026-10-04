@@ -71,19 +71,7 @@ def _recommend(actions):
     if len(actions)==1:
         return actions[0]
     maximal=[a for a in actions if not any(_dominates(other,a) for other in actions if other is not a)]
-    if len(maximal)==1:
-        return maximal[0]
-    queries={a["query"] for a in maximal}
-    if len(queries)==1:
-        return {"query":next(iter(queries)),"target":None,
-                "evidence":sorted({e for a in maximal for e in a["evidence"]}),
-                "rule":"co-equal candidate probes share one bounded front door; choose one candidate from next",
-                "resolves":sorted({r for a in maximal for r in a["resolves"]}),
-                "expected_evidence":"candidate-dependent","cost":"low",
-                "specificity":"general","blocking":any(a["blocking"] for a in maximal),
-                "evidence_quality":max((a["evidence_quality"] for a in maximal),
-                                       key=lambda q:QUALITY_RANK[q])}
-    return None
+    return maximal[0] if len(maximal)==1 else None
 
 def route(*,profile=None,revq=None,interesting=None):
     """Project observations into candidate probes; never choose a challenge class."""
