@@ -153,7 +153,7 @@ class GovernorWiring(unittest.TestCase):
 class FrontDoorTextRendering(unittest.TestCase):
     """Default text output must surface the route-result's essential fields,
     not collapse to a bare `label: status` line."""
-    def test_route_text_output_shows_decision_commitment_and_skill(self):
+    def test_route_text_output_shows_evidence_before_optional_recommendation(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = os.path.join(tmp, "silent")
             with open(binary, "wb") as f:
@@ -161,9 +161,9 @@ class FrontDoorTextRendering(unittest.TestCase):
             os.chmod(binary, 0o755)
             code, out, err = run_rat("route", binary)
             self.assertEqual(code, 0, err)
-            self.assertIn("DECISION", out)
             self.assertIn("COMMITMENT", out)
             self.assertIn("SKILL", out)
+            self.assertNotIn("DECISION", out)
 
 class DynVerifyStateCompactPassthrough(unittest.TestCase):
     """Pure argv-forwarding -- exercised against a legacy CLI's own usage/
