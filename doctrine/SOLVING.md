@@ -97,25 +97,33 @@ primitive PASS 뒤에만 chain을 최소화하고 `solve_local.py` 또는 최소
 
 ## context 규율
 
-- `decomp`와 `gdbq`를 우선 사용한다. 함수 목록·문자열·xref의 대량 읽기는 요약만 회수한다.
+- raw dump보다 bounded query를 우선한다. `decomp`와 `gdbq`도 필요한 함수/측정에만 사용한다.
 - 주소·offset·gadget·layout은 evidence-backed typed observation (`kind:"pwn.offset"`)으로 기록한다. 문서의 예시 수치를 복사해 사용하지 않는다.
-- 상태 읽기: FAST hot-path에서는 `state compact --budget-tokens N`(토큰 bounded 뷰)이 기본이다. `state show`는 DEEP에서 전체 materialized 뷰가 필요할 때 쓰는 상위 명령이며 STATE 원본(`STATE.v2.jsonl`)을 통째로 붙여넣지 않는다. 가설·실패·재현 조건은 즉시 append한다.
+- 상태 읽기: `rat state compact --budget-tokens N`이 기본이다. `state show`는 DEEP에서 전체 materialized 뷰가 실제로 필요할 때만 쓰며 STATE 원본(`STATE.v2.jsonl`)을 통째로 붙여넣지 않는다.
+- 같은 deterministic artifact를 반복 주입하지 않는다. cache/index가 장기 truth이고 모델 context는 현재 branch의 working set이다.
+- 반증된 branch의 raw 출력은 context에서 제거하고 가설·실패·재현 조건은 즉시 append한다.
 
 ## 로컬 도구
 
 | 목적 | 명령 |
 |---|---|
-| 정찰·triage | `recon <bin> [libc]` / `revq <bin>` |
-| 디컴파일 | `decomp <bin> [func]` |
+| 현재 evidence snapshot | `rat state compact --budget-tokens N` |
+| route 재평가(필요할 때만) | `rat route <bin>` |
+| bounded 구조 조회 | `rat query func|oracle|pwn|pattern|slice ...` |
+| 함수 단위 디컴파일 | `decomp <bin> <func>` |
 | 배치 관찰 | `gdbq <bin> "b *main" "run"` |
-| 로컬 스캐폴드 | `newchal <name> <bin> [libc]` |
-| 로컬 검증 | `./solve_local.py` 또는 `pwnkit.run_batch(...)` |
-| 상태 기록 | `state hypothesis`, typed `state event append`, typed `state primitive`, `state route`(ruled-out 경로 기록 = 재시도 금지 dead-end), `state alert` |
+| 로컬 스캐폴드(최초 ingest에만) | `newchal <name> <bin> [libc]` |
+| 로컬 검증 | `rat-verify ...` / `./solve_local.py` / `pwnkit.run_batch(...)` |
+| 상태 기록 | `state hypothesis`, typed `state event append`, typed `state primitive`, `state route`, `state failclass` |
 
 ## 협업
 
-- 한 번에 활성 문제는 하나다. 팬아웃은 큰 정적 읽기 또는 vuln class가 불확실한 경우에만 최대 3개까지 사용한다.
-- primitive 검증과 PoC 조립은 순차적으로 수렴한다. skeptic은 완료 선언 전 로컬 재현을 반증한다.
+- 한 번에 활성 문제는 하나다.
+- 팬아웃은 독립된 경쟁 branch가 실제로 2~3개 존재하고 한 실험으로 합치기 어려울 때만 최대 3개까지 사용한다.
+- 각 subagent는 서로 다른 branch 또는 큰 bounded read만 맡고 main agent에는 결론·증거 digest·falsifier만 반환한다.
+- 동일 함수/동일 hypothesis를 여러 agent가 반복 분석하지 않는다.
+- primitive 검증과 PoC 조립은 순차적으로 수렴한다.
+- deterministic verifier가 명확한 경우 skeptic은 기본 OFF다. 환경 민감·증거 충돌·해석 불일치가 남을 때만 사용한다.
 - 에이전트는 외부 상호작용을 수행하거나 다른 에이전트에게 맡기지 않는다. 범위 밖 요구는 기록하고 멈춘다.
 
 ## 산출물
