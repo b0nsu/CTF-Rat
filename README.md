@@ -98,7 +98,7 @@ flowchart LR
 | **[knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)** | Knowledge router → `knowledge/ctf-skills/`                                                                                                                           |
 
 > [!NOTE]
-> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (ROE+6-phase) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
+> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (FAST evidence handoff + bounded convergence loop) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
 >
 > Benchmark corpus, ablations, and design-review docs live on the `dev` branch. `main` ships only the operational tools needed to actually solve and verify challenges.
 
