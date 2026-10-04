@@ -24,9 +24,13 @@ PRIMITIVE_EXAMPLE = {
     "class": "control-flow", "status": "candidate",
     "input_digest": "sha256:" + "0" * 64, "environment_digest": "sha256:" + "0" * 64,
     "self_evidence": [],
-    "constraints": ["promote to pass only after obs_rsp/obs_marker/obs_ret exist as active direct SELF observations"],
+    "constraints": [
+        "PASS requires >=3 distinct active direct SELF observations",
+        "control-flow/v1 coverage: pwn.reg + pwn.marker/pwn.memory-control + pwn.control-target/pwn.offset",
+    ],
     "side_effects": [],
     "remote_equivalent": True, "producer": {"tool": "pwnstage", "version": "1"}, "revision": 1,
+    "extensions": {"proof_contract": "control-flow/v1"},
 }
 def active_chal():
     try:
@@ -373,7 +377,7 @@ typed writes (canonical):
   event append <rat.observation/v1 doc.json>     record a measured observation (SELF evidence)
   finding <action> <rat.finding/v1 doc.json>     action: propose|support|confirm|refute|invalidate
   primitive <action> <rat.primitive/v1 doc.json> action: candidate|pass|fail|block
-                                                 (pass needs >=3 active+direct SELF observations)
+                                                 (pass needs >=3 active+direct SELF observations + class proof coverage when defined)
   primitive consume <name> <input_digest> <env_digest>
   invalidate-evidence <observation_id>...        advisory -> hard trust removal
 
