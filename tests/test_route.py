@@ -19,13 +19,36 @@ class RouterV2(unittest.TestCase):
         self.assertEqual(set(doc["dimensions"]["vulnerability_surfaces"]),
                          {"heap-lifetime-candidate","format-string-candidate","stack-overwrite-candidate"})
         self.assertIn("checker",doc["dimensions"]["program_shapes"])
-        self.assertEqual(doc["decision"]["action"],"rat query func")
+        self.assertIsNone(doc["decision"])
+        self.assertEqual(doc["commitment"],"provisional")
+        self.assertEqual({item["query"] for item in doc["next"]},{"rat query func","rat query pwn"})
 
     def test_observation_order_does_not_change_meaning(self):
         profile={"imports":["free","gets","malloc","printf","read"],"facts":[{"kind":"elf.nx","value":True}]}
         a=route(profile=profile,revq=rev_checker(),interesting=[{"func":"check","score":1}])
         profile["imports"].reverse(); b=route(profile=profile,revq=copy.deepcopy(rev_checker()),interesting=[{"func":"check","score":99}])
         self.assertEqual(a,b)
+
+    def test_checker_fact_dominates_heuristic_overflow_probe(self):
+        doc=route(profile={"imports":["read"]},
+                  revq=rev_checker(),interesting=[{"func":"check","score":9}])
+        self.assertEqual(doc["decision"]["action"],"rat query func")
+        self.assertEqual(doc["decision"]["evidence_quality"],"fact")
+        self.assertEqual(doc["decision"]["specificity"],"concrete")
+
+    def test_independent_fact_backed_leads_do_not_force_recommendation(self):
+        doc=route(profile={"imports":["malloc","free","printf","read"]})
+        self.assertIsNone(doc["decision"])
+        self.assertEqual(doc["commitment"],"provisional")
+        self.assertEqual({a["target"] for a in doc["next"] if a["query"]=="rat query pwn"},
+                         {"inspect-bounded-allocator-callsites-and-lifetimes",
+                          "inspect-bounded-format-callsites-before-runtime-probe",
+                          "inspect-bounded-input-callsite-then-measure-overwrite"})
+        for action in doc["next"]:
+            self.assertIn("resolves",action)
+            self.assertIn("expected_evidence",action)
+            self.assertIn("cost",action)
+            self.assertIn("evidence_quality",action)
 
     def test_imports_never_commit_or_lock_skill(self):
         for imports in (["malloc","free"],["printf","read"],["gets"],["copy_from_user"]):
