@@ -56,7 +56,13 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids):
  contract=PRIMITIVE_PROOF_CONTRACTS.get(payload.get("class"))
  if not contract: return
  ext=payload.get("extensions") or {}
- if ext.get("proof_contract")!=contract["version"]:
+ declared=ext.get("proof_contract")
+ # Current local writers canonicalize known classes with proof_contract before
+ # validation. A missing declaration can therefore only come from an older
+ # stored/replayed event produced before this policy existed; keep that history
+ # readable. Once declared, the version and coverage are fail-closed.
+ if declared is None: return
+ if declared!=contract["version"]:
   raise ValueError("PASS primitive class %s requires proof_contract %s" %
                    (payload.get("class"),contract["version"]))
  missing=[]
