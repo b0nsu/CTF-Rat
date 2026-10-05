@@ -11,9 +11,24 @@
 - **PASS 기록(typed STATE v2 전용, 필수)**: `state primitive <name> pass <evidence>` 형태의 legacy 명령은 `bin/state`가 거부한다. PASS는 아래 3단계로 typed v2 스트림에 기록해야 한다.
   1. SELF로 직접 확인한 관찰 3개 이상을 `rat.observation/v1` 문서로 각각 기록: `state event append obs_N.json` (각 문서는 `quality.level:"direct"`, `validity.state:"active"`).
   2. `rat.primitive/v1` 문서를 작성: `status:"pass"`, `self_evidence:[관찰 3개 이상의 observation_id]`, 나머지 필수 필드(`primitive_id`,`name`,`class`,`input_digest`,`environment_digest`,`constraints`,`side_effects`,`remote_equivalent`,`producer`,`revision`). **`input_digest`/`environment_digest`는 자유값이 아니다**: SELF observation의 direct 증거 봉투가 실제로 측정한 subject·environment 해시와 정확히 일치해야 한다(도구가 봉투에 stamp한 `subject_digest`/`environment_digest`). 불일치 시 `revise_primitive`가 "PASS SELF evidence must measure the primitive input_digest/environment_digest"로 거부한다 — 바이너리 A의 증거로 바이너리 B PASS를 만들 수 없다.
-  3. `state primitive pass primitive.json` 로 typed v2 스트림에 append — `bin/state`/`ratlib.state_v2.revise_primitive`가 "3개의 active+direct SELF observation" invariant를 실제로 검증한다.
+  3. `state primitive pass primitive.json` 로 typed v2 스트림에 append — `bin/state`/`ratlib.state_v2.revise_primitive`가 "3개의 distinct active+direct SELF observation + 3개의 distinct evidence artifact + input/environment binding" invariant를 실제로 검증한다. 또한 아래 canonical primitive class는 **class별 proof slot coverage**까지 통과해야 한다.
 - `state primitive fail <rat.primitive/v1 doc.json>` / `state primitive block <rat.primitive/v1 doc.json>`: primitive 실패/보류. **legacy 텍스트 로그는 `bin/state`가 거부하므로 fail/blocked도 typed v2 문서가 필수**다(각각 `status:"fail"` / `status:"blocked"`). 명령어는 `block`, 문서 status는 `blocked`로 서로 다름에 주의. 같은 경로로 체이닝 금지.
 - `state no <text> -- <reason>`: 재시도 금지 dead-end.
+
+## Primitive proof contract
+
+generic gate(`>=3` distinct active+direct SELF)는 모든 PASS의 바닥 조건이다. 그러나 canonical class는 같은 사실을 세 번 측정한 것만으로 PASS할 수 없다. 각 class가 요구하는 서로 다른 의미의 proof slot을 observation `kind`로 덮어야 한다.
+
+| primitive class | contract | required proof slots |
+|---|---|---|
+| `control-flow` | `control-flow/v1` | control state: `pwn.reg*` 또는 `pwn.control-flow.state*` · attacker marker: `pwn.marker*` 또는 `pwn.memory-control*` · control target: `pwn.control-target*` 또는 `pwn.offset` |
+| `solution-reconstruction` | `solution-reconstruction/v1` | recovered input: `rev.solution.input*` 또는 `rev.symsolve.input*` · success oracle: `rev.solution.oracle*` 또는 `rev.oracle*` · concrete replay: `rev.solution.replay*` 또는 `rev.symsolve.concrete-verify*` |
+
+PASS 시 runtime은 canonical class의 `extensions.proof_contract`를 해당 version으로 고정하고, self_evidence에 각 slot을 만족하는 observation이 실제로 있는지 검사한다. 하나의 observation이 여러 slot을 대신하지 못하도록 slot 수만큼 distinct observation coverage도 요구한다.
+
+기존 자유 문자열 class는 backward compatibility 때문에 generic gate만 적용한다. 신규 PWN control-flow 및 REV solution-reconstruction primitive는 위 canonical class를 사용한다. canonical class를 피하기 위해 임의 class 문자열로 바꾸는 것은 verification 우회로 간주한다.
+
+`rev.symsolve.concrete-verify`라는 kind 이름 자체는 direct를 의미하지 않는다. 다른 observation과 동일하게 evidence envelope에서 runtime이 `quality.level=direct`를 재계산해야 해당 proof slot에 사용 가능하다.
 
 ## Primitive PASS 조건
 
@@ -66,13 +81,15 @@ cat > obs_rsp.json <<JSON
  "subject":{"binary":"./chal"},"kind":"pwn.reg","value":"RSP=0x7fffffffde80",
  "evidence":["$r1"],"quality":{"level":"direct"},"validity":{"state":"active"}}
 JSON
-#   obs_marker.json: value "[RSP]=0x4141414141414141 attacker marker", evidence=["$r2"] (같은 형식)
-#   obs_ret.json:    value "next ret target=0x401234", evidence=["$r3"] (같은 형식)
+#   obs_marker.json: kind "pwn.marker", value "[RSP]=0x4141414141414141 attacker marker", evidence=["$r2"]
+#   obs_ret.json:    kind "pwn.control-target", value "next ret target=0x401234", evidence=["$r3"]
 state event append obs_rsp.json
 state event append obs_marker.json
 state event append obs_ret.json
 
-# 3) primitive.json: status:"pass", self_evidence=[위 3개 observation_id].
+# 3) primitive.json: class:"control-flow", status:"pass", self_evidence=[위 3개 observation_id].
+#    runtime이 extensions.proof_contract="control-flow/v1"을 canonicalize하고
+#    pwn.reg + pwn.marker + pwn.control-target coverage를 검증한다.
 #    input_digest는 SELF evidence가 실제로 측정한 subject_digest(=측정된 ./chal의 sha256)와,
 #    environment_digest는 측정 호스트의 tooling-owned digest와 정확히 일치해야 한다(불일치 시
 #    PASS는 "must measure the primitive input_digest/environment_digest"로 거부된다).

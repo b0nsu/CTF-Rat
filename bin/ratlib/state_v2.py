@@ -15,6 +15,82 @@ PRIMITIVE_TRANSITIONS={
  ("pass","pass"), ("pass","stale"), ("pass","consumed"),
  ("blocked","candidate"), ("stale","candidate"),
 }
+# Canonical proof coverage for primitive classes that have stable semantics.
+# The generic >=3 direct SELF invariant remains the floor for every PASS.  These
+# contracts add semantic coverage on top of that floor, so three measurements of
+# the same fact cannot satisfy a canonical primitive merely by having distinct IDs.
+# Unknown/legacy class strings intentionally keep the generic gate for backward
+# compatibility; new producers should use one of the canonical classes below.
+PRIMITIVE_PROOF_CONTRACTS={
+ "control-flow":{
+  "version":"control-flow/v1",
+  "slots":{
+   "control-state":("pwn.reg","pwn.reg.","pwn.control-flow.state","pwn.control-flow.state."),
+   "attacker-marker":("pwn.marker","pwn.marker.","pwn.memory-control","pwn.memory-control."),
+   "control-target":("pwn.control-target","pwn.control-target.","pwn.offset"),
+  },
+ },
+ "solution-reconstruction":{
+  "version":"solution-reconstruction/v1",
+  "slots":{
+   "recovered-input":("rev.solution.input","rev.solution.input.","rev.symsolve.input","rev.symsolve.input."),
+   "success-oracle":("rev.solution.oracle","rev.solution.oracle.","rev.oracle","rev.oracle."),
+   "concrete-replay":("rev.solution.replay","rev.solution.replay.","rev.symsolve.concrete-verify","rev.symsolve.concrete-verify."),
+  },
+ },
+}
+def primitive_proof_contract(class_name):
+ contract=PRIMITIVE_PROOF_CONTRACTS.get(class_name)
+ if not contract: return None
+ return {"version":contract["version"],
+         "slots":{name:list(patterns) for name,patterns in contract["slots"].items()}}
+def _proof_kind_matches(kind, patterns):
+ if not isinstance(kind,str): return False
+ for pattern in patterns:
+  if pattern.endswith("."):
+   if kind.startswith(pattern): return True
+  elif kind==pattern:
+   return True
+ return False
+def _validate_primitive_proof_coverage(payload, observations, self_ids):
+ contract=PRIMITIVE_PROOF_CONTRACTS.get(payload.get("class"))
+ if not contract: return
+ ext=payload.get("extensions") or {}
+ declared=ext.get("proof_contract")
+ # Current local writers canonicalize known classes with proof_contract before
+ # validation. A missing declaration can therefore only come from an older
+ # stored/replayed event produced before this policy existed; keep that history
+ # readable. Once declared, the version and coverage are fail-closed.
+ if declared is None: return
+ if declared!=contract["version"]:
+  raise ValueError("PASS primitive class %s requires proof_contract %s" %
+                   (payload.get("class"),contract["version"]))
+ missing=[]
+ matches_by_slot={}
+ for slot,patterns in contract["slots"].items():
+  matches=sorted(oid for oid in self_ids
+                 if _proof_kind_matches(observations.get(oid,{}).get("kind"),patterns))
+  matches_by_slot[slot]=matches
+  if not matches: missing.append(slot)
+ if missing:
+  raise ValueError("PASS primitive class %s missing proof slots: %s" %
+                   (payload.get("class"),", ".join(missing)))
+ # Require a real one-to-one slot -> observation assignment.  A simple union
+ # size check is insufficient once future contracts contain overlapping kind
+ # patterns (Hall's condition can fail even when the union is large enough).
+ assigned={}
+ def claim(slot,seen):
+  for oid in matches_by_slot[slot]:
+   if oid in seen: continue
+   seen.add(oid)
+   previous=assigned.get(oid)
+   if previous is None or claim(previous,seen):
+    assigned[oid]=slot
+    return True
+  return False
+ if not all(claim(slot,set()) for slot in sorted(matches_by_slot)):
+  raise ValueError("PASS primitive class %s needs distinct observations across proof slots" %
+                   payload.get("class"))
 # Controlled vocabulary for L1 failure classification (compounding loop). Fail-closed:
 # bin/state and the direct API reject any class outside this set.
 FAILURE_CLASSES={"route-miss","offset-wrong","libc-mismatch","env","tooling-gap","timeout","other"}
@@ -394,6 +470,12 @@ class Stream:
              "class":"unspecified","constraints":[],"side_effects":[],
              "remote_equivalent":False,"producer":{"role":actor},"revision":old.get("revision",0)+1}
   for key,value in defaults.items(): p.setdefault(key,value)
+  if typ=="primitive.revised" and p.get("status")=="pass":
+   contract=PRIMITIVE_PROOF_CONTRACTS.get(p.get("class"))
+   if contract:
+    extensions=dict(p.get("extensions") or {})
+    extensions.setdefault("proof_contract",contract["version"])
+    p["extensions"]=extensions
   return p
  def _validate_payload(self, typ, payload, events, actor):
   """Keep the direct API on the same typed path as the ``state`` CLI.
@@ -486,6 +568,7 @@ class Stream:
        raise ValueError("PASS SELF evidence must measure the primitive input_digest")
       if any(env!=environment_digest for _subj,env in claims):
        raise ValueError("PASS SELF evidence must measure the primitive environment_digest")
+     _validate_primitive_proof_coverage(payload,view["observations"],self_ids)
   elif typ=="primitive.consumed":
    if not all(isinstance(payload.get(k),str) and payload[k] for k in ("primitive_id","input_digest","environment_digest")): raise ValueError("primitive consumption requires provenance")
    p=view["primitives"].get(payload["primitive_id"])
