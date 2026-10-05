@@ -50,52 +50,76 @@ Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
 9. safe-linking 대상이면 `encoded_fd == target ^ (chunk_addr >> 12)` 를 실측 주소로 계산했다.
 10. 실패 원인을 libc mismatch 로 올리기 전에 Docker/loopback 또는 leak/build-id/hash 증거를 확보했다.
 
-예 (스캐폴드는 `state event --example` / `state primitive --example`로 그대로 뽑아 값만 채운다):
+예 — canonical proof observation은 가능한 한 수동 JSON 작성 대신 `rat-adapt --proof` 경로로 만든다.
 
-**중요**: `evidence`는 사람이 쓴 설명 object가 아니라 **content-addressed artifact digest 문자열 배열**이다
-(`["sha256:..."]`). `quality.level`도 호출자가 주장하는 값이 아니라, 인용한 evidence artifact의
-해시된 바이트에서 런타임이 재계산한다(`state_v2._evidence_quality`) — 아래처럼 `quality`를
-아무 값이나 채워 보내도 실제 값으로 덮어써진다. "direct"를 얻으려면 evidence가 신뢰된 verifier
-(`gdbq`/`symsolve`)의 `rat.tool-result/v1` 성공 envelope를 가리켜야 하고, 그 envelope는 실제로
-`subject_path`(대상 바이너리)를 측정한 것이어야 한다. `rat-adapt`가 이 envelope를 만드는 유일한
-공개 CLI 경로다:
+`rat-adapt --proof`는 신뢰된 verifier(`gdbq`/`symsolve`)의 direct envelope을 만든 뒤, **실제 stdout을 proof mode별 parser로 다시 검증한 경우에만** canonical observation을 STATE에 기록한다. PWN proof mode에서는 임의 GDB command를 받지 않고 adapter가 bounded command를 직접 생성한다. 같은 envelope/kind를 다시 기록하려 하면 기존 observation을 재사용한다.
+
+### PWN control-flow/v1
+
+아래 예에서 `payload.bin`은 이미 준비한 최소 재현 입력이고 `proof_stop`은 검사할 안정적인 breakpoint다. `--proof-address`는 `$rsp`, `$rdi`, `0x...` 및 단일 +/- offset 형태만 허용하며 command injection 문자열은 거부한다.
 
 ```sh
-state hypothesis "saved EBP low-byte overwrite may pivot main epilogue into attacker-controlled stack data"
+state hypothesis "local control-flow candidate"
 
-# 1) 최소 입력으로 신뢰된 verifier(gdbq)를 실제 측정 모드로 실행 -- --direct-subject가
-#    이 실행을 SELF-measurement로 표시하고, 결과 envelope에 subject_digest/environment_digest를
-#    바인딩한다. 세 개의 서로 다른 측정을 세 번 실행해 서로 다른 envelope 3개를 얻는다.
-r1=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch regs.gdb | \
-     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
-r2=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch marker.gdb | \
-     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
-r3=$(bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal gdbq --batch ret.gdb | \
-     python3 -c 'import json,sys; print(json.load(sys.stdin)["extensions"]["envelope_digest"])')
+# 1) control-state: breakpoint hit 뒤 RIP/RSP(/RBP)를 gdbq가 직접 측정.
+bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
+  --proof pwn-control-state --proof-input payload.bin --proof-break proof_stop \
+  gdbq
 
-# 2) 각 envelope digest를 evidence로 인용하는 관찰을 기록. quality/validity는 필수 필드지만
-#    quality.level 값 자체는 런타임이 evidence로부터 재계산하므로 여기 값은 힌트일 뿐이다.
-cat > obs_rsp.json <<JSON
-{"schema":"rat.observation/v1","observation_id":"obs_rsp","run_id":"run_1",
- "created_at":"2026-01-01T00:00:00Z","producer":{"tool":"gdbq","version":"1"},
- "subject":{"binary":"./chal"},"kind":"pwn.reg","value":"RSP=0x7fffffffde80",
- "evidence":["$r1"],"quality":{"level":"direct"},"validity":{"state":"active"}}
-JSON
-#   obs_marker.json: kind "pwn.marker", value "[RSP]=0x4141414141414141 attacker marker", evidence=["$r2"]
-#   obs_ret.json:    kind "pwn.control-target", value "next ret target=0x401234", evidence=["$r3"]
-state event append obs_rsp.json
-state event append obs_marker.json
-state event append obs_ret.json
+# 2) attacker-marker: 지정 주소의 실제 bytes가 marker와 정확히 일치해야 기록.
+bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
+  --proof pwn-memory-control --proof-input payload.bin --proof-break proof_stop \
+  --proof-address '$rsp+8' --proof-marker 4141414141414141 \
+  gdbq
 
-# 3) primitive.json: class:"control-flow", status:"pass", self_evidence=[위 3개 observation_id].
-#    runtime이 extensions.proof_contract="control-flow/v1"을 canonicalize하고
-#    pwn.reg + pwn.marker + pwn.control-target coverage를 검증한다.
-#    input_digest는 SELF evidence가 실제로 측정한 subject_digest(=측정된 ./chal의 sha256)와,
-#    environment_digest는 측정 호스트의 tooling-owned digest와 정확히 일치해야 한다(불일치 시
-#    PASS는 "must measure the primitive input_digest/environment_digest"로 거부된다).
-state primitive --example > primitive.json    # 스캐폴드 → 값 채우기
-state primitive pass primitive.json           # revise_primitive가 3xactive+direct SELF invariant + subject/env binding 검증
+# 3) control-target: 지정 word의 실측 값이 예상 target과 정확히 일치해야 기록.
+bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
+  --proof pwn-control-target --proof-input payload.bin --proof-break proof_stop \
+  --proof-address '$rsp' --proof-target 0x401234 \
+  gdbq
+
+# 위 세 실행은 각각 다른 direct envelope과 canonical observation을 만든다.
+# state show에서 observation_id를 확인해 primitive.json.self_evidence에 넣는다.
+state primitive --example > primitive.json
+# class:"control-flow", status:"pass", self_evidence:[세 observation_id],
+# input/environment digest를 실제 측정값에 맞춘 뒤:
+state primitive pass primitive.json
 ```
+
+각 proof mode는 다음 kind만 생성한다.
+
+| proof mode | canonical observation kind | parser가 확인하는 것 |
+|---|---|---|
+| `pwn-control-state` | `pwn.reg` | breakpoint 실제 hit + RIP/RSP 존재 |
+| `pwn-memory-control` | `pwn.memory-control` | breakpoint hit + 지정 주소 bytes == marker |
+| `pwn-control-target` | `pwn.control-target` | breakpoint hit + 지정 word == target |
+| `rev-solution-input` | `rev.solution.input` | symsolve가 concrete solution hex를 실제 출력 |
+| `rev-success-oracle` | `rev.solution.oracle` | concrete input 실행이 정상 종료 + 기대 문자열 출력 |
+| `rev-concrete-replay` | `rev.solution.replay` | 별도 concrete replay 정상 종료 + 기대 문자열 + replay sentinel |
+
+### REV solution-reconstruction/v1
+
+solver 자체를 반복 세 번 돌릴 필요는 없다. recovered input은 `symsolve` direct run에서 한 번 얻고, 나머지 두 slot은 그 concrete input을 `gdbq`로 독립 재실행해 채운다.
+
+```sh
+# 1) symbolic reconstruction. symsolve stdout의 concrete hex를 parser가 추출해 기록.
+bin/rat-adapt --root .rat --input ./checker --direct-subject ./checker \
+  --proof rev-solution-input \
+  symsolve ./checker --find-str Correct --stdin 16 --printable
+
+# 위 observation의 solutions 값을 concrete.bin으로 materialize한 뒤:
+# 2) success oracle
+bin/rat-adapt --root .rat --input ./checker --direct-subject ./checker \
+  --proof rev-success-oracle --proof-input concrete.bin --proof-expect Correct \
+  gdbq
+
+# 3) 별도 concrete replay
+bin/rat-adapt --root .rat --input ./checker --direct-subject ./checker \
+  --proof rev-concrete-replay --proof-input concrete.bin --proof-expect Correct \
+  gdbq
+```
+
+proof mode가 없는 기존 `rat-adapt ... gdbq --batch ...` 경로와 수동 `state event append`는 compatibility/특수 분석용으로 남아 있다. 그러나 canonical proof contract를 채우는 기본 경로는 위 semantic producer다. `quality.level`은 여전히 호출자가 정하지 않으며, STATE가 envelope bytes에서 direct/derived/heuristic을 재계산한다.
 
 `state schema rat.primitive/v1` / `state schema rat.observation/v1`로 필수 필드 스키마를 직접 확인할 수 있다.
 

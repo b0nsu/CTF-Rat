@@ -2,12 +2,19 @@
 """P1 adapter for legacy recon/revq/gdbq/symsolve commands."""
 import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from ratlib.contracts import execute
+from ratlib.contracts import PROOF_MODES, execute, prepare_proof_invocation, record_proof_observation
 p=argparse.ArgumentParser(); p.add_argument("--root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60)
 p.add_argument("--direct-subject",help="path (must be one of --input) this invocation measures; "
     "opts the run into direct-evidence issuance when it is a real measurement mode of a trusted "
     "verifier build (see ratlib.state_v2.direct_measurement_policy). Cite the printed "
     "extensions.envelope_digest as an observation's evidence to mint 'direct' quality (PRIMITIVE_GATE.md).")
+p.add_argument("--proof",choices=sorted(PROOF_MODES),help="validate verifier output and record one canonical direct proof observation")
+p.add_argument("--proof-input",help="concrete stdin file for generated gdbq proof runs")
+p.add_argument("--proof-break",help="safe symbol/address where PWN proof runs stop before inspection")
+p.add_argument("--proof-address",help="safe register/address expression for memory/target proof")
+p.add_argument("--proof-marker",help="expected attacker marker bytes as hex for pwn-memory-control")
+p.add_argument("--proof-target",help="expected uint64 control target for pwn-control-target")
+p.add_argument("--proof-expect",help="expected program output for REV oracle/replay proof")
 p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
 a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
 paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"symsolve")}
@@ -16,9 +23,36 @@ args=list(a.args)
 # `gdbq <binary> <gdb-command>...`; rat-adapt accepts `gdbq --batch file.gdb`
 # and binds the batch to the declared direct subject before contracts.execute
 # verifies that the executed target and stamped subject are identical.
-if a.tool=="gdbq" and args[:1]==["--batch"]:
+if not a.proof and a.tool=="gdbq" and args[:1]==["--batch"]:
     if len(args)!=2 or not a.direct_subject:
         p.error("gdbq --batch requires exactly one command file and --direct-subject")
     args=[a.direct_subject,"source "+args[1]]
-argv=[paths[a.tool],*args]
-print(json.dumps(execute(argv,root=a.root,input_paths=a.input,parameters={"args":a.args},timeout=a.timeout,direct_subject=a.direct_subject),ensure_ascii=False))
+root=os.path.abspath(a.root or os.path.join(os.getcwd(),".rat"))
+inputs=list(a.input)
+if a.proof_input and a.proof_input not in inputs:
+    inputs.append(a.proof_input)
+try:
+    argv=prepare_proof_invocation(
+        a.tool,paths[a.tool],args,direct_subject=a.direct_subject,proof=a.proof,
+        proof_input=a.proof_input,proof_break=a.proof_break,
+        proof_address=a.proof_address,proof_marker=a.proof_marker,
+        proof_target=a.proof_target,proof_expect=a.proof_expect)
+    parameters={"args":a.args}
+    if a.proof:
+        parameters["proof"]={
+            "mode":a.proof,"input":a.proof_input,"break":a.proof_break,
+            "address":a.proof_address,"marker":a.proof_marker,
+            "target":a.proof_target,"expect":a.proof_expect,
+        }
+    result=execute(argv,root=root,input_paths=inputs,parameters=parameters,
+                   timeout=a.timeout,direct_subject=a.direct_subject)
+    if a.proof:
+        proof_record=record_proof_observation(
+            result,root=root,direct_subject=a.direct_subject,proof=a.proof,
+            proof_address=a.proof_address,proof_marker=a.proof_marker,
+            proof_target=a.proof_target,proof_expect=a.proof_expect)
+        result["extensions"]={**(result.get("extensions") or {}),
+                              "proof_observation":proof_record}
+except ValueError as exc:
+    p.error(str(exc))
+print(json.dumps(result,ensure_ascii=False))
