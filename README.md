@@ -56,9 +56,9 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 ctfguard begin <challenge> [target]
 # 2. Route — project evidence dimensions and bounded candidate probes
 rat route <bin>
-# 3. Detailed triage
-revq <bin>        # rev
-recon <bin>       # pwn
+# 3. Run one bounded discriminator; use full recon/revq only when evidence says it is needed
+rat query pwn <bin>              # example pwn capability query
+rat query func <bin> <function>  # example rev function card
 ```
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
@@ -73,8 +73,8 @@ flowchart LR
     D --> F["🧪 rat-verify / concrete-verify"]
     E --> F
     F --> G{"PASS?"}
-    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>SOLVING · PRIMITIVE_GATE"]
-    H --> B
+    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>inherit STATE · cache · current evidence"]
+    H -->|next discriminator| D
     G -->|yes| I["📦 pkshare → HANDOFF.md<br/>knowledge/learned/"]
 
     style A fill:#264653,color:#fff
@@ -98,7 +98,7 @@ flowchart LR
 | **[knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)** | Knowledge router → `knowledge/ctf-skills/`                                                                                                                           |
 
 > [!NOTE]
-> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (ROE+6-phase) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
+> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (FAST evidence handoff + bounded convergence loop) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
 >
 > Benchmark corpus, ablations, and design-review docs live on the `dev` branch. `main` ships only the operational tools needed to actually solve and verify challenges.
 
