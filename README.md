@@ -128,7 +128,7 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <br>
 
 `rat route <bin>` projects observations into independent dimensions and returns evidence-linked bounded candidate probes (a thin composition of rat-doctor + rat-profile + revq,
-no new analysis). It emits a recommendation only when one probe clearly dominates the alternatives on deterministic evidence/cost criteria, and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
+no new analysis). Static routing leaves `skill=null`; after an active derived/direct STATE observation confirms the method, `rat route <bin> --skill <name> --skill-evidence <obs_id> --skill-reason <reason>` records the committed Skill in the existing route-assessment note. It emits a recommendation only when one probe clearly dominates the alternatives on deterministic evidence/cost criteria, and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
 

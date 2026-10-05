@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -7,6 +8,7 @@ BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
 sys.path.insert(0, BIN)
 
 from ratlib import metrics
+from ratlib.state_v2 import Stream
 
 
 class MetricTruthTests(unittest.TestCase):
@@ -36,6 +38,46 @@ class MetricTruthTests(unittest.TestCase):
             stream_cls.return_value.read.return_value = events
             self.assertEqual(metrics.first_verified_solve_ts("/tmp/chal"), 1090)
         gate.assert_called_once_with("/tmp/chal", verification_id="verify_first")
+
+    def test_decision_revision_count_ignores_skill_only_transition(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            decision = {"action": "rat query pwn", "target": "x", "evidence": ["overflow-imports"], "rule": "x"}
+            base = {
+                "kind": "route-assessment",
+                "decision": decision,
+                "commitment": "provisional",
+                "leads": ["stack-overwrite"],
+                "skill": None,
+                "dimensions": {},
+                "unresolved": [],
+            }
+            stream.append("note.recorded", {"note_id": "r1", "fingerprint": "f1", **base})
+            stream.append("note.recorded", {
+                "note_id": "r2", "fingerprint": "f2", **base,
+                "commitment": "committed", "skill": "pwn-stack",
+                "skill_evidence_observation_ids": ["obs_pc"], "skill_reason": "runtime proof",
+            })
+            got = metrics.route_assessment_metrics(root)
+            self.assertEqual(got["decision_revision_count"], 0)
+            self.assertEqual(got["first_skill"], "pwn-stack")
+
+    def test_decision_revision_count_tracks_actual_decision_change(self):
+        with tempfile.TemporaryDirectory() as root:
+            stream = Stream(root)
+            common = {
+                "kind": "route-assessment", "commitment": "provisional",
+                "leads": [], "skill": None, "dimensions": {}, "unresolved": [],
+            }
+            stream.append("note.recorded", {
+                "note_id": "r1", "fingerprint": "f1",
+                "decision": {"action": "rat query pwn", "target": "x"}, **common,
+            })
+            stream.append("note.recorded", {
+                "note_id": "r2", "fingerprint": "f2",
+                "decision": {"action": "rat query func", "target": "check"}, **common,
+            })
+            self.assertEqual(metrics.route_assessment_metrics(root)["decision_revision_count"], 1)
 
 
 if __name__ == "__main__":
