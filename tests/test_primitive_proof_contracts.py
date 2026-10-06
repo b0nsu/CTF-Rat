@@ -49,7 +49,7 @@ def primitive_doc(primitive_id, cls, status, evidence, revision):
 class PrimitiveProofContractTests(unittest.TestCase):
     def test_control_flow_contract_is_explicit_and_versioned(self):
         contract = primitive_proof_contract("control-flow")
-        self.assertEqual(contract["version"], "control-flow/v1")
+        self.assertEqual(contract["version"], "control-flow/v2")
         self.assertEqual(
             set(contract["slots"]),
             {"control-state", "attacker-marker", "control-target"},
@@ -66,22 +66,9 @@ class PrimitiveProofContractTests(unittest.TestCase):
                 stream,
                 primitive_doc("p", "control-flow", "candidate", [], 1),
             )
-            revise_primitive(
-                stream,
-                primitive_doc(
-                    "p",
-                    "control-flow",
-                    "pass",
-                    ["obs_reg", "obs_marker", "obs_target"],
-                    2,
-                ),
-            )
-            passed = stream.view()["primitives"]["p"]
-            self.assertEqual(passed["status"], "pass")
-            self.assertEqual(
-                passed["extensions"]["proof_contract"],
-                "control-flow/v1",
-            )
+            with self.assertRaisesRegex(ValueError, "missing proof slots: control-target"):
+                revise_primitive(stream, primitive_doc("p", "control-flow", "pass",
+                                                     ["obs_reg", "obs_marker", "obs_target"], 2))
 
     def test_three_direct_measurements_of_same_fact_do_not_satisfy_contract(self):
         with tempfile.TemporaryDirectory() as root:
@@ -114,20 +101,9 @@ class PrimitiveProofContractTests(unittest.TestCase):
                     "revp", "solution-reconstruction", "candidate", [], 1
                 ),
             )
-            revise_primitive(
-                stream,
-                primitive_doc(
-                    "revp",
-                    "solution-reconstruction",
-                    "pass",
-                    ["input", "oracle", "replay"],
-                    2,
-                ),
-            )
-            self.assertEqual(
-                stream.view()["primitives"]["revp"]["extensions"]["proof_contract"],
-                "solution-reconstruction/v1",
-            )
+            with self.assertRaisesRegex(ValueError, "missing proof slots"):
+                revise_primitive(stream, primitive_doc("revp", "solution-reconstruction", "pass",
+                                                     ["input", "oracle", "replay"], 2))
 
     def test_unknown_legacy_class_keeps_generic_three_direct_gate(self):
         with tempfile.TemporaryDirectory() as root:
@@ -198,7 +174,7 @@ class PrimitiveProofContractTests(unittest.TestCase):
                 2,
             )
             doc["extensions"] = {"proof_contract": "control-flow/v0"}
-            with self.assertRaisesRegex(ValueError, "requires proof_contract control-flow/v1"):
+            with self.assertRaisesRegex(ValueError, "requires proof_contract control-flow/v2"):
                 revise_primitive(stream, doc)
 
 

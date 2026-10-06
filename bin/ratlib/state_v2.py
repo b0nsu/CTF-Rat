@@ -23,15 +23,15 @@ PRIMITIVE_TRANSITIONS={
 # compatibility; new producers should use one of the canonical classes below.
 PRIMITIVE_PROOF_CONTRACTS={
  "control-flow":{
-  "version":"control-flow/v1",
+  "version":"control-flow/v2",
   "slots":{
    "control-state":("pwn.reg","pwn.reg.","pwn.control-flow.state","pwn.control-flow.state."),
    "attacker-marker":("pwn.marker","pwn.marker.","pwn.memory-control","pwn.memory-control."),
-   "control-target":("pwn.control-target","pwn.control-target.","pwn.offset"),
+   "control-target":("pwn.control-target","pwn.control-target."),
   },
  },
  "solution-reconstruction":{
-  "version":"solution-reconstruction/v1",
+  "version":"solution-reconstruction/v2",
   "slots":{
    "recovered-input":("rev.solution.input","rev.solution.input.","rev.symsolve.input","rev.symsolve.input."),
    "success-oracle":("rev.solution.oracle","rev.solution.oracle.","rev.oracle","rev.oracle."),
@@ -52,7 +52,26 @@ def _proof_kind_matches(kind, patterns):
   elif kind==pattern:
    return True
  return False
-def _validate_primitive_proof_coverage(payload, observations, self_ids):
+def _semantic_slot_supported(class_name, slot, observation, root):
+ # No supported verifier currently proves the input->control-target->transfer
+ # relation. Word/offset labels cannot assert that relation at the STATE gate.
+ if class_name=="control-flow": return slot!="control-target"
+ if class_name!="solution-reconstruction": return True
+ if not isinstance(observation.get("value"),dict): return False
+ mode={"recovered-input":"rev-solution-input","success-oracle":"rev-success-oracle",
+       "concrete-replay":"rev-concrete-replay"}[slot]
+ from .contracts import parse_proof_value
+ try:
+  for digest in observation.get("evidence",[]):
+   doc=json.loads(get(digest,root=root))
+   doc["extensions"]={**(doc.get("extensions") or {}),"envelope_digest":digest}
+   expected=(observation.get("value") or {}).get("expected")
+   value=parse_proof_value(mode,doc,root,proof_expect=expected)
+   if value!=observation.get("value"): return False
+  return bool(observation.get("evidence"))
+ except (ValueError,TypeError,KeyError,OSError): return False
+
+def _validate_primitive_proof_coverage(payload, observations, self_ids, *, root=None, current=False):
  contract=PRIMITIVE_PROOF_CONTRACTS.get(payload.get("class"))
  if not contract: return
  ext=payload.get("extensions") or {}
@@ -61,7 +80,10 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids):
  # validation. A missing declaration can therefore only come from an older
  # stored/replayed event produced before this policy existed; keep that history
  # readable. Once declared, the version and coverage are fail-closed.
- if declared is None: return
+ if "proof_contract" not in ext:
+  if current: raise ValueError("historical PASS requires current proof revalidation before consumption")
+  return
+ if not current and declared == payload["class"] + "/v1": return
  if declared!=contract["version"]:
   raise ValueError("PASS primitive class %s requires proof_contract %s" %
                    (payload.get("class"),contract["version"]))
@@ -69,7 +91,8 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids):
  matches_by_slot={}
  for slot,patterns in contract["slots"].items():
   matches=sorted(oid for oid in self_ids
-                 if _proof_kind_matches(observations.get(oid,{}).get("kind"),patterns))
+                 if _proof_kind_matches(observations.get(oid,{}).get("kind"),patterns)
+                 and _semantic_slot_supported(payload.get("class"),slot,observations[oid],root))
   matches_by_slot[slot]=matches
   if not matches: missing.append(slot)
  if missing:
@@ -474,10 +497,12 @@ class Stream:
    contract=PRIMITIVE_PROOF_CONTRACTS.get(p.get("class"))
    if contract:
     extensions=dict(p.get("extensions") or {})
+    if "proof_contract" in extensions and extensions["proof_contract"] != contract["version"]:
+     raise ValueError("new PASS requires proof_contract " + contract["version"])
     extensions.setdefault("proof_contract",contract["version"])
     p["extensions"]=extensions
   return p
- def _validate_payload(self, typ, payload, events, actor):
+ def _validate_payload(self, typ, payload, events, actor, *, writing=False):
   """Keep the direct API on the same typed path as the ``state`` CLI.
 
   Old v1 migrations are intentionally admitted as derived legacy records; all
@@ -568,11 +593,12 @@ class Stream:
        raise ValueError("PASS SELF evidence must measure the primitive input_digest")
       if any(env!=environment_digest for _subj,env in claims):
        raise ValueError("PASS SELF evidence must measure the primitive environment_digest")
-     _validate_primitive_proof_coverage(payload,view["observations"],self_ids)
+     _validate_primitive_proof_coverage(payload,view["observations"],self_ids,root=self.root)
   elif typ=="primitive.consumed":
    if not all(isinstance(payload.get(k),str) and payload[k] for k in ("primitive_id","input_digest","environment_digest")): raise ValueError("primitive consumption requires provenance")
    p=view["primitives"].get(payload["primitive_id"])
    if not p or p.get("status")!="pass": raise ValueError("primitive is not an active PASS")
+   _validate_primitive_proof_coverage(p,view["observations"],p.get("self_evidence",[]),root=self.root,current=writing)
    if p.get("input_digest")!=payload["input_digest"] or p.get("environment_digest")!=payload["environment_digest"]: raise ValueError("primitive environment mismatch")
   elif typ=="evidence.invalidated":
    if not isinstance(payload.get("observation_ids"),list) or not payload["observation_ids"] or not isinstance(payload.get("reason"),str) or not payload["reason"].strip(): raise ValueError("evidence invalidation requires IDs and reason")
@@ -678,7 +704,7 @@ class Stream:
      fcntl.flock(f,fcntl.LOCK_UN)
      raise ValueError("invalid state event at line %d: %s" % (n, exc)) from exc
    payload=self._canonicalize_payload(typ,payload,events,actor=actor,task_id=task_id)
-   self._validate_payload(typ,payload,events,actor)
+   self._validate_payload(typ,payload,events,actor,writing=True)
    e={"schema":EVENT_SCHEMA,"stream_id":sid or _id("stream"),"seq":len(events)+1,"event_id":_id("evt"),"at":now(),"actor":actor,"task_id":task_id,"type":typ,"payload":payload,"caused_by":caused_by or []}
    f.seek(0,2); f.write(json.dumps(e,sort_keys=True,separators=(",",":"))+"\n"); f.flush(); os.fsync(f.fileno()); fcntl.flock(f,fcntl.LOCK_UN)
   self._update_manifest(e, payload.get("checkpoint_id") if typ=="checkpoint.created" else None)
