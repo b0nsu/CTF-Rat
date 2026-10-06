@@ -983,6 +983,9 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
                 "cache": {"state": rev.get("cache_state"), "key": cache_key},
             },
             "cache_state": rev.get("cache_state"),
+            "extensions": {"subject_binding": {
+                "role": "binary", "digest": "sha256:" + cur_sha,
+            }},
         }
         validate(doc, "rat.tool-result/v1")
         root = resolve_index_root(binpath, override=index_root)

@@ -237,6 +237,7 @@ def benchmark_result_v2(d):
 
 def route_result(d):
     _need(d,("schema","signals","dimensions","unresolved","next","capabilities","leads","decision","commitment","skill"))
+    if d.get("input_digest") is not None: _digest(d["input_digest"])
     forbidden={"track","subroute","confidence","alternatives","score_semantics","conflict"}&set(d)
     if forbidden: raise ValidationError("obsolete route v1 fields: %s; regenerate with `rat route <bin>`" % ", ".join(sorted(forbidden)))
     if not isinstance(d["signals"],list) or any(
@@ -261,7 +262,18 @@ def route_result(d):
         if not isinstance(action,Mapping) or {"query","target","evidence","rule"}-set(action): raise ValidationError("invalid route action")
     decision=d["decision"]
     if decision is not None and (not isinstance(decision,Mapping) or {"action","target","evidence","rule"}-set(decision)): raise ValidationError("invalid route decision")
-    if decision is None and d["commitment"]!="unknown": raise ValidationError("missing decision requires unknown commitment")
+    if decision is None and d["commitment"] not in {"unknown","committed"}: raise ValidationError("missing decision requires unknown or committed commitment")
+    assessment=d.get("skill_assessment")
+    if d["commitment"]=="committed":
+        if d.get("input_digest") is None: raise ValidationError("committed route requires input_digest")
+        if (not isinstance(assessment,Mapping) or assessment.get("skill")!=d["skill"]
+            or not isinstance(assessment.get("reason"),str) or not assessment["reason"].strip()
+            or not isinstance(assessment.get("evidence_observation_ids"),list)
+            or not assessment["evidence_observation_ids"]
+            or any(not isinstance(x,str) or not x for x in assessment["evidence_observation_ids"])):
+            raise ValidationError("committed route requires skill evidence and reason")
+    elif assessment is not None:
+        raise ValidationError("uncommitted route cannot have skill assessment")
 
 _QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail",
                            "source_invalid","source_stale","budget_omitted","budget_too_small","analysis_unavailable","card_limit"}

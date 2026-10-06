@@ -229,6 +229,9 @@ def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str
                 "cache": {"state": cache_state, "key": "sha256:" + cache_key(prov)},
             },
             "cache_state": cache_state,
+            "extensions": {"subject_binding": {
+                "role": "binary", "digest": "sha256:" + prov["binary_sha256"],
+            }},
         }
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
         from ratlib.artifact import put_bytes

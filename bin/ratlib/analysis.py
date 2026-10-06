@@ -94,6 +94,10 @@ def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=()
         # evidence/primitive lifecycle may promote independently verified
         # observations.
         doc["extensions"]={"analysis_policy":{"maturity":"experimental","promotion_allowed":False,"evidence_quality":"heuristic","limitations":P2_LIMITATIONS[name]}}
+    if doc["inputs"]:
+        doc.setdefault("extensions", {})["subject_binding"] = {
+            "role": "binary", "digest": input_digest,
+        }
     return doc
 def emit(doc,a):
     print(json.dumps(doc,sort_keys=True) if a.format=="json" else "%s: %s"%(doc["tool"]["name"],json.dumps(doc["summary"],ensure_ascii=False)))
