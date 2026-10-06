@@ -61,6 +61,9 @@ evidence 참조만 검사하므로, 해당 JSONL을 쓸 수 있는 실행자는 
 
 ## DEEP 전용 (명시 요청 또는 위 승격 조건 충족 시에만 로드)
 
+DEEP는 새 triage를 시작하지 않는다. 먼저 `state compact --budget-tokens N`으로 FAST에서 누적한 confirmed/invalidating evidence, PASS primitive, unknowns/hypotheses/next/ruled-out을 이어받고, 실제로 경쟁하는 unresolved premise만 최대 3개 branch로 판별한다. `recon`/`revq`/`decomp` 재실행은 누락 전제를 확인하는 데 필요한 경우에만 한다.
+
+
 [doctrine/SOLVING.md](doctrine/SOLVING.md)(로컬 분석·재현 프로토콜) · [doctrine/SOLVABILITY.md](doctrine/SOLVABILITY.md)(확신도 게이트) ·
 [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)(hypothesis→primitive SELF 확인) · [knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)(지식 라우터).
 `doctrine/FINALS.md`는 설계 참고문서이며 실행 경로가 아니다.

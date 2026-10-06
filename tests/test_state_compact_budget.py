@@ -23,6 +23,8 @@ def seeded_stream(d):
     revise_primitive(s, {"primitive_id": "p1", "status": "pass", "self_evidence": ["o1", "o2", "o3"],
                           "input_digest": CANONICAL_SUBJECT, "environment_digest": CANONICAL_ENVIRONMENT})
     for i in range(5):
+        s.append("unknown.recorded", {"unknown_id": "u%d" % i, "text": "unknown premise %d" % i})
+    for i in range(5):
         s.append("hypothesis.recorded", {"hypothesis_id": "h%d" % i, "text": "hypothesis number %d" % i})
     for i in range(5):
         s.append("next.recorded", {"probe": "probe number %d" % i})
@@ -32,9 +34,11 @@ def seeded_stream(d):
 
 class BudgetCompactUnit(unittest.TestCase):
     def test_no_budget_keeps_everything(self):
-        view = {"findings": {"f": {"state": "confirmed"}}, "primitives": {}, "hypotheses": {"h1": {}},
+        view = {"findings": {"f": {"state": "confirmed"}}, "primitives": {},
+                "unknowns": {"u1": {"text": "which branch?"}}, "hypotheses": {"h1": {}},
                 "next_probes": ["p1"], "ruled_out": {}}
         out = budget_compact(view)
+        self.assertEqual(out["unknowns"], {"u1": {"text": "which branch?"}})
         self.assertEqual(out["hypotheses"], {"h1": {}})
         self.assertFalse(out["truncated"])
         self.assertEqual(out["omitted_counts"], {})
@@ -43,6 +47,7 @@ class BudgetCompactUnit(unittest.TestCase):
         view = {
             "findings": {"bad": {"state": "invalidated"}, "good": {"state": "confirmed"}},
             "primitives": {"p": {"status": "pass"}},
+            "unknowns": {"u%d" % i: {"text": "u" * 200} for i in range(20)},
             "hypotheses": {"h%d" % i: {"text": "x" * 200} for i in range(20)},
             "next_probes": [], "ruled_out": {},
         }
@@ -50,14 +55,16 @@ class BudgetCompactUnit(unittest.TestCase):
         self.assertEqual(out["invalidating_findings"], {"bad": {"state": "invalidated"}})
         self.assertEqual(out["confirmed_findings"], {"good": {"state": "confirmed"}})
         self.assertEqual(out["pass_primitives"], {"p": {"status": "pass"}})
+        self.assertEqual(out["unknowns"], {})
         self.assertEqual(out["hypotheses"], {})
         self.assertTrue(out["truncated"])
+        self.assertEqual(out["omitted_counts"]["unknowns"], 20)
         self.assertEqual(out["omitted_counts"]["hypotheses"], 20)
         self.assertTrue(out["budget_exceeded_by_critical_tiers"])
         self.assertGreater(out["estimated_tokens"], out["budget_tokens"])
 
     def test_droppable_tiers_keep_newest_first(self):
-        view = {"findings": {}, "primitives": {},
+        view = {"findings": {}, "primitives": {}, "unknowns": {},
                 "hypotheses": {"old": {"text": "a" * 50}, "new": {"text": "b" * 50}},
                 "next_probes": [], "ruled_out": {}}
         fixed = {"invalidating_findings": {}, "confirmed_findings": {}, "pass_primitives": {}}
@@ -68,10 +75,24 @@ class BudgetCompactUnit(unittest.TestCase):
 
     def test_same_view_and_budget_and_cursor_is_deterministic(self):
         view = {"findings": {"f": {"state": "confirmed"}}, "primitives": {},
-                "hypotheses": {"h1": {}, "h2": {}}, "next_probes": ["a", "b"], "ruled_out": {"r": {}}}
+                "unknowns": {"u1": {"text": "open"}}, "hypotheses": {"h1": {}, "h2": {}},
+                "next_probes": ["a", "b"], "ruled_out": {"r": {}}}
         a = budget_compact(view, budget_tokens=50, cursor={"stream_id": "s", "seq": 3})
         b = budget_compact(view, budget_tokens=50, cursor={"stream_id": "s", "seq": 3})
         self.assertEqual(a, b)
+
+    def test_unknowns_are_budgeted_before_hypotheses(self):
+        view = {
+            "findings": {}, "primitives": {},
+            "unknowns": {"u": {"text": "unresolved"}},
+            "hypotheses": {"h": {"text": "hypothesis"}},
+            "next_probes": [], "ruled_out": {},
+        }
+        fixed = {"invalidating_findings": {}, "confirmed_findings": {}, "pass_primitives": {}}
+        budget = estimate_tokens(fixed) + estimate_tokens({"text": "unresolved"})
+        out = budget_compact(view, budget_tokens=budget)
+        self.assertIn("u", out["unknowns"])
+        self.assertNotIn("h", out["hypotheses"])
 
 class BudgetCompactAgainstRealStream(unittest.TestCase):
     def test_pass_primitive_and_confirmed_finding_survive_tiny_budget(self):
@@ -80,6 +101,7 @@ class BudgetCompactAgainstRealStream(unittest.TestCase):
             out = budget_compact(s.view(), budget_tokens=5)
             self.assertIn("f1", out["confirmed_findings"])
             self.assertIn("p1", out["pass_primitives"])
+            self.assertEqual(out["unknowns"], {})
             self.assertEqual(out["hypotheses"], {})
             self.assertEqual(out["next_probes"], [])
             self.assertEqual(out["ruled_out"], {})
@@ -89,6 +111,7 @@ class BudgetCompactAgainstRealStream(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s = seeded_stream(d)
             out = budget_compact(s.view(), budget_tokens=100000)
+            self.assertEqual(len(out["unknowns"]), 5)
             self.assertEqual(len(out["hypotheses"]), 5)
             self.assertEqual(len(out["next_probes"]), 5)
             self.assertEqual(len(out["ruled_out"]), 5)
