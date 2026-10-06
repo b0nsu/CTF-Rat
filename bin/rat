@@ -31,6 +31,29 @@ from ratlib.state_v2 import Stream
 
 DEFAULT_BUDGET_BYTES = 16384
 
+# Evidence kinds that are strong enough to commit one route-specific Skill.
+# Keep this compatible with canonical verifier-produced kinds (PR #77) as well
+# as existing bounded-analysis observations.
+SKILL_EVIDENCE_KINDS = {
+    "pwn-stack": ("pwn.reg", "pwn.memory-control", "pwn.stack.", "pwn.crash."),
+    "pwn-format": ("pwn.format.",),
+    "pwn-heap": ("pwn.heap.",),
+    "pwn-rop": ("pwn.rop.", "pwn.offset"),
+    "pwn-kernel": ("pwn.kernel.",),
+    "rev-checker": ("rev.checker.", "rev.oracle.", "rev.solution.oracle", "rev.solution.replay"),
+    "rev-vm": ("rev.vm.",),
+    "rev-packed": ("rev.packing.", "rev.unpack."),
+    "rev-symbolic": ("rev.symsolve.", "rev.solution.input"),
+}
+
+def _skill_kind_matches(skill, kind):
+    if not isinstance(kind, str):
+        return False
+    return any(
+        kind.startswith(pattern) if pattern.endswith(".") else kind == pattern
+        for pattern in SKILL_EVIDENCE_KINDS.get(skill, ())
+    )
+
 def _canonical_digest(value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -281,16 +304,79 @@ def _gather_profile(binary, store):
 def _state_dir(binary):
     return os.path.dirname(os.path.realpath(binary))
 
-def _record_route_assessment(state_dir, source, result):
+def _select_route_skill(state_dir, result, skill, evidence_ids, reason, *, binary_digest=None):
+    """Commit one route-specific Skill only from active non-heuristic STATE evidence."""
+    evidence_ids = list(dict.fromkeys(evidence_ids or []))
+    reason = (reason or "").strip()
+    if skill is None:
+        if evidence_ids or reason:
+            raise ValueError("--skill-evidence/--skill-reason require --skill")
+        return [], None
+    if skill not in ROUTE_SKILLS:
+        raise ValueError("unknown skill %r" % skill)
+    if not evidence_ids:
+        raise ValueError("--skill requires at least one --skill-evidence observation ID")
+    if not reason:
+        raise ValueError("--skill requires --skill-reason")
+    view = Stream(state_dir).view()
+    for observation_id in evidence_ids:
+        observation = view.get("observations", {}).get(observation_id)
+        if observation is None:
+            raise ValueError("skill evidence cites unknown observation_id: %s" % observation_id)
+        if observation.get("validity", {}).get("state") != "active":
+            raise ValueError("skill evidence cites inactive observation_id: %s" % observation_id)
+        level = observation.get("quality", {}).get("level")
+        if level not in {"derived", "direct"}:
+            raise ValueError("skill evidence must be derived/direct, got %r for %s" %
+                             (level, observation_id))
+        kind = observation.get("kind")
+        if not _skill_kind_matches(skill, kind):
+            raise ValueError("observation kind %r does not support skill %s" % (kind, skill))
+        from ratlib.state_v2 import _classify_evidence
+        target = binary_digest or result.get("input_digest")
+        if not target:
+            raise ValueError("skill evidence requires current binary digest")
+        subject = observation.get("subject", {}).get("binary_digest")
+        if subject is not None and subject != target:
+            raise ValueError("skill observation subject does not match current binary digest")
+        if not observation.get("evidence"):
+            raise ValueError("skill evidence has no verifiable binary subject binding")
+        for digest in observation["evidence"]:
+            classification = _classify_evidence(digest, Stream(state_dir).root)
+            envelope = json.loads(artifact_get(digest, root=Stream(state_dir).root))
+            binding = (envelope.get("extensions") or {}).get("subject_binding") or {}
+            measured = classification.get("subject_digest")
+            if classification["level"] != "direct":
+                if (binding.get("role") != "binary" or
+                        not any(i.get("role") == "binary" and i.get("digest") == binding.get("digest")
+                                for i in envelope.get("inputs", []))):
+                    raise ValueError("skill evidence has no verifiable binary subject binding")
+                measured = binding.get("digest")
+            if measured != target:
+                raise ValueError("skill evidence does not measure current binary digest")
+    result["skill_assessment"] = {
+        "skill": skill, "evidence_observation_ids": evidence_ids, "reason": reason,
+    }
+    result["skill"] = skill
+    result["commitment"] = "committed"
+    return evidence_ids, reason
+
+def _record_route_assessment(state_dir, source, result, *,
+                             skill_evidence_observation_ids=None, skill_reason=None):
     """Persist observer-readable route telemetry without a new STATE event type.
 
     note.recorded is existing append-only plumbing and is not solving progress.
     The fingerprint excludes timing and capabilities so repeated identical
-    assessments collapse cleanly when metrics count route revisions.
+    assessments collapse cleanly when metrics count route revisions. A committed
+    Skill stores the cited observation IDs and reason in the same route note.
     """
     core = {"decision": result.get("decision"), "commitment": result.get("commitment"),
             "leads": result.get("leads", []), "skill": result.get("skill"),
+            "input_digest": result.get("input_digest"),
             "dimensions": result.get("dimensions", {}), "unresolved": result.get("unresolved", [])}
+    if result.get("skill"):
+        core["skill_evidence_observation_ids"] = sorted(set(skill_evidence_observation_ids or []))
+        core["skill_reason"] = (skill_reason or "").strip()
     fingerprint = _canonical_digest(core)
     Stream(state_dir).append("note.recorded", {
         "note_id": "route-assessment-" + fingerprint.split(":", 1)[1][:16],
@@ -354,6 +440,7 @@ def cmd_route(args):
         revq_error = {"code": "analysis_failed",
                       "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    result["input_digest"] = _file_sha256(binary)
     if fast and not args.fast:
         result.setdefault("diagnostics", []).append({
             "code": "dependency_missing",
@@ -363,11 +450,27 @@ def cmd_route(args):
         result.setdefault("diagnostics", []).append(revq_error)
     result["capabilities"] = {**result["capabilities"], **caps}
     state_dir = _state_dir(binary)
-    _record_route_assessment(state_dir, "route", result)
+    try:
+        skill_evidence, skill_reason = _select_route_skill(
+            state_dir, result,
+            getattr(args, "skill", None),
+            getattr(args, "skill_evidence", []),
+            getattr(args, "skill_reason", None),
+            binary_digest=result["input_digest"])
+    except ValueError as exc:
+        result.setdefault("diagnostics", []).append({
+            "code": "input_invalid", "severity": "error", "message": str(exc),
+        })
+        return _emit(result, EXIT_INPUT, args.format)
+    validate(result, "rat.route-result/v2")
     novelty_key = {"decision": result.get("decision"), "dimensions": result.get("dimensions"),
-                   "commitment": result.get("commitment"),
+                   "commitment": result.get("commitment"), "skill": result.get("skill"),
                    "signals": [s["value"] for s in result["signals"]]}
     result = _governor_wrap(state_dir, "route", novelty_key, result)
+    validate(result, "rat.route-result/v2")
+    _record_route_assessment(
+        state_dir, "route", result,
+        skill_evidence_observation_ids=skill_evidence, skill_reason=skill_reason)
     return _emit(result, EXIT_OK, args.format)
 
 def _file_sha256(path):
@@ -962,8 +1065,14 @@ def build_parser():
                "bookkeeping, not solving progress; see doctrine/SOLVABILITY.md.")
     sub = p.add_subparsers(dest="command")
 
-    pr = sub.add_parser("route", help="rank route + commitment from cached profile+revq; provisional routes do not lock a skill")
+    pr = sub.add_parser("route", help="project route evidence; optionally commit one Skill from cited STATE observations")
     pr.add_argument("binary"); pr.add_argument("--store"); pr.add_argument("--fast", action="store_true")
+    pr.add_argument("--skill", choices=sorted(ROUTE_SKILLS),
+                    help="commit one route-specific Skill after runtime/structural evidence exists")
+    pr.add_argument("--skill-evidence", action="append", default=[], metavar="OBS_ID",
+                    help="active derived/direct STATE observation supporting --skill (repeatable)")
+    pr.add_argument("--skill-reason",
+                    help="short evidence-linked reason for committing --skill")
     pr.add_argument("--format", choices=("text", "json"), default="text")
 
     pb = sub.add_parser("brief", help="one-shot startup briefing card (doctor+route+recon/revq+libc, budgeted)")

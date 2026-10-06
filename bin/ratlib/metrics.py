@@ -289,12 +289,12 @@ def route_assessment_metrics(state_dir):
         }
     first = rows[0]
     revisions = 0
-    previous = first.get("fingerprint")
+    previous_decision = first.get("decision")
     for row in rows[1:]:
-        current = row.get("fingerprint")
-        if current != previous:
+        current_decision = row.get("decision")
+        if current_decision != previous_decision:
             revisions += 1
-        previous = current
+        previous_decision = current_decision
     first_skill = next((row.get("skill") for row in rows if row.get("skill")), None)
     return {
         "first_dimensions": first.get("dimensions"),
