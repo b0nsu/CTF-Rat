@@ -28,10 +28,11 @@ from ratlib.state_v2 import (
 )
 
 
-def direct_gdbq_doc(root, subject, stdout):
-    tool = ROOT / "bin" / "gdbq"
+def direct_gdbq_doc(root, subject, stdout, *, inferior=None, producer="gdbq"):
+    """Synthetic immutable capture for unit tests; not an execution attestation."""
+    tool = ROOT / "bin" / producer
     build = _file_digest(str(tool))
-    if trusted_producer_for_build(build) != "gdbq":
+    if trusted_producer_for_build(build) != producer:
         raise RuntimeError("test requires registered gdbq build")
     subject_digest = _file_digest(str(subject))
     capture = put_bytes(
@@ -44,7 +45,7 @@ def direct_gdbq_doc(root, subject, stdout):
     policy = {
         "level": "direct",
         "promotion_allowed": True,
-        "producer": "gdbq",
+        "producer": producer,
         "registry": VERIFIER_CONTRACT_VERSION,
         "build_digest": build,
         "subject_digest": subject_digest,
@@ -54,7 +55,7 @@ def direct_gdbq_doc(root, subject, stdout):
     now = "2026-01-01T00:00:00+00:00"
     doc = {
         "schema": "rat.tool-result/v1",
-        "tool": {"name": "gdbq", "version": "legacy-adapter/v1", "build_digest": build},
+        "tool": {"name": producer, "version": "legacy-adapter/v1", "build_digest": build},
         "run_id": "local",
         "invocation_id": "invoke_test",
         "status": "ok",
@@ -62,7 +63,7 @@ def direct_gdbq_doc(root, subject, stdout):
         "finished_at": now,
         "duration_ms": 1,
         "inputs": [{"role": "input", "digest": subject_digest, "size": subject.stat().st_size}],
-        "parameters": {},
+        "parameters": {"proof": {"expect": "Correct!"}},
         "summary": {"stdout_bytes": len(stdout), "stderr_bytes": 0, "truncated": False},
         "artifacts": [{key: capture[key] for key in ("kind", "digest", "media_type", "size", "logical_name")}],
         "findings": [],
@@ -75,10 +76,25 @@ def direct_gdbq_doc(root, subject, stdout):
             "cache": {"key": "proof-test", "hit": False, "source_invocation": None},
         },
         "extensions": {"evidence_policy": policy},
-        "tool_name": "gdbq",
+        "tool_name": producer,
         "params_digest": "unindexed",
         "cache_state": "miss",
     }
+    if producer == "gdbq":
+        debugger = put_bytes(stdout.encode(), kind="debugger-output", media_type="text/plain",
+                             logical_name="debugger.txt", root=root)
+        doc["artifacts"].append({key: debugger[key] for key in
+                                 ("kind", "digest", "media_type", "size", "logical_name")})
+        doc["extensions"]["debugger_capture"] = {
+            "digest": debugger["digest"], "invocation_id": doc["invocation_id"],
+            "subject_digest": subject_digest, "complete": True, "truncated": False,
+        }
+    if inferior is not None:
+        out = put_bytes(inferior.encode(), kind="inferior-output", media_type="text/plain",
+                        logical_name="inferior.txt", root=root)
+        doc["artifacts"].append({key: out[key] for key in ("kind", "digest", "media_type", "size", "logical_name")})
+        doc["extensions"]["inferior_capture"] = {"digest": out["digest"], "invocation_id": doc["invocation_id"],
+                "subject_digest": subject_digest, "complete": True, "truncated": False}
     raw = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
     envelope = put_bytes(
         raw,
@@ -112,7 +128,8 @@ class ProofInvocationTests(unittest.TestCase):
             self.assertEqual(argv[1], str(subject))
             self.assertEqual(argv[2], "break stop_here")
             self.assertIn("run < ", argv[3])
-            self.assertEqual(argv[4], "x/4bx $rsp+8")
+            self.assertEqual(argv[-2], "x/4bx $rsp+8")
+            self.assertIn("RAT_PROOF_ADDRESS=", argv[-3])
             with self.assertRaisesRegex(ValueError, "do not accept arbitrary"):
                 prepare_proof_invocation(
                     "gdbq",
@@ -152,16 +169,21 @@ class ProofParserTests(unittest.TestCase):
             subject.write_bytes(b"ELF")
             state = (
                 "Breakpoint 1, stop_here ()\n"
+                "RAT_PROOF_MEASURE_BEGIN\n"
                 "rip            0x401234  0x401234 <stop_here>\n"
                 "rsp            0x7fffffffe000  0x7fffffffe000\n"
                 "rbp            0x7fffffffe020  0x7fffffffe020\n"
+                "RAT_PROOF_MEASURE_END\n"
             )
             state_doc = direct_gdbq_doc(str(root), subject, state)
             value = parse_proof_value("pwn-control-state", state_doc, str(root))
             self.assertEqual(value["rip"], 0x401234)
             self.assertEqual(value["rsp"], 0x7FFFFFFFE000)
 
-            memory = "Breakpoint 1, stop_here ()\n0x7fffffffe008:\t0x41\t0x42\t0x43\t0x44\n"
+            memory = ("Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
+                      "RAT_PROOF_ADDRESS=0x7fffffffe008\n"
+                      "0x7fffffffe008:\t0x41\t0x42\t0x43\t0x44\n"
+                      "RAT_PROOF_MEASURE_END\n")
             memory_doc = direct_gdbq_doc(str(root), subject, memory)
             value = parse_proof_value(
                 "pwn-memory-control",
@@ -172,7 +194,10 @@ class ProofParserTests(unittest.TestCase):
             )
             self.assertEqual(value["marker_hex"], "41424344")
 
-            target = "Breakpoint 1, stop_here ()\n0x7fffffffe008:\t0x0000000000401234\n"
+            target = ("Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
+                      "RAT_PROOF_ADDRESS=0x7fffffffe008\n"
+                      "0x7fffffffe008:\t0x0000000000401234\n"
+                      "RAT_PROOF_MEASURE_END\n")
             target_doc = direct_gdbq_doc(str(root), subject, target)
             value = parse_proof_value(
                 "pwn-control-target",
@@ -181,7 +206,7 @@ class ProofParserTests(unittest.TestCase):
                 proof_address="$rsp+8",
                 proof_target="0x401234",
             )
-            self.assertEqual(value["target"], 0x401234)
+            self.assertEqual(value["word"], 0x401234)
 
     def test_rev_semantic_parsers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,12 +214,26 @@ class ProofParserTests(unittest.TestCase):
             subject = pathlib.Path(directory, "chal")
             subject.write_bytes(b"ELF")
             solution = "  stdin  = b'ABCD'\n           hex: 41424344\n"
-            solution_doc = direct_gdbq_doc(str(root), subject, solution)
+            solution_doc = direct_gdbq_doc(str(root), subject, solution, producer="symsolve")
             value = parse_proof_value("rev-solution-input", solution_doc, str(root))
             self.assertEqual(value["solutions"], {"stdin": "41424344"})
 
+            for output, expected in (
+                ("  file   = b'FLAG'\n         hex: 464c4147\n", {"file": "464c4147"}),
+                ("  stdin = b'A'\n         hex: 41\n"
+                 "  file = b'B'\n         hex: 42\n", {"stdin": "41", "file": "42"}),
+                ("  argv1 = b'A'\n         hex: 41\n"
+                 "  file = b'B'\n         hex: 42\n", {"argv1": "41", "file": "42"}),
+            ):
+                with self.subTest(output=output):
+                    doc = direct_gdbq_doc(str(root), subject, output, producer="symsolve")
+                    self.assertEqual(
+                        parse_proof_value("rev-solution-input", doc, str(root))["solutions"],
+                        expected,
+                    )
+
             oracle = "Correct!\n[Inferior 1 (process 123) exited normally]\n"
-            oracle_doc = direct_gdbq_doc(str(root), subject, oracle)
+            oracle_doc = direct_gdbq_doc(str(root), subject, oracle, inferior="Correct!\n")
             self.assertEqual(
                 parse_proof_value(
                     "rev-success-oracle",
@@ -206,7 +245,7 @@ class ProofParserTests(unittest.TestCase):
             )
 
             replay = oracle + "RAT_REPLAY_COMPLETE\n"
-            replay_doc = direct_gdbq_doc(str(root), subject, replay)
+            replay_doc = direct_gdbq_doc(str(root), subject, replay, inferior="Correct!\n")
             self.assertEqual(
                 parse_proof_value(
                     "rev-concrete-replay",
@@ -225,7 +264,9 @@ class ProofParserTests(unittest.TestCase):
             doc = direct_gdbq_doc(
                 str(root),
                 subject,
-                "Breakpoint 1, stop_here ()\n0x1000:\t0x41\t0x42\n",
+                "Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
+                "RAT_PROOF_ADDRESS=0x1000\n0x1000:\t0x41\t0x42\n"
+                "RAT_PROOF_MEASURE_END\n",
             )
             with self.assertRaisesRegex(ValueError, "does not match"):
                 parse_proof_value(
@@ -236,11 +277,33 @@ class ProofParserTests(unittest.TestCase):
                     proof_marker="4344",
                 )
 
+    def test_pwn_parser_uses_bound_debugger_response_and_checks_address(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory, ".rat")
+            subject = pathlib.Path(directory, "chal")
+            subject.write_bytes(b"ELF")
+            debugger = ("program log: 0x401234 0x41 0x42\n"
+                        "Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
+                        "RAT_PROOF_ADDRESS=0x1000\n0x1008:\t0x41\t0x42\n"
+                        "RAT_PROOF_MEASURE_END\n")
+            doc = direct_gdbq_doc(str(root), subject, debugger, inferior="0x1000: 0x41 0x42\n")
+            with self.assertRaisesRegex(ValueError, "address does not match"):
+                parse_proof_value("pwn-memory-control", doc, str(root),
+                                  proof_address="$rsp", proof_marker="4142")
+
+            good = debugger.replace("0x1008:\t", "0x1000:\t")
+            doc = direct_gdbq_doc(str(root), subject, good, inferior="0x2000: 0x99 0x99\n")
+            self.assertEqual(
+                parse_proof_value("pwn-memory-control", doc, str(root),
+                                  proof_address="$rsp", proof_marker="4142")["marker_hex"],
+                "4142",
+            )
+
 
 @unittest.skipUnless(shutil.which("gdb") and shutil.which("cc"), "gdb+cc required")
-@unittest.skipUnless(platform.machine() in {"x86_64", "amd64"}, "x86-64 proof fixture")
+@unittest.skipUnless(sys.platform == "linux" and platform.machine() in {"x86_64", "amd64"}, "Linux x86-64 proof fixture")
 class ProofProducerIntegrationTests(unittest.TestCase):
-    def test_three_generated_gdbq_proofs_reach_control_flow_pass(self):
+    def test_general_captures_cannot_reach_control_flow_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = pathlib.Path(directory)
             source = directory / "proof.c"
@@ -306,17 +369,10 @@ class ProofProducerIntegrationTests(unittest.TestCase):
                 "environment_digest": environment_fingerprint(),
             }
             revise_primitive(stream, primitive)
-            revise_primitive(
-                stream,
-                {
-                    **primitive,
-                    "status": "pass",
-                    "self_evidence": [reg, marker_obs, target_obs],
-                },
-            )
-            passed = stream.view()["primitives"]["control"]
-            self.assertEqual(passed["status"], "pass")
-            self.assertEqual(passed["extensions"]["proof_contract"], "control-flow/v1")
+            self.assertEqual(stream.view()["observations"][target_obs]["kind"], "pwn.memory-word")
+            with self.assertRaisesRegex(ValueError, "missing proof slots: control-target"):
+                revise_primitive(stream, {**primitive, "status": "pass",
+                                         "self_evidence": [reg, marker_obs, target_obs]})
 
 class ProofStateWriterTests(unittest.TestCase):
     def test_records_direct_canonical_observation_and_deduplicates(self):
@@ -327,10 +383,10 @@ class ProofStateWriterTests(unittest.TestCase):
             doc = direct_gdbq_doc(
                 str(root),
                 subject,
-                "Breakpoint 1, stop_here ()\n"
+                "Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
                 "rip 0x401234\n"
                 "rsp 0x7fffffffe000\n"
-                "rbp 0x7fffffffe020\n",
+                "rbp 0x7fffffffe020\nRAT_PROOF_MEASURE_END\n",
             )
             first = record_proof_observation(
                 doc,
@@ -350,6 +406,90 @@ class ProofStateWriterTests(unittest.TestCase):
             stored = Stream(directory).view()["observations"][first["observation_id"]]
             self.assertEqual(stored["kind"], "pwn.reg")
             self.assertEqual(stored["quality"]["level"], "direct")
+
+
+class ProofCaptureFixture:
+    def build_checker(self, directory, *, success=False):
+        source = directory / "checker.c"
+        binary = directory / "checker"
+        source.write_text('#include <stdio.h>\nint main(void) { puts("' +
+                          ('Correct!' if success else 'Wrong!') + '"); return 0; }\n')
+        result = subprocess.run(["cc", "-g", "-O0", "-fno-pie", "-no-pie", "-o", str(binary), str(source)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return binary
+
+@unittest.skipUnless(sys.platform == "linux" and shutil.which("gdb") and shutil.which("cc"),
+                     "Linux GNU GDB+cc required")
+class ProofRevCaptureEngineTests(ProofCaptureFixture, unittest.TestCase):
+    def test_actual_inferior_output_success_and_debugger_only_failure(self):
+        from ratlib.contracts import execute
+        for success in (False, True):
+            with self.subTest(success=success), tempfile.TemporaryDirectory(prefix="Correct!") as tmp:
+                directory = pathlib.Path(tmp)
+                binary = self.build_checker(directory, success=success)
+                payload = directory / "input"; payload.write_bytes(b"")
+                root = str(directory / ".rat")
+                for mode in ("rev-success-oracle", "rev-concrete-replay"):
+                    argv = prepare_proof_invocation("gdbq", str(ROOT / "bin" / "gdbq"), [],
+                         direct_subject=str(binary), proof=mode, proof_input=str(payload), proof_expect="Correct!")
+                    doc = execute(argv, root=root, input_paths=[str(binary), str(payload)],
+                         direct_subject=str(binary), parameters={"proof": {"mode": mode, "expect": "Correct!"}})
+                    if success:
+                        value = parse_proof_value(mode, doc, root, proof_expect="Correct!")
+                        self.assertEqual(value["exit"], "normal")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "does not contain"):
+                            parse_proof_value(mode, doc, root, proof_expect="Correct!")
+
+@unittest.skipUnless(sys.platform == "linux" and platform.machine() in {"x86_64", "amd64"}
+                     and shutil.which("gdb") and shutil.which("cc"), "Linux x86-64 gdb+cc required")
+class ProofCaptureEngineTests(ProofCaptureFixture, unittest.TestCase):
+    def test_stripped_instruction_address_and_symbol_breakpoints(self):
+        from ratlib.contracts import execute
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            binary = self.build_checker(directory)
+            payload = directory / "input"; payload.write_bytes(b"")
+            symbols = subprocess.check_output(["nm", str(binary)], text=True)
+            address = next(line.split()[0] for line in symbols.splitlines() if line.split()[-1] == "main")
+            for location in ("main", "0x" + address):
+                if location.startswith("0x"):
+                    subprocess.run(["strip", str(binary)], check=True)
+                argv = prepare_proof_invocation("gdbq", str(ROOT / "bin" / "gdbq"), [],
+                    direct_subject=str(binary), proof="pwn-control-state", proof_input=str(payload), proof_break=location)
+                root = str(directory / ".rat")
+                doc = execute(
+                    argv, root=root, input_paths=[str(binary), str(payload)],
+                    direct_subject=str(binary), fresh=True,
+                    parameters={"proof": {"mode": "pwn-control-state"}},
+                )
+                self.assertIn("rip", parse_proof_value("pwn-control-state", doc, root))
+
+    def test_fresh_invocation_bypasses_cache_after_invalidation(self):
+        from ratlib.contracts import execute
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp); binary = self.build_checker(directory)
+            payload = directory / "input"; payload.write_bytes(b"")
+            root = str(directory / ".rat")
+            argv = prepare_proof_invocation("gdbq", str(ROOT / "bin" / "gdbq"), [],
+                direct_subject=str(binary), proof="pwn-control-state", proof_input=str(payload), proof_break="main")
+            def run(fresh=False):
+                return execute(
+                    argv, root=root, input_paths=[str(binary), str(payload)],
+                    direct_subject=str(binary), fresh=fresh,
+                    parameters={"proof": {"mode": "pwn-control-state"}},
+                )
+            first = run()
+            recorded = record_proof_observation(first, root=root, direct_subject=str(binary), proof="pwn-control-state")
+            Stream(tmp).append("evidence.invalidated", {"observation_ids": [recorded["observation_id"]], "reason": "stale"})
+            cached = run(); self.assertTrue(cached["provenance"]["cache"]["hit"])
+            with self.assertRaisesRegex(ValueError, "remeasure"):
+                record_proof_observation(cached, root=root, direct_subject=str(binary), proof="pwn-control-state")
+            fresh = run(True)
+            self.assertNotEqual(fresh["extensions"]["envelope_digest"], first["extensions"]["envelope_digest"])
+            new = record_proof_observation(fresh, root=root, direct_subject=str(binary), proof="pwn-control-state")
+            self.assertNotEqual(new["observation_id"], recorded["observation_id"])
 
 
 if __name__ == "__main__":

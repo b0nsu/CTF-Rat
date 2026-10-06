@@ -17,12 +17,20 @@
 
 ## Primitive proof contract
 
-generic gate(`>=3` distinct active+direct SELF)는 모든 PASS의 바닥 조건이다. 그러나 canonical class는 같은 사실을 세 번 측정한 것만으로 PASS할 수 없다. 각 class가 요구하는 서로 다른 의미의 proof slot을 observation `kind`로 덮어야 한다.
+generic gate(`>=3` distinct active+direct SELF)는 모든 PASS의 바닥 조건이다. 그러나 canonical class는 같은 사실을 세 번 측정한 것만으로 PASS할 수 없다. 각 class의 proof slot은 kind와 hash-covered verifier 결과의 의미 검증을 함께 통과해야 한다.
 
 | primitive class | contract | required proof slots |
 |---|---|---|
-| `control-flow` | `control-flow/v1` | control state: `pwn.reg*` 또는 `pwn.control-flow.state*` · attacker marker: `pwn.marker*` 또는 `pwn.memory-control*` · control target: `pwn.control-target*` 또는 `pwn.offset` |
-| `solution-reconstruction` | `solution-reconstruction/v1` | recovered input: `rev.solution.input*` 또는 `rev.symsolve.input*` · success oracle: `rev.solution.oracle*` 또는 `rev.oracle*` · concrete replay: `rev.solution.replay*` 또는 `rev.symsolve.concrete-verify*` |
+| `control-flow` | `control-flow/v2` | control state: `pwn.reg*` 또는 `pwn.control-flow.state*` · attacker marker: `pwn.marker*` 또는 `pwn.memory-control*` · control target: 검증된 입력 변경 → 제어 대상 → 제어 이전 관계 (현재 producer 미지원) |
+| `solution-reconstruction` | `solution-reconstruction/v2` | recovered input: `rev.solution.input*` 또는 `rev.symsolve.input*` · success oracle: `rev.solution.oracle*` 또는 `rev.oracle*` · concrete replay: `rev.solution.replay*` 또는 `rev.symsolve.concrete-verify*` |
+
+신규 PASS는 계약 필드가 없으면 현재 버전을 채우고 null·빈 문자열·잘못된 버전은 거부한다.
+필드가 실제로 없는 과거 history와 v1 계약은 읽을 수 있지만 현재 consume에는 재검증이 필요하다.
+과거 이벤트를 복사해 신규 revise할 때도 현재 계약을 검사한다. 이 호환은 작성 시점 인증이 아니다.
+
+REV oracle/replay는 GDB transcript와 분리한 inferior stdout/stderr artifact에서만 성공 문자열을 찾는다.
+artifact digest·size·완전성·invocation/subject binding을 immutable envelope와 대조하며, 정상 종료는
+debugger transcript에서 별도로 확인한다. sentinel은 실행 완료 보조 정보다.
 
 PASS 시 runtime은 canonical class의 `extensions.proof_contract`를 해당 version으로 고정하고, self_evidence에 각 slot을 만족하는 observation이 실제로 있는지 검사한다. 하나의 observation이 여러 slot을 대신하지 못하도록 slot 수만큼 distinct observation coverage도 요구한다.
 
@@ -52,54 +60,27 @@ Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
 
 예 — canonical proof observation은 가능한 한 수동 JSON 작성 대신 `rat-adapt --proof` 경로로 만든다.
 
-`rat-adapt --proof`는 신뢰된 verifier(`gdbq`/`symsolve`)의 direct envelope을 만든 뒤, **실제 stdout을 proof mode별 parser로 다시 검증한 경우에만** canonical observation을 STATE에 기록한다. PWN proof mode에서는 임의 GDB command를 받지 않고 adapter가 bounded command를 직접 생성한다. 같은 envelope/kind를 다시 기록하려 하면 기존 observation을 재사용한다.
+`rat-adapt --proof`는 신뢰된 verifier(`gdbq`/`symsolve`)의 direct envelope을 만든 뒤, **immutable capture를 proof mode별 parser로 다시 검증한 경우에만** 지원하는 observation을 STATE에 기록한다. PWN proof mode에서는 임의 GDB command를 받지 않고 adapter가 bounded command를 직접 생성한다. 같은 envelope/kind는 active이며 현재 의미 검증과 값이 일치할 때만 재사용한다. invalidated/stale capture는 거부하며 `--fresh`로 실제 새 invocation을 실행해야 한다.
 
-### PWN control-flow/v1
+### PWN 관찰의 지원 범위
 
-아래 예에서 `payload.bin`은 이미 준비한 최소 재현 입력이고 `proof_stop`은 검사할 안정적인 breakpoint다. `--proof-address`는 `$rsp`, `$rdi`, `0x...` 및 단일 +/- offset 형태만 허용하며 command injection 문자열은 거부한다.
+`pwn-control-state`는 register snapshot, `pwn-memory-control`은 marker 일치만 기록한다.
+`pwn-control-target`은 일반 word 일치만 확인하므로 `pwn.memory-word`로 기록하고
+`control_relation_proven:false`를 반환한다. 이 세 관찰을 조합해도 `control-flow/v2` PASS는 거부한다.
+현재 verifier는 입력이 제어 대상을 변경하고 그 대상이 제어 이전에 사용되는 동일 scenario 관계를
+증명하지 못한다. `pwn.offset`이나 kind prefix도 control-target 슬롯을 대신할 수 없다.
 
-```sh
-state hypothesis "local control-flow candidate"
+모든 GDB proof run은 inferior stdout/stderr와 debugger 응답을 별도 immutable artifact로 저장한다.
+PWN parser는 adapter가 삽입한 단일 measurement 구간만 읽고, memory 응답에 출력된 실제 주소가
+같은 구간의 계산 주소와 일치하는지 확인한다. 분리 capture의 invocation/subject/digest/완전성 중
+하나라도 맞지 않으면 observation을 만들지 않는다. 이 계약 이전의 PWN envelope는 history에서는
+읽을 수 있지만 새 observation으로 재사용할 수 없으며 `--fresh` 재측정이 필요하다.
 
-# 1) control-state: breakpoint hit 뒤 RIP/RSP(/RBP)를 gdbq가 직접 측정.
-bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
-  --proof pwn-control-state --proof-input payload.bin --proof-break proof_stop \
-  gdbq
-
-# 2) attacker-marker: 지정 주소의 실제 bytes가 marker와 정확히 일치해야 기록.
-bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
-  --proof pwn-memory-control --proof-input payload.bin --proof-break proof_stop \
-  --proof-address '$rsp+8' --proof-marker 4141414141414141 \
-  gdbq
-
-# 3) control-target: 지정 word의 실측 값이 예상 target과 정확히 일치해야 기록.
-bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
-  --proof pwn-control-target --proof-input payload.bin --proof-break proof_stop \
-  --proof-address '$rsp' --proof-target 0x401234 \
-  gdbq
-
-# 위 세 실행은 각각 다른 direct envelope과 canonical observation을 만든다.
-# state show에서 observation_id를 확인해 primitive.json.self_evidence에 넣는다.
-state primitive --example > primitive.json
-# class:"control-flow", status:"pass", self_evidence:[세 observation_id],
-# input/environment digest를 실제 측정값에 맞춘 뒤:
-state primitive pass primitive.json
-```
-
-각 proof mode는 다음 kind만 생성한다.
-
-| proof mode | canonical observation kind | parser가 확인하는 것 |
-|---|---|---|
-| `pwn-control-state` | `pwn.reg` | breakpoint 실제 hit + RIP/RSP 존재 |
-| `pwn-memory-control` | `pwn.memory-control` | breakpoint hit + 지정 주소 bytes == marker |
-| `pwn-control-target` | `pwn.control-target` | breakpoint hit + 지정 word == target |
-| `rev-solution-input` | `rev.solution.input` | symsolve가 concrete solution hex를 실제 출력 |
-| `rev-success-oracle` | `rev.solution.oracle` | concrete input 실행이 정상 종료 + 기대 문자열 출력 |
-| `rev-concrete-replay` | `rev.solution.replay` | 별도 concrete replay 정상 종료 + 기대 문자열 + replay sentinel |
-
-### REV solution-reconstruction/v1
+### REV solution-reconstruction/v2
 
 solver 자체를 반복 세 번 돌릴 필요는 없다. recovered input은 `symsolve` direct run에서 한 번 얻고, 나머지 두 slot은 그 concrete input을 `gdbq`로 독립 재실행해 채운다.
+solution parser는 producer가 출력하는 `stdin`, `argv1`, `file` 라벨을 각각 보존하며, 과거
+`file:<path>` 라벨도 읽는다.
 
 ```sh
 # 1) symbolic reconstruction. symsolve stdout의 concrete hex를 parser가 추출해 기록.
@@ -158,3 +139,27 @@ proof mode가 없는 기존 `rat-adapt ... gdbq --batch ...` 경로와 수동 `s
 [ ] libc mismatch 가설이면 Docker image hash/loopback, leak, build-id 중 하나로 증명했나?
 [ ] 실패 경로는 state no 또는 primitive fail로 기록했나?
 ```
+
+## Engine provenance / trust boundary (completion gate)
+
+`symsolve --record-state-dir <challenge-dir>`는 concrete-verify 성공 시 heuristic STATE observation과
+연결된 rev-symbolic primitive revision을 자동 기록한다. completion gate는 primitive의
+`producer.engine`이나 `solve_origin` 태그만으로 판단하지 않는다. `solution-reconstruction` 등
+허용된 복원 class, 또는 직접 측정한 PWN SELF observation이 없는 rev route-assessment가 있으면 태그 없이도 연결된 활성
+`rev.symsolve.concrete-verify` observation의 engine provenance를 확인하고, 근거가 없으면 기본
+deny한다. 그 observation의 `engine_identity.harness_sha256`은 trusted verifier manifest와
+대조하고 합성 `engine_build_digest`와의 일치를 확인한다. 이전 형식처럼 `engine_identity`가
+없는 기록은 새 concrete-verify 또는 수동 attestation이 필요하다. 뒤에 추가된 PWN route note만으로 앞선 rev 후보를 지우지 않으며, active+direct
+`pwn.*` SELF observation은 잠정적 rev route보다 우선한다. Router v2의 rev lead와 PWN lead가
+한 note에 함께 있으면 그 note만으로 rev 분류하지 않는다.
+rev route note가 없거나 혼합 lead뿐이고 primitive class가 allowlist 밖이면 이 분류로는 잡히지 않는다.
+PWN SELF observation의 kind가 `pwn.*`가 아닌 정당한 PWN solve는 잠정 rev route 때문에
+오탐될 수 있으므로 수동 attestation 또는 명시적 route 근거 정리가 필요하다.
+수동 solve는 유효한 `rat.writeup-attestation/v1`로 통과할 수 있다.
+환경변수로 엔진 게이트를 완화하는 경로는 없다.
+
+이 trust boundary는 로컬 랩 규약이며 STATE JSONL과 observation에는 작성자 서명이 없다. 따라서
+실행자는 평문 append로 sanctioned observation과 route note를 위조할 수 있고, 게이트는 이를 구별하지 못한다.
+`operator_attestation`도 서명된 운영자 증명이 아니다. 코드는 스키마·시간·현재 solve에서 사용 가능한
+evidence 참조만 검사하므로, 해당 JSONL을 쓸 수 있는 실행자는 attestation도 위조할 수 있다.
+완전한 작성자 인증에는 서명 또는 out-of-band 운영자 신호가 필요하다.

@@ -26,11 +26,11 @@ PRIMITIVE_EXAMPLE = {
     "self_evidence": [],
     "constraints": [
         "PASS requires >=3 distinct active direct SELF observations",
-        "control-flow/v1 coverage: pwn.reg + pwn.marker/pwn.memory-control + pwn.control-target/pwn.offset",
+        "control-flow/v2: control-target relation is currently unsupported; register/marker/word captures cannot PASS",
     ],
     "side_effects": [],
     "remote_equivalent": True, "producer": {"tool": "pwnstage", "version": "1"}, "revision": 1,
-    "extensions": {"proof_contract": "control-flow/v1"},
+    "extensions": {"proof_contract": "control-flow/v2"},
 }
 def active_chal():
     try:
