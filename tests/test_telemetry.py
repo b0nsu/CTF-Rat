@@ -67,6 +67,10 @@ class BenchmarkResultV2Schema(unittest.TestCase):
     def test_valid_document_passes_without_provenance_for_backward_compatibility(self):
         validate(self._valid())
 
+    def test_v2_schema_alias_remains_accepted(self):
+        doc = self._valid(); doc["schema"] = "rat.benchmark-result/v2"
+        validate(doc)
+
     def test_valid_optional_provenance_passes(self):
         doc = self._valid(); doc["provenance"] = self._provenance()
         validate(doc)

@@ -34,7 +34,7 @@ def validate(doc: Mapping[str, Any], expected: str | None = None) -> Mapping[str
       "rat.finding/v1": finding, "rat.checkpoint/v1": checkpoint, "rat.primitive/v1": primitive,
       "rat.run/v1": run, "rat.role-contract/v1": role_contract,
       "rat.task-output/v1": task_output, "rat.skeptic-report/v1": skeptic_report,
-      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v3": benchmark_result_v2,
+      "rat.benchmark-result/v1": benchmark_result, "rat.benchmark-result/v2": benchmark_result_v2, "rat.benchmark-result/v3": benchmark_result_v2,
       "rat.route-result/v2": route_result, "rat.query-result/v1": query_result,
       "rat.cache-stats/v1": cache_stats, "rat.brief-card/v1": brief_card,
       "rat.bench-result/v2": bench_result,
