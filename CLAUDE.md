@@ -24,6 +24,9 @@ host:port. 작업자는 위 대상의 테스트 권한을 보유하며, 목표(f
 6. **DEEP 승격 조건(아래 하나라도)**: discriminator 뒤에도 복수 가설 경쟁 · env-민감(패킹/anti-debug/커널) · 같은 실패 반복 · evidence 충돌 · Progress Novelty Governor stuck(최근 5회 tool/query에 새 artifact digest·finding 개정·ruled-out route·primitive 상태변화 전무, `ratlib.governor.check_progress` 훅) → 강제 re-route 또는 DEEP.
 7. **SOLVED/PASS 금지 조건**: typed STATE v2 PASS(`state primitive pass <rat.primitive/v1 doc.json>`, `>=3`개의 distinct active+direct SELF observation + canonical class별 proof coverage 필요 — [doctrine/PRIMITIVE_GATE.md](doctrine/PRIMITIVE_GATE.md)) 없이 체이닝 금지, `rat-verify`/`symsolve --find-str`(concrete-verify) 등 deterministic verify 없이 완료 선언 금지. legacy `state primitive <name> pass <evidence>` 문법은 이 invariant를 우회하므로 `bin/state`가 거부한다.
 
+**FAST continuation (evidence-backed)**: 초기 판별 뒤에는 현재 STATE의 활성 evidence를 먼저 확인한다. 재현 가능한 입력·success oracle 후보가 있으면 bounded 실험으로 확인하고 기존 deterministic verifier로 검증한다. 활성 PASS primitive와 미완성 solve가 있으면 그 primitive의 다음 검증 가능한 단계에 집중하되, 환경 불일치·반증·evidence invalidation은 먼저 해결한다. 관련 없는 `unknown` 또는 오래된 route lead 때문에 이미 증명된 측정을 처음부터 반복하지 않는다. 반대로 미해결 전제가 현재 단계를 실제로 막으면 저비용 discriminator 한 개를 실행한다. `governor`의 `focused-deep`은 *조언*이지 PASS/완료 증거가 아니며, verifier 없는 SOLVED 선언과 PASS 이전 체이닝은 계속 금지된다.
+
+
 `symsolve --record-state-dir <challenge-dir>`는 concrete-verify 성공 시 heuristic STATE observation과
 연결된 rev-symbolic primitive revision을 자동 기록한다. completion gate는 primitive의
 `producer.engine`이나 `solve_origin` 태그만으로 판단하지 않는다. `solution-reconstruction` 등
