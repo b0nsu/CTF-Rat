@@ -52,7 +52,7 @@ RAT_DEEP_IMAGE="${RAT_DEEP_IMAGE:-ctf-rat:deep}"
 docker build --platform=linux/amd64 -f Dockerfile.test -t "$RAT_DEEP_IMAGE" .
 #   이미지의 기본 Python에는 pwntools, /opt/ctf-rat-angr에는 native angr를 각각 설치한다.
 #   requirements-deep.txt는 분리된 angr 환경 전용이다.
-# 자동 dispatch나 ratbench의 자동 빌드는 없다. 사람이 명시해 컨테이너에서 실행할 때만 사용한다.
+# 자동 dispatch는 없다. 사람이 명시해 컨테이너에서 실행할 때만 사용한다.
 docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" -e CTF_HOME="$PWD" \
   "$RAT_DEEP_IMAGE" bin/symsolve ./challenge --find-str Correct --stdin 16
 # 전체 Docker 회귀 테스트에는 bwrap mount와 GDB ptrace 권한이 필요하다.

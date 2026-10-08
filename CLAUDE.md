@@ -92,7 +92,6 @@ pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 �
          pwnlibc identify --leak sym=0x..   leak→libc 식별+오프셋(DB: `index build`, 미매칭은 unknown, 추측금지)
 버스     state              STATE.jsonl (+`compact --budget-tokens N`)
 계측     rat-metrics        세션 duplicate/cache/time-to-flag + first_dimensions/first_action/commitment/decision_revision/first_skill 집계(read-only)
-벤치     ratbench           챌린지 스위트 러너(Mode A 스크립티드/결정론 · Mode B 외부CLI 온디맨드) + `report --schema legacy|v3`→LEADERBOARD
 학습     pklearn            learned/ 레슨 증류(distill/promote/gaps/used) — 증거 수집만, 자동요약 금지
          state failclass <class>   실패 분류표(route-miss|offset-wrong|libc-mismatch|env|tooling-gap|timeout|other)
 검증     pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate
@@ -109,11 +108,9 @@ python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
 python3 solve/_template/rev/qiling_trace.py selftest
 python3 bin/k_kallsyms --selftest
-python3 bin/ratbench selftest
 python3 bin/pklearn selftest
 python3 bin/pwngadget selftest
 python3 bin/pwnlibc selftest
-python3 bin/ratbench run          # Mode A 스위트 전 엔트리 route 정확 (CI 회귀; 실 solve-rate 증거 아님)
 python3 -m unittest tests.test_writeup_pipeline
 ```
 
