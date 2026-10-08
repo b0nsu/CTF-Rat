@@ -80,5 +80,63 @@ class EvidenceBackedContinuation(unittest.TestCase):
         self.assertEqual(recommend([self.obs, self.passed, consumed])["action"], "focused-deep")
 
 
+    def test_refuted_finding_on_pass_proof_precedes_focus(self):
+        refuted = self.event("finding.revised", finding_id="f1", state="refuted",
+                             evidence_observation_ids=["o1"])
+        for events in ([self.obs, self.passed, refuted],
+                       [self.obs, refuted, self.passed]):
+            with self.subTest(events=events):
+                self.assertEqual(recommend(events), {
+                    "action": "re-route", "basis": ["finding:f1", "primitive:p1"]})
+
+    def test_unrelated_refutation_does_not_mask_valid_pass(self):
+        other = self.event("observation.recorded", observation_id="o2",
+                           kind="measured", value=2, evidence=["sha256:other"])
+        refuted = self.event("finding.revised", finding_id="f1", state="refuted",
+                             evidence_observation_ids=["o2"])
+        self.assertEqual(recommend([self.obs, other, self.passed, refuted]),
+                         {"action": "focused-deep", "basis": ["primitive:p1"]})
+
+    def test_explicit_derived_self_evidence_cannot_support_focus(self):
+        self.obs["payload"]["quality"] = {"level": "derived"}
+        self.assertEqual(recommend([self.obs, self.passed])["action"],
+                         "re-route-or-deep-escalate")
+
+    def test_explicit_inactive_self_evidence_cannot_support_focus(self):
+        self.obs["payload"]["validity"] = {"state": "invalidated"}
+        self.assertEqual(recommend([self.obs, self.passed])["action"],
+                         "re-route-or-deep-escalate")
+
+    def test_active_direct_self_evidence_preserves_focus(self):
+        self.obs["payload"]["quality"] = {"level": "direct"}
+        self.obs["payload"]["validity"] = {"state": "active"}
+        self.assertEqual(recommend([self.obs, self.passed]),
+                         {"action": "focused-deep", "basis": ["primitive:p1"]})
+
+    def test_stale_environment_requires_a_recorded_observation(self):
+        environment = self.event("finding.revised", finding_id="env1",
+                                 state="stale", **{"class": "environment"},
+                                 evidence_observation_ids=["missing"])
+        self.assertEqual(recommend([environment])["action"],
+                         "re-route-or-deep-escalate")
+
+    def test_invalidated_environment_proof_still_prompts_recheck(self):
+        environment = self.event("finding.revised", finding_id="env1",
+                                 state="confirmed", **{"class": "env"},
+                                 evidence_observation_ids=["o1"])
+        invalid = self.event("evidence.invalidated", observation_ids=["o1"],
+                             reason="environment-change")
+        self.assertEqual(recommend([self.obs, self.passed, environment, invalid]),
+                         {"action": "verify-environment", "basis": ["finding:env1"]})
+
+    def test_consumed_pass_with_shared_refutation_re_routes(self):
+        consumed = self.event("primitive.consumed", primitive_id="p1",
+                               input_digest="input", environment_digest="env")
+        refuted = self.event("finding.revised", finding_id="f1", state="refuted",
+                             evidence_observation_ids=["o1"])
+        self.assertEqual(recommend([self.obs, self.passed, consumed, refuted]),
+                         {"action": "re-route", "basis": ["finding:f1", "primitive:p1"]})
+
+
 if __name__ == "__main__":
     unittest.main()
