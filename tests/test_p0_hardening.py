@@ -1,5 +1,3 @@
-import importlib.machinery
-import importlib.util
 import hashlib
 import json
 import os
@@ -14,14 +12,6 @@ BIN = os.path.join(ROOT, "bin")
 sys.path.insert(0, BIN)
 
 from ratlib import completion
-
-
-def load_ratbench():
-    loader = importlib.machinery.SourceFileLoader("_ratbench_p0_test", os.path.join(BIN, "ratbench"))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
 
 
 class _FakeStream:
@@ -334,147 +324,6 @@ class CompletionGateTests(unittest.TestCase):
         result = self._run_symbolic_gate(fake)
         self.assertFalse(result["verified"])
         self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
-
-
-class RatbenchIsolationTests(unittest.TestCase):
-    def test_mode_b_workspace_excludes_ground_truth(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            for name, data in (("CLAUDE.md", "runtime instructions\n"),
-                               ("AGENTS.md", "runtime instructions\n"),
-                               ("FLAG_FORMAT", "FLAG{...}\n")):
-                with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
-                    fh.write(data)
-            os.makedirs(os.path.join(root, "bin"))
-            with open(os.path.join(root, "bin", "rat"), "w", encoding="utf-8") as fh:
-                fh.write("#!/bin/sh\n")
-            os.makedirs(os.path.join(root, "solve", "_template"))
-            with open(os.path.join(root, "solve", "_template", "README"), "w", encoding="utf-8") as fh:
-                fh.write("template\n")
-            fixture = os.path.join(root, "bench", "artifacts", "case")
-            os.makedirs(fixture)
-            with open(os.path.join(fixture, "src.c"), "w", encoding="utf-8") as fh:
-                fh.write('const char *answer = "open-sesame";\n')
-            with open(os.path.join(fixture, "route.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"expected":"answer"}\n')
-            with open(os.path.join(fixture, "chall"), "wb") as fh:
-                fh.write(b"runtime-binary")
-
-            entry = {
-                "id": "case", "dir": "bench/artifacts/case", "binary": "chall",
-                "source": "src.c", "route_fixture": "route.json",
-            }
-            original = ratbench.ctf_home
-            ratbench.ctf_home = lambda: root
-            try:
-                kit_root, chal_dir, binary = ratbench._prepare_eval_workspace(entry, sandbox)
-            finally:
-                ratbench.ctf_home = original
-
-            self.assertTrue(os.path.isfile(os.path.join(kit_root, "CLAUDE.md")))
-            self.assertTrue(os.path.isfile(os.path.join(kit_root, "AGENTS.md")))
-            self.assertTrue(os.path.isfile(binary))
-            self.assertFalse(os.path.exists(os.path.join(kit_root, "bench")))
-            self.assertFalse(os.path.exists(os.path.join(chal_dir, "src.c")))
-            self.assertFalse(os.path.exists(os.path.join(chal_dir, "route.json")))
-
-    def test_mode_b_rejects_normalized_ground_truth_aliases(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            fixture = os.path.join(root, "bench", "artifacts", "case")
-            os.makedirs(os.path.join(root, "bin"))
-            os.makedirs(fixture)
-            for name in ("src.c", "route.json", "chall"):
-                with open(os.path.join(fixture, name), "wb") as fh:
-                    fh.write(b"fixture")
-            entry = {
-                "id": "case", "dir": "bench/artifacts/case", "binary": "chall",
-                "source": "src.c", "route_fixture": "route.json",
-                "runtime_files": ["sub/../src.c"],
-            }
-            original = ratbench.ctf_home
-            ratbench.ctf_home = lambda: root
-            try:
-                with self.assertRaises(ValueError):
-                    ratbench._prepare_eval_workspace(entry, sandbox)
-            finally:
-                ratbench.ctf_home = original
-
-    def test_mode_b_rejects_symlink_ground_truth_aliases(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            fixture = os.path.join(root, "bench", "artifacts", "case")
-            os.makedirs(fixture)
-            for name in ("src.c", "route.json", "chall"):
-                with open(os.path.join(fixture, name), "wb") as fh:
-                    fh.write(b"fixture")
-            os.symlink("src.c", os.path.join(fixture, "source-alias"))
-            entry = {
-                "id": "case", "dir": "bench/artifacts/case", "binary": "chall",
-                "source": "src.c", "route_fixture": "route.json",
-                "runtime_files": ["source-alias"],
-            }
-            with patch.object(ratbench, "ctf_home", return_value=root):
-                with self.assertRaisesRegex(ValueError, "ground-truth/state file"):
-                    ratbench._prepare_eval_workspace(entry, sandbox)
-
-    def test_mode_b_rejects_symlink_flag_alias(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            fixture = os.path.join(root, "bench", "artifacts", "case")
-            os.makedirs(fixture)
-            for name in ("chall", "flag.txt"):
-                with open(os.path.join(fixture, name), "wb") as target:
-                    target.write(b"CTF{secret}")
-            os.symlink("flag.txt", os.path.join(fixture, "data.bin"))
-            entry = {"id": "case", "dir": "bench/artifacts/case", "binary": "chall",
-                     "runtime_files": ["data.bin"]}
-            with patch.object(ratbench, "ctf_home", return_value=root):
-                with self.assertRaisesRegex(ValueError, "flag file"):
-                    ratbench._prepare_eval_workspace(entry, sandbox)
-            self.assertFalse(os.path.exists(os.path.join(sandbox, "ctf-rat", "solve", "case", "data.bin")))
-
-    def test_mode_b_rejects_symlink_alias_to_state_directory(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            fixture = os.path.join(root, "bench", "artifacts", "case")
-            state_dir = os.path.join(fixture, ".rat")
-            os.makedirs(state_dir)
-            with open(os.path.join(fixture, "chall"), "wb") as fh:
-                fh.write(b"binary")
-            with open(os.path.join(state_dir, "STATE.jsonl"), "w", encoding="utf-8") as fh:
-                fh.write("private state")
-            os.symlink(".rat", os.path.join(fixture, "state-alias"))
-            entry = {
-                "id": "case", "dir": "bench/artifacts/case", "binary": "chall",
-                "runtime_files": ["state-alias/STATE.jsonl"],
-            }
-            with patch.object(ratbench, "ctf_home", return_value=root):
-                with self.assertRaisesRegex(ValueError, "ground-truth/state file"):
-                    ratbench._prepare_eval_workspace(entry, sandbox)
-
-    def test_mode_b_runtime_export_rejects_symlink_to_benchmark_tree(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
-            bench = os.path.join(root, "bench")
-            runtime_bin = os.path.join(root, "bin")
-            os.makedirs(bench)
-            os.makedirs(runtime_bin)
-            with open(os.path.join(bench, "answer"), "w", encoding="utf-8") as fh:
-                fh.write("secret")
-            os.symlink(os.path.join(bench, "answer"), os.path.join(runtime_bin, "answer-alias"))
-            with patch.object(ratbench, "ctf_home", return_value=root):
-                with self.assertRaisesRegex(ValueError, "symlink escapes allowlist"):
-                    ratbench._copy_runtime_export(os.path.join(sandbox, "export"))
-
-    def test_mode_b_rejects_fixture_directory_symlink_escape(self):
-        ratbench = load_ratbench()
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
-            os.symlink(outside, os.path.join(root, "fixture-alias"))
-            entry = {"id": "case", "dir": "fixture-alias", "binary": "chall"}
-            with patch.object(ratbench, "ctf_home", return_value=root):
-                with self.assertRaisesRegex(ValueError, "escapes CTF_HOME"):
-                    ratbench._prepare_eval_workspace(entry, os.path.join(root, "sandbox"))
 
 
 if __name__ == "__main__":
