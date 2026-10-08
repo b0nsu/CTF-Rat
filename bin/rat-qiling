@@ -8,6 +8,7 @@ import sys
 import tempfile
 
 from ratlib.runner import EXIT_DEPENDENCY, EXIT_INPUT, EXIT_TIMEOUT, run
+from ratlib.angr_runtime import reexec_for_angr
 
 SCHEMA = "rat.qiling-result/v1"
 
@@ -114,4 +115,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if "--selftest" not in sys.argv[1:] and "--help" not in sys.argv[1:] and "-h" not in sys.argv[1:]:
+        reexec_for_angr(__file__, sys.argv[1:])
     raise SystemExit(main())

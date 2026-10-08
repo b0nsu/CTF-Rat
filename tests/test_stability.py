@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -139,6 +140,9 @@ class SafeArchiveTests(unittest.TestCase):
             with self.assertRaises(ArchiveError):
                 safe_extract_archive(archive, os.path.join(temp, "dest"))
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "APFS is Unicode-normalization-insensitive: NFC and NFD forms "
+                     "of the same name are one file and cannot coexist")
     def test_unicode_and_glob_names_remain_distinct(self):
         with tempfile.TemporaryDirectory() as temp:
             archive, dest = os.path.join(temp, "names.zip"), os.path.join(temp, "dest")
@@ -186,11 +190,68 @@ class RunnerTests(unittest.TestCase):
         result = run([sys.executable, "-c", "import os,signal;os.kill(os.getpid(),signal.SIGTERM)"])
         self.assertEqual((result.signal, result.exit_code), (15, 143))
 
-    def test_cpu_resource_limit_uses_timeout_exit(self):
-        result = run([sys.executable, "-c", "while True: pass"], timeout_seconds=5,
+    @unittest.skipUnless(os.name == "posix", "RLIMIT_CPU requires POSIX")
+    def test_cpu_resource_limit_is_applied_to_child(self):
+        # Inspect the child's CPU rlimit directly: a busy loop can hit the wall
+        # timeout first when a shared CI runner throttles its CPU allocation.
+        import resource
+        parent_hard = resource.getrlimit(resource.RLIMIT_CPU)[1]
+        expected_hard = 2 if parent_hard == resource.RLIM_INFINITY else min(2, parent_hard)
+        result = run([sys.executable, "-c",
+                      "import resource;print(*resource.getrlimit(resource.RLIMIT_CPU))"],
                      limits=ResourceLimits(cpu_seconds=1))
+        self.assertEqual(result.exit_code, 0, result.stderr.preview)
+        self.assertEqual(tuple(map(int, result.stdout.preview.split())),
+                         (min(1, expected_hard), expected_hard))
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(signal, "SIGXCPU"),
+                         "SIGXCPU requires POSIX")
+    def test_cpu_resource_signal_uses_timeout_exit(self):
+        # Test the SIGXCPU -> resource_limited/EXIT_TIMEOUT contract without
+        # racing the separate wall-clock deadline on a loaded CI runner.
+        result = run([sys.executable, "-c",
+                      "import os,signal;os.kill(os.getpid(),signal.SIGXCPU)"])
+        self.assertEqual(result.signal, signal.SIGXCPU)
         self.assertTrue(result.resource_limited)
+        self.assertFalse(result.timed_out)
         self.assertEqual(result.exit_code, EXIT_TIMEOUT)
+
+    def test_open_files_limit_is_applied_to_child(self):
+        # RLIMIT_NOFILE is set on every platform (runner.py:126). Assert the child
+        # actually inherits the configured soft cap rather than the ambient one.
+        result = run([sys.executable, "-c",
+                      "import resource;print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])"],
+                     limits=ResourceLimits(open_files=128))
+        self.assertEqual(result.exit_code, 0, result.stderr.preview)
+        self.assertEqual(result.stdout.preview.strip(), b"128")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_AS is skipped on darwin (runner.py:123)")
+    def test_address_space_limit_is_applied_on_linux(self):
+        # The darwin branch skips RLIMIT_AS; on Linux it must actually bound the
+        # child's virtual memory. Assert the soft cap reaches the child so this
+        # safety boundary has a regression test on the platform that enforces it.
+        cap = 1024 * 1024 * 1024
+        result = run([sys.executable, "-c",
+                      "import resource;print(resource.getrlimit(resource.RLIMIT_AS)[0])"],
+                     limits=ResourceLimits(address_space_bytes=cap))
+        self.assertEqual(result.exit_code, 0, result.stderr.preview)
+        self.assertEqual(result.stdout.preview.strip(), str(cap).encode())
+
+    def test_file_size_limit_caps_child_output_to_disk(self):
+        # RLIMIT_FSIZE (runner.py:125) bounds child output to disk on both
+        # platforms. The portable invariant is that the child cannot create a
+        # file larger than the limit -- Linux kills it with SIGXFSZ, macOS returns
+        # a short write, but in neither case does the oversized file materialize.
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "big")
+            code = "import os,sys;fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);os.write(fd,b'x'*(1<<20))"
+            result = run([sys.executable, "-c", code, path],
+                         limits=ResourceLimits(file_size_bytes=4096))
+            # A single write that straddles the limit may be truncated to a short
+            # write (POSIX allows this) rather than raising SIGXFSZ -- the kernel
+            # only signals when a write can make *zero* forward progress. The
+            # portable invariant is the file size cap, not the signal.
+            self.assertLessEqual(os.path.getsize(path), 4096, result.stderr.preview)
 
     def test_timeout_has_common_exit_code(self):
         start = time.monotonic()
@@ -357,7 +418,13 @@ class ManifestAndQilingTests(unittest.TestCase):
             with open(path) as f: self.assertEqual(f.read(), "original\n")
 
     def test_qiling_missing_dependency_is_explicit(self):
-        if importlib.util.find_spec("qiling") is not None:
+        from ratlib.angr_runtime import configured_python
+        runtime_python = configured_python() or sys.executable
+        runtime_has_qiling = subprocess.run(
+            [runtime_python, "-c", "import importlib.util,sys; sys.exit(importlib.util.find_spec('qiling') is None)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if runtime_has_qiling:
             self.skipTest("Qiling installed; dependency-missing branch not applicable")
         with tempfile.TemporaryDirectory() as temp:
             binary = os.path.join(temp, "binary"); rootfs = os.path.join(temp, "rootfs")
@@ -471,6 +538,20 @@ class NewchalTests(unittest.TestCase):
             self.assertEqual([item["role"] for item in materialized["inputs"]], ["binary"])
             self.assertTrue(os.path.isfile(os.path.join(temp, "solve", "safe_slug", "Dockerfile")))
 
+    def test_relative_binary_path_is_resolved_before_chdir(self):
+        # newchal absolutizes the binary path BEFORE `cd "$D"`. The pre-fix raw
+        # `readlink -f` fallback left a relative path on macOS/BSD, so the
+        # post-chdir `cp` resolved against the solve dir and aborted the scaffold.
+        with tempfile.TemporaryDirectory() as temp:
+            self.make_home(temp)
+            srcdir = os.path.join(temp, "dist"); os.makedirs(srcdir)
+            with open(os.path.join(srcdir, "chal"), "wb") as f: f.write(b"fixture")
+            completed = subprocess.run([os.path.join(BIN, "newchal"), "relbin", "chal"],
+                                       cwd=srcdir, env=dict(os.environ, CTF_HOME=temp),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(temp, "solve", "relbin", "chal")))
+
     def test_slug_and_symlink_escape_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             self.make_home(temp)
@@ -536,6 +617,111 @@ class NewchalTests(unittest.TestCase):
             self.assertEqual(preserved["run_id"], existing["run_id"])
 
 
+class TriageAllTests(unittest.TestCase):
+    """triage-all consumes recon's JSON view (no Korean grep) and sorts rows by
+    tier, keeping un-parseable/error rows from masquerading as valid HARD."""
+
+    STUB = (
+        "#!/bin/sh\n"
+        'base=$(basename "$1")\n'
+        'case "$base" in\n'
+        "  *fast*) echo '{\"status\":\"ok\",\"triage\":{\"tier\":\"fast\",\"confidence\":\"0.90\",\"techniques\":[\"bof\"]}}';;\n"
+        "  *hard*) echo '{\"status\":\"ok\",\"triage\":{\"tier\":\"hard\",\"confidence\":\"0.20\",\"techniques\":[\"heap\"]}}';;\n"
+        "  *err*)  echo '{\"status\":\"error\",\"error\":\"cannot load\"}';;\n"
+        "  *pe*)   echo '{\"status\":\"pe\"}';;\n"
+        "  *bad*)  echo 'this is not json';;\n"
+        "esac\n"
+    )
+
+    def _home(self, temp):
+        os.makedirs(os.path.join(temp, "bin"), exist_ok=True)
+        recon = os.path.join(temp, "bin", "recon")
+        with open(recon, "w") as f: f.write(self.STUB)
+        os.chmod(recon, 0o755)
+
+    def test_rows_sorted_by_tier_with_error_last(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._home(temp)
+            names = ["hard_a", "fast_a", "err_a", "pe_a", "bad_a"]
+            paths = []
+            for n in names:
+                p = os.path.join(temp, n)
+                with open(p, "wb") as f: f.write(b"x")
+                paths.append(p)
+            completed = subprocess.run([os.path.join(BIN, "triage-all"), *paths],
+                                       env=dict(os.environ, CTF_HOME=temp),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, timeout=20)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            lines = completed.stdout.splitlines()
+            data = [l for l in lines if any(k in l for k in ("fast_a", "hard_a", "err_a", "pe_a", "bad_a"))]
+            self.assertEqual(len(data), 5, completed.stdout)
+            # fast (tier 0) sorts first; error (key 3) sorts last.
+            self.assertIn("fast_a", data[0])
+            self.assertIn("🟢 FAST", data[0])
+            self.assertIn("err_a", data[-1])
+            self.assertIn("ERR", data[-1])
+            joined = "\n".join(data)
+            self.assertIn("🟠 HARD", joined)   # hard tier row
+            self.assertIn("PE(rev)", joined)   # status:pe classified as rev track
+            self.assertIn("recon 실패", joined)  # invalid JSON falls back, not a HARD row
+
+    def test_no_binaries_is_usage_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._home(temp)
+            completed = subprocess.run([os.path.join(BIN, "triage-all"), os.path.join(temp, "nonexistent")],
+                                       env=dict(os.environ, CTF_HOME=temp),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 1)
+
+
+class CtfpullDefaultsTests(unittest.TestCase):
+    """CTF_HOME defaults to the repo root (not the legacy ~/ctf) so ctfpull
+    resolves ctfguard/newchal and the dotenv path the same way every other tool
+    does. Pin the default so it cannot silently regress to ~/ctf again."""
+
+    def test_ctf_home_defaults_to_repo_root_when_unset(self):
+        repo_root = os.path.abspath(os.path.join(BIN, ".."))
+        old = os.environ.pop("CTF_HOME", None)
+        try:
+            module = load_ctfpull_module()
+        finally:
+            if old is not None: os.environ["CTF_HOME"] = old
+        self.assertEqual(module.CTF_HOME, repo_root)
+        self.assertNotEqual(module.CTF_HOME, os.path.expanduser("~/ctf"))
+        self.assertEqual(module.DEFAULT_ENV_PATHS,
+                         ["./.ctfd.env", os.path.join(repo_root, ".ctfd.env")])
+
+    def test_ctf_home_env_override_is_honored(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old = os.environ.get("CTF_HOME")
+            os.environ["CTF_HOME"] = temp
+            try:
+                module = load_ctfpull_module()
+            finally:
+                if old is None: os.environ.pop("CTF_HOME", None)
+                else: os.environ["CTF_HOME"] = old
+            self.assertEqual(module.CTF_HOME, os.path.abspath(temp))
+            self.assertIn(os.path.join(os.path.abspath(temp), ".ctfd.env"), module.DEFAULT_ENV_PATHS)
+
+    def test_default_staging_lives_inside_challenge_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old = os.environ.get("CTF_HOME")
+            os.environ["CTF_HOME"] = temp
+            try:
+                module = load_ctfpull_module()
+            finally:
+                if old is None: os.environ.pop("CTF_HOME", None)
+                else: os.environ["CTF_HOME"] = old
+            self.assertEqual(module.challenge_staging_path(None, "warmup_pwn"),
+                             os.path.join(temp, "solve", "warmup_pwn", "artifact"))
+
+    def test_explicit_destination_keeps_legacy_layout(self):
+        module = load_ctfpull_module()
+        self.assertEqual(module.challenge_staging_path("/tmp/incoming", "warmup_pwn"),
+                         "/tmp/incoming/warmup_pwn")
+
+
 class SelftestExitTests(unittest.TestCase):
     def test_forced_failure_is_nonzero_and_reported(self):
         root = os.path.abspath(os.path.join(BIN, ".."))
@@ -566,13 +752,12 @@ class PrimitiveGateTests(unittest.TestCase):
             rejected = self.run_state(state_path, "primitive", "rip", "pass",
                                       "core:rip=0x41414141 marker=SELF")
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("typed STATE v2 gate", rejected.stderr)
+            self.assertIn("STATE v2", rejected.stderr)
             candidate = self.run_state(state_path, "primitive", "rip", "candidate",
                                        "core:rip=0x41414141 marker=SELF")
-            self.assertEqual(candidate.returncode, 0, candidate.stderr)
-            with open(state_path) as f: events = [json.loads(line) for line in f]
-            self.assertEqual(events[-1]["status"], "candidate")
-            self.assertTrue(events[-1]["evidence"])
+            self.assertNotEqual(candidate.returncode, 0)
+            self.assertIn("STATE v2", candidate.stderr)
+            self.assertFalse(os.path.exists(state_path))
 
 
 class GuardExitTests(unittest.TestCase):

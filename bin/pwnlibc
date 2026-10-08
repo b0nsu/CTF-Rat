@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""pwnlibc — leak -> libc identification + offset lookup (plans/TOOL_ADDITIONS.md T2).
+
+The most common pwn bottleneck ("which libc is this leak?") had no tool: libcgate only
+audits provenance, pwnleak only extracts pointers. pwnlibc builds a symbol-offset DB from
+libc binaries and matches a leak's page offset + inter-symbol distances against it — always
+deterministic, and honest: a libc not in the DB returns "unknown" rather than a recalled guess.
+
+  pwnlibc index build --libc-dir <dir> [--db <path>]     # readelf -sW -> JSON DB
+  pwnlibc index build --from-reference [--db <path>]      # from reference/glibc/*.so
+  pwnlibc identify --leak system=0x7f... [--leak puts=0x7f...] [--db <path>]
+  pwnlibc offsets <version|sha256> [--db <path>]
+  pwnlibc selftest
+
+Only offsets the DB actually contains are used. No recall.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+
+# Symbols worth pinning for identification + exploitation.
+SHORTLIST = [
+    "system", "__libc_start_main", "puts", "printf", "read", "write", "open",
+    "gets", "setvbuf", "malloc", "free", "environ", "__free_hook", "__malloc_hook",
+]
+
+
+def _ctf_home():
+    return os.environ.get("CTF_HOME", os.path.abspath(os.path.join(BIN, "..")))
+
+
+def _default_db():
+    return os.path.join(_ctf_home(), "reference", "libc-offsets", "libc-db.json")
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _which(name):
+    from shutil import which
+    return which(name)
+
+
+# ---------------------------------------------------------------------------
+# index build
+# ---------------------------------------------------------------------------
+# Size column is usually decimal but some binutils emit it in hex (0x…) for large symbols.
+_SYM_LINE = re.compile(r"^\s*\d+:\s+([0-9a-fA-F]+)\s+(?:0x)?[0-9a-fA-F]+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)")
+
+
+def _readelf_symbols(path):
+    """Return {name: offset} for SHORTLIST symbols via readelf -sW."""
+    if not _which("readelf"):
+        return None
+    try:
+        out = subprocess.run(["readelf", "-sW", path], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=60).stdout.decode(errors="replace")
+    except Exception:
+        return None
+    want = set(SHORTLIST)
+    syms = {}
+    for line in out.splitlines():
+        m = _SYM_LINE.match(line)
+        if not m:
+            continue
+        val, name = m.group(1), m.group(2)
+        name = name.split("@")[0]  # strip @GLIBC_2.x versioning
+        if name in want and name not in syms:
+            try:
+                syms[name] = int(val, 16)
+            except ValueError:
+                pass
+    return syms
+
+
+_LOAD_LINE = re.compile(
+    r"^\s*LOAD\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+(0x[0-9a-fA-F]+)")
+
+
+def _load_segments(path):
+    """Return [(p_offset, p_vaddr, p_filesz)] for PT_LOAD segments via readelf -lW."""
+    if not _which("readelf"):
+        return []
+    try:
+        out = subprocess.run(["readelf", "-lW", path], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=30).stdout.decode(errors="replace")
+    except Exception:
+        return []
+    segs = []
+    for line in out.splitlines():
+        m = _LOAD_LINE.match(line)
+        if m:
+            segs.append((int(m.group(1), 16), int(m.group(2), 16), int(m.group(3), 16)))
+    return segs
+
+
+def _find_binsh(path):
+    """Virtual address of "/bin/sh\\0" in the libc image.
+
+    data.find gives a FILE offset, but symbol values from readelf are virtual
+    addresses; the two differ by (p_vaddr - p_offset) of the containing PT_LOAD
+    whenever that delta is nonzero, so str_bin_sh must be translated to a vaddr to
+    stay consistent with system()/etc. and with `base + str_bin_sh` at exploit time.
+    """
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return None
+    foff = data.find(b"/bin/sh\x00")
+    if foff < 0:
+        return None
+    return _foff_to_vaddr(foff, _load_segments(path))
+
+
+def _foff_to_vaddr(foff, segments):
+    """Map a file offset to a virtual address through the containing PT_LOAD."""
+    for p_offset, p_vaddr, p_filesz in segments:
+        if p_offset <= foff < p_offset + p_filesz:
+            return foff - p_offset + p_vaddr
+    # No mapping resolved (readelf missing or unmapped hit): fall back to the file
+    # offset rather than guessing. Correct for the common libc where the containing
+    # segment has p_vaddr == p_offset; a divergent build should be re-derived.
+    return foff
+
+
+def _build_id(path):
+    if not _which("readelf"):
+        return None
+    try:
+        out = subprocess.run(["readelf", "-n", path], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=30).stdout.decode(errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"Build ID:\s*([0-9a-f]+)", out)
+    return m.group(1) if m else None
+
+
+def _version_from_name(name, sha=None):
+    m = re.search(r"(\d+\.\d+)", name)
+    if m:
+        return m.group(1)
+    # No X.Y in the name (e.g. plain "libc.so.6"): fall back to a short content hash so
+    # two different such libcs get distinct version keys instead of colliding on the name.
+    return ("sha:" + sha[:12]) if sha else name
+
+
+def _one_gadgets_for(version):
+    """Absorb existing reference/libc-offsets/*.txt one-gadget lists matching this exact version.
+
+    Matched on a version-token boundary (not a bare substring): "2.31" must not also
+    pull in a "2.310" or "12.31" file's gadgets under the wrong libc's offsets.
+    """
+    d = os.path.join(_ctf_home(), "reference", "libc-offsets")
+    if not os.path.isdir(d):
+        return []
+    pattern = re.compile(r"(?<![0-9.])" + re.escape(version) + r"(?![0-9.])")
+    gadgets = []
+    for fn in os.listdir(d):
+        if not fn.endswith(".txt") or not pattern.search(fn):
+            continue
+        for line in open(os.path.join(d, fn), encoding="utf-8", errors="replace"):
+            m = re.search(r"(0x[0-9a-fA-F]+)", line)
+            if m:
+                gadgets.append({"offset": int(m.group(1), 16), "constraints": line.strip()})
+    return gadgets
+
+
+def _index_one(path):
+    syms = _readelf_symbols(path)
+    if not syms:
+        return None
+    sha = _sha256(path)
+    version = _version_from_name(os.path.basename(path), sha)
+    return {
+        "version": version, "path": os.path.basename(path),
+        "build_id": _build_id(path), "sha256": sha,
+        "symbols": syms, "str_binsh": _find_binsh(path),
+        "one_gadgets": _one_gadgets_for(version),
+    }
+
+
+def cmd_index_build(args):
+    if not _which("readelf"):
+        print("[pwnlibc:err] readelf not found (binutils)", file=sys.stderr); return 3
+    if args.from_reference:
+        libc_dir = os.path.join(_ctf_home(), "reference", "glibc")
+    else:
+        libc_dir = args.libc_dir
+    if not libc_dir or not os.path.isdir(libc_dir):
+        print("[pwnlibc:err] --libc-dir <dir> required (or --from-reference with fetched libcs)", file=sys.stderr); return 4
+    entries = []
+    for fn in sorted(os.listdir(libc_dir)):
+        p = os.path.join(libc_dir, fn)
+        if not os.path.isfile(p) or not re.search(r"libc.*\.so", fn):
+            continue
+        e = _index_one(p)
+        if e:
+            entries.append(e)
+    if not entries:
+        print("[pwnlibc:err] no libc*.so with readable symbols under %s" % libc_dir, file=sys.stderr); return 4
+    db = {"schema": "rat.libc-db/v1", "entries": entries}
+    db_path = args.db or _default_db()
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    with open(db_path, "w", encoding="utf-8") as fh:
+        json.dump(db, fh, indent=1, sort_keys=True)
+    print("[pwnlibc] indexed %d libc(s) -> %s" % (len(entries), db_path))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# identify
+# ---------------------------------------------------------------------------
+def _parse_leaks(leak_args):
+    leaks = {}
+    for spec in leak_args or []:
+        if "=" not in spec:
+            raise ValueError("--leak must be NAME=0xADDR (got %r)" % spec)
+        name, addr = spec.split("=", 1)
+        leaks[name.strip()] = int(addr, 0)
+    return leaks
+
+
+def _candidate_base(entry, leaks):
+    """Return the consistent libc base implied by all leaks, or None if inconsistent/missing."""
+    base = None
+    for name, addr in leaks.items():
+        off = entry["symbols"].get(name)
+        if off is None:
+            return None  # this libc lacks a symbol we leaked -> cannot be it
+        b = addr - off
+        if b & 0xfff:
+            return None  # base must be page-aligned
+        if base is None:
+            base = b
+        elif base != b:
+            return None  # leaks disagree -> not this libc
+    return base
+
+
+def identify(db, leaks):
+    candidates = []
+    for entry in db.get("entries", []):
+        base = _candidate_base(entry, leaks)
+        if base is not None:
+            candidates.append({"version": entry["version"], "sha256": entry["sha256"],
+                               "build_id": entry.get("build_id"), "base": base})
+    return candidates
+
+
+def _distinguishing_symbol(db, candidates, leaks):
+    """Suggest a not-yet-leaked symbol whose page offset differs across candidates."""
+    cand_versions = {c["version"] for c in candidates}
+    entries = [e for e in db["entries"] if e["version"] in cand_versions]
+    for sym in SHORTLIST:
+        if sym in leaks:
+            continue
+        pages = set()
+        ok = True
+        for e in entries:
+            off = e["symbols"].get(sym)
+            if off is None:
+                ok = False; break
+            pages.add(off & 0xfff)
+        if ok and len(pages) == len(entries) and len(entries) > 1:
+            return sym
+    return None
+
+
+def cmd_identify(args):
+    db_path = args.db or _default_db()
+    if not os.path.isfile(db_path):
+        print("[pwnlibc:err] no DB at %s (run `pwnlibc index build` first)" % db_path, file=sys.stderr); return 4
+    with open(db_path, encoding="utf-8") as fh:
+        db = json.load(fh)
+    try:
+        leaks = _parse_leaks(args.leak)
+    except ValueError as exc:
+        print("[pwnlibc:err] %s" % exc, file=sys.stderr); return 2
+    if not leaks:
+        print("[pwnlibc:err] at least one --leak NAME=0xADDR required", file=sys.stderr); return 2
+    candidates = identify(db, leaks)
+    result = {"schema": "rat.libc-identify/v1", "leaks": {k: hex(v) for k, v in leaks.items()},
+              "candidates": candidates, "resolved": None, "suggest_leak": None, "status": "unknown"}
+    if len(candidates) == 1:
+        result["resolved"] = candidates[0]; result["status"] = "resolved"
+    elif len(candidates) > 1:
+        result["status"] = "ambiguous"
+        result["suggest_leak"] = _distinguishing_symbol(db, candidates, leaks)
+    _emit_identify(result, args.format)
+    return 0
+
+
+def _emit_identify(result, fmt):
+    if fmt == "json":
+        print(json.dumps(result, sort_keys=True)); return
+    print("LIBC IDENTIFY  status=%s  leaks=%s" % (result["status"], ", ".join(result["leaks"])))
+    if result["status"] == "resolved":
+        r = result["resolved"]
+        print("  RESOLVED  %s  base=%#x  sha256=%s" % (r["version"], r["base"], r["sha256"][:16] + "..."))
+    elif result["status"] == "ambiguous":
+        for c in result["candidates"]:
+            print("  candidate %s  base=%#x" % (c["version"], c["base"]))
+        if result["suggest_leak"]:
+            print("  -> leak `%s` next to disambiguate (differs across candidates)" % result["suggest_leak"])
+        else:
+            print("  -> no single distinguishing symbol in DB; leak another pointer")
+    else:
+        print("  UNKNOWN — no DB libc matches this leak set (do not guess the version)")
+
+
+# ---------------------------------------------------------------------------
+# offsets
+# ---------------------------------------------------------------------------
+def cmd_offsets(args):
+    db_path = args.db or _default_db()
+    if not os.path.isfile(db_path):
+        print("[pwnlibc:err] no DB at %s" % db_path, file=sys.stderr); return 4
+    with open(db_path, encoding="utf-8") as fh:
+        db = json.load(fh)
+    key = args.key
+    exact = [e for e in db["entries"] if e["sha256"] == key or e["version"] == key]
+    matches = exact or [e for e in db["entries"] if e["sha256"].startswith(key)]
+    if not matches:
+        print("[pwnlibc:err] no DB entry for %r" % key, file=sys.stderr); return 4
+    if len(matches) > 1:
+        # Never silently pick the first alphabetical/insertion-order match: a short
+        # sha prefix or a version string can legitimately name several builds. Fail
+        # closed (the repo's stated "unknown, never guess" principle) and name them.
+        print("[pwnlibc:err] %r matches %d DB entries, ambiguous: %s" %
+              (key, len(matches), ", ".join(sorted(e["sha256"][:16] for e in matches))), file=sys.stderr)
+        return 4
+    e = matches[0]
+    if args.format == "json":
+        print(json.dumps(e, sort_keys=True)); return 0
+    print("LIBC %s  sha256=%s" % (e["version"], e["sha256"][:16] + "..."))
+    for name in SHORTLIST:
+        if name in e["symbols"]:
+            print("  %-22s 0x%x" % (name, e["symbols"][name]))
+    if e.get("str_binsh") is not None:
+        print("  %-22s 0x%x" % ("str_bin_sh", e["str_binsh"]))
+    for g in e.get("one_gadgets", []):
+        print("  one_gadget 0x%x  %s" % (g["offset"], g.get("constraints", "")))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def _selftest():
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    # synthetic DB: two libcs sharing system page offset but differing on puts
+    # NOTE: a single leak only constrains the low 12 bits (page offset); these two
+    # libcs deliberately differ there on `system` so one system leak resolves uniquely.
+    db = {"schema": "rat.libc-db/v1", "entries": [
+        {"version": "2.27", "sha256": "a" * 64, "build_id": "aa",
+         "symbols": {"system": 0x4f550, "puts": 0x809c0, "printf": 0x64e80}, "str_binsh": 0x1b3e9a, "one_gadgets": []},
+        {"version": "2.31", "sha256": "b" * 64, "build_id": "bb",
+         "symbols": {"system": 0x55560, "puts": 0x849c0, "printf": 0x61c90}, "str_binsh": 0x1b75aa, "one_gadgets": []},
+    ]}
+    base = 0x7f1234500000
+    # leak only system -> both/one match by page offset; here offsets differ so unique
+    r1 = identify(db, {"system": base + 0x4f550})
+    chk(len(r1) == 1 and r1[0]["version"] == "2.27", "identify: single system leak resolves 2.27")
+    chk(r1[0]["base"] == base, "identify: recovered base correct")
+    # a base whose system page offset matches 2.27 but is not page-aligned -> rejected
+    r_bad = identify(db, {"system": base + 0x4f550 + 1})
+    chk(len(r_bad) == 0, "identify: non-page-aligned base rejected")
+    # construct genuine ambiguity: two entries with identical system offset, different puts
+    amb = {"schema": "rat.libc-db/v1", "entries": [
+        {"version": "X", "sha256": "c" * 64, "symbols": {"system": 0x50000, "puts": 0x80000}, "str_binsh": 0},
+        {"version": "Y", "sha256": "d" * 64, "symbols": {"system": 0x50000, "puts": 0x81100}, "str_binsh": 0},
+    ]}
+    rc = identify(amb, {"system": base + 0x50000})
+    chk(len(rc) == 2, "identify: shared system offset -> ambiguous (2 candidates)")
+    sug = _distinguishing_symbol(amb, rc, {"system": base + 0x50000})
+    chk(sug == "puts", "identify: suggests `puts` to disambiguate")
+    # two leaks must agree on base
+    r2 = identify(db, {"system": base + 0x4f550, "puts": base + 0x809c0})
+    chk(len(r2) == 1 and r2[0]["version"] == "2.27", "identify: two consistent leaks resolve")
+    r3 = identify(db, {"system": base + 0x4f550, "puts": base + 0x849c0})  # puts from 2.31
+    chk(len(r3) == 0, "identify: inconsistent leaks -> no match (honest unknown)")
+    # str_bin_sh file-offset -> vaddr translation through PT_LOAD (regression: was a raw
+    # file offset, wrong whenever the containing segment has p_vaddr != p_offset).
+    segs = [(0x0, 0x0, 0x2d000), (0x2d000, 0x2e000, 0x30000)]  # 2nd LOAD: vaddr != offset
+    chk(_foff_to_vaddr(0x1000, segs) == 0x1000, "binsh: identity when p_vaddr==p_offset (1st LOAD)")
+    chk(_foff_to_vaddr(0x2e100, segs) == 0x2f100, "binsh: file offset translated to vaddr in divergent segment")
+    chk(_foff_to_vaddr(0x999999, []) == 0x999999, "binsh: no-segment fallback returns file offset")
+    if fails:
+        print("pwnlibc selftest: FAIL (%d)" % len(fails)); return 1
+    print("pwnlibc selftest: OK"); return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "selftest":
+        return _selftest()
+    ap = argparse.ArgumentParser(prog="pwnlibc", description="leak -> libc identify + offsets")
+    sub = ap.add_subparsers(dest="cmd")
+
+    idx = sub.add_parser("index")
+    idxsub = idx.add_subparsers(dest="idxcmd")
+    ib = idxsub.add_parser("build")
+    ib.add_argument("--libc-dir"); ib.add_argument("--from-reference", action="store_true"); ib.add_argument("--db")
+
+    ident = sub.add_parser("identify")
+    ident.add_argument("--leak", action="append"); ident.add_argument("--db")
+    ident.add_argument("--format", choices=("text", "json"), default="text")
+
+    off = sub.add_parser("offsets")
+    off.add_argument("key"); off.add_argument("--db")
+    off.add_argument("--format", choices=("text", "json"), default="text")
+
+    args = ap.parse_args(argv)
+    if args.cmd == "index" and args.idxcmd == "build":
+        return cmd_index_build(args)
+    if args.cmd == "identify":
+        return cmd_identify(args)
+    if args.cmd == "offsets":
+        return cmd_offsets(args)
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

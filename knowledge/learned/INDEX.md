@@ -18,5 +18,6 @@ that have an evidence path and explicit applicability and failure conditions.
 
 | Pattern | Status | Source | Evidence |
 |---|---|---|---|
-| [Relocation-Hidden Pre-Main Wrapper](rev/relocation-hidden-premain.md) | `candidate` | `unsat` | `/work/solve/unsat/.rat/events/STATE.v2.jsonl` |
-| [Table-Encoded GF(16) Runtime](rev/table-encoded-gf16-runtime.md) | `candidate` | `chorus` | `/work/solve/chorus/HANDOFF.md` |
+| _(none yet)_ | | | |
+
+> 인덱스에는 파일이 실제 존재하고 evidence 경로가 repo-relative인 lesson만 등재한다. 외부 머신 경로(`/work/...`)나 미존재 파일 링크는 등재 금지.

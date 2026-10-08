@@ -17,30 +17,30 @@ export PATH="$(git rev-parse --show-toplevel)/bin:$PATH"   # k_* 커널 래퍼 �
 
 ### Phase 1 — 정적분석 / 완화 파악
 1. init 스크립트(`init`,`/etc/init.d/*`)·제공 `run.sh`·`.ko` 모듈 확인. **완화 확정**: KASLR / SMEP / SMAP / KPTI / `kptr_restrict` / `dmesg_restrict` / seccomp.
-   - `run.sh` 있으면 그 QEMU 라인의 `-cpu`,`-append`,`-m`,`-smp` **그대로 미러** (재발명 금지). `run_qemu.sh` 는 cwd의 run.sh 감지 시 그 라인을 stderr로 보여줌.
-2. 심볼·베이스: `vmlinux` 있으면 `nm`, 없으면 `System.map`/`/proc/kallsyms`. **KASLR base·심볼 오프셋은 `kallsyms_diff.py` 로 live 실측**(recall 금지).
+   - `run.sh` 있으면 그 QEMU 라인의 `-cpu`,`-append`,`-m`,`-smp` **그대로 미러** (재발명 금지). `k_run_qemu` 는 cwd의 run.sh 감지 시 그 라인을 stderr로 보여줌.
+2. 심볼·베이스: `vmlinux` 있으면 `nm`, 없으면 `System.map`/`/proc/kallsyms`. **KASLR base·심볼 오프셋은 `k_kallsyms` 로 live 실측**(recall 금지).
 
 ### Phase 2 — 페이로드 작성 + 재패킹 (자동)
 3. `exploit.c`(정적, `-static`) 작성/수정. 커널 타깃 primitive 골격.
-4. `repack.sh -i <initramfs> -e exploit.c` → static 컴파일 → initramfs cpio 트리에 주입 → 원본 압축 방식대로 재패킹. 출력 이미지 경로를 stdout으로 반환.
+4. `k_repack -i <initramfs> -e exploit.c` → static 컴파일 → initramfs cpio 트리에 주입 → 원본 압축 방식대로 재패킹. 출력 이미지 경로를 stdout으로 반환.
 
 ### Phase 3 — 가벼운 디버깅 + 트리거
-5. `run_qemu.sh -k <bzImage> -i <repacked>` → gdbstub(:1234) 열고 백그라운드 부팅, 콘솔은 `qemu.log`로. (`-S` 옵션 = boot에서 halt, early attach용. `--debug` = nokaslr+earlyprintk.)
+5. `k_run_qemu -k <bzImage> -i <repacked>` → gdbstub(:1234) 열고 백그라운드 부팅, 콘솔은 `qemu.log`로. (`-S` 옵션 = boot에서 halt, early attach용. `--debug` = nokaslr+earlyprintk.)
 6. gdb 붙여 vuln 지점 BP, **바뀐 레지스터(`$rip`,`$rsp`)·타깃 struct만 핀포인트** 관찰. 전체 context 덤프 금지.
    - `gdb -q -x kernel/.gdbinit-kernel` → `kattach`(=target remote :1234). pagination/color off, context=regs+disasm+code.
-7. **큰 상태(레지스터셋·메모리·slab)는 `dump_heap.py` 로 파일로** 빼고 `grep`/`awk`. 인라인 덤프 금지.
+7. **큰 상태(레지스터셋·메모리·slab)는 `k_dump_heap` 로 파일로** 빼고 `grep`/`awk`. 인라인 덤프 금지.
 
 ### Phase 4 — 크래시 분석 피드백
 8. panic/oops 시 `qemu.log`의 레지스터·call trace로 결함 파악 (`-no-reboot`라 panic에서 정지).
 9. Phase 2로 복귀·수정, root 셸까지 루프. **stop-loss(L4)** 준수.
 
-## 도구 (전부 kernel/bin, PATH 추가 또는 bin/k_* 심볼릭)
+## 도구 (전부 bin/, PATH 추가 시 k_* 직접 호출)
 | 목적 | 명령 |
 |---|---|
-| QEMU 부팅(gdbstub+백그라운드+콘솔→파일) | `run_qemu.sh -k bzImage -i initramfs [--debug] [-S] [-p PORT]` |
-| initramfs 재패킹(컴파일+주입) | `repack.sh -i initramfs.cpio.gz -e exploit.c [--name N --dest /path]` |
-| 큰 커널 상태 → 파일 (batch gdb) | `dump_heap.py --regs` / `--addr 0x.. --len N` / `--vmlinux vmlinux --sym NAME` / `--cmd "x/40gx \$rsp"` |
-| KASLR base·심볼 오프셋 live 해석 | `kallsyms_diff.py System.map --base 0x.. ` / `--anchor sym=0x.. [--sym A B] [--all]` |
+| QEMU 부팅(gdbstub+백그라운드+콘솔→파일) | `k_run_qemu -k bzImage -i initramfs [--debug] [-S] [-p PORT]` |
+| initramfs 재패킹(컴파일+주입) | `k_repack -i initramfs.cpio.gz -e exploit.c [--name N --dest /path]` |
+| 큰 커널 상태 → 파일 (batch gdb) | `k_dump_heap --regs` / `--addr 0x.. --len N` / `--vmlinux vmlinux --sym NAME` / `--cmd "x/40gx \$rsp"` |
+| KASLR base·심볼 오프셋 live 해석 | `k_kallsyms System.map --base 0x.. ` / `--anchor sym=0x.. [--sym A B] [--all]` |
 | gdb 튜닝(색/페이지/context off) | `gdb -q -x kernel/.gdbinit-kernel` 후 `kattach` |
 
 ## 지식 계층 (grounding — driver 아님, userland 승계)
@@ -49,30 +49,40 @@ export PATH="$(git rev-parse --show-toplevel)/bin:$PATH"   # k_* 커널 래퍼 �
 - 오프셋/gadget/주소는 여기서 recall 금지 — 문서는 개념 예시일 뿐, 전부 이 바이너리·이 커널에서 live 실측 후 사용.
 
 ## context 규율 (userland과 동일 철학)
-- **큰 출력은 항상 파일로**: 콘솔은 `qemu.log`, gdb 대량 상태는 `dump_heap.py` → `dumps/`. raw `gdb`/전체 `x/`/`info all-registers` 인라인 금지.
+- **큰 출력은 항상 파일로**: 콘솔은 `qemu.log`, gdb 대량 상태는 `k_dump_heap` → `dumps/`. raw `gdb`/전체 `x/`/`info all-registers` 인라인 금지.
 - gdb는 **batch·핀포인트**: 필요한 레지스터/주소만. pwndbg 전체 배너/context 패널은 `.gdbinit-kernel` 이 이미 억제.
 - ANSI/배너 잔여물은 userland `pwnclean` 필터 재사용 가능(`... | pwnclean`).
-- 주소/offset/gadget/slide는 **STATE.jsonl 버스에 기록 후 사용**(hallucinate 방지). 진입 즉시 `state show`, checkpoint마다 append (`state offset`/`ok`/`no`/`next`/`alert`). userland CLAUDE.md의 데이터-버스 규약 그대로.
+- 주소/offset/gadget/slide는 **STATE v2 버스에 기록 후 사용**(hallucinate 방지). 진입 즉시 `state show`, checkpoint마다 append. `state offset`/`state ok`는 legacy 문법이라 `bin/state`가 거부한다 — offset은 `state event append <rat.observation/v1 doc.json>`(kind=pwn.offset), 확인된 사실은 `state finding propose|support|confirm <rat.finding/v1 doc.json>`으로 기록한다. `state no`/`next`/`alert`는 그대로 사용 가능. userland CLAUDE.md의 데이터-버스 규약 그대로.
 
 ## 커널 디버깅 모델 (gdbq 한계 정정과 대응)
-- QEMU gdbstub는 **halt(-S)·BP 정지 상태의 메모리/레지스터 관찰**에 강함 → `dump_heap.py`(batch)·`.gdbinit-kernel`이 이 용도.
-- 반면 **트리거(입력 드라이브)는 gdb stdin이 아니라 guest 안 exploit**이 함: initramfs의 `init`이 자동 실행하거나, 인터랙티브가 필요하면 `run_qemu.sh --fg`(serial 상호작용).
+- QEMU gdbstub는 **halt(-S)·BP 정지 상태의 메모리/레지스터 관찰**에 강함 → `k_dump_heap`(batch)·`.gdbinit-kernel`이 이 용도.
+- 반면 **트리거(입력 드라이브)는 gdb stdin이 아니라 guest 안 exploit**이 함: initramfs의 `init`이 자동 실행하거나, 인터랙티브가 필요하면 `k_run_qemu --fg`(serial 상호작용).
 - 즉: gdb=관찰자, exploit(guest 내부)=구동자. userland의 "gdbq는 메뉴 구동 못 함, 구동은 pwntools"와 같은 분업.
 
-## 파이프라인 self-test (testkit/)
-`kernel/testkit/` = distro 커널(bzImage, linux-image-kvm) + 정적 init.c + exploit.c + base.cpio.gz. 도구 변경 후 회귀검증:
+## 파이프라인 self-test
+
+### (미구축) 전체 boot-loop testkit 구축 절차
+`kernel/testkit/`(bzImage + 정적 init.c + exploit.c + base.cpio.gz)는 **아직 없다** — bzImage+cpio 확보가
+필요해 오프라인 즉시 구축 불가. 확보되면 아래로 repack+boot 파이프라인을 회귀검증:
 ```bash
 cd kernel/testkit
-OUT=$(repack.sh -i base.cpio.gz -e exploit.c --name exploit)
-run_qemu.sh -k bzImage -i "$OUT" --debug
+OUT=$(k_repack -i base.cpio.gz -e exploit.c --name exploit)
+k_run_qemu -k bzImage -i "$OUT" --debug
 grep -aE 'SMOKE_INIT_OK|PWN_EXPLOIT_RAN' qemu.log   # 둘 다 나오면 repack+boot 파이프라인 정상
 ```
 (실제 커널 챌린지가 아니라 **인프라 검증용**. 진짜 exploit 개발은 실제 챌린지 확보 후.)
 
+### 순수 로직 회귀 (QEMU 불필요, 상시 가능)
+System.map 파싱 + KASLR slide 산식은 QEMU 없이 검증 가능:
+```bash
+python3 bin/k_kallsyms --selftest      # slide 산식 + System.map 파싱 결정론 검증
+bash -n bin/k_repack && bash -n bin/k_run_qemu   # 셸 문법
+```
+
 ## honest-mode (오염 금지 — userland SOLVABILITY 그대로 + 커널 강조)
 - ✅ 허용: 기법/개념 검색 (KASLR bypass 이론, kernel ROP/JOP, `modprobe_path`/`cred` overwrite, ret2usr, `commit_creds(prepare_kernel_cred(0))` 원리, CVE 클래스 일반론).
 - ❌ 금지: **이 챌린지의** 답/writeup/exploit/flag 검색.
-- KASLR slide·심볼 주소·struct 필드 오프셋은 커널 버전마다 드리프트 → **전부 live 실측**(`/proc/kallsyms`·leak·gdb). recall한 상수는 반드시 재확인. (userland `calibration.md`의 recall-오탐 사례와 동형.)
+- KASLR slide·심볼 주소·struct 필드 오프셋은 커널 버전마다 드리프트 → **전부 live 실측**(`/proc/kallsyms`·leak·gdb). recall한 상수는 반드시 재확인. (userland `docs/calibration.md`의 recall-오탐 사례와 동형.)
 
 ## SOLVABILITY (kernel) — L0 하드스킵 amend
 - `doctrine/SOLVABILITY.md` L0는 mixed 파일 더미 triage에서 kernel을 즉시 후순위로 둠. **그 규칙은 "커널이 명시적 목표"인 지금엔 적용 안 됨** — 이 환경이 구축됐으므로 kernel은 더 이상 자동 스킵이 아니다. (그 문서 L0에 이 파일로의 cross-ref 추가함.)
@@ -90,5 +100,5 @@ grep -aE 'SMOKE_INIT_OK|PWN_EXPLOIT_RAN' qemu.log   # 둘 다 나오면 repack+b
 - 다음 세션이 이어받을 수 있게 HANDOFF.md에: 확정 오프셋(kbase-relative)·검증된 primitive·막힌 기법과 이유·다음 시도 후보를 남길 것. 같은 챌린지를 다른 세션이 재검증할 경우 **오염 여부(이전 결과 재사용 가능한지, 재현 안 되는지)를 발견 즉시 사용자에게 보고**.
 
 ## GDB MCP (spec 해결방안 #2) — 평가 결과: 연기
-- compact-text 경로(`.gdbinit-kernel` + batch `dump_heap.py` + pwnclean)가 **검증 완료·주력**. spec #2("구조화 데이터 추출")의 의도를 이미 충족.
+- compact-text 경로(`.gdbinit-kernel` + batch `k_dump_heap` + pwnclean)가 **검증 완료·주력**. spec #2("구조화 데이터 추출")의 의도를 이미 충족.
 - 즉시 쓸 pip GDB-MCP 패키지 없음. node/npx(=/mnt/c nodejs) 경유 설치는 가능하나 **외부 MCP 연결은 사용자 승인 필요한 결정**(신규 외부 의존+신뢰). → **선택적 future work**. 붙일 때도 compact-text를 fallback으로 유지(블로킹 의존 금지).

@@ -114,7 +114,13 @@ class LocalPwnToolTests(unittest.TestCase):
         # The environment-independent RIP-hijack evidence is control_cyclic_offset;
         # fault_addr is only required to be consistent with it (unset, or the same
         # controlled value -- never some unrelated address).
-        result = self.tool("pwncrash", str(self.binary), "--pattern-length", "256", "--repetitions", "2", "--json")
+        result = self.tool("pwncrash", str(self.binary), "--pattern-length", "256", "--repetitions", "2", "--json", check=False)
+        # Some container hosts deny GDB PTRACE_GETREGS even to a privileged
+        # container. The crash is reproduced but core-backed evidence cannot
+        # be collected, so this assertion is not evaluable on that platform.
+        if result.returncode and "PTRACE_GETREGS" in (result.stderr + result.stdout):
+            self.skipTest("container host denies GDB PTRACE_GETREGS")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         report = json.loads(result.stdout)
         self.assertEqual(report["verdict"], "crash-reproduced")
         self.assertEqual(report["stable_signal"], 11)

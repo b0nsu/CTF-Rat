@@ -37,12 +37,21 @@ def key(*, tool, inputs, parameters, dependencies, policy_digest, output_schema=
     raw=json.dumps(doc,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(); return "sha256:"+hashlib.sha256(raw).hexdigest()
 
 def canonical_key(*, binary_sha256, tool_name, tool_version, params, dep_versions,
-                   artifact_inputs=(), output_schema="rat.tool-result/v1", analysis_schema_version="v1"):
-    """Canonical cache key v2, shared by revq/decomp/rat-profile."""
+                   artifact_inputs=(), output_schema="rat.tool-result/v1", analysis_schema_version="v1",
+                   policy_digest=None):
+    """Canonical cache key v2, including producer policy when declared.
+
+    ``policy_digest`` is optional for compatibility with existing external
+    callers.  Omitting it preserves the pre-policy key byte-for-byte; canonical
+    producers should pass their stable policy digest so a policy change cannot
+    silently reuse an artifact produced under different semantics.
+    """
     doc={"schema":"rat.cache-key/v2","binary_sha256":binary_sha256,"tool_name":tool_name,"tool_version":tool_version,
          "params":params,"dep_versions":dep_versions,
          "artifact_inputs":sorted(artifact_inputs,key=lambda x:(x.get("role",""),x.get("digest",""))),
          "output_schema":output_schema,"analysis_schema_version":analysis_schema_version}
+    if policy_digest is not None:
+        doc["policy_digest"]=policy_digest
     raw=json.dumps(doc,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(); return "sha256:"+hashlib.sha256(raw).hexdigest()
 
 class Cache:

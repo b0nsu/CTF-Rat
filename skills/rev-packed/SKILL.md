@@ -6,8 +6,10 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/anti-analysis-c
 - `revq` EVASION line: packer section name (e.g. UPX), high Shannon entropy (>=7.2/8), or anti-debug imports/strings (`ptrace`, `/proc/self/status`, `ld_preload`).
 
 ## FIRST ACTION
+- PE/DLL이면(`revq` 배너에 `PLATFORM: PE/Windows`) 정적은 `decomp`/`revq` 그대로, 동적 언팩 관찰은 `solve/_template/rev/qiling_trace.py`(Qiling, rootfs 필요 — SETUP §8) — gdbq/symsolve 직행 금지.
 - Do not trust static function/string extraction yet — it is likely incomplete or obfuscated.
-- `gdbq <bin> "b *_start" "run"` or a supervised dynamic run to reach the unpacked/decrypted state before re-running `revq --refresh`.
+- If the EVASION line names UPX (or `upx -t <bin>` succeeds): unpack statically first — `upx -d -o <bin>.unpacked <bin>`, then `revq --refresh <bin>.unpacked`. This is deterministic and skips dynamic tracing.
+- Otherwise (custom/unknown packer): breaking at `*_start` lands you *before* the unpacking stub runs — that is the wrong moment. Run to the OEP (original entry point) instead: let the stub decrypt, then break after the tail jump into the unpacked code (e.g. `gdbq <bin> "b *<OEP>" "run"` once the OEP is found via a hardware-write watchpoint on the target segment, or single-step the final `jmp`/`ret` out of the stub). Only then dump/`revq --refresh` the unpacked image.
 
 ## PIVOT
 - Once unpacked and `revq` shows a clear checker/VM signal, hand off to `rev-checker`/`rev-vm`/`rev-symbolic` as normal — this skill's job is only to get past the packing layer.

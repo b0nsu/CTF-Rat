@@ -1,7 +1,7 @@
 import argparse, os, sqlite3, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.cache import Cache, canonical_key, key as legacy_key, resolve_index_root
-from ratlib.decomp_cache import cache_key as decomp_cache_key, provenance as decomp_provenance, write_meta as write_decomp_meta
+from ratlib.decomp_cache import cache_key as decomp_cache_key, payload_digest as decomp_payload_digest, provenance as decomp_provenance, write_meta as write_decomp_meta
 
 def ck(**overrides):
     base = dict(binary_sha256="sha256:" + "a" * 64, tool_name="revq", tool_version="2",
@@ -104,6 +104,21 @@ class DecompCacheIndexRegistration(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertEqual(entry["backend"], "decomp_dir")
             self.assertEqual(entry["path"], cache)
+            # Content anchor pins the complete sealed payload, not just _index.txt.
+            self.assertEqual(entry["envelope_digest"], decomp_payload_digest(cache))
+
+    def test_lineage_survives_cache_dir_deletion(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temp:
+            binary, scripts, ghidra, cache = self._fixture(temp)
+            write_decomp_meta(cache, binary, ghidra, scripts, "complete")
+            prov = decomp_provenance(binary, ghidra, scripts)
+            idx_root = resolve_index_root(binary)
+            shutil.rmtree(cache)  # mutable artifact gone
+            entry = Cache(idx_root).get_entry("sha256:" + decomp_cache_key(prov))
+            # the row is now dangling on `path`, but the content anchor persists
+            self.assertFalse(os.path.exists(entry["path"]))
+            self.assertTrue(entry["envelope_digest"].startswith("sha256:"))
 
     def test_partial_cache_is_not_registered(self):
         with tempfile.TemporaryDirectory() as temp:

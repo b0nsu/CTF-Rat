@@ -20,6 +20,16 @@
 `--submission --attestation <json>`으로 제공한 경우에만 생성한다. 기존 문서는
 기본적으로 덮어쓰지 않으며, 기계 생성본을 의도적으로 재생성할 때만 `--force`를 쓴다.
 
+### 템플릿 섹션 분리 — 최소(HANDOFF) vs 확장(WRITEUP/SUBMISSION)
+
+아래 단일 템플릿에서 각 `##` 제목은 `(minimal)` 또는 `(extended)`로 표시된다.
+
+- **최소(minimal)** — 기본 `HANDOFF.md`가 반드시 채워야 하는 섹션: 상태와 범위 · Artifact와 환경 ·
+  핵심 요약 · Gate Status · 제약과 운영자 인계. primitive 입력/환경 digest, marker 증거, 미검증 조건이
+  여기 담긴다(= `doctrine/SOLVING.md` 산출물 계약의 HANDOFF 최소 집합).
+- **확장(extended)** — WRITEUP/SUBMISSION으로 승격할 때만 채우는 서사·재사용 섹션: 풀이과정 · 재현 ·
+  배제된 경로 · 재사용 가능한 지식 · AI·자동화 사용 · 외부 제출본. HANDOFF 단계에선 생략(또는 `TBD`) 가능.
+
 ## 상태 신뢰 원본
 
 - `.rat/events/STATE.v2.jsonl`이 있으면 materialized v2 view만 authoritative하다.
@@ -48,7 +58,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 ````md
 # <문제명> — <상태>
 
-## 상태와 범위
+## 상태와 범위 (minimal)
 
 - 문서 유형: <handoff / writeup / submission>
 - 상태: <ANALYZING / PRIMITIVE_PASS / BLOCKED / OPERATOR_COMPLETED>
@@ -56,7 +66,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - 로컬 flag 검증: <수행하지 않음 / 의도된 challenge flag를 로컬에서 확인; 대상·실행 조건·환경 digest>
 - 외부 결과·제출: <수행하지 않음 / 운영자 확인>
 
-## Artifact와 환경
+## Artifact와 환경 (minimal)
 
 - OS / 아키텍처:
 - 제공 파일과 SHA-256:
@@ -65,20 +75,20 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - Docker image 또는 환경 digest:
 - 분석·재현 도구와 버전:
 
-## 핵심 요약
+## 핵심 요약 (minimal)
 
 - 확인된 사실:
 - 검증된 primitive:
 - 활성 가설:
 - 검증하지 않은 주장:
 
-## 풀이과정
+## 풀이과정 (extended)
 
 1. <관측한 사실과 근거>
 2. <가설과 이를 검증하거나 배제한 실험>
 3. <결과와 다음 판단>
 
-## Gate Status
+## Gate Status (minimal)
 
 - primitive: <PASS / BLOCKED / NOT STARTED>
 - 최소 입력:
@@ -88,7 +98,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - ASLR / argv / env / layout 의존성:
 - 증거 파일:
 
-## 재현
+## 재현 (extended)
 
 ```text
 <제공된 artifact부터 primitive 관측까지의 로컬 명령>
@@ -97,17 +107,17 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - 예상 관측:
 - 실패 조건:
 
-## 배제된 경로
+## 배제된 경로 (extended)
 
 - <경로와 재시도하지 않을 근거>
 
-## 제약과 운영자 인계
+## 제약과 운영자 인계 (minimal)
 
 - 남은 체이닝 조건:
 - 사람이 확인해야 하는 내용:
 - 자동화 범위 밖 작업:
 
-## 재사용 가능한 지식
+## 재사용 가능한 지식 (extended)
 
 - 일반화된 패턴:
 - 적용 전제조건:
@@ -115,7 +125,7 @@ observation에서 실제로 참조 가능한 값이어야 한다.
 - 다음 문제에서의 최소 확인 절차:
 - 승격 상태: <candidate / validated / reused>
 
-## AI·자동화 사용
+## AI·자동화 사용 (extended)
 
 - 사용 여부:
 - 사용 도구:

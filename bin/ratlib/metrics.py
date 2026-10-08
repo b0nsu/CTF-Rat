@@ -1,13 +1,52 @@
 """Read-only session telemetry aggregator.
 
-Reads tool-result envelopes from a .rat artifact store plus STATE.jsonl and
-emits one rat.session-metrics/v1 jsonl line. No binary execution, no network.
+Reads tool-result envelopes from a .rat artifact store plus the authoritative
+typed STATE v2 stream, with legacy STATE.jsonl fallback for pre-v2 sessions,
+and emits one rat.session-metrics/v1 jsonl line. It can also parse an externally
+captured execve trace for process-level tool-call metrics. No binary execution,
+no network.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, sys
+import argparse, ast, hashlib, json, os, re, sys
 from datetime import datetime
 from .artifact import get as artifact_get
+from .completion import completion_gate
 from .state_v2 import Stream
+
+def _readable_tool_result(doc):
+    """Check fields consumed by telemetry; retain historical partial envelopes.
+
+    This is a reader boundary, not current-schema validation. In particular,
+    summary may be any JSON value and old tool_name-only records remain readable.
+    """
+    if not isinstance(doc, dict) or doc.get("schema") != "rat.tool-result/v1":
+        return False
+    for key in ("tool", "provenance", "parameters"):
+        if key in doc and not isinstance(doc[key], dict):
+            return False
+    tool = doc.get("tool", {})
+    if "name" in tool and not isinstance(tool["name"], str):
+        return False
+    if "tool_name" in doc and not isinstance(doc["tool_name"], str):
+        return False
+    provenance = doc.get("provenance", {})
+    for key in ("cache", "dependency_versions"):
+        if key in provenance and not isinstance(provenance[key], dict):
+            return False
+    inputs = doc.get("inputs", [])
+    if not isinstance(inputs, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("digest", ""), str)
+            for item in inputs):
+        return False
+    duration = doc.get("duration_ms", 0)
+    return isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0
+
+
+def _tool_name(doc):
+    """tool.name is canonical; tool_name is a legacy projection fallback."""
+    name = (doc.get("tool") or {}).get("name") or doc.get("tool_name")
+    return name if isinstance(name, str) and name else "(unattributed)"
+
 
 def iter_tool_results(root):
     meta_base = os.path.join(root, "metadata", "sha256")
@@ -25,13 +64,13 @@ def iter_tool_results(root):
                     rec = json.load(f)
             except (OSError, ValueError):
                 continue
-            if rec.get("kind") != "tool-result":
+            if not isinstance(rec, dict) or rec.get("kind") != "tool-result":
                 continue
             try:
                 doc = json.loads(artifact_get(rec["digest"], root=root))
             except Exception:
                 continue
-            if doc.get("schema") == "rat.tool-result/v1":
+            if _readable_tool_result(doc):
                 yield doc
 
 def operation_fingerprint(doc):
@@ -49,6 +88,164 @@ def operation_fingerprint(doc):
     raw = json.dumps(key, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
+# strace `-e trace=execve -s 4096` output. We intentionally accept only
+# completed, successful execve records; unfinished/resumed or failed lookups are
+# not tool executions and therefore must not inflate process-level telemetry.
+_EXECVE_RE = re.compile(
+    r'^(?:\d+\s+)?execve\("((?:\\.|[^"])*)", (\[.*\]), [^)]*\)\s+=\s+0$'
+)
+_TRACE_TEMPLATE_TOOLS = {"symsolve.py", "vmlift.py", "qiling_trace.py"}
+_TRACE_SYMBOLIC_TOOLS = {"symsolve", "symsolve.py"}
+_TRACE_NON_MEASUREMENT_ARGS = {"selftest", "--selftest", "-h", "--help", "help", "--version", "-V"}
+
+def _decode_trace_path(value):
+    try:
+        decoded = ast.literal_eval('"' + value + '"')
+    except (SyntaxError, ValueError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+def _trace_candidate_path(value, kit_root, challenge_dir=None):
+    if not isinstance(value, str) or not value:
+        return None
+    if os.path.isabs(value):
+        return os.path.realpath(value)
+    bases = [kit_root]
+    if challenge_dir:
+        bases.append(challenge_dir)
+    for base in bases:
+        candidate = os.path.realpath(os.path.join(base, value))
+        if candidate.startswith(os.path.realpath(kit_root) + os.sep):
+            return candidate
+    return os.path.realpath(value)
+
+def _trace_tool_call(exec_path, argv, kit_root, challenge_dir=None):
+    """Return (canonical tool name, tool argv) for one CTF-Rat process exec."""
+    if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+        return None
+    bin_root = os.path.realpath(os.path.join(kit_root, "bin"))
+    template_root = os.path.realpath(os.path.join(kit_root, "solve", "_template", "rev"))
+    path = _trace_candidate_path(exec_path, kit_root, challenge_dir)
+    if path and os.path.dirname(path) == bin_root:
+        return os.path.basename(path), argv[1:]
+    for index, token in enumerate(argv[1:], 1):
+        candidate = _trace_candidate_path(token, kit_root, challenge_dir)
+        if not candidate:
+            continue
+        if os.path.dirname(candidate) == bin_root:
+            return os.path.basename(candidate), argv[index + 1:]
+        if os.path.dirname(candidate) == template_root and os.path.basename(candidate) in _TRACE_TEMPLATE_TOOLS:
+            return os.path.basename(candidate), argv[index + 1:]
+    return None
+
+def _normalize_trace_arg(value, kit_root, challenge_dir=None):
+    roots = [(os.path.realpath(kit_root), "$CTF_HOME")]
+    if challenge_dir:
+        roots.append((os.path.realpath(challenge_dir), "$CHAL"))
+    for root, label in sorted(roots, key=lambda item: len(item[0]), reverse=True):
+        if value == root:
+            return label
+        if value.startswith(root + os.sep):
+            return label + value[len(root):]
+    return value
+
+def process_trace_metrics(path, kit_root, challenge_dir=None):
+    """Parse observer-owned execve telemetry into benchmark-safe process metrics."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = list(fh)
+    except OSError:
+        return None
+    calls = []
+    ghidra_runs = 0
+    symbolic_runs = 0
+    name_counts = {}
+    fingerprints = {}
+    for raw in lines:
+        match = _EXECVE_RE.match(raw.strip())
+        if not match:
+            continue
+        exec_path = _decode_trace_path(match.group(1))
+        if exec_path is None:
+            continue
+        try:
+            argv = ast.literal_eval(match.group(2))
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+            continue
+        if os.path.basename(exec_path) == "analyzeHeadless":
+            ghidra_runs += 1
+        call = _trace_tool_call(exec_path, argv, kit_root, challenge_dir)
+        if call is None:
+            continue
+        name, tool_argv = call
+        normalized_argv = [_normalize_trace_arg(x, kit_root, challenge_dir) for x in tool_argv]
+        fingerprint = json.dumps([name, normalized_argv], sort_keys=False, separators=(",", ":"), ensure_ascii=False)
+        fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
+        name_counts[name] = name_counts.get(name, 0) + 1
+        calls.append((name, normalized_argv))
+        if name in _TRACE_SYMBOLIC_TOOLS and not (_TRACE_NON_MEASUREMENT_ARGS & set(tool_argv)):
+            symbolic_runs += 1
+    duplicate = sum(count - 1 for count in fingerprints.values() if count > 1)
+    return {
+        "tool_calls": len(calls),
+        "duplicate_tool_calls": duplicate,
+        "ghidra_runs": ghidra_runs,
+        "symbolic_runs": symbolic_runs,
+        "tool_name_counts": name_counts,
+    }
+
+
+def benchmark_envelope_observations(store_root):
+    """Observed, *envelope-scoped* Mode B cache/output counters.
+
+    The artifact store covers only CTF-Rat tools that emit tool-result envelopes;
+    standalone tool caches, native agent usage, and CLI output delivered to the
+    model are outside this scope. Never promote these counts to run-wide metrics.
+    A fresh Mode B workspace with no envelopes has unknown coverage, not zero.
+    """
+    docs = list(iter_tool_results(store_root))
+    if not docs:
+        return None
+    session = aggregate(docs)
+    grouped = {}
+    for doc in docs:
+        name = _tool_name(doc)
+        grouped.setdefault(name, []).append(doc)
+    by_tool = {}
+    for name in sorted(grouped):
+        observed = aggregate(grouped[name])
+        by_tool[name] = {
+            "envelope_count": len(grouped[name]),
+            "cache_requests": observed["cache_requests"],
+            "cache_hits": observed["cache_hits"],
+            "cache_unusable_hits": observed["cache_unusable_hits"],
+            "cache_hit_ratio": observed["cache_hit_ratio"],
+        }
+    captured_bytes = 0
+    for doc in docs:
+        summary = doc.get("summary")
+        if not isinstance(summary, dict):
+            captured_bytes = None
+            break
+        stdout_bytes, stderr_bytes = summary.get("stdout_bytes"), summary.get("stderr_bytes")
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 0
+               for n in (stdout_bytes, stderr_bytes)):
+            captured_bytes = None
+            break
+        captured_bytes += stdout_bytes + stderr_bytes
+    return {
+        "scope": "tool-result-envelopes-only",
+        "envelope_count": len(docs),
+        "by_tool": by_tool,
+        "cache_requests": session["cache_requests"],
+        "cache_hits": session["cache_hits"],
+        "cache_unusable_hits": session["cache_unusable_hits"],
+        "cache_hit_ratio": session["cache_hit_ratio"],
+        "captured_stdout_stderr_bytes": captured_bytes,
+    }
+
 def guard_started_at(ctf_home, chal=None):
     try:
         with open(os.path.join(ctf_home, "ACTIVE.json"), encoding="utf-8") as f:
@@ -59,22 +256,81 @@ def guard_started_at(ctf_home, chal=None):
         return None
     return obj.get("started_at")
 
-def _first_primitive_pass_ts_v2(state_dir):
-    best = None
+def route_assessment_metrics(state_dir):
+    """Summarize commitment-aware route assessments already recorded in STATE.
+
+    `rat route` and `rat brief` store these as ordinary ``note.recorded`` events
+    with ``kind=route-assessment``.  Reusing the existing stream keeps routing
+    telemetry observer-readable without adding a second database or a new STATE
+    event family. Repeating the same assessment increases assessment_count but
+    not revision_count; the latter counts adjacent fingerprint transitions.
+    """
     try:
         events = Stream(state_dir).read()
     except (OSError, ValueError):
+        return {
+            "first_dimensions": None, "first_action": None, "first_commitment": None,
+            "route_assessment_count": 0, "decision_revision_count": 0,
+            "first_skill": None,
+        }
+    rows = []
+    for event in events:
+        if event.get("type") != "note.recorded":
+            continue
+        payload = event.get("payload", {}) or {}
+        if payload.get("kind") != "route-assessment":
+            continue
+        rows.append(payload)
+    if not rows:
+        return {
+            "first_dimensions": None, "first_action": None, "first_commitment": None,
+            "route_assessment_count": 0, "decision_revision_count": 0,
+            "first_skill": None,
+        }
+    first = rows[0]
+    revisions = 0
+    previous_decision = first.get("decision")
+    for row in rows[1:]:
+        current_decision = row.get("decision")
+        if current_decision != previous_decision:
+            revisions += 1
+        previous_decision = current_decision
+    first_skill = next((row.get("skill") for row in rows if row.get("skill")), None)
+    return {
+        "first_dimensions": first.get("dimensions"),
+        "first_action": first.get("decision"),
+        "first_commitment": first.get("commitment"),
+        "route_assessment_count": len(rows),
+        "decision_revision_count": revisions,
+        "first_skill": first_skill,
+    }
+
+def _first_primitive_pass_ts_v2(state_dir):
+    """Timestamp of the earliest STILL-ACTIVE primitive PASS, never a stale one."""
+    try:
+        stream = Stream(state_dir)
+        events = stream.read()
+        view = stream._materialize(events)
+    except (OSError, ValueError):
         return None
+    active_ids = {pid for pid, p in view["primitives"].items() if p.get("status") in ("pass", "consumed")}
+    if not active_ids:
+        return None
+    latest_pass_ts = {}
     for e in events:
-        if e.get("type") != "primitive.revised" or e.get("payload", {}).get("status") != "pass":
+        if e.get("type") != "primitive.revised":
+            continue
+        p = e.get("payload", {})
+        pid = p.get("primitive_id")
+        if pid not in active_ids or p.get("status") != "pass":
             continue
         try:
             ts = int(datetime.fromisoformat(e["at"]).timestamp())
         except (KeyError, ValueError):
             continue
-        if best is None or ts < best:
-            best = ts
-    return best
+        if pid not in latest_pass_ts or ts > latest_pass_ts[pid]:
+            latest_pass_ts[pid] = ts
+    return min(latest_pass_ts.values()) if latest_pass_ts else None
 
 def _first_primitive_pass_ts_legacy(state_dir):
     path = os.path.join(state_dir, "STATE.jsonl")
@@ -98,51 +354,96 @@ def _first_primitive_pass_ts_legacy(state_dir):
     return best
 
 def first_primitive_pass_ts(state_dir):
-    """Typed STATE v2 is the authoritative PASS gate (>=3 active direct SELF
-    observations, enforced by ratlib.state_v2.revise_primitive) -- prefer it.
-    Legacy STATE.jsonl is only consulted for pre-v2 sessions that never wrote
-    a v2 stream; the legacy `state primitive ... pass` command is rejected.
-
-    Once a v2 stream exists it is authoritative: a session that wrote typed
-    events but has no typed PASS has NOT passed, so we must not silently fall
-    back to a legacy PASS (that would let a rejected legacy write leak into v2
-    time-to-flag telemetry). Legacy is consulted only when no v2 stream ever
-    existed."""
+    """Typed STATE v2 is authoritative once the v2 stream exists."""
     if os.path.exists(Stream(state_dir).path):
         return _first_primitive_pass_ts_v2(state_dir)
     return _first_primitive_pass_ts_legacy(state_dir)
 
-def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
+def first_verified_solve_ts(state_dir):
+    """Timestamp of the authenticated, currently-active verified solve."""
+    try:
+        events = Stream(state_dir).read()
+    except (OSError, ValueError):
+        return None
+    for event in events:
+        if event.get("type") != "verification.recorded":
+            continue
+        verification_id = event.get("payload", {}).get("verification_id")
+        if not verification_id:
+            continue
+        if completion_gate(state_dir, verification_id=verification_id).get("verified") is not True:
+            continue
+        try:
+            return int(datetime.fromisoformat(event["at"]).timestamp())
+        except (KeyError, ValueError):
+            return None
+    return None
+
+def index_backends(root):
+    """Distinct reusable cache artifacts per backend from the canonical index."""
+    try:
+        from .cache import Cache
+        return Cache(root).stats().get("by_backend", {})
+    except Exception:
+        return {}
+
+def _elapsed_seconds(started_at, finished_at):
+    if isinstance(started_at, int) and isinstance(finished_at, int) and finished_at >= started_at:
+        return finished_at - started_at
+    return None
+
+def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
+              verified_solve_at=None, verify_pass_at=None, index_backend_counts=None,
+              route_metrics=None):
+    """Aggregate telemetry without conflating primitive proof with solved state.
+
+    Route metrics are optional for backward-compatible programmatic callers. Live
+    ``rat-metrics`` supplies them from STATE; unavailable history remains explicit
+    ``None``/zero rather than being inferred from the current router.
+
+    ``cache_hit_ratio`` measures effective successful reuse. A cache lookup that
+    returns a non-OK result remains an effective miss and is separately exposed
+    through ``cache_unusable_hits``; it is not duplicate computation.
+    """
     docs = list(docs)
     seen_fingerprints = {}
     duplicate = 0
-    cache_hits = cache_misses = 0
+    cache_hits = cache_misses = cache_unusable_hits = 0
     tool_name_counts = {}
     duration_total = 0
     for doc in docs:
         status = doc.get("status")
         cache_state = doc.get("cache_state")
         if cache_state is None:
-            cache_state = "hit" if (doc.get("provenance", {}) or {}).get("cache", {}).get("hit") else "miss"
-        is_hit = cache_state == "hit" and status == "ok"
-        if is_hit:
-            cache_hits += 1
-        else:
+            cache = (doc.get("provenance", {}) or {}).get("cache", {}) or {}
+            cache_state = cache.get("state")
+            if cache_state is None and cache.get("hit") is True:
+                cache_state = "hit"
+        if cache_state == "hit":
+            if status == "ok":
+                cache_hits += 1
+            else:
+                # The cache lookup succeeded but did not yield reusable output.
+                # It remains an effective miss without implying recomputation.
+                cache_misses += 1
+                cache_unusable_hits += 1
+        elif cache_state == "miss":
             cache_misses += 1
             fp = operation_fingerprint(doc)
             if fp in seen_fingerprints:
                 duplicate += 1
             seen_fingerprints[fp] = seen_fingerprints.get(fp, 0) + 1
-        name = doc.get("tool_name") or (doc.get("tool", {}) or {}).get("name", "")
+        name = _tool_name(doc)
         tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
         duration_total += doc.get("duration_ms", 0) or 0
     cache_requests = cache_hits + cache_misses
-    time_to_flag_sec = None
-    if isinstance(guard_started_at, int) and isinstance(verify_pass_at, int) and verify_pass_at >= guard_started_at:
-        time_to_flag_sec = verify_pass_at - guard_started_at
-    ghidra_runs = sum(n for name, n in tool_name_counts.items() if "ghidra" in name.lower())
+    if primitive_pass_at is None and verify_pass_at is not None:
+        primitive_pass_at = verify_pass_at
+    time_to_first_valid_primitive_sec = _elapsed_seconds(guard_started_at, primitive_pass_at)
+    time_to_verified_solve_sec = _elapsed_seconds(guard_started_at, verified_solve_at)
     revq_runs = tool_name_counts.get("revq", 0)
-    functions_decompiled = tool_name_counts.get("decomp", 0)
+    decomp_invocations = tool_name_counts.get("decomp", 0)
+    route_metrics = route_metrics or {}
     return {
         "schema": "rat.session-metrics/v1",
         "tool_calls": len(docs),
@@ -150,18 +451,29 @@ def aggregate(docs, *, guard_started_at=None, verify_pass_at=None):
         "cache_requests": cache_requests,
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
+        "cache_unusable_hits": cache_unusable_hits,
         "cache_hit_ratio": (cache_hits / cache_requests) if cache_requests else None,
-        "time_to_flag_sec": time_to_flag_sec,
-        "functions_decompiled": functions_decompiled,
-        "ghidra_runs": ghidra_runs,
+        "time_to_first_valid_primitive_sec": time_to_first_valid_primitive_sec,
+        "time_to_verified_solve_sec": time_to_verified_solve_sec,
+        "time_to_flag_sec": time_to_first_valid_primitive_sec,
+        "functions_decompiled": None,
+        "ghidra_runs": None,
+        "decomp_invocations": decomp_invocations,
         "revq_runs": revq_runs,
         "duration_ms_total": duration_total,
+        "indexed_artifacts_by_backend": dict(index_backend_counts) if index_backend_counts else {},
+        "first_dimensions": route_metrics.get("first_dimensions"),
+        "first_action": route_metrics.get("first_action"),
+        "first_commitment": route_metrics.get("first_commitment"),
+        "route_assessment_count": route_metrics.get("route_assessment_count", 0),
+        "decision_revision_count": route_metrics.get("decision_revision_count", 0),
+        "first_skill": route_metrics.get("first_skill"),
     }
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="rat-metrics")
     ap.add_argument("--root", help=".rat artifact store root (default: ./.rat)")
-    ap.add_argument("--state-dir", help="directory containing STATE.jsonl (default: cwd)")
+    ap.add_argument("--state-dir", help="directory containing .rat/events/STATE.v2.jsonl (legacy STATE.jsonl fallback; default: cwd)")
     ap.add_argument("--ctf-home", help="repo root for ACTIVE.json lookup (default: $CTF_HOME)")
     ap.add_argument("--chal", help="expected active challenge name for guard-begin lookup")
     ns = ap.parse_args(argv)
@@ -172,7 +484,10 @@ def main(argv=None):
     metrics = aggregate(
         iter_tool_results(root),
         guard_started_at=guard_started_at(ctf_home, ns.chal),
-        verify_pass_at=first_primitive_pass_ts(state_dir),
+        primitive_pass_at=first_primitive_pass_ts(state_dir),
+        verified_solve_at=first_verified_solve_ts(state_dir),
+        index_backend_counts=index_backends(root),
+        route_metrics=route_assessment_metrics(state_dir),
     )
     print(json.dumps(metrics, sort_keys=True, ensure_ascii=False))
     return 0

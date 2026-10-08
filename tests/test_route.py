@@ -1,140 +1,82 @@
-import os, sys, unittest
+import copy, os, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.route import route
-from ratlib.schema import validate
+from ratlib.schema import ValidationError, validate
 
-def profile(imports=(), facts=()):
-    return {"imports": list(imports), "facts": [{"kind": k, "value": v} for k, v in facts]}
+def rev_checker():
+    return {"functions":[{"name":"check","calls":["memcmp@GLIBC_2.2.5"],"strings":["Correct","Wrong"]}]}
 
-def revq(imports=(), evasion=(), functions=(), strings=()):
-    return {"imports": list(imports), "evasion": list(evasion), "functions": list(functions),
-            "strings": [{"val": s} for s in strings]}
+class RouterV2(unittest.TestCase):
+    def test_contract_has_no_ranking_or_representative_fields(self):
+        doc=route(profile={"imports":["gets"],"facts":[{"kind":"elf.nx","value":True}]})
+        validate(doc,"rat.route-result/v2")
+        self.assertFalse({"track","subroute","confidence","alternatives","score_semantics","conflict"}&set(doc))
+        self.assertEqual(doc["commitment"],"provisional"); self.assertIsNone(doc["skill"])
 
-class RouteFixtures(unittest.TestCase):
-    def test_memcmp_checker_routes_rev_checker(self):
-        r = route(revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
-        self.assertEqual(r["subroute"], "rev-checker")
-        self.assertEqual(r["track"], "rev")
-        self.assertGreater(r["confidence"], 0.5)
+    def test_dimensions_coexist_without_erasing_evidence(self):
+        doc=route(profile={"imports":["malloc","free","printf","read","gets"]},
+                  revq=rev_checker(),interesting=[{"func":"check","score":9}])
+        self.assertEqual(set(doc["dimensions"]["vulnerability_surfaces"]),
+                         {"heap-lifetime-candidate","format-string-candidate","stack-overwrite-candidate"})
+        self.assertIn("checker",doc["dimensions"]["program_shapes"])
+        self.assertIsNone(doc["decision"])
+        self.assertEqual(doc["commitment"],"provisional")
+        self.assertEqual({item["query"] for item in doc["next"]},{"rat query func","rat query pwn"})
 
-    def test_gets_without_nx_routes_pwn_stack(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
-        self.assertEqual(r["subroute"], "pwn-stack")
+    def test_observation_order_does_not_change_meaning(self):
+        profile={"imports":["free","gets","malloc","printf","read"],"facts":[{"kind":"elf.nx","value":True}]}
+        a=route(profile=profile,revq=rev_checker(),interesting=[{"func":"check","score":1}])
+        profile["imports"].reverse(); b=route(profile=profile,revq=copy.deepcopy(rev_checker()),interesting=[{"func":"check","score":99}])
+        self.assertEqual(a,b)
 
-    def test_gets_with_nx_routes_pwn_rop(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", True)]))
-        self.assertEqual(r["subroute"], "pwn-rop")
+    def test_checker_fact_dominates_heuristic_overflow_probe(self):
+        doc=route(profile={"imports":["read"]},
+                  revq=rev_checker(),interesting=[{"func":"check","score":9}])
+        self.assertEqual(doc["decision"]["action"],"rat query func")
+        self.assertEqual(doc["decision"]["evidence_quality"],"fact")
+        self.assertEqual(doc["decision"]["specificity"],"concrete")
 
-    def test_heap_imports_route_pwn_heap(self):
-        r = route(profile=profile(imports=["malloc", "free"]))
-        self.assertEqual(r["subroute"], "pwn-heap")
+    def test_independent_fact_backed_leads_do_not_force_recommendation(self):
+        doc=route(profile={"imports":["malloc","free","printf","read"]})
+        self.assertIsNone(doc["decision"])
+        self.assertEqual(doc["commitment"],"provisional")
+        self.assertEqual({a["target"] for a in doc["next"] if a["query"]=="rat query pwn"},
+                         {"inspect-bounded-allocator-callsites-and-lifetimes",
+                          "inspect-bounded-format-callsites-before-runtime-probe",
+                          "inspect-bounded-input-callsite-then-measure-overwrite"})
+        for action in doc["next"]:
+            self.assertIn("resolves",action)
+            self.assertIn("expected_evidence",action)
+            self.assertIn("cost",action)
+            self.assertIn("evidence_quality",action)
 
-    def test_printf_plus_read_routes_pwn_format(self):
-        r = route(profile=profile(imports=["printf", "read"]))
-        self.assertEqual(r["subroute"], "pwn-format")
+    def test_imports_never_commit_or_lock_skill(self):
+        for imports in (["malloc","free"],["printf","read"],["gets"],["copy_from_user"]):
+            doc=route(profile={"imports":imports})
+            self.assertEqual(doc["commitment"],"provisional"); self.assertIsNone(doc["skill"])
 
-    def test_kernel_imports_route_pwn_kernel(self):
-        r = route(profile=profile(imports=["copy_from_user", "kmalloc"]))
-        self.assertEqual(r["subroute"], "pwn-kernel")
+    def test_no_evidence_is_unknown(self):
+        doc=route(); self.assertEqual(doc["commitment"],"unknown"); self.assertIsNone(doc["decision"])
 
-    def test_packed_evasion_routes_rev_packed(self):
-        r = route(revq=revq(evasion=["패커 섹션 UPX0"]))
-        self.assertEqual(r["subroute"], "rev-packed")
-        self.assertEqual(r["track"], "rev")
+    def test_old_fields_are_rejected_with_regeneration_command(self):
+        doc=route(); doc["confidence"]=.5
+        with self.assertRaisesRegex(ValidationError,"rat route <bin>"): validate(doc)
 
-    def test_vm_dispatch_hint_routes_rev_vm(self):
-        r = route(revq=revq(functions=[{"name": "vm_dispatch_loop"}]))
-        self.assertEqual(r["subroute"], "rev-vm")
+    def test_typed_packing_and_checker_both_survive(self):
+        rev=rev_checker(); rev.update({"evasion_signal_schema":"rat.evasion-signals/v1","evasion_signals":[{"kind":"packer-section","value":"UPX0","quality":"fact"}]})
+        doc=route(profile={"imports":["malloc"]},revq=rev,interesting=[{"func":"check"}])
+        self.assertIn("packing",doc["dimensions"]["obstacles"]); self.assertIn("checker",doc["dimensions"]["program_shapes"])
 
-    def test_no_signal_routes_unknown(self):
-        r = route(profile=profile(), revq=revq())
-        self.assertEqual(r["subroute"], "unknown")
-        self.assertEqual(r["confidence"], 0.0)
-        self.assertIsNone(r["skill"])
+    def test_pe_preserves_independent_vulnerability_evidence_but_limits_actions(self):
+        imports=["malloc","free","printf","read","gets"]
+        elf=route(profile={"imports":imports},revq={"platform":"elf"})
+        pe=route(profile={"imports":imports},revq={"platform":"pe"})
+        expected={"heap-lifetime-candidate","format-string-candidate","stack-overwrite-candidate"}
+        self.assertEqual(set(elf["dimensions"]["vulnerability_surfaces"]),expected)
+        self.assertEqual(set(pe["dimensions"]["vulnerability_surfaces"]),expected)
+        for kind in ("heap-imports","format-input-imports","overflow-imports"):
+            self.assertTrue(any(signal["kind"] == kind for signal in pe["signals"]))
+        self.assertFalse(any(action["query"] == "rat query pwn" for action in pe["next"]))
+        self.assertTrue(any(action["query"].endswith("qiling_trace.py") for action in pe["next"]))
 
-class RouteMixedSignal(unittest.TestCase):
-    def test_heap_plus_generic_interesting_routes_pwn_heap_not_rev(self):
-        r = route(profile=profile(imports=["malloc", "free"]),
-                  revq=revq(imports=["malloc", "free", "memcmp"]),
-                  interesting=[{"func": "wrong", "score": 3, "why": ["문자열 상수 비교 대상"]}])
-        self.assertEqual(r["subroute"], "pwn-heap")
-        self.assertTrue(r["conflict"])
-        self.assertEqual(r["alternatives"][0]["subroute"], "rev-symbolic")
-
-    def test_gets_plus_generic_interesting_routes_pwn_stack_not_rev(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]),
-                  revq=revq(imports=["gets", "memcmp"]),
-                  interesting=[{"func": "success", "score": 2, "why": ["문자열 상수 비교 대상"]}])
-        self.assertEqual(r["subroute"], "pwn-stack")
-        self.assertTrue(r["conflict"])
-
-    def test_printf_read_plus_explicit_compare_call_still_routes_rev_checker(self):
-        r = route(profile=profile(imports=["printf", "read"]),
-                  revq=revq(imports=["printf", "read", "memcmp"]),
-                  interesting=[{"func": "check_flag", "score": 8, "why": ["비교함수 호출: memcmp"]}])
-        self.assertEqual(r["subroute"], "rev-checker")
-        self.assertTrue(r["conflict"])
-        self.assertEqual(r["alternatives"][0]["subroute"], "pwn-format")
-
-class RouteDeterminism(unittest.TestCase):
-    def test_identical_inputs_produce_identical_route(self):
-        p, rv, inter = profile(imports=["gets"], facts=[("elf.nx", True)]), None, None
-        self.assertEqual(route(profile=p, revq=rv, interesting=inter),
-                          route(profile=p, revq=rv, interesting=inter))
-
-class RouteDegradation(unittest.TestCase):
-    def test_missing_revq_still_routes_from_profile_alone(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]), revq=None)
-        self.assertEqual(r["capabilities"], {"profile": True, "revq": False})
-        self.assertEqual(r["subroute"], "pwn-stack")
-
-    def test_missing_profile_still_routes_from_revq_alone(self):
-        r = route(profile=None, revq=revq(imports=["memcmp"]),
-                  interesting=[{"func": "check", "score": 5, "why": ["비교함수 호출: memcmp"]}])
-        self.assertEqual(r["capabilities"], {"profile": False, "revq": True})
-        self.assertEqual(r["subroute"], "rev-checker")
-
-    def test_no_artifacts_at_all_degrades_to_unknown_without_crashing(self):
-        r = route()
-        self.assertEqual(r["subroute"], "unknown")
-        self.assertEqual(r["capabilities"], {"profile": False, "revq": False})
-
-class RouteResultShape(unittest.TestCase):
-    """signals/next must be structured, not plain strings."""
-    def test_signals_are_structured_kind_value_quality(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
-        self.assertTrue(r["signals"])
-        for s in r["signals"]:
-            self.assertEqual(set(s), {"kind", "value", "quality"})
-            self.assertIn(s["quality"], {"fact", "heuristic"})
-
-    def test_next_is_a_list_of_query_target_pairs(self):
-        r = route(profile=profile(imports=["gets"], facts=[("elf.nx", False)]))
-        self.assertIsInstance(r["next"], list)
-        for n in r["next"]:
-            self.assertEqual(set(n), {"query", "target"})
-
-    def test_revq_interesting_signal_carries_func_and_score_as_heuristic(self):
-        r = route(revq=revq(imports=["memcmp"]),
-                   interesting=[{"func": "check", "score": 8, "why": ["비교함수 호출: memcmp"]}])
-        interesting_signals = [s for s in r["signals"] if s["kind"] == "revq-interesting"]
-        self.assertEqual(len(interesting_signals), 1)
-        self.assertEqual(interesting_signals[0]["quality"], "heuristic")
-        self.assertEqual(interesting_signals[0]["value"]["func"], "check")
-        self.assertEqual(r["next"][0]["target"], "check")
-
-    def test_import_based_signals_are_facts(self):
-        r = route(profile=profile(imports=["malloc", "free"]))
-        self.assertTrue(all(s["quality"] == "fact" for s in r["signals"]))
-
-    def test_route_result_validates_against_schema(self):
-        for r in (
-            route(profile=profile(imports=["gets"], facts=[("elf.nx", True)])),
-            route(revq=revq(evasion=["패커 섹션 UPX0"])),
-            route(),
-        ):
-            validate(r, "rat.route-result/v1")
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == "__main__": unittest.main()

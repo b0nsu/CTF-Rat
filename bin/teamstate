@@ -1,39 +1,277 @@
 #!/usr/bin/env python3
-import sys, os, json, glob
-from ratlib.runner import run
-REPO=os.environ.get("CTF_TEAM", os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "team"))
-def main():
-    if len(sys.argv)<2: print("usage: teamstate <name>"); return
-    n=sys.argv[1]
-    try: run(["git","-C",REPO,"pull","-q","--rebase"], timeout_seconds=30,
-             tool_version="git")
-    except: pass
-    d=os.path.join(REPO,"chals",n)
-    files=sorted(glob.glob(os.path.join(d,"*.jsonl")))
-    if not files: print("팀 STATE 없음: %s (등록/동기화 됐나?)"%d); return
-    print("== TEAM STATE: %s (작성자 %d명) =="%(n,len(files)))
-    all_off={}; all_no=[]; per={}
-    for f in files:
-        a=os.path.basename(f)[:-6]; per[a]={"offset":[],"ok":[],"no":[],"alert":[],"next":[]}
-        for ln in open(f):
-            ln=ln.strip()
-            if not ln: continue
-            try: e=json.loads(ln)
-            except: continue
-            t=e.get("t")
-            if t=="offset": per[a]["offset"].append((e["k"],e.get("v"))); all_off[e["k"]]=e.get("v")
-            elif t in("ok","alert","next"): per[a][t].append(e.get("text",""))
-            elif t=="no": per[a]["no"].append(e["text"]); all_no.append(e["text"])
-    if all_off:
-        print("\n[통합 검증 오프셋 — 재측정 불필요]")
-        for k,v in all_off.items(): print("  %s = %s"%(k,v))
-    if all_no:
-        print("\n[통합 배제 — 재시도 금지]")
-        for x in dict.fromkeys(all_no): print("  X %s"%x[:90])
-    for a,dd in per.items():
-        if not any(dd[k] for k in ("alert","ok","next")): continue
-        print("\n[%s]"%a)
-        for x in dd["alert"]: print("  ! %s"%x[:90])
-        for x in dd["ok"]:    print("  + %s"%x[:90])
-        for x in dd["next"]:  print("  > %s"%x[:90])
-main()
+"""Materialize trusted per-author STATE v2 team snapshots."""
+import glob
+import json
+import os
+import re
+import sys
+
+from ratlib.state_v2 import project_trusted_offsets, validate_history
+from ratlib import team_state_store as store
+
+CTF_HOME = os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REPO = os.environ.get("CTF_TEAM") or os.path.join(CTF_HOME, "team")
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def safe_slug(value):
+    return bool(SLUG_RE.fullmatch(value or "") and value not in {".", ".."})
+
+
+def require_plain_under(root, path, label):
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except ValueError as exc:
+        raise ValueError("%s escapes root: %s" % (label, path)) from exc
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        raise ValueError("%s escapes root: %s" % (label, path))
+    cur = root_abs
+    for part in [] if rel == "." else rel.split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.lexists(cur) and os.path.islink(cur):
+            raise ValueError("%s must not be a symlink: %s" % (label, cur))
+    real_root = os.path.realpath(root_abs)
+    real_path = os.path.realpath(path_abs)
+    if os.path.commonpath((real_root, real_path)) != real_root:
+        raise ValueError("%s escapes root: %s" % (label, path))
+
+
+def require_plain_dir_under(root, path, label):
+    require_plain_under(root, path, label)
+    if not os.path.isdir(path):
+        raise ValueError("%s is not a directory: %s" % (label, path))
+
+
+def read_bytes_under(root, path, label):
+    require_plain_under(root, path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("%s cannot be safely read: %s" % (label, exc)) from exc
+    with os.fdopen(fd, "rb") as source:
+        return source.read()
+
+
+def read_snapshot_events(snap):
+    require_plain_dir_under(REPO, os.path.join(snap, ".rat"), ".rat")
+    require_plain_dir_under(REPO, os.path.join(snap, ".rat", "events"), "events")
+    data = read_bytes_under(REPO, os.path.join(snap, ".rat", "events", "STATE.v2.jsonl"), "STATE v2 stream")
+    return store.parse_state_events(data, allow_partial_tail=False)
+
+
+def valid_snapshot(author_dir, state_root, challenge):
+    require_plain_under(REPO, state_root, "state-v2")
+    require_plain_under(REPO, author_dir, "author path")
+    if not os.path.isdir(author_dir):
+        raise ValueError("author path is not a directory: %s" % author_dir)
+    current = os.path.join(author_dir, "CURRENT")
+    require_plain_under(REPO, current, "CURRENT")
+    author = os.path.basename(author_dir)
+    if not safe_slug(author):
+        raise ValueError("unsafe author slug: %r" % author)
+    name = read_bytes_under(REPO, current, "CURRENT").decode("utf-8").strip()
+    if not safe_slug(name) or "-" not in name:
+        raise ValueError("invalid CURRENT for %s" % author)
+    snapshots = os.path.join(author_dir, "snapshots")
+    require_plain_under(REPO, snapshots, "snapshots")
+    if not os.path.isdir(snapshots):
+        raise ValueError("missing snapshots directory for %s" % author)
+    snap = os.path.join(author_dir, "snapshots", name)
+    require_plain_under(REPO, snap, "snapshot")
+    if not os.path.isdir(snap):
+        raise ValueError("invalid snapshot path for %s" % author)
+    events = read_snapshot_events(snap)
+    if not events:
+        raise ValueError("empty snapshot for %s" % author)
+    expected = "%s-%d" % (events[-1]["stream_id"], events[-1]["seq"])
+    if expected != name:
+        raise ValueError("CURRENT cursor mismatch for %s" % author)
+    return author, snap, events, current
+
+
+def _valid_publication_cursor(value):
+    if not isinstance(value, dict) or set(value) != {"stream_id", "seq", "snapshot"}:
+        return False
+    if not isinstance(value["stream_id"], str) or not value["stream_id"]:
+        return False
+    if not isinstance(value["seq"], int) or value["seq"] < 1:
+        return False
+    return value["snapshot"] == "%s-%d" % (value["stream_id"], value["seq"])
+
+
+def verify_publication(author, challenge, snap, events, digests, snapshots_dir, current_path):
+    path = store.publication_manifest_state(REPO, snap)
+    if not path:
+        return "compatibility"
+    try:
+        doc = json.loads(read_bytes_under(REPO, path, "PUBLICATION").decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid PUBLICATION.json for %s" % author) from exc
+    if not isinstance(doc, dict):
+        raise ValueError("invalid PUBLICATION.json for %s" % author)
+    last = events[-1]
+    expected = {
+        "schema": "rat.team-publication/v1",
+        "author": author,
+        "challenge": challenge,
+        "stream_id": last["stream_id"],
+        "seq": last["seq"],
+        "snapshot": "%s-%d" % (last["stream_id"], last["seq"]),
+        "frozen_stream_digest": "sha256:" + store._sha(read_bytes_under(REPO, os.path.join(snap, ".rat", "events", "STATE.v2.jsonl"), "STATE v2 stream")),
+        "referenced_artifacts": sorted(digests),
+    }
+    for key, value in expected.items():
+        if doc.get(key) != value:
+            raise ValueError("PUBLICATION.json %s mismatch for %s" % (key, author))
+    reason = doc.get("replacement_reason")
+    supersedes = doc.get("supersedes")
+    try:
+        store.validate_publication_lineage(
+            supersedes, reason, stream_id=last["stream_id"], seq=last["seq"])
+    except ValueError as exc:
+        raise ValueError("%s for %s" % (exc, author)) from exc
+    if supersedes is not None:
+        store.verify_publication_predecessor(REPO, snapshots_dir, supersedes)
+    try:
+        parent_name = store.selection_parent_current(REPO, current_path, expected["snapshot"])
+    except ValueError as exc:
+        raise ValueError("%s for %s" % (exc, author)) from exc
+    if parent_name is None:
+        expected_supersedes = None
+        expected_reason = None
+    else:
+        parent_stream, parent_seq = parent_name.rsplit("-", 1)
+        expected_supersedes = {"stream_id": parent_stream, "seq": int(parent_seq), "snapshot": parent_name}
+        expected_reason = "explicit replace-lineage" if parent_stream != last["stream_id"] else None
+    if supersedes != expected_supersedes or reason != expected_reason:
+        raise ValueError("PUBLICATION.json does not match committed predecessor for %s" % author)
+    return "manifest"
+
+
+def verify_snapshot_closure(events, root):
+    digests = store.collect_event_digests(events)
+    closure = store.verify_artifact_closure(os.path.join(root, ".rat"), digests, containment_root=REPO, label="snapshot", exact=True)
+    # closure's keys are the recursively-expanded artifact set (event-cited digests
+    # PLUS nested artifacts those envelopes cite) -- teamsync writes PUBLICATION.json
+    # and the git-tracked path list against that same full set, so this must return
+    # it too, not the flat event-cited `digests`, or every publication looks tampered.
+    return sorted(closure)
+
+
+def direct_active(view, oid):
+    obs = view["observations"].get(oid, {})
+    return obs.get("quality", {}).get("level") == "direct" and obs.get("validity", {}).get("state") == "active"
+
+
+def legacy_files(chal_dir):
+    return sorted(path for path in glob.glob(os.path.join(chal_dir, "*.jsonl")) if os.path.isfile(path))
+
+
+def main(argv=None):
+    argv = argv or sys.argv[1:]
+    # remote_trust() defaults to refresh=True (git pull --rebase) to preserve the
+    # existing default behavior/tests. --no-refresh opts into a genuinely
+    # read-only view (compares against whatever the last fetch/pull left the
+    # remote-tracking ref at) for a caller that just wants to look, not mutate.
+    refresh = "--no-refresh" not in argv
+    argv = [a for a in argv if a != "--no-refresh"]
+    if len(argv) != 1 or not safe_slug(argv[0]):
+        print("usage: teamstate [--no-refresh] <name>", file=sys.stderr)
+        print("  (default runs `git pull --rebase` first; --no-refresh is read-only)", file=sys.stderr)
+        return 2
+    name = argv[0]
+    chal_dir = os.path.join(REPO, "chals", name)
+    state_root = os.path.join(chal_dir, "state-v2")
+    try:
+        require_plain_under(REPO, state_root, "state-v2")
+    except Exception as exc:
+        print("[invalid snapshots]", file=sys.stderr)
+        print("  state-v2: %s" % exc, file=sys.stderr)
+        return 2
+    with store.repo_lock(REPO):
+        try:
+            trust = store.remote_trust(REPO, [chal_dir], refresh=refresh)
+        except Exception as exc:
+            trust = store.GitOutcome("local-stale", "refresh", 1, str(exc))
+        stale = trust.state in {"local-only", "local-stale", "conflict"}
+        author_dirs = sorted(glob.glob(os.path.join(state_root, "*")))
+        legacy = legacy_files(chal_dir)
+        if not author_dirs and not legacy:
+            print("팀 STATE 없음: %s (등록/동기화 됐나?)" % chal_dir)
+            return 1
+
+        print("== TEAM STATE v2: %s [%s] ==" % (name, trust.state))
+        failures = []
+        aggregate = {}
+        conflict = False
+        for author_dir in author_dirs:
+            try:
+                author, snap, events, current_path = valid_snapshot(author_dir, state_root, name)
+                view = validate_history(events, snap)
+                digests = verify_snapshot_closure(events, snap)
+                publication_kind = verify_publication(
+                    author, name, snap, events, digests, os.path.join(author_dir, "snapshots"), current_path)
+                paths = store.publication_paths(
+                    REPO,
+                    snap,
+                    current_path,
+                    digests,
+                    require_manifest=(publication_kind != "compatibility"),
+                )
+                store.verify_git_tree_matches(REPO, paths, treeish="HEAD")
+                offsets = project_trusted_offsets(view, os.path.join(snap, ".rat"))
+            except Exception as exc:
+                failures.append("%s: %s" % (os.path.basename(author_dir), exc))
+                continue
+            publication_label = "compatibility snapshot" if publication_kind == "compatibility" else publication_kind
+            print("\n[%s] typed/direct cursor=%s:%d publication=%s" % (
+                author, events[-1]["stream_id"], events[-1]["seq"], publication_label))
+            if offsets:
+                for key, value in sorted(offsets.items()):
+                    print("  offset %s = %#x" % (key, value))
+                    if key in aggregate and aggregate[key] != value:
+                        conflict = True
+                        print("  CONFLICT %s: aggregate=%#x author=%#x" % (key, aggregate[key], value))
+                    else:
+                        aggregate[key] = value
+            for finding in sorted(view["findings"].values(), key=lambda x: x.get("finding_id", "")):
+                if finding.get("state") in {"confirmed", "verified"}:
+                    if all(direct_active(view, oid) for oid in finding.get("evidence_observation_ids", [])):
+                        print("  finding[%s] %s" % (finding["state"], finding.get("text", finding["finding_id"])))
+            for primitive in sorted(view["primitives"].values(), key=lambda x: x.get("primitive_id", "")):
+                if primitive.get("status") in {"pass", "consumed"}:
+                    self_evidence = primitive.get("self_evidence", [])
+                    if len(set(self_evidence)) >= 3 and all(direct_active(view, oid) for oid in self_evidence):
+                        print("  primitive[%s] %s" % (primitive["status"], primitive["primitive_id"]))
+            for route in view["ruled_out"].values():
+                print("  ruled-out(author-local) %s" % route.get("text", route.get("fingerprint")))
+            for probe in view["next_probes"]:
+                print("  next(author-local) %s" % probe.get("text", probe.get("probe", probe.get("probe_id"))))
+            for alert in view["alerts"]:
+                print("  alert(advisory) %s" % alert.get("text", alert.get("alert_id")))
+
+        if stale:
+            detail = "git %s failed" % trust.step if trust.state == "local-stale" and trust.step else "trusted aggregate suppressed"
+            if trust.stderr.strip():
+                detail = "%s: %s" % (detail, trust.stderr.strip())
+            print("\n[%s] %s; trusted aggregate suppressed" % (trust.state, detail), file=sys.stderr)
+        if aggregate and not conflict and not stale:
+            print("\n[aggregate typed/direct offsets]")
+            for key, value in sorted(aggregate.items()):
+                print("  %s = %#x" % (key, value))
+        if legacy:
+            print("\n[legacy/unverified]")
+            for path in legacy:
+                print("  %s (historical context only)" % os.path.basename(path))
+        if failures:
+            print("\n[invalid snapshots]", file=sys.stderr)
+            for item in failures:
+                print("  %s" % item, file=sys.stderr)
+        return 2 if failures or conflict or stale else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

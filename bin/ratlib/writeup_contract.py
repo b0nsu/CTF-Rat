@@ -33,6 +33,10 @@ def is_digest(value):
 
 
 def validate_attestation(document, available_evidence):
+    """Check an attestation's shape and evidence references, not its author.
+
+    This plain STATE document has no signature or out-of-band operator identity.
+    """
     required = {"schema", "operator", "confirmed_at", "result", "evidence"}
     if not isinstance(document, dict) or set(document) != required:
         raise ValueError("attestation must contain exactly: %s" % ", ".join(sorted(required)))
@@ -50,6 +54,8 @@ def validate_attestation(document, available_evidence):
     evidence = document["evidence"]
     if not isinstance(evidence, list) or not evidence or not all(is_digest(item) for item in evidence):
         raise ValueError("attestation evidence must contain SHA-256 digests")
+    if len(evidence) != len(set(evidence)):
+        raise ValueError("attestation evidence must not contain duplicates")
     missing = sorted(set(evidence) - set(available_evidence))
     if missing:
         raise ValueError("attestation references unavailable evidence: %s" % ", ".join(missing))

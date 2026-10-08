@@ -2,7 +2,10 @@ import json, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 from ratlib.schema import validate, ValidationError
 from ratlib.contracts import execute
-from ratlib.metrics import aggregate, operation_fingerprint, first_primitive_pass_ts
+from ratlib.metrics import (aggregate, operation_fingerprint, first_primitive_pass_ts,
+                            process_trace_metrics, route_assessment_metrics,
+                            benchmark_envelope_observations)
+from ratlib.artifact import put_bytes
 from ratlib.state_v2 import Stream
 
 D = "sha256:" + "a" * 64
@@ -36,7 +39,7 @@ class ToolResultSchema(unittest.TestCase):
 class BenchmarkResultV2Schema(unittest.TestCase):
     def _valid(self):
         return {
-            "schema": "rat.benchmark-result/v2", "benchmark_run_id": "r1", "ablation_id": "A0",
+            "schema": "rat.benchmark-result/v3", "benchmark_run_id": "r1", "ablation_id": "A0",
             "challenge_id": "c1", "attempt": 1, "status": "completed", "eligible": True, "outcome": "verified",
             "started_at": "2026-08-23T00:00:00Z", "finished_at": "2026-08-23T00:01:00Z", "oracle": {}, "ground_truth": {},
             "metrics": {
@@ -50,8 +53,35 @@ class BenchmarkResultV2Schema(unittest.TestCase):
             },
         }
 
-    def test_valid_document_passes(self):
+    def _provenance(self):
+        return {
+            "suite_digest": D,
+            "corpora": ["private"],
+            "agent": {"executable": "codex", "command_digest": D,
+                      "model_id": "gpt-test", "reasoning_effort": "high"},
+            "execution": {"timeout_seconds": 600, "observer_execve_trace": True},
+            "environment": {"os": "linux", "arch": "x86_64", "runtime": "python-3.12"},
+            "toolchain": {"ctf_rat_revision": "a" * 40, "schema_bundle": "v1"},
+        }
+
+    def test_valid_document_passes_without_provenance_for_backward_compatibility(self):
         validate(self._valid())
+
+    def test_v2_schema_alias_remains_accepted(self):
+        doc = self._valid(); doc["schema"] = "rat.benchmark-result/v2"
+        validate(doc)
+
+    def test_valid_optional_provenance_passes(self):
+        doc = self._valid(); doc["provenance"] = self._provenance()
+        validate(doc)
+
+    def test_bad_provenance_digest_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["suite_digest"] = "sha256:bad"
+        with self.assertRaises(ValidationError): validate(doc)
+
+    def test_bad_provenance_timeout_rejected(self):
+        doc = self._valid(); doc["provenance"] = self._provenance(); doc["provenance"]["execution"]["timeout_seconds"] = 0
+        with self.assertRaises(ValidationError): validate(doc)
 
     def test_missing_metric_group_rejected(self):
         doc = self._valid(); del doc["metrics"]["cache"]
@@ -72,7 +102,152 @@ class OperationFingerprint(unittest.TestCase):
     def test_different_parameters_change_fingerprint(self):
         self.assertNotEqual(operation_fingerprint(envelope(parameters={"a": 1})), operation_fingerprint(envelope(parameters={"a": 2})))
 
+class ProcessTraceMetrics(unittest.TestCase):
+    def test_counts_process_tools_duplicates_and_heavy_analyzers(self):
+        with tempfile.TemporaryDirectory() as d:
+            kit = os.path.join(d, "kit")
+            chal = os.path.join(kit, "solve", "fixture")
+            trace = os.path.join(d, "execve.log")
+            lines = [
+                f'100 execve("{kit}/bin/rat", ["rat", "route", "{chal}/chall"], 0x0) = 0',
+                f'101 execve("{kit}/bin/rat-profile", ["rat-profile", "{chal}/chall", "--format", "json"], 0x0) = 0',
+                f'102 execve("{kit}/bin/rat", ["rat", "route", "{chal}/chall"], 0x0) = 0',
+                '103 execve("/opt/ghidra/support/analyzeHeadless", ["analyzeHeadless", "/tmp/proj", "p"], 0x0) = 0',
+                f'104 execve("/usr/bin/python3", ["python3", "{kit}/solve/_template/rev/symsolve.py", "{chal}/chall", "--find", "0x401000"], 0x0) = 0',
+                f'105 execve("{kit}/bin/revq", ["revq", "{chal}/chall"], 0x0) = -1 ENOENT (No such file or directory)',
+            ]
+            with open(trace, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            metrics = process_trace_metrics(trace, kit, chal)
+            self.assertEqual(metrics["tool_calls"], 4)
+            self.assertEqual(metrics["duplicate_tool_calls"], 1)
+            self.assertEqual(metrics["ghidra_runs"], 1)
+            self.assertEqual(metrics["symbolic_runs"], 1)
+            self.assertEqual(metrics["tool_name_counts"].get("rat"), 2)
+            self.assertEqual(metrics["tool_name_counts"].get("rat-profile"), 1)
+            self.assertEqual(metrics["tool_name_counts"].get("symsolve.py"), 1)
+
+    def test_missing_trace_is_unknown_not_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(process_trace_metrics(os.path.join(d, "missing.log"), os.path.join(d, "kit")))
+
+class BenchmarkEnvelopeObservations(unittest.TestCase):
+    def _store(self, root, doc):
+        put_bytes(json.dumps(doc, sort_keys=True).encode(), kind="tool-result",
+                  media_type="application/json", logical_name="result.json", root=root)
+
+    def test_scoped_cache_and_capture_measurements_use_immutable_envelopes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self.assertIsNone(benchmark_envelope_observations(root))
+            self._store(root, envelope(invocation_id="one", cache_state="miss",
+                                       summary={"stdout_bytes": 7, "stderr_bytes": 2}))
+            self._store(root, envelope(invocation_id="two", cache_state="hit",
+                                       summary={"stdout_bytes": 7, "stderr_bytes": 2}))
+            self._store(root, envelope(invocation_id="three", cache_state="bypass",
+                                       summary={"stdout_bytes": 3, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["scope"], "tool-result-envelopes-only")
+            self.assertEqual(observed["envelope_count"], 3)
+            self.assertEqual(observed["cache_requests"], 2)
+            self.assertEqual(observed["cache_hits"], 1)
+            self.assertEqual(observed["cache_unusable_hits"], 0)
+            self.assertEqual(observed["cache_hit_ratio"], 0.5)
+            self.assertEqual(observed["captured_stdout_stderr_bytes"], 21)
+            self.assertEqual(observed["by_tool"]["x"], {
+                "envelope_count": 3, "cache_requests": 2, "cache_hits": 1,
+                "cache_unusable_hits": 0, "cache_hit_ratio": 0.5,
+            })
+
+    def test_by_tool_coverage_distinguishes_producers_and_bypassed_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            for name, invocation_id, state, status in (
+                ("revq", "revq-miss", "miss", "ok"),
+                ("revq", "revq-hit", "hit", "ok"),
+                ("decomp", "decomp-hit-partial", "hit", "partial"),
+                ("decomp", "decomp-bypass", "bypass", "partial"),
+            ):
+                self._store(root, envelope(
+                    tool={"name": name}, tool_name=name, invocation_id=invocation_id,
+                    cache_state=state, status=status,
+                    summary={"stdout_bytes": 0, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["envelope_count"], 4)
+            self.assertEqual(observed["cache_requests"], 3)
+            self.assertEqual(observed["cache_hits"], 1)
+            self.assertEqual(observed["cache_unusable_hits"], 1)
+            self.assertAlmostEqual(observed["cache_hit_ratio"], 1 / 3)
+            self.assertEqual(observed["by_tool"], {
+                "decomp": {"envelope_count": 2, "cache_requests": 1,
+                           "cache_hits": 0, "cache_unusable_hits": 1,
+                           "cache_hit_ratio": 0.0},
+                "revq": {"envelope_count": 2, "cache_requests": 2,
+                         "cache_hits": 1, "cache_unusable_hits": 0,
+                         "cache_hit_ratio": 0.5},
+            })
+
+    def test_missing_capture_size_remains_unknown_without_dropping_cache_facts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self._store(root, envelope(invocation_id="no-bytes", cache_state="miss",
+                                       summary={"stdout_bytes": 5}))
+            observed = benchmark_envelope_observations(root)
+            self.assertIsNone(observed["captured_stdout_stderr_bytes"])
+            self.assertEqual(observed["cache_requests"], 1)
+            self.assertEqual(observed["cache_hits"], 0)
+            self.assertEqual(observed["cache_hit_ratio"], 0.0)
+
+    def test_no_cache_lookup_is_not_a_zero_hit_ratio(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            self._store(root, envelope(invocation_id="bypass", cache_state="bypass",
+                                       summary={"stdout_bytes": 0, "stderr_bytes": 0}))
+            observed = benchmark_envelope_observations(root)
+            self.assertEqual(observed["cache_requests"], 0)
+            self.assertIsNone(observed["cache_hit_ratio"])
+
+
 class Aggregate(unittest.TestCase):
+    def test_bypass_and_unknown_states_are_not_cache_requests(self):
+        bypass = envelope(cache_state="bypass")
+        unknown = envelope()
+        del unknown["cache_state"]
+        unknown["provenance"]["cache"] = {"key": None, "hit": False,
+                                            "source_invocation": None}
+        metrics = aggregate([bypass, unknown])
+        self.assertEqual(metrics["tool_calls"], 2)
+        self.assertEqual(metrics["cache_requests"], 0)
+        self.assertEqual(metrics["cache_hits"], 0)
+        self.assertEqual(metrics["cache_misses"], 0)
+        self.assertIsNone(metrics["cache_hit_ratio"])
+
+    def test_direct_subjects_use_distinct_cache_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            tool = os.path.join(d, "measure")
+            for path, data in ((tool, b"#!/bin/sh\nprintf measured\n"),
+                               (os.path.join(d, "a"), b"a"),
+                               (os.path.join(d, "b"), b"b")):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            os.chmod(tool, 0o755)
+            a, b = os.path.join(d, "a"), os.path.join(d, "b")
+            first = execute([tool], root=os.path.join(d, ".rat"), input_paths=[a, b], direct_subject=a)
+            second = execute([tool], root=os.path.join(d, ".rat"), input_paths=[a, b], direct_subject=b)
+            self.assertEqual(first["cache_state"], "miss")
+            self.assertEqual(second["cache_state"], "miss")
+
+    def test_command_arguments_use_distinct_cache_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            tool = os.path.join(d, "measure")
+            with open(tool, "wb") as fh:
+                fh.write(b"#!/bin/sh\nprintf '%s' \"$1\"\n")
+            os.chmod(tool, 0o755)
+            first = execute([tool, "first"], root=os.path.join(d, ".rat"))
+            second = execute([tool, "second"], root=os.path.join(d, ".rat"))
+            self.assertEqual(first["cache_state"], "miss")
+            self.assertEqual(second["cache_state"], "miss")
+
     def test_duplicate_tool_calls_counts_repeated_fingerprint_misses(self):
         docs = [envelope(cache_state="miss"), envelope(cache_state="miss")]
         m = aggregate(docs)
@@ -115,6 +290,80 @@ class Aggregate(unittest.TestCase):
     def test_time_to_flag_sec_is_elapsed_seconds_between_guard_begin_and_verify_pass(self):
         m = aggregate([envelope()], guard_started_at=1000, verify_pass_at=1090)
         self.assertEqual(m["time_to_flag_sec"], 90)
+
+    def test_indexed_artifacts_backend_counts_default_empty(self):
+        self.assertEqual(aggregate([envelope()])["indexed_artifacts_by_backend"], {})
+
+    def test_indexed_artifacts_surface_tools_that_bypass_the_tool_result_store(self):
+        from ratlib.cache import Cache, canonical_key
+        from ratlib.metrics import index_backends
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, ".rat")
+            c = Cache(root)
+            c.put_entry(canonical_key(binary_sha256="sha256:" + "a" * 64, tool_name="revq",
+                        tool_version="2", params={}, dep_versions={}), backend="revq_json", path="/tmp/x.revq.json")
+            c.put_entry(canonical_key(binary_sha256="sha256:" + "a" * 64, tool_name="pwngadget",
+                        tool_version="1", params={"q": "ret"}, dep_versions={}), backend="pwngadget", path="/tmp/g.json")
+            m = aggregate([], index_backend_counts=index_backends(root))
+            self.assertEqual(m["tool_calls"], 0)
+            self.assertEqual(m["indexed_artifacts_by_backend"].get("revq_json"), 1)
+            self.assertEqual(m["indexed_artifacts_by_backend"].get("pwngadget"), 1)
+
+    def test_route_metrics_surface_without_changing_existing_callers(self):
+        m = aggregate([], route_metrics={"first_dimensions": {"vulnerability_surfaces":["format-string-candidate"]},
+                                         "first_action": {"action":"decomp"},
+                                         "first_commitment": "provisional",
+                                         "route_assessment_count": 3,
+                                         "decision_revision_count": 1,
+                                         "first_skill": "rev-checker"})
+        self.assertEqual(m["first_action"]["action"], "decomp")
+        self.assertEqual(m["first_commitment"], "provisional")
+        self.assertEqual(m["decision_revision_count"], 1)
+        self.assertEqual(m["first_skill"], "rev-checker")
+
+class RouteAssessmentMetrics(unittest.TestCase):
+    def _append(self, stream, fingerprint, action, commitment, *, skill=None, source="route"):
+        stream.append("note.recorded", {
+            "note_id": "route-assessment-" + fingerprint,
+            "kind": "route-assessment",
+            "source": source,
+            "fingerprint": "sha256:" + fingerprint * 64,
+            "commitment": commitment,
+            "decision": {"action": action, "target":"x","evidence":[],"rule":"test"},
+            "skill": skill,
+            "dimensions": {},
+        })
+
+    def test_empty_state_is_explicitly_unmeasured(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = route_assessment_metrics(d)
+            self.assertIsNone(m["first_action"])
+            self.assertIsNone(m["first_commitment"])
+            self.assertEqual(m["route_assessment_count"], 0)
+            self.assertEqual(m["decision_revision_count"], 0)
+
+    def test_identical_reassessment_is_not_revision(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Stream(d)
+            self._append(s, "a", "decomp", "provisional")
+            self._append(s, "a", "decomp", "provisional", source="brief")
+            m = route_assessment_metrics(d)
+            self.assertEqual(m["first_action"]["action"], "decomp")
+            self.assertEqual(m["first_commitment"], "provisional")
+            self.assertEqual(m["route_assessment_count"], 2)
+            self.assertEqual(m["decision_revision_count"], 0)
+            self.assertIsNone(m["first_skill"])
+
+    def test_changed_fingerprint_counts_revision_and_first_committed_skill(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Stream(d)
+            self._append(s, "a", "decomp", "provisional")
+            self._append(s, "b", "rat query func", "committed", skill="rev-checker")
+            self._append(s, "b", "rat query func", "committed", skill="rev-checker", source="brief")
+            m = route_assessment_metrics(d)
+            self.assertEqual(m["route_assessment_count"], 3)
+            self.assertEqual(m["decision_revision_count"], 1)
+            self.assertEqual(m["first_skill"], "rev-checker")
 
 class FirstPrimitivePassTs(unittest.TestCase):
     """Once a v2 stream exists it is authoritative: a legacy PASS must never

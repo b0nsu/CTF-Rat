@@ -14,6 +14,10 @@ Quick reference for RE challenges. For detailed techniques, see supporting files
 
 ## Prerequisites
 
+> **ctf-rat 배너**: 이 랩 환경은 `SETUP.md`로 이미 준비된다(venv+angr/qiling, Ghidra, PE 동적=qiling_trace.py — `pkselftest`이 GREEN이면 완료).
+> 아래 `pip install`/`apt install`/`brew install` 지시는 **무시**한다. 도구는 레포의 `bin/`(revq·decomp·symsolve·vmlift 등)과 venv가 상위이다.
+> vendored 업스트림 원문 보존을 위해 아래 절은 남겨둔다 — 참조용일 뿐 실행하지 말 것.
+
 **Python packages (all platforms):**
 ```bash
 pip install frida-tools angr qiling uncompyle6 capstone lief z3-solver

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
 import platform
 import re
+import subprocess
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +30,64 @@ def sha256_file(path: str) -> str:
         for chunk in iter(lambda: source.read(64 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def environment_identity() -> dict[str, str]:
+    """Canonical runtime identity shared by run manifests and benchmarks."""
+    return {"os": os.sys.platform, "arch": platform.machine() or "unknown",
+            "runtime": "python-%d.%d" % os.sys.version_info[:2]}
+
+
+def ctf_rat_revision(root: Optional[str] = None) -> str:
+    """Resolve a reproducible CTF-Rat revision without making git mandatory.
+
+    Explicit ``CTF_RAT_REVISION`` wins.  Benchmark callers may then supply the
+    repository root so a normal git checkout records HEAD.  Exported/runtime
+    copies without git metadata preserve the historical ``worktree`` fallback.
+    """
+    explicit = os.environ.get("CTF_RAT_REVISION")
+    if explicit:
+        return explicit
+    if root:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", os.path.abspath(root), "rev-parse", "HEAD"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5, text=True,
+            )
+            revision = proc.stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+                revision = revision.lower()
+                diff = subprocess.run(
+                    ["git", "-C", os.path.abspath(root), "diff", "--binary", "HEAD", "--"],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).stdout
+                untracked = subprocess.run(
+                    ["git", "-C", os.path.abspath(root), "ls-files", "--others",
+                     "--exclude-standard", "-z"],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).stdout
+                if not diff and not untracked:
+                    return revision
+                dirty = hashlib.sha256()
+                dirty.update(diff)
+                for relative in sorted(path for path in untracked.split(b"\0") if path):
+                    dirty.update(relative + b"\0")
+                    path = os.path.join(os.path.abspath(root), os.fsdecode(relative))
+                    try:
+                        dirty.update(os.fsencode(sha256_file(path)))
+                    except OSError:
+                        dirty.update(b"unreadable")
+                return revision + "+dirty.sha256:" + dirty.hexdigest()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "worktree"
+
+
+def toolchain_identity(root: Optional[str] = None) -> dict[str, str]:
+    return {"ctf_rat_revision": ctf_rat_revision(root), "schema_bundle": "v1"}
 
 
 def validate(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -53,10 +113,43 @@ def validate(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     return manifest
 
 
-def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
-    validate(manifest)
+def _sync_state_projection(path: str, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Refresh the manifest's observer cursor from canonical STATE v2 when present.
+
+    ``Stream.append()`` writes STATE first and updates ``run.json`` afterwards.
+    Multiple writers can therefore reach the manifest in a different order than
+    their already-serialized STATE sequence. Re-derive the projection while the
+    manifest writer lock is held so an older writer can never move the cursor (or
+    checkpoint pointer) backwards.
+    """
+    payload = copy.deepcopy(dict(manifest))
+    challenge_dir = os.path.dirname(os.path.abspath(path))
+    state_path = os.path.join(challenge_dir, ".rat", "events", "STATE.v2.jsonl")
+    if not os.path.isfile(state_path):
+        return payload
+    try:
+        from .state_v2 import Stream, cursor
+        events = Stream(challenge_dir).read()
+    except (OSError, ValueError, RuntimeError):
+        # The state writer already treats run.json as an observer projection: a
+        # manifest refresh must not make an otherwise durable STATE append fail.
+        return payload
+    if not events:
+        return payload
+    latest_checkpoint = None
+    for event in events:
+        if event.get("type") == "checkpoint.created":
+            latest_checkpoint = (event.get("payload") or {}).get("checkpoint_id") or latest_checkpoint
+    payload["state"] = {
+        "stream_id": events[-1]["stream_id"],
+        "latest_event_cursor": cursor(events[-1]),
+        "latest_checkpoint_id": latest_checkpoint,
+    }
+    return payload
+
+
+def _atomic_write_unlocked(path: str, manifest: Mapping[str, Any]) -> None:
     parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".run-", suffix=".json.tmp", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -78,6 +171,28 @@ def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
         raise
 
 
+def atomic_write(path: str, manifest: Mapping[str, Any]) -> None:
+    """Atomically replace a run manifest while serializing competing writers.
+
+    The lock protects the final projection/write step. Before replacement, STATE
+    v2 (when present) is re-read as the canonical source of cursor/checkpoint truth;
+    callers may still update other manifest fields without being able to regress
+    observer state through a stale read-modify-write race.
+    """
+    validate(manifest)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    lock_path = os.path.join(parent, ".run-manifest.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            payload = _sync_state_projection(path, manifest)
+            validate(payload)
+            _atomic_write_unlocked(path, payload)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def read(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as source:
         payload = json.load(source)
@@ -95,6 +210,8 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
     inputs = [_input("binary", binary)]
     if libc:
         inputs.append(_input("libc", libc, "libc.so.6"))
+    toolchain = toolchain_identity()
+    toolchain["newchal_version"] = "p0-v1"
     return {
         "schema": SCHEMA,
         "run_id": "run_" + uuid.uuid4().hex,
@@ -105,10 +222,8 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
         "inputs": inputs,
         "target_policy": {"guard_challenge": name, "allowlist": [remote] if remote else [],
                           "network_mode": "ctfguard-target" if remote else "none"},
-        "environment": {"os": os.sys.platform, "arch": platform.machine() or "unknown",
-                        "runtime": "python-%d.%d" % os.sys.version_info[:2]},
-        "toolchain": {"ctf_rat_revision": os.environ.get("CTF_RAT_REVISION", "worktree"),
-                      "newchal_version": "p0-v1", "schema_bundle": "v1"},
+        "environment": environment_identity(),
+        "toolchain": toolchain,
         "policy": {"archive": {}, "subprocess": {"wall_timeout_seconds": 60,
                                                    "output_hard_cap_bytes": 64 * 1024 * 1024}},
         "state": {"stream_id": None, "latest_event_cursor": None, "latest_checkpoint_id": None},

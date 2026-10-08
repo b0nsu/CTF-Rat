@@ -1,7 +1,11 @@
 """Immutable local SHA-256 object store used by challenge directories."""
 from __future__ import annotations
-import argparse, hashlib, json, os, shutil, tempfile
+import argparse, hashlib, json, os, re, shutil, tempfile
 from datetime import datetime, timezone
+
+_DIGEST_RE = re.compile(rb"sha256:[0-9a-f]{64}")
+_DIGEST_TOKEN_BYTES = len(b"sha256:") + 64
+_SCAN_CHUNK_BYTES = 1024 * 1024
 
 def digest_bytes(data: bytes) -> str: return "sha256:" + hashlib.sha256(data).hexdigest()
 def _root(path: str | None = None) -> str: return os.path.abspath(path or os.path.join(os.getcwd(), ".rat"))
@@ -58,20 +62,58 @@ def verify(digest: str | None = None, *, root: str | None = None) -> list[str]:
         try: get(d,root=root)
         except Exception: failures.append(d)
     return failures
+
+def _file_references(path: str) -> set[str]:
+    """Extract digest references from one file without loading large captures at once."""
+    found=set(); tail=b""
+    try:
+        with open(path,"rb") as source:
+            while True:
+                chunk=source.read(_SCAN_CHUNK_BYTES)
+                if not chunk: break
+                data=tail+chunk
+                found.update(match.group(0).decode("ascii") for match in _DIGEST_RE.finditer(data))
+                tail=data[-(_DIGEST_TOKEN_BYTES-1):]
+    except OSError:
+        pass
+    return found
+
 def reachable(root: str) -> set[str]:
-    found=set(); import re
-    for base,_,files in os.walk(root):
-        if "/objects/" in base or "/metadata/" in base: continue
+    """Return the transitive artifact closure reachable from mutable control files.
+
+    STATE/tasks/checkpoints/cache indexes/run.json are roots. Artifact payloads are
+    immutable graph nodes and may themselves reference child artifacts (for example
+    a tool-result envelope referring to stdout/stderr captures). GC must therefore
+    mark through reachable object payloads before sweeping, otherwise it can keep an
+    evidence envelope while deleting the measurement artifacts that make it valid.
+    """
+    root=_root(root); found=set()
+    for base,dirs,files in os.walk(root):
+        relative=os.path.relpath(base,root)
+        first=relative.split(os.sep,1)[0] if relative != "." else None
+        if first in {"objects","metadata"}:
+            dirs[:]=[]
+            continue
         for name in files:
-            try: data=open(os.path.join(base,name),"rb").read().decode("utf-8","ignore")
-            except OSError: continue
-            found.update(re.findall(r"sha256:[0-9a-f]{64}",data))
+            found.update(_file_references(os.path.join(base,name)))
     # ``run.json`` is solve-owned and deliberately sits beside .rat; it is a
     # root reference even though it is outside the object-store directory.
-    try:
-        data=open(os.path.join(os.path.dirname(os.path.abspath(root)),"run.json"),"rb").read().decode("utf-8","ignore")
-        found.update(re.findall(r"sha256:[0-9a-f]{64}",data))
-    except OSError: pass
+    found.update(_file_references(os.path.join(os.path.dirname(root),"run.json")))
+
+    # Mark the full immutable object graph. Read raw bytes rather than get(): a
+    # referenced but corrupt parent should still conservatively retain any child
+    # digests visible in its bytes so GC never makes forensic recovery worse.
+    pending=list(found); expanded=set()
+    while pending:
+        digest=pending.pop()
+        if digest in expanded:
+            continue
+        expanded.add(digest)
+        try: obj,_=_paths(root,digest)
+        except ValueError: continue
+        for child in _file_references(obj):
+            if child not in found:
+                found.add(child); pending.append(child)
     return found
 def gc(*,root: str | None=None,dry_run=True) -> list[str]:
     root=_root(root); keep=reachable(root); removed=[]; base=os.path.join(root,"objects","sha256")

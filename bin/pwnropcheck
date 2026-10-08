@@ -9,7 +9,13 @@ import json
 import os
 import sys
 
-from elftools.elf.elffile import ELFFile
+try:
+    from elftools.elf.elffile import ELFFile
+except ImportError as exc:  # pragma: no cover - depends on optional environment
+    ELFFile = None
+    ELFTOOLS_ERROR = exc
+else:
+    ELFTOOLS_ERROR = None
 
 
 def integer(value) -> int:
@@ -32,6 +38,8 @@ def sha256(path: str) -> str:
 
 
 def mapping(spec: str) -> dict:
+    if ELFFile is None:
+        raise argparse.ArgumentTypeError("pyelftools is required for --map: %s" % ELFTOOLS_ERROR)
     try:
         path, base_text = spec.rsplit("@", 1)
         base = integer(base_text)
@@ -106,13 +114,15 @@ def parser() -> argparse.ArgumentParser:
     source = result.add_mutually_exclusive_group(required=True)
     source.add_argument("--chain", help="comma-separated qwords; every entry is treated as code")
     source.add_argument("--file", help="JSON list or {entries:[{value,kind,name}]} document")
-    result.add_argument("--map", action="append", type=mapping, default=[], metavar="ELF@BASE")
+    result.add_argument("--map", action="append", default=[], metavar="ELF@BASE")
     result.add_argument("--bits", type=int, choices=(32, 64), default=64)
     result.add_argument("--endian", choices=("little", "big"), default="little")
     result.add_argument("--bad-byte", action="append", type=byte_value, default=[])
     result.add_argument("--initial-rsp-mod16", type=int, default=0,
                         help="RSP modulo 16 while it points at the first chain qword")
-    result.add_argument("--json", action="store_true")
+    result.add_argument("--format", choices=("text", "json"), default="text")
+    result.add_argument("--json", dest="format", action="store_const", const="json",
+                        help="deprecated alias for --format json")
     return result
 
 
@@ -123,12 +133,22 @@ def main(argv=None) -> int:
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print("pwnropcheck: %s" % exc, file=sys.stderr)
         return 2
+    try:
+        maps = [mapping(spec) for spec in args.map]
+    except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
+        message = str(exc)
+        if args.format == "json":
+            print(json.dumps({"schema": "rat.pwnropcheck/v1", "status": "error",
+                              "errors": [message], "verdict": "error"}, sort_keys=True, indent=2))
+        else:
+            print("pwnropcheck: %s" % message, file=sys.stderr)
+        return 2
     word_size = args.bits // 8
     errors = []
     warnings = []
     if not 0 <= initial < 16:
         errors.append("initial RSP modulo must be in the range 0..15")
-    for item in args.map:
+    for item in maps:
         if item["bits"] != args.bits:
             errors.append("mapping bitness does not match --bits: %s" % item["path"])
         if item["endian"] != args.endian:
@@ -143,7 +163,7 @@ def main(argv=None) -> int:
             raw = entry["value"].to_bytes(word_size, args.endian, signed=False)
         bad = sorted({byte for byte in args.bad_byte if byte in raw})
         rsp_mod16 = (initial + word_size * (entry["index"] + 1)) % 16
-        item, segment = locate(entry["value"], args.map)
+        item, segment = locate(entry["value"], maps)
         mapped = item is not None
         executable = bool(segment and segment["execute"])
         result = entry | {
@@ -163,7 +183,7 @@ def main(argv=None) -> int:
         if entry["kind"] == "call" and args.bits == 64 and rsp_mod16 != 8:
             errors.append("entry %d call violates SysV AMD64 entry alignment" % entry["index"])
         checked.append(result)
-    if not args.map:
+    if not maps:
         warnings.append("no ELF mappings supplied; code-address provenance cannot pass")
     if not any(entry["kind"] == "call" for entry in entries):
         warnings.append("no call entries were labelled; ABI alignment was not asserted")
@@ -174,15 +194,15 @@ def main(argv=None) -> int:
         "bits": args.bits,
         "initial_rsp_mod16": initial,
         "entries": checked,
-        "mappings": [{key: value for key, value in item.items() if key != "segments"} for item in args.map],
+        "mappings": [{key: value for key, value in item.items() if key != "segments"} for item in maps],
         "errors": errors,
         "warnings": warnings,
         "verdict": "pass" if not errors else "fail",
     }
-    if args.json:
+    if args.format == "json":
         print(json.dumps(report, sort_keys=True, indent=2))
     else:
-        print("verdict=%s entries=%d mappings=%d" % (report["verdict"], len(entries), len(args.map)))
+        print("verdict=%s entries=%d mappings=%d" % (report["verdict"], len(entries), len(maps)))
         for entry in checked:
             print("%02d %-6s %-18s rsp%%16=%d mapped=%s exec=%s" % (
                 entry["index"], entry["kind"], entry["hex"], entry["rsp_mod16_at_entry"],

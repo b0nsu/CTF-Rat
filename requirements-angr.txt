@@ -1,0 +1,4 @@
+# Native symbolic engine, isolated from the pwntools environment.
+angr==9.2.223
+unicorn==2.1.4
+qiling==1.4.6

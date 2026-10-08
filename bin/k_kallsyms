@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""kallsyms_diff — KASLR base + symbol-offset resolver for kernel-pwn Phase 1.
+"""k_kallsyms — KASLR base + symbol-offset resolver for kernel-pwn Phase 1.
 
-Kernel-side sibling of the userland ``glibc-aio`` offset lookup: instead of *recalling*
-kernel symbol addresses (which drift across builds and are re-slid every boot by KASLR),
+Kernel-side offset resolver, mirroring the userland `reference/glibc/` lookup discipline
+(measure, don't recall): instead of *recalling* kernel symbol addresses
+(which drift across builds and are re-slid every boot by KASLR),
 you feed it the *static* symbol table shipped with the challenge and ONE live-measured
 anchor, and it prints the resolved runtime addresses. Honest-mode rule (HANDOFF B.3): the
 anchor MUST be live-measured from the running target (/proc/kallsyms, a leak, or GDB) —
@@ -19,14 +20,14 @@ Anchor (pick ONE; without one, prints static offsets relative to _text only):
 
 Symbol selection:
     --sym NAME [NAME ...]    resolve these (repeatable); default = kernel-pwn shortlist
-    --all                    resolve the WHOLE table to a file, print only the path
-                             (big-output-goes-to-a-file rule; grep it, don't inline it)
-    -o FILE                  output path for --all (default ~/ctf/kernel/dumps/kallsyms-resolved.txt)
+    --all                    resolve the WHOLE table to a file, while stdout prints
+                             summary/path/grep guidance instead of the large table
+    -o FILE                  output path for --all (default $CTF_HOME/kernel/dumps/kallsyms-resolved.txt)
 
 Examples:
-    kallsyms_diff.py System.map --base 0xffffffffab000000
-    kallsyms_diff.py System.map --anchor commit_creds=0xffffffffab089d40 --sym modprobe_path
-    kallsyms_diff.py kallsyms.txt --anchor commit_creds=0x... --all -o dumps/live.txt
+    k_kallsyms System.map --base 0xffffffffab000000
+    k_kallsyms System.map --anchor commit_creds=0xffffffffab089d40 --sym modprobe_path
+    k_kallsyms kallsyms.txt --anchor commit_creds=0x... --all -o dumps/live.txt
 """
 import argparse
 import os
@@ -71,8 +72,48 @@ def find_text_base(syms):
     return None, None
 
 
+def _selftest():
+    """Pure-logic regression (no QEMU): symtab parsing + KASLR slide math."""
+    import tempfile
+    sample = (
+        "ffffffff81000000 T _text\n"
+        "ffffffff81000000 T _stext\n"          # duplicate addr, first-wins for name
+        "ffffffff8108a000 T commit_creds\n"
+        "ffffffff8108b000 T prepare_kernel_cred\n"
+        "ffffffff82000000 D modprobe_path\n"
+        "                 U undefined_skip\n"   # nm undefined line -> skipped
+        "not-a-hex T garbage\n"                 # non-hex addr -> skipped
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".map", delete=False) as fh:
+        fh.write(sample); tmp = fh.name
+    try:
+        syms = parse_symtab(tmp)
+        assert syms["_text"] == 0xffffffff81000000, syms.get("_text")
+        assert syms["commit_creds"] == 0xffffffff8108a000
+        assert "undefined_skip" not in syms and "garbage" not in syms
+        tname, tstatic = find_text_base(syms)
+        assert tname == "_text" and tstatic == 0xffffffff81000000
+        # slide via --base: runtime _text one 2MiB slot higher
+        base = 0xffffffff81200000
+        slide = base - tstatic
+        assert slide == 0x200000 and slide % 0x200000 == 0, hex(slide)
+        # slide via --anchor: derive from a non-base symbol, must equal the base slide
+        anchor_live = syms["commit_creds"] + slide
+        assert (anchor_live - syms["commit_creds"]) == slide
+        # resolving a symbol under that slide
+        assert syms["modprobe_path"] + slide == 0xffffffff82200000
+    finally:
+        os.unlink(tmp)
+    print("k_kallsyms selftest: OK")
+    return 0
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="kallsyms_diff", add_help=True,
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--selftest" in argv:
+        return _selftest()
+    ap = argparse.ArgumentParser(prog="k_kallsyms", add_help=True,
                                  description="KASLR base + symbol-offset resolver")
     ap.add_argument("symtab", help="System.map / nm output / captured kallsyms")
     ap.add_argument("--base", help="live runtime address of _text (hex)")

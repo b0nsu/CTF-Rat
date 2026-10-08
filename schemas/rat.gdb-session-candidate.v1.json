@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rat.gdb-session-candidate/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "kind", "direct_evidence", "session_id", "run_id", "process_identity", "binary_digest", "environment_digest", "scenario_digest", "tool_version", "observations"],
+  "properties": {
+    "schema": {"const": "rat.gdb-session-candidate/v1"},
+    "kind": {"const": "candidate"},
+    "direct_evidence": {"const": false},
+    "session_id": {"type": "string", "pattern": "^gdb_[0-9a-f]{32}$"},
+    "run_id": {"type": "string", "minLength": 1},
+    "process_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gdb_pid", "inferior_pid"],
+      "properties": {"gdb_pid": {"type": "integer", "minimum": 1}, "inferior_pid": {"type": "integer", "minimum": 1}}
+    },
+    "binary_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "environment_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "scenario_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "tool_version": {"type": "string", "minLength": 1},
+    "observations": {"type": "array", "items": {"type": "object", "required": ["sequence", "action", "result", "process_identity"]}}
+  }
+}

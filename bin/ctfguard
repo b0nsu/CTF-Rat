@@ -37,6 +37,24 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+def help_text(command=None):
+    usage = {
+        "begin": "ctfguard begin <chal> [target...]",
+        "target": "ctfguard target <target...>",
+        "check": "ctfguard check [chal]",
+        "check-newchal": "ctfguard check-newchal <chal>",
+        "check-target": "ctfguard check-target <host> <port> | <user> <host> <port>",
+        "nc": "ctfguard nc <host> <port> [nc args...]",
+        "ssh": "ctfguard ssh <user> <host> <port> [ssh args...]",
+        "finish": "ctfguard finish [blocked|complete]",
+        "status": "ctfguard status",
+    }
+    if command in usage:
+        print("usage: " + usage[command])
+    else:
+        print("usage: ctfguard <command> [args...]\ncommands: " + " ".join(usage))
+
+
 def policy_die(msg):
     die(msg, code=5)
 
@@ -186,8 +204,15 @@ def cmd_status(args):
 
 def main():
     if len(sys.argv) < 2:
-        die("cmds: begin target check check-newchal check-target nc ssh finish status")
+        help_text()
+        raise SystemExit(2)
     cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd in ("-h", "--help"):
+        help_text()
+        return
+    if "-h" in args or "--help" in args:
+        help_text(cmd)
+        return
     table = {
         "begin": cmd_begin,
         "target": cmd_target,

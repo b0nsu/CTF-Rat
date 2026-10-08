@@ -6,7 +6,7 @@ ctfpull — CTF 문제 수집 어댑터 (INGEST).
 CTFd 플랫폼에서 문제 목록/상세를 당겨, 첨부를 스테이징하고 `newchal` 스캐폴드로 넘긴다.
 flag 자동제출은 하지 않는다 (ToS + honest-mode).
 
-설정 우선순위: CLI 플래그 > 환경변수(CTFD_URL/CTFD_TOKEN) > dotenv 파일(--env, 기본 ./.ctfd.env → ~/ctf/.ctfd.env)
+설정 우선순위: CLI 플래그 > 환경변수(CTFD_URL/CTFD_TOKEN) > dotenv 파일(--env, 기본 ./.ctfd.env → $CTF_HOME/.ctfd.env). CTF_HOME 미설정 시 레포 루트.
 
 사용:
   ctfpull ctfd --list [--category pwn] [--json]
@@ -32,8 +32,12 @@ from ratlib.run_manifest import atomic_write as atomic_write_run_manifest
 from ratlib.run_manifest import validate as validate_shared_run_manifest
 from ratlib.runner import run as run_bounded
 
-DEFAULT_ENV_PATHS = ["./.ctfd.env", os.path.expanduser("~/ctf/.ctfd.env")]
-CTF_HOME = os.path.expanduser(os.environ.get("CTF_HOME", "~/ctf"))
+# CTF_HOME defaults to the repo root (this file is <root>/bin/ctfpull), matching
+# every other bin/ tool. The old `~/ctf` default diverged and broke ctfguard/
+# newchal resolution when CTF_HOME was unset.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+CTF_HOME = os.path.abspath(os.path.expanduser(os.environ.get("CTF_HOME", _REPO_ROOT)))
+DEFAULT_ENV_PATHS = ["./.ctfd.env", os.path.join(CTF_HOME, ".ctfd.env")]
 
 
 # ─────────────────────────── 유틸 ───────────────────────────
@@ -321,6 +325,13 @@ def write_run_manifest(path, payload):
     atomic_write_run_manifest(path, payload)
 
 
+def challenge_staging_path(dest, name):
+    """Return the ingest directory while keeping explicit --dest compatible."""
+    if dest is None:
+        return os.path.join(CTF_HOME, "solve", name, "artifact")
+    return os.path.join(os.path.abspath(os.path.expanduser(dest)), name)
+
+
 def render_newchal_cmd(name, main_bin, libc, conn, run_manifest=None):
     argv = ["newchal", name, main_bin]
     if conn and libc:
@@ -362,7 +373,7 @@ def cmd_fetch(base, token, cookie, insecure, chal_id, dest, bin_hint, run_newcha
         die("문제 상세 응답 형식 이상 (id=%s)" % chal_id)
     name = slugify(detail.get("name", "chal_%s" % chal_id))
     conn = parse_connection_info(detail.get("connection_info"))
-    staging = os.path.join(dest, name)
+    staging = challenge_staging_path(dest, name)
     os.makedirs(staging, exist_ok=True)
     info("문제: %s (id=%s, cat=%s) → %s" % (detail.get("name"), chal_id, detail.get("category"), staging))
     if conn:
@@ -518,7 +529,7 @@ def main():
     g.add_argument("--all", action="store_true", help="일괄 fetch")
     sp.add_argument("--category", help="카테고리 필터 (예: pwn, rev)")
     sp.add_argument("--json", action="store_true", help="목록을 JSON으로")
-    sp.add_argument("--dest", default=os.path.join(CTF_HOME, "solve_incoming"), help="스테이징 루트")
+    sp.add_argument("--dest", help="스테이징 루트 (기본: solve/<name>/artifact)")
     sp.add_argument("--bin", dest="bin_hint", help="메인 바이너리 파일명 강제 지정")
     sp.add_argument("--no-newchal", action="store_true", help="newchal 호출 없이 스테이징만")
     sp.add_argument("--no-extract", action="store_true", help="첨부 archive를 해제하지 않음")
@@ -526,7 +537,7 @@ def main():
     sp.add_argument("--url", help="CTFd base URL")
     sp.add_argument("--token", help="CTFd API 토큰")
     sp.add_argument("--cookie", help="세션 쿠키 (예: 'session=...')")
-    sp.add_argument("--env", help="dotenv 경로 (기본 ./.ctfd.env → ~/ctf/.ctfd.env)")
+    sp.add_argument("--env", help="dotenv 경로 (기본 ./.ctfd.env → $CTF_HOME/.ctfd.env)")
     sp.add_argument("--insecure", action="store_true", help="TLS 검증 생략 (자체서명 랩)")
 
     sub.add_parser("selftest", help="네트워크 없이 내부 로직 검증")

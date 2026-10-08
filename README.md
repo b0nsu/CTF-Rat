@@ -54,11 +54,11 @@ knowledge, and reference data all live in one repo — set it up **once** on any
 # 0. One-time environment setup (venv+angr+pwntools, Ghidra, glibc-fetch)  →  SETUP.md
 # 1. Lock the target engagement (allowlist / active lock)
 ctfguard begin <challenge> [target]
-# 2. Route — decide track/subroute/skill (thin composition, no new analysis)
+# 2. Route — project evidence dimensions and bounded candidate probes
 rat route <bin>
-# 3. Detailed triage
-revq <bin>        # rev
-recon <bin>       # pwn
+# 3. Run one bounded discriminator; use full recon/revq only when evidence says it is needed
+rat query pwn <bin>              # example pwn capability query
+rat query func <bin> <function>  # example rev function card
 ```
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
@@ -67,15 +67,14 @@ recon <bin>       # pwn
 
 ```mermaid
 flowchart LR
-    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>decide track · subroute · skill"]
-    B --> C{"track?"}
-    C -->|pwn| D["🎯 recon → pwnkit/pwnstage<br/>primitives → payload"]
-    C -->|rev| E["🔍 revq → decomp<br/>symsolve / vmlift"]
+    A["📥 newchal / ctfpull<br/>collect artifact"] --> B["🧭 rat route<br/>signals · dimensions · candidate probes"]
+    B --> D["🎯 run one bounded discriminator<br/>recommend only on clear dominance"]
+    B --> E["🔍 preserve coexisting leads and unresolved premises"]
     D --> F["🧪 rat-verify / concrete-verify"]
     E --> F
     F --> G{"PASS?"}
-    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>SOLVING · PRIMITIVE_GATE"]
-    H --> B
+    G -->|no, DEEP condition| H["🔬 lazy-load doctrine<br/>inherit STATE · cache · current evidence"]
+    H -->|next discriminator| D
     G -->|yes| I["📦 pkshare → HANDOFF.md<br/>knowledge/learned/"]
 
     style A fill:#264653,color:#fff
@@ -99,7 +98,7 @@ flowchart LR
 | **[knowledge/GROUNDING_INDEX.md](knowledge/GROUNDING_INDEX.md)** | Knowledge router → `knowledge/ctf-skills/`                                                                                                                           |
 
 > [!NOTE]
-> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (ROE+6-phase) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
+> **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (FAST evidence handoff + bounded convergence loop) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
 >
 > Benchmark corpus, ablations, and design-review docs live on the `dev` branch. `main` ships only the operational tools needed to actually solve and verify challenges.
 
@@ -110,7 +109,8 @@ flowchart LR
 ```
 CLAUDE.md / AGENTS.md      agent entry point (symlink)
 SETUP.md                   environment-agnostic initial setup
-doctrine/                  SOLVING · SOLVABILITY · calibration · FINALS
+doctrine/                  SOLVING · SOLVABILITY · PRIMITIVE_GATE · REFUSAL · FINALS
+docs/                       calibration (오염 상수 포함 — doctrine 밖)
 knowledge/                 vendored pwn/rev knowledge + repo-owned learned/ + writeup pipeline
 reference/                 libc-offsets/ · glibc/(list · SOURCES · glibc-fetch)
 bin/                       all tools (+ghidra_scripts/)
@@ -127,10 +127,14 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 <summary><code>rat</code> — the single front-door dispatcher</summary>
 <br>
 
-`rat route <bin>` decides track/subroute/skill (a thin composition of rat-doctor + rat-profile + revq,
-no new analysis), and `rat query {func,oracle,slice}` · `rat dyn|verify` · `rat state compact` ·
+`rat route <bin>` projects observations into independent dimensions and returns evidence-linked bounded candidate probes (a thin composition of rat-doctor + rat-profile + revq,
+no new analysis). Static routing leaves `skill=null`; after an active derived/direct STATE observation confirms the method, `rat route <bin> --skill <name> --skill-evidence <obs_id> --skill-reason <reason>` records the committed Skill in the existing route-assessment note. It emits a recommendation only when one probe clearly dominates the alternatives on deterministic evidence/cost criteria, and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
+
+`rat query pattern <bin>` returns at most three source-bound hypothesis aids for
+coexisting Router v2 leads. `rat dyn session` optionally keeps one local GDB
+process for sequential observations; see [GDB session usage](docs/GDB_SESSION.md).
 
 </details>
 
@@ -144,6 +148,10 @@ Never auto-submits flags (ToS + honest-mode).
 ctfpull ctfd --list [--category pwn]
 ctfpull ctfd --id 42 [--dest DIR]        # download → extract → detect ELF → run.json → newchal
 ```
+
+기본 수집 경로는 `solve/<name>/artifact/`이며, 생성된 풀이 파일과 제공 원본이
+`solve/<name>/` 한 곳에 모인다. `--dest DIR`을 명시하면 기존처럼 `DIR/<name>/`에
+스테이징한다.
 
 Config precedence: CLI > env vars (`CTFD_URL` / `CTFD_TOKEN`) > dotenv (`--env`, default `./.ctfd.env`).
 
@@ -170,7 +178,7 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 <summary>🎯 <b>pwn</b></summary>
 <br>
 
-`pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope`
+`pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope` / `pwnclean` / `pkflag`
 
 </details>
 
@@ -181,6 +189,7 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 - **Environment / execution plan** — `rat-doctor <bin> --format json` shows which paths (native/GDB/angr/Ghidra/QEMU/Qiling/Wine) actually work for this artifact and why others are blocked. Regression testing is handled separately by `pkselftest`.
 - **Reproducible scenarios** — `rat-scenario init|validate|show` normalizes the input/argv/env/oracle shared by `rat-dyn` / `rat-runtime` / `rat-verify`. Binary stdin is preserved via `--stdin-file`.
 - **State bus** — `state` (record confirmed / ruled-out / next) · **kernel** — `k_*` (kernel/).
+- **Internal schema test helper** — `ratlib.schema_docs` extracts validator field contracts for `tests/test_schema_docs.py`; it is not part of runtime STATE validation.
 - **Handoff & knowledge** — `pkshare` → `HANDOFF.md`; `writeupcheck` quality gate → reviewed lessons land in `knowledge/learned/`. Typed STATE v2 takes precedence; legacy PASS entries are shown only as candidates. Completion docs require an operator attestation linked to an evidence digest.
 
 </details>
@@ -197,16 +206,18 @@ python3 solve/_template/rev/vmlift.py selftest
 python3 bin/ctfpull selftest && python3 tests/e2e_mock.py
 python3 -m unittest tests.test_writeup_pipeline
 bash tests/e2e_rev.sh        # real crackme e2e if angr is installed, selftest only otherwise
+bash tests/e2e_rev.sh --require-engine  # release/CI gate: missing native angr is failure
 ```
 
-Passing means `ALL GREEN ✅` across the board.
+Release verification requires `--require-engine` and `ALL GREEN ✅`; the optional
+selftest-only run is reported as partial coverage.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 
 ## 📐 Operating Principles
 
 > [!IMPORTANT]
-> One active challenge at a time · fan-out only **inside** a challenge · delegate large reads to a subagent and pull back **conclusions only** · `STATE.jsonl` is the **single source of truth** · **no reinventing** what an existing tool already does.
+> One active challenge at a time · fan-out only **inside** a challenge · delegate large reads to a subagent and pull back **conclusions only** · typed `.rat/events/STATE.v2.jsonl` is the canonical state stream (`STATE.jsonl` is legacy inspection/import only) · **no reinventing** what an existing tool already does.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 

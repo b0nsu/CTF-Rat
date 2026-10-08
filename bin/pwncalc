@@ -236,21 +236,34 @@ def display(doc: dict, as_json: bool) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
-    root.add_argument("--json", action="store_true", help="emit a stable JSON report")
+    root.add_argument("--format", choices=("text", "json"), default="text",
+                      help="output format (default: text)")
+    root.add_argument("--json", dest="format", action="store_const", const="json",
+                      help="deprecated alias for --format json")
     commands = root.add_subparsers(dest="command", required=True)
 
+    def add_format_options(command):
+        command.add_argument("--format", choices=("text", "json"), default=argparse.SUPPRESS,
+                             help="output format (default: text)")
+        command.add_argument("--json", dest="format", action="store_const", const="json",
+                             default=argparse.SUPPRESS,
+                             help="deprecated alias for --format json")
+
     base = commands.add_parser("base", help="calculate a module base from a leak and offset")
+    add_format_options(base)
     base.add_argument("--leak", required=True, type=integer)
     base.add_argument("--offset", required=True, type=integer)
     base.add_argument("--bits", type=int, choices=(32, 64), default=64)
     base.add_argument("--alignment", type=integer, default=0x1000)
 
     resolve = commands.add_parser("resolve", help="resolve an offset against a module base")
+    add_format_options(resolve)
     resolve.add_argument("--base", required=True, type=integer)
     resolve.add_argument("--offset", required=True, type=integer)
     resolve.add_argument("--bits", type=int, choices=(32, 64), default=64)
 
     offset = commands.add_parser("elf-offset", help="read a symbol or string virtual offset from an ELF")
+    add_format_options(offset)
     offset.add_argument("--elf", required=True)
     choice = offset.add_mutually_exclusive_group(required=True)
     choice.add_argument("--symbol")
@@ -258,6 +271,7 @@ def parser() -> argparse.ArgumentParser:
     offset.add_argument("--occurrence", type=integer, default=0)
 
     relocate = commands.add_parser("relocate", help="calculate a base and selected ELF addresses")
+    add_format_options(relocate)
     relocate.add_argument("--elf", required=True)
     relocate.add_argument("--leak", required=True, type=integer)
     relocate.add_argument("--leak-symbol", required=True)
@@ -280,7 +294,7 @@ def main(argv=None) -> int:
             if not args.symbol and not args.string:
                 raise ValueError("relocate requires at least one --symbol or --string")
             doc = relocate_result(args)
-        display(doc, args.json)
+        display(doc, args.format == "json")
         return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print("pwncalc: %s" % exc, file=sys.stderr)

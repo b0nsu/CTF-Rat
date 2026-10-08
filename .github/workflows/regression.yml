@@ -5,7 +5,7 @@ on:
   push:
     branches: ['**']
   schedule:
-    - cron: '0 4 * * *'   # nightly deep run
+    - cron: '0 4 * * *'   # nightly workflow; also enables analysis-deep
   workflow_dispatch:
 
 jobs:
@@ -17,13 +17,18 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb bubblewrap
       - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
       # tool selftests (pure logic, no angr — see bin/revq "Mac selftest 격리")
       - run: python3 bin/rat selftest
       - run: python3 bin/revq selftest
       - run: python3 solve/_template/rev/symsolve.py selftest
       - run: python3 solve/_template/rev/vmlift.py selftest
+      - run: python3 solve/_template/rev/qiling_trace.py selftest
+      - run: python3 bin/k_kallsyms --selftest
+      - run: python3 bin/pklearn selftest
+      - run: python3 bin/pwngadget selftest
+      - run: python3 bin/pwnlibc selftest
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 tests/e2e_artifact_handoff.py
       - run: python3 tests/e2e_analysis.py --category core
@@ -36,13 +41,14 @@ jobs:
   # angr-backed integration: real ELF Function Card / oracle wiring / data
   # slice / custom-store index registration + governor STATE separation, plus
   # the crackme e2e. Kept OFF the every-push fast path (heavy angr install);
-  # runs on PRs to main, nightly, and manual dispatch. The fast `regression`
+  # runs on dev pushes, PRs to main, nightly, and manual dispatch. The fast `regression`
   # job stays authoritative for pure/unit/operational coverage.
   analysis-deep:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
       (github.event_name == 'pull_request' && github.base_ref == 'main')
     steps:
       - uses: actions/checkout@v4
@@ -50,9 +56,13 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3
-      - run: python3 -m pip install --disable-pip-version-check -r requirements-deep.txt
-      - run: python3 -c "import angr; print('angr', angr.__version__)"
-      # angr-gated cases in the suite unskip once angr+gcc+Linux are present
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 bubblewrap
+      - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - run: python3 -m venv .venv-angr
+      - run: .venv-angr/bin/python -m pip install --disable-pip-version-check -r requirements-deep.txt
+      - run: .venv-angr/bin/python -c "import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"
+      # The base interpreter runs pwntools cases; the isolated interpreter runs
+      # angr integrations with the native Unicorn version it requires.
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
-      - run: bash tests/e2e_rev.sh
+      - run: PATH="$PWD/.venv-angr/bin:$PATH" .venv-angr/bin/python -m unittest tests.test_loop_slice_integration tests.test_function_call_sites tests.test_rat_dispatcher
+      - run: bash tests/e2e_rev.sh --require-engine

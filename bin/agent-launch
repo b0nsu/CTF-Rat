@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Show the ctf-rat welcome art, then hand control to the real CLI.
+set -euo pipefail
+
+agent=${1:?usage: agent-launch claude|codex [args...]}
+shift
+case "$agent" in claude|codex) ;; *) echo "unknown agent: $agent" >&2; exit 2 ;; esac
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+wrapper_dir=$repo/bin
+
+# Resolve the real CLI without recursing into this repo's PATH wrappers.
+real_cli=
+IFS=: read -r -a path_entries <<< "$PATH"
+for entry in "${path_entries[@]}"; do
+  [[ -n $entry ]] || entry=.
+  candidate_dir=$(cd -- "$entry" 2>/dev/null && pwd -P) || continue
+  [[ $candidate_dir == "$wrapper_dir" ]] && continue
+  if [[ -f "$candidate_dir/$agent" && -x "$candidate_dir/$agent" ]]; then
+    real_cli=$candidate_dir/$agent
+    break
+  fi
+done
+if [[ -z $real_cli ]]; then
+  printf '%s: real CLI not found in PATH\n' "$agent" >&2
+  exit 127
+fi
+
+here=$(pwd -P)
+if [[ ( $here == "$repo" || $here == "$repo"/* ) && -t 0 && -t 1 && $# -eq 0 ]]; then
+  if [[ $agent == claude ]]; then
+    if [[ -z ${NO_COLOR:-} ]]; then printf '\033[38;2;217;119;87m'; fi
+    cat <<'ART'
+            .------------------.
+        .---|   []        []   |---.
+        |   |   []        []   |   |
+        '---|                  |---'
+            |                  |
+            '---||--||--||--||-'
+                ||  ||  ||  ||
+             .--'          '--.
+           (o)                (o)
+          +----------------------+
+          |  > ctf-rat _         |
+          |  route/query/verify  |
+          +----------------------+
+           \____________________/
+                 C L A U D E
+ART
+  else
+    if [[ -z ${NO_COLOR:-} ]]; then printf '\033[38;2;112;195;183m'; fi
+    cat <<'ART'
+             .--------------.
+           .'  .----------.  '.
+          /   /  <>    <>  \   \
+         |   |   <    >    |   |
+         |   |    \__/     |   |
+          \   \__________/   /
+           '.___      ___.'
+                |    |
+             .--'    '--.
+           (o)          (o)
+          +----------------------+
+          |  > ctf-rat _         |
+          |  route/query/verify  |
+          +----------------------+
+           \____________________/
+                  C O D E X
+ART
+  fi
+  if [[ -z ${NO_COLOR:-} ]]; then
+    printf '\033[0m'
+  fi
+  printf '       route · verify · reuse\n'
+  printf '\n'
+  if ! "$repo/bin/agent-preflight"; then
+    exit 2
+  fi
+  # Both CLIs may redraw the terminal immediately after startup.
+  sleep 1
+fi
+
+exec "$real_cli" "$@"

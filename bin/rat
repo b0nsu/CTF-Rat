@@ -8,21 +8,51 @@ rat-verify, state, ratlib.cache). Legacy CLIs are unchanged and still work
 standalone -- this is an additional canonical entrypoint, not a replacement.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.machinery, importlib.util, json, os, subprocess, sys
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+from datetime import datetime, timezone
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BIN)
 
 from ratlib.artifact import get as artifact_get
+from ratlib.angr_runtime import reexec_for_angr
 from ratlib.cache import Cache, resolve_index_root
+from ratlib.cards import project_pwn_capability
+from ratlib.patterns import project_patterns
+from ratlib.graph_projection import project_graph
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
-from ratlib.governor import check_progress
-from ratlib.route import route as route_fn
+from ratlib.governor import check_progress, snapshot_digest, recommend
+from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
+                          STRONG_OVERFLOW_IMPORTS as route_mod_STRONG,
+                          WEAK_OVERFLOW_IMPORTS as route_mod_WEAK)
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
-from ratlib.state_v2 import Stream, cursor as event_cursor
+from ratlib.state_v2 import Stream
 
 DEFAULT_BUDGET_BYTES = 16384
+
+# Evidence kinds that are strong enough to commit one route-specific Skill.
+# Keep this compatible with canonical verifier-produced kinds (PR #77) as well
+# as existing bounded-analysis observations.
+SKILL_EVIDENCE_KINDS = {
+    "pwn-stack": ("pwn.reg", "pwn.memory-control", "pwn.stack.", "pwn.crash."),
+    "pwn-format": ("pwn.format.",),
+    "pwn-heap": ("pwn.heap.",),
+    "pwn-rop": ("pwn.rop.", "pwn.offset"),
+    "pwn-kernel": ("pwn.kernel.",),
+    "rev-checker": ("rev.checker.", "rev.oracle.", "rev.solution.oracle", "rev.solution.replay"),
+    "rev-vm": ("rev.vm.",),
+    "rev-packed": ("rev.packing.", "rev.unpack."),
+    "rev-symbolic": ("rev.symsolve.", "rev.solution.input"),
+}
+
+def _skill_kind_matches(skill, kind):
+    if not isinstance(kind, str):
+        return False
+    return any(
+        kind.startswith(pattern) if pattern.endswith(".") else kind == pattern
+        for pattern in SKILL_EVIDENCE_KINDS.get(skill, ())
+    )
 
 def _canonical_digest(value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -49,28 +79,84 @@ def _render_next(items):
 def _render_route_text(doc):
     if doc.get("error"):
         return "ROUTE       error (%s)" % doc["error"].get("message")
-    lines = ["ROUTE       %s" % doc.get("subroute"),
-              "CONFIDENCE  %.2f" % (doc.get("confidence") or 0.0),
-              "SKILL       %s" % (doc.get("skill") or "-")]
-    if doc.get("conflict"):
-        lines.append("CONFLICT    yes")
+    skill = doc.get("skill")
+    skill_line = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else (skill or "-")
+    decision = doc.get("decision") or {}
+    lines = ["COMMITMENT  %s" % doc.get("commitment", "unknown"), "SKILL       %s" % skill_line]
+    dimensions = doc.get("dimensions") or {}
+    if dimensions:
+        lines += ["", "DIMENSIONS"]
+        for key in ("vulnerability_surfaces", "program_shapes", "obstacles", "constraints"):
+            values = dimensions.get(key) or []
+            if values:
+                lines.append("  %s: %s" % (key, ", ".join(str(v) for v in values)))
     signals = doc.get("signals") or []
     if signals:
         lines += ["", "SIGNALS"] + ["  %s: %s" % (s.get("kind"), _brief(s.get("value"))) for s in signals]
-    alternatives = doc.get("alternatives") or []
-    if alternatives:
-        lines += ["", "ALTERNATIVES"] + ["  %s (confidence=%.2f)" % (a.get("subroute"), a.get("confidence") or 0.0)
-                                          for a in alternatives]
+    unresolved = doc.get("unresolved") or []
+    if unresolved:
+        lines += ["", "UNRESOLVED"] + ["  - %s" % item for item in unresolved]
+    diagnostics = doc.get("diagnostics") or []
+    if diagnostics:
+        lines += ["", "DIAGNOSTICS"] + ["  - %s" % item.get("message", "") for item in diagnostics]
+    leads = doc.get("leads") or []
+    if leads:
+        lines += ["", "COEXISTING LEADS"] + ["  %s" % name for name in leads]
     nxt = doc.get("next") or []
     if nxt:
-        lines += ["", "NEXT"] + _render_next(nxt)
+        lines += ["", "CANDIDATE PROBES"] + _render_next(nxt)
+    if decision:
+        lines += ["", "RECOMMENDED  %s %s" % (decision.get("action", ""), decision.get("target") or "")]
     if doc.get("governor", {}).get("stuck"):
         lines += ["", "GOVERNOR    stuck (%s)" % doc["governor"].get("action")]
+    return "\n".join(lines)
+
+def _render_graph_text(doc):
+    facts = doc.get("facts") or {}
+    coverage = doc.get("coverage") or {}
+    omitted = coverage.get("omitted") or {}
+    lines = ["GRAPH       %s (%s)" % (facts.get("engine", "unknown"), doc.get("status")),
+             "RECOVERED   %s functions" % facts.get("recovered_functions", 0),
+             "VISIBLE     %s functions, %s internal edges" %
+             (facts.get("visible_functions", 0), facts.get("visible_internal_edges", 0))]
+    for node in facts.get("graph") or []:
+        lines.append("%s@%s [size=%s blocks=%s]" %
+                     (node["name"], node["address"], node["size"], node["blocks"]))
+        if node["calls"]:
+            lines.append("  -> " + ", ".join(node["calls"]))
+        if node["named_targets"]:
+            lines.append("  named targets (not resolved to functions): " + ", ".join(node["named_targets"]))
+        if node["hidden_calls"] or node["ambiguous_calls"]:
+            lines.append("  hidden internal=%d ambiguous=%d" %
+                         (node["hidden_calls"], node["ambiguous_calls"]))
+    lines.extend(["OMITTED     functions=%s, internal edges from visible nodes=%s" %
+                  (omitted.get("functions", 0), omitted.get("internal_edges_from_visible_nodes", 0)),
+                  "SCOPE       %s" % coverage.get("scope", "")])
+    if doc.get("diagnostics"):
+        lines.extend("WARNING     %s" % d["message"] for d in doc["diagnostics"])
     return "\n".join(lines)
 
 def _render_query_text(doc):
     lines = ["QUERY       %s" % doc.get("query"), "STATUS      %s" % doc.get("status")]
     facts = doc.get("facts") or {}
+    if doc.get("query") == "pattern":
+        for card in facts.get("cards") or []:
+            src = card["source"]
+            lines += ["", "CARD        %s (%s)" % (card["id"], card["kind"]),
+                      "SOURCE      %s %s" % (src["path"], src["digest"]),
+                      "SELECTED    %s" % card["selection"],
+                      "PREMISE     %s" % card["premise"],
+                      "REFUTE      %s" % card["refutation"],
+                      "NEXT        %s" % card["next_experiment"]]
+            for heading, body in card["excerpt"].items():
+                lines += [heading.upper(), body]
+            if card.get("knowledge"):
+                ref = card["knowledge"]
+                lines += ["KNOWLEDGE   %s#%s %s" % (ref["path"], ref["section"], ref["digest"]),
+                          ref["excerpt"]]
+        for d in doc.get("diagnostics") or []:
+            lines.append("WARNING     %s" % d["message"])
+        return "\n".join(lines)
     if facts:
         lines += ["", "FACTS"] + ["  %s: %s" % (k, _brief(v)) for k, v in facts.items()]
     heuristics = doc.get("heuristics") or {}
@@ -89,17 +175,17 @@ def _print(doc, fmt):
         print(json.dumps(doc, sort_keys=True, ensure_ascii=False))
         return
     schema = doc.get("schema")
-    if schema == "rat.route-result/v1":
+    if schema == "rat.route-result/v2":
         print(_render_route_text(doc))
     elif schema == "rat.query-result/v1":
-        print(_render_query_text(doc))
+        print(_render_graph_text(doc) if doc.get("query") == "graph" and doc.get("status") != "error" else _render_query_text(doc))
     else:
-        label = doc.get("query") or doc.get("subroute") or doc.get("schema")
+        label = doc.get("query") or doc.get("schema")
         status = doc.get("status") or ("stuck" if doc.get("governor", {}).get("stuck") else "ok")
         print("%s: %s" % (label, status))
 
 def _emit(doc, code, fmt):
-    """Single validate->print->return exit shared by every subcommand.
+    """Validate, print, and return structured in-process route/query results.
     Validates against the doc's own schema, matching the explicit-literal
     validate() calls this replaced -- behavior identical, one call site."""
     validate(doc, doc["schema"]); _print(doc, fmt); return code
@@ -132,6 +218,34 @@ def _gather_revq(binary, fast, store):
         raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
     return mod, rev
 
+def _record_revq_invocation(mod, binary, fast, store, rev, started_at,
+                            started_monotonic, operation, requested=None):
+    """Record one successful in-process revq use through its canonical recorder.
+
+    `rat` intentionally loads revq in-process, so the process observer cannot see
+    a separate revq execve. Reuse revq's existing tool-result producer instead of
+    creating a second telemetry contract. Persistence remains best-effort and can
+    never turn a valid front-door result into a failure.
+    """
+    try:
+        requested_engine = "binutils" if fast else "angr"
+        current_sha = rev.get("sha256") or mod.sha256(binary)
+        _, cache_key = mod._canonical_index(
+            binary, rev.get("engine") or requested_engine, current_sha, store)
+        parameters = {
+            "requested_engine": requested_engine,
+            "effective_engine": rev.get("engine") or requested_engine,
+            "refresh": False,
+            "operation": operation,
+            "requested": requested,
+            "frontdoor": "rat",
+        }
+        mod._persist_invocation(
+            binary, current_sha, requested_engine, False, rev, cache_key, store,
+            started_at, started_monotonic, parameters)
+    except Exception:
+        pass
+
 # ---- legacy tool delegation (subprocess capture -- these tools only print, never return a doc) ----
 def _run_subprocess(argv, timeout=120):
     try:
@@ -142,8 +256,26 @@ def _run_subprocess(argv, timeout=120):
     except OSError as exc:
         return 3, "", str(exc)
 
+def _detect_platform_file(binary):
+    """Classify a binary container via `file`, independent of revq extraction
+    (mirrors revq._detect_platform). Used by brief's support-scope note."""
+    code, out, _ = _run_subprocess(["file", "--", binary])
+    if code != 0:
+        return None
+    if "PE32" in out or "MS Windows" in out:
+        return "pe"
+    if "ELF" in out:
+        return "elf"
+    if "Mach-O" in out:
+        return "macho"
+    return "?"
+
 def _doctor_capabilities(binary):
-    code, out, _ = _run_subprocess([os.path.join(BIN, "rat-doctor"), binary, "--format", "json"])
+    # The front door may have re-execed into .venv-angr while the shell still
+    # resolves python3 to the pwn environment. Probe the interpreter actually
+    # running this command so a provisioned rev engine is never hidden.
+    code, out, _ = _run_subprocess([sys.executable, os.path.join(BIN, "rat-doctor"),
+                                    binary, "--format", "json"])
     if code != 0:
         return {"native": False, "angr": False, "ghidra": False}
     try:
@@ -162,14 +294,7 @@ def _gather_profile(binary, store):
     except Exception:
         return None
 
-# ---- Progress Novelty Governor wiring -- route/query plus STATE progress ----
-# Events that represent real solving progress (new observation, finding/primitive
-# revision, ruled-out route, ...) as opposed to this governor's own bookkeeping
-# (`governor.checked`, which must not count as progress against itself).
-_STATE_PROGRESS_EVENT_TYPES = {
-    "observation.recorded", "finding.revised", "primitive.revised", "primitive.consumed",
-    "evidence.invalidated", "hypothesis.recorded", "unknown.recorded", "route.ruled_out", "next.recorded",
-}
+# ---- Progress Novelty Governor wiring -- route/query plus canonical STATE evidence ----
 # The solving STATE lives next to the challenge binary (dirname(binary)/.rat),
 # NOT under the cache/index store. Those coincide by default because the default
 # index root is dirname(binary)/.rat, but `--store /elsewhere` overrides only the
@@ -179,19 +304,98 @@ _STATE_PROGRESS_EVENT_TYPES = {
 def _state_dir(binary):
     return os.path.dirname(os.path.realpath(binary))
 
+def _select_route_skill(state_dir, result, skill, evidence_ids, reason, *, binary_digest=None):
+    """Commit one route-specific Skill only from active non-heuristic STATE evidence."""
+    evidence_ids = list(dict.fromkeys(evidence_ids or []))
+    reason = (reason or "").strip()
+    if skill is None:
+        if evidence_ids or reason:
+            raise ValueError("--skill-evidence/--skill-reason require --skill")
+        return [], None
+    if skill not in ROUTE_SKILLS:
+        raise ValueError("unknown skill %r" % skill)
+    if not evidence_ids:
+        raise ValueError("--skill requires at least one --skill-evidence observation ID")
+    if not reason:
+        raise ValueError("--skill requires --skill-reason")
+    view = Stream(state_dir).view()
+    for observation_id in evidence_ids:
+        observation = view.get("observations", {}).get(observation_id)
+        if observation is None:
+            raise ValueError("skill evidence cites unknown observation_id: %s" % observation_id)
+        if observation.get("validity", {}).get("state") != "active":
+            raise ValueError("skill evidence cites inactive observation_id: %s" % observation_id)
+        level = observation.get("quality", {}).get("level")
+        if level not in {"derived", "direct"}:
+            raise ValueError("skill evidence must be derived/direct, got %r for %s" %
+                             (level, observation_id))
+        kind = observation.get("kind")
+        if not _skill_kind_matches(skill, kind):
+            raise ValueError("observation kind %r does not support skill %s" % (kind, skill))
+        from ratlib.state_v2 import _classify_evidence
+        target = binary_digest or result.get("input_digest")
+        if not target:
+            raise ValueError("skill evidence requires current binary digest")
+        subject = observation.get("subject", {}).get("binary_digest")
+        if subject is not None and subject != target:
+            raise ValueError("skill observation subject does not match current binary digest")
+        if not observation.get("evidence"):
+            raise ValueError("skill evidence has no verifiable binary subject binding")
+        for digest in observation["evidence"]:
+            classification = _classify_evidence(digest, Stream(state_dir).root)
+            envelope = json.loads(artifact_get(digest, root=Stream(state_dir).root))
+            binding = (envelope.get("extensions") or {}).get("subject_binding") or {}
+            measured = classification.get("subject_digest")
+            if classification["level"] != "direct":
+                if (binding.get("role") != "binary" or
+                        not any(i.get("role") == "binary" and i.get("digest") == binding.get("digest")
+                                for i in envelope.get("inputs", []))):
+                    raise ValueError("skill evidence has no verifiable binary subject binding")
+                measured = binding.get("digest")
+            if measured != target:
+                raise ValueError("skill evidence does not measure current binary digest")
+    result["skill_assessment"] = {
+        "skill": skill, "evidence_observation_ids": evidence_ids, "reason": reason,
+    }
+    result["skill"] = skill
+    result["commitment"] = "committed"
+    return evidence_ids, reason
+
+def _record_route_assessment(state_dir, source, result, *,
+                             skill_evidence_observation_ids=None, skill_reason=None):
+    """Persist observer-readable route telemetry without a new STATE event type.
+
+    note.recorded is existing append-only plumbing and is not solving progress.
+    The fingerprint excludes timing and capabilities so repeated identical
+    assessments collapse cleanly when metrics count route revisions. A committed
+    Skill stores the cited observation IDs and reason in the same route note.
+    """
+    core = {"decision": result.get("decision"), "commitment": result.get("commitment"),
+            "leads": result.get("leads", []), "skill": result.get("skill"),
+            "input_digest": result.get("input_digest"),
+            "dimensions": result.get("dimensions", {}), "unresolved": result.get("unresolved", [])}
+    if result.get("skill"):
+        core["skill_evidence_observation_ids"] = sorted(set(skill_evidence_observation_ids or []))
+        core["skill_reason"] = (skill_reason or "").strip()
+    fingerprint = _canonical_digest(core)
+    Stream(state_dir).append("note.recorded", {
+        "note_id": "route-assessment-" + fingerprint.split(":", 1)[1][:16],
+        "kind": "route-assessment", "source": source, "fingerprint": fingerprint, **core,
+    })
+
 def _governor_wrap(state_dir, action, novelty_key, doc):
     stream = Stream(state_dir)
     events = stream.read()
-    progress = [e for e in events if e["type"] in _STATE_PROGRESS_EVENT_TYPES]
-    state_cursor = event_cursor(progress[-1]) if progress else None
-    digest = _canonical_digest({**novelty_key, "state_cursor": state_cursor})
+    digest = _canonical_digest({"result": novelty_key, "evidence": snapshot_digest(events)})
     checked = [e for e in events if e["type"] == "governor.checked"]
     novel = digest not in {e["payload"]["digest"] for e in checked}
     history = [e["payload"]["novel"] for e in checked] + [novel]
     stream.append("governor.checked", {"action": action, "novel": novel, "digest": digest})
     check = check_progress(history)
     if check["stuck"]:
-        doc["governor"] = {"stuck": True, "action": check["action"], "reason": check["reason"]}
+        advice = recommend(events)
+        doc["governor"] = {"stuck": True, "action": advice["action"],
+                           "reason": check["reason"], "basis": advice["basis"]}
     return doc
 
 # ---- rat.query-result/v1 envelope ----
@@ -215,9 +419,7 @@ def cmd_route(args):
     binary = args.binary
     bad = _check_binary(binary)
     if bad:
-        # Still a fully schema-conformant rat.route-result/v1 document -- the
-        # "error" field carries the diagnostic without leaving the required
-        # track/subroute/confidence/signals/capabilities/skill/next fields out.
+        # Keep errors in the v2 envelope so callers never need a second shape.
         result = route_fn()
         result["error"] = bad
         return _emit(result, EXIT_INPUT, args.format)
@@ -225,18 +427,330 @@ def cmd_route(args):
     caps = _doctor_capabilities(binary)
     profile = _gather_profile(binary, store)
     fast = args.fast or not caps.get("angr", False)
-    rev, interesting = None, None
+    rev, interesting, revq_error = None, None, None
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
-    except Exception:
+        _record_revq_invocation(mod, binary, fast, store, rev,
+                                revq_started_at, revq_started_monotonic, "route")
+    except Exception as exc:
         rev, interesting = None, None
+        revq_error = {"code": "analysis_failed",
+                      "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    result["input_digest"] = _file_sha256(binary)
+    if fast and not args.fast:
+        result.setdefault("diagnostics", []).append({
+            "code": "dependency_missing",
+            "message": "native angr unavailable; route used binutils only (see SETUP.md)",
+        })
+    if revq_error:
+        result.setdefault("diagnostics", []).append(revq_error)
     result["capabilities"] = {**result["capabilities"], **caps}
-    novelty_key = {"track": result["track"], "subroute": result["subroute"],
+    state_dir = _state_dir(binary)
+    try:
+        skill_evidence, skill_reason = _select_route_skill(
+            state_dir, result,
+            getattr(args, "skill", None),
+            getattr(args, "skill_evidence", []),
+            getattr(args, "skill_reason", None),
+            binary_digest=result["input_digest"])
+    except ValueError as exc:
+        result.setdefault("diagnostics", []).append({
+            "code": "input_invalid", "severity": "error", "message": str(exc),
+        })
+        return _emit(result, EXIT_INPUT, args.format)
+    validate(result, "rat.route-result/v2")
+    novelty_key = {"decision": result.get("decision"), "dimensions": result.get("dimensions"),
+                   "commitment": result.get("commitment"), "skill": result.get("skill"),
                    "signals": [s["value"] for s in result["signals"]]}
-    result = _governor_wrap(_state_dir(binary), "route", novelty_key, result)
+    result = _governor_wrap(state_dir, "route", novelty_key, result)
+    validate(result, "rat.route-result/v2")
+    _record_route_assessment(
+        state_dir, "route", result,
+        skill_evidence_observation_ids=skill_evidence, skill_reason=skill_reason)
     return _emit(result, EXIT_OK, args.format)
+
+def _file_sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    except OSError:
+        return None
+
+def _libc_match(binary_dir, libc_path, db_path=None):
+    """Supplied-libc digest + a hash-verified version match against the pwnlibc DB.
+
+    The only trustworthy signal is the content hash: a libc renamed to look like
+    a known version but with different bytes must NOT report a match. We compare
+    the computed sha256 against the pwnlibc offset DB
+    (reference/libc-offsets/libc-db.json, built via `pwnlibc index build`); a
+    filename heuristic is deliberately not used because it silently mislabels
+    renamed binaries and undermines honest-mode. When the DB is absent or the
+    digest is unknown, reference_match stays None -> the card renders "unknown".
+
+    "unknown" is deliberately ambiguous between "no DB present" and "DB present
+    but no matching entry" -- both are an honest non-answer. A DB that IS present
+    but fails to load/parse is a DIFFERENT situation (an operator-actionable
+    tooling fault, not a normal no-match), so it is reported separately via
+    ``db_status`` rather than being silently folded into the same "unknown".
+    """
+    out = {"supplied": None, "sha256": None, "reference_match": None, "match_method": None, "db_status": "absent"}
+    candidate = libc_path
+    if candidate is None:
+        for name in ("libc.so.6", "libc-2.27.so", "libc.so"):
+            p = os.path.join(binary_dir, name)
+            if os.path.isfile(p):
+                candidate = p; break
+    if candidate is None or not os.path.isfile(candidate):
+        return out
+    out["supplied"] = os.path.relpath(candidate)
+    digest = _file_sha256(candidate)
+    out["sha256"] = digest
+    hexdigest = digest.split(":", 1)[1] if digest and ":" in digest else digest
+    if db_path is None:
+        db_path = os.path.join(BIN, "..", "reference", "libc-offsets", "libc-db.json")
+    if os.path.isfile(db_path):
+        try:
+            with open(db_path, encoding="utf-8") as fh:
+                db = json.load(fh)
+            out["db_status"] = "ok"
+            if hexdigest:
+                for e in db.get("entries", []):
+                    if e.get("sha256") == hexdigest:
+                        out["reference_match"] = e.get("version")
+                        out["match_method"] = "sha256"
+                        break
+        except (OSError, ValueError) as exc:
+            # Distinct from "absent": an operator needs to know the DB exists but
+            # is unreadable/malformed (bad `pwnlibc index build` output, truncated
+            # write, etc), not just "no match found".
+            out["db_status"] = "corrupt: %s" % exc
+    return out
+
+def _pwn_summary(profile):
+    facts = {f.get("kind"): f.get("value") for f in (profile or {}).get("facts", []) or []}
+    imports = set((profile or {}).get("imports", []) or [])
+    prot = {k: facts.get(k) for k in ("elf.nx", "elf.pie", "elf.canary", "elf.relro") if k in facts}
+    sinks = sorted(imports & (route_mod_STRONG | route_mod_WEAK | {"printf", "fprintf", "malloc", "free", "system"}))
+    return {"protections": prot, "sinks": sinks}
+
+def _rev_summary(revq, interesting):
+    top = []
+    for it in (interesting or [])[:5]:
+        top.append({"func": it.get("func"), "score": it.get("score"), "why": it.get("why")})
+    return {"top_interesting": top, "evasion": (revq or {}).get("evasion", []) or [],
+            "platform": (revq or {}).get("platform")}
+
+def _render_brief_text(card):
+    L = ["BRIEF       %s" % card["binary"]]
+    if card.get("binary_sha256"):
+        L.append("SHA256      %s" % card["binary_sha256"])
+    caps = card["capabilities"]
+    L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
+    r = card["route"]
+    decision = r.get("decision") or {}
+    L += ["", "COMMITMENT  %s" % r.get("commitment", "unknown")]
+    if card.get("skill_path"):
+        L.append("SKILL       %s" % card["skill_path"])
+    if r.get("leads"):
+        L.append("LEADS       " + ", ".join(r["leads"]))
+    unresolved = r.get("unresolved") or []
+    if unresolved:
+        L.append("UNRESOLVED  " + " | ".join(unresolved[:3]))
+    nxt = r.get("next") or []
+    if nxt:
+        L += ["CANDIDATES   " + "; ".join("%s %s" % (n.get("query", ""), n.get("target") or "") for n in nxt)]
+    if decision:
+        L += ["RECOMMENDED  %s %s" % (decision.get("action", ""), decision.get("target") or "")]
+    ts = card["track_summary"]
+    pwn = ts.get("pwn") or {}
+    rev = ts.get("rev") or {}
+    if pwn:
+        L += ["", "PROTECTIONS " + (", ".join("%s=%s" % (k, v) for k, v in pwn.get("protections", {}).items()) or "-"),
+              "SINKS       " + (", ".join(pwn.get("sinks", [])) or "-")]
+    if rev:
+        L += ["", "INTERESTING"]
+        for it in rev.get("top_interesting", []):
+            L.append("  %-20s score=%s" % (it.get("func"), it.get("score")))
+        if rev.get("evasion"):
+            L.append("EVASION     " + "; ".join(rev["evasion"]))
+        if rev.get("platform"):
+            L.append("PLATFORM    %s" % rev["platform"])
+    libc = card["libc"]
+    if libc.get("supplied"):
+        if libc.get("reference_match"):
+            match_line = "%s (sha256-verified)" % libc["reference_match"]
+        elif str(libc.get("db_status", "")).startswith("corrupt"):
+            match_line = "unknown -- libc DB is CORRUPT (%s); rebuild with `pwnlibc index build`" % libc["db_status"]
+        else:
+            match_line = "unknown (build DB via `pwnlibc index build` or run `pwnlibc identify`)"
+        L += ["", "LIBC        %s" % libc["supplied"], "  match     %s" % match_line]
+    if card["truncated"]:
+        L += ["", "TRUNCATED   %s (raise --budget-tokens)" % ", ".join(card["truncated"])]
+    for se in card["side_effects"]:
+        L.append("NOTE        %s" % se)
+    return "\n".join(L)
+
+def _bound_brief_to_budget(card, budget_tokens, *, render=None):
+    """Bound the card to the token budget (approx 4 bytes/token).
+
+    Drop the lowest-priority sections first, re-checking after each cut so we
+    never discard a section that did not need trimming. Honors the plan's
+    truncation contract and never claims a trim brought the card under budget
+    when it did not: if the core route/header alone exceed the budget, that is
+    surfaced as an explicit "over-budget" marker in `truncated` rather than
+    silently shipping an over-budget card. Mutates and returns `card`.
+    """
+    budget_bytes = budget_tokens * 4
+    render = render or _render_brief_text
+    def over():
+        return len(render(card).encode()) > budget_bytes
+    if over():
+        card["libc"] = {"supplied": None, "sha256": None, "reference_match": None,
+                        "match_method": None, "note": "trimmed for budget"}
+        card["truncated"].append("libc")
+    if over():
+        card["track_summary"] = {"note": "trimmed for budget"}
+        card["truncated"].append("track_summary")
+    if over() and (card["route"].get("next") or []):
+        card["route"]["next"] = []
+        card["truncated"].append("route.next")
+    if over():
+        card["truncated"].append("over-budget")
+    return card
+
+def _empty_brief_card(binary, budget_tokens):
+    """A schema-conformant rat.brief-card/v1 shell for the error/diagnostics path."""
+    route = route_fn()
+    return {
+        "schema": "rat.brief-card/v1", "binary": binary, "binary_sha256": None,
+        "capabilities": {}, "route": route, "skill_path": None,
+        "track_summary": {}, "libc": {"supplied": None, "sha256": None, "reference_match": None, "match_method": None, "db_status": "absent"},
+        "budget_tokens": budget_tokens, "truncated": [], "side_effects": [], "diagnostics": [],
+    }
+
+def cmd_brief(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        card = _empty_brief_card(binary, args.budget_tokens)
+        card["error"] = bad
+        card["diagnostics"] = [{"code": bad["code"], "severity": "error", "message": bad["message"]}]
+        if args.format == "json":
+            print(json.dumps(card, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print("rat brief: %s" % bad["message"], file=sys.stderr)
+        return EXIT_INPUT
+    store = resolve_index_root(binary, override=args.store)
+    caps = _doctor_capabilities(binary)
+    profile = _gather_profile(binary, store)
+    fast = args.fast or not caps.get("angr", False)
+    rev, interesting, revq_error = None, None, None
+    diagnostics = []
+    if fast and not args.fast:
+        diagnostics.append({"code": "dependency_missing", "severity": "warning",
+                            "message": "native angr unavailable; brief used binutils only (see SETUP.md)"})
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
+    try:
+        mod, rev = _gather_revq(binary, fast, store)
+        interesting = mod.compute_interesting(rev)
+        _record_revq_invocation(mod, binary, fast, store, rev,
+                                revq_started_at, revq_started_monotonic, "brief")
+    except Exception as exc:
+        rev, interesting = None, None
+        revq_error = "%s: %s" % (type(exc).__name__, str(exc) or "no detail")
+    route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    route["capabilities"] = {**route.get("capabilities", {}), **caps}
+    state_dir = _state_dir(binary)
+    _record_route_assessment(state_dir, "brief", route)
+    novelty_key = {"decision": route.get("decision"), "dimensions": route.get("dimensions"),
+                   "commitment": route.get("commitment"),
+                   "signals": [s["value"] for s in route["signals"]]}
+    route = _governor_wrap(state_dir, "brief", novelty_key, route)
+    skill = route.get("skill")
+    skill_path = ("skills/%s/SKILL.md" % skill) if skill in ROUTE_SKILLS else None
+    track_summary = {"pwn": _pwn_summary(profile), "rev": _rev_summary(rev, interesting)}
+    libc = _libc_match(os.path.dirname(os.path.realpath(binary)), args.libc)
+    card = {
+        "schema": "rat.brief-card/v1", "binary": os.path.relpath(binary) if not os.path.isabs(binary) else binary,
+        "binary_sha256": _file_sha256(binary),
+        "capabilities": caps, "route": route, "skill_path": skill_path,
+        "track_summary": track_summary, "libc": libc,
+        "budget_tokens": args.budget_tokens, "truncated": [],
+        "side_effects": ["rat brief appended route-assessment note + governor.checked to STATE."],
+        "diagnostics": diagnostics,
+    }
+    if revq_error:
+        card["side_effects"].append("revq analysis unavailable; brief is partial: %s" % revq_error)
+        diagnostics.append({"code": "analysis_failed", "severity": "warning",
+                            "message": "revq analysis unavailable; brief is partial: %s" % revq_error})
+    if str(libc.get("db_status", "")).startswith("corrupt"):
+        card["side_effects"].append("libc DB is corrupt (%s); rebuild with `pwnlibc index build`" % libc["db_status"])
+        diagnostics.append({"code": "libc_db_corrupt", "severity": "warning",
+                            "message": "libc DB is present but failed to load: %s" % libc["db_status"]})
+    platform = (rev or {}).get("platform") or _detect_platform_file(binary)
+    if platform in ("macho", "?"):
+        note = ("non-ELF binary detected (platform=%s): this kit targets ELF/Linux (PE is rev-only). "
+                "ROUTE/PLATFORM reading unknown here is expected, not a failure -- re-run on the ELF/Linux artifact."
+                % platform)
+        card["side_effects"].append(note)
+        diagnostics.append({"code": "out_of_scope_platform", "severity": "info", "message": note})
+    if args.budget_tokens:
+        json_render = lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        _bound_brief_to_budget(card, args.budget_tokens,
+                               render=json_render if args.format == "json" else _render_brief_text)
+    validate(card["route"], "rat.route-result/v2")
+    validate(card, "rat.brief-card/v1")
+    if args.format == "json":
+        print(json.dumps(card, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(_render_brief_text(card))
+    return EXIT_OK
+
+def cmd_query_graph(args):
+    binary = args.binary
+    query = "graph"
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
+    if args.budget_bytes < 1 or args.max_nodes < 1:
+        return _emit(*_query_error(query, "input_invalid",
+                                   "--budget-bytes and --max-nodes must be positive", EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
+    try:
+        mod, rev = _gather_revq(binary, args.fast, store)
+        # The ranking is heuristic; only recovered names/addresses/edges are facts.
+        graph = project_graph(rev, interesting=mod.compute_interesting(rev),
+                              budget_bytes=args.budget_bytes, max_nodes=args.max_nodes)
+    except Exception as exc:
+        return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            started_at, started_monotonic, "graph",
+                            requested={"budget_bytes": args.budget_bytes, "max_nodes": args.max_nodes})
+    doc = _query_envelope(
+        query, status="ok" if graph["coverage"]["complete"] else "partial",
+        facts=graph["facts"],
+        heuristics={"selection": "main/_start, revq interesting score, call degree; ranking is not proof"},
+        artifacts=[], coverage=graph["coverage"],
+        diagnostics=[{"code": "partial", "severity": "warning", "message": reason}
+                     for reason in graph["diagnostics"]],
+        provenance={"binary_sha256": rev.get("sha256"), "engine": rev.get("engine"),
+                    "cache": {"hit": rev.get("cache_state") == "hit"}},
+        budget_bytes=args.budget_bytes,
+    )
+    doc = _governor_wrap(_state_dir(binary), "query:graph",
+                         {"digest": rev.get("sha256"), "visible": [n["address"] for n in graph["facts"]["graph"]]}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
 
 def cmd_query_func(args):
     binary, name = args.binary, args.name
@@ -245,6 +759,8 @@ def cmd_query_func(args):
     if bad:
         return _emit(*_query_error(query, bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
@@ -252,12 +768,13 @@ def cmd_query_func(args):
     card = mod.compute_function_card(rev, name)
     if card is None:
         return _emit(*_query_error(query, "input_invalid", "function '%s' not found" % name, EXIT_INPUT), args.format)
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            revq_started_at, revq_started_monotonic, "func", requested=name)
     budget = args.budget_bytes
-    # budget_bytes is a per-query pool, not per-list -- share it across
-    # callers/callees/strings instead of granting each its own full budget.
     kept, truncated, omit = truncate_lists_sharing_budget(
         [("callers", card["facts"]["callers"]), ("callees", card["facts"]["callees"]),
-         ("strings", card["facts"]["strings"])], budget)
+         ("strings", card["facts"]["strings"]), ("call_sites", card["facts"]["call_sites"]),
+         ("compare_sites", card["facts"]["compare_sites"])], budget)
     callers_omit, callees_omit, strings_omit = omit["callers"], omit["callees"], omit["strings"]
     facts = {**card["facts"], **kept}
     unresolved = card["unresolved"]
@@ -270,11 +787,104 @@ def cmd_query_func(args):
                            heuristics={**card["heuristics"], "next": card["next"]}, artifacts=[],
                            coverage={"complete": not (unresolved or truncated), "scope": query,
                                      "omitted": {"unresolved": [u["kind"] for u in unresolved],
-                                                 "truncated_counts": {"callers": callers_omit, "callees": callees_omit, "strings": strings_omit}}},
+                                                 "truncated_counts": {"callers": callers_omit, "callees": callees_omit, "strings": strings_omit,
+                                                                      "call_sites": omit["call_sites"], "compare_sites": omit["compare_sites"]}}},
                            diagnostics=diagnostics,
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
     doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+def cmd_query_pwn(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("pwn", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    store = resolve_index_root(binary, override=args.store)
+    profile = _gather_profile(binary, store)
+    if profile is None:
+        return _emit(*_query_error("pwn", "dependency_missing", "rat-profile produced no usable binary profile", EXIT_DEPENDENCY), args.format)
+    card = project_pwn_capability(profile)
+    budget = args.budget_bytes
+    sink_items = sorted(card["facts"]["sinks"].items())
+    kept, truncated, omit = truncate_lists_sharing_budget(sink_items, budget)
+    facts = {**card["facts"], "sinks": kept}
+    diagnostics = []
+    if truncated:
+        diagnostics.append({"code": "partial", "severity": "warning",
+                            "message": "PWN sink projection truncated at item boundary (budget_bytes=%d); counts remain exact" % budget})
+    cache_state = (profile.get("provenance") or {}).get("cache") or {}
+    if not isinstance(cache_state, dict):
+        cache_state = {}
+    if "hit" not in cache_state:
+        cache_state = {**cache_state, "hit": True if cache_state.get("state") == "hit" else None}
+    doc = _query_envelope(
+        "pwn", status="partial" if truncated else "ok", facts=facts,
+        heuristics=card["heuristics"], artifacts=[],
+        coverage={"complete": not truncated, "scope": "binary-profile imports+protections",
+                  "omitted": {"truncated_counts": omit} if truncated else None},
+        diagnostics=diagnostics,
+        provenance={**card["provenance"], "cache": cache_state},
+        budget_bytes=budget,
+    )
+    doc = _governor_wrap(_state_dir(binary), "query:pwn", {"facts": facts, "heuristics": card["heuristics"]}, doc)
+    return _emit(doc, EXIT_OK, args.format)
+
+
+def cmd_query_pattern(args):
+    binary = args.binary
+    bad = _check_binary(binary)
+    if bad:
+        return _emit(*_query_error("pattern", bad["code"], bad["message"], EXIT_INPUT), args.format)
+    if args.budget_bytes < 512 or not 1 <= args.max_cards <= 3:
+        return _emit(*_query_error("pattern", "input_invalid", "budget >=512 and max_cards 1..3 required", EXIT_INPUT), args.format)
+    expected = {}
+    for item in args.expect_source:
+        if "=sha256:" not in item:
+            return _emit(*_query_error("pattern", "input_invalid", "--expect-source requires path=sha256:digest", EXIT_INPUT), args.format)
+        path, digest = item.split("=", 1)
+        if not path.startswith(("skills/", "knowledge/")) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return _emit(*_query_error("pattern", "input_invalid", "invalid expected source path/digest", EXIT_INPUT), args.format)
+        expected[path] = digest
+    store = resolve_index_root(binary, override=args.store)
+    profile = _gather_profile(binary, store)
+    caps = _doctor_capabilities(binary)
+    fast = args.fast or not caps.get("angr", False)
+    rev, interesting, diagnostics = None, None, []
+    try:
+        mod, rev = _gather_revq(binary, fast, store)
+        interesting = mod.compute_interesting(rev)
+    except Exception as exc:
+        diagnostics.append({"code": "analysis_unavailable", "severity": "warning", "message": str(exc)})
+    route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    try:
+        cards, issues = project_patterns(route["leads"], route["signals"],
+                                         root=os.path.dirname(BIN), budget_bytes=args.budget_bytes,
+                                         max_cards=args.max_cards, expected_digests=expected)
+    except ValueError as exc:
+        return _emit(*_query_error("pattern", "input_invalid", str(exc), EXIT_INPUT), args.format)
+    diagnostics.extend(issues)
+    doc = _query_envelope("pattern", status="partial" if diagnostics else "ok",
+                          facts={"cards": cards, "kind": "hypothesis-aid", "direct_evidence": False},
+                          heuristics={"selection": "exact Router v2 leads in lexical order; no probability rank"},
+                          artifacts=[], coverage={"complete": not diagnostics,
+                                                  "scope": "selected Skill sections only", "omitted": [d["code"] for d in diagnostics]},
+                          diagnostics=diagnostics,
+                          provenance={"binary_sha256": _file_sha256(binary), "route_leads": route["leads"],
+                                      "cache": {"hit": None}}, budget_bytes=args.budget_bytes)
+    doc = _governor_wrap(_state_dir(binary), "query:pattern",
+                         {"cards": [c["id"] + c["source"]["digest"] for c in cards]}, doc)
+    render = (lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False)) if args.format == "json" else _render_query_text
+    while cards and len(render(doc).encode()) + 1 > args.budget_bytes:
+        removed = cards.pop()
+        diagnostics.append({"code": "budget_omitted", "severity": "warning", "message": "%s omitted: total output budget" % removed["id"]})
+        doc["status"] = "partial"; doc["coverage"]["complete"] = False
+        doc["coverage"]["omitted"].append("budget_omitted")
+    while len(render(doc).encode()) + 1 > args.budget_bytes and len(diagnostics) > 1:
+        diagnostics.pop()
+    if len(render(doc).encode()) + 1 > args.budget_bytes:
+        return _emit(*_query_error("pattern", "budget_too_small",
+                                   "pattern envelope and diagnostics exceed budget", EXIT_INPUT), args.format)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_oracle(args):
@@ -283,15 +893,15 @@ def cmd_query_oracle(args):
     if bad:
         return _emit(*_query_error("oracle", bad["code"], bad["message"], EXIT_INPUT), args.format)
     store = resolve_index_root(binary, override=args.store)
+    revq_started_at = datetime.now(timezone.utc).isoformat()
+    revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store)
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
-    # auto_connect / ambiguity are decided by compute_oracle over the FULL
-    # candidate set -- we only bound the *projection* returned to the model, so
-    # a binary with many "success"/"failure"-like strings can't blow up a single
-    # oracle query's context. Truncation never changes the resolve decision.
+    _record_revq_invocation(mod, binary, args.fast, store, rev,
+                            revq_started_at, revq_started_monotonic, "oracle")
     succ_full, fail_full = oracle["success_candidates"], oracle["failure_candidates"]
     budget = args.budget_bytes
     kept, truncated, omit = truncate_lists_sharing_budget(
@@ -322,6 +932,16 @@ def cmd_query_oracle(args):
     doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
     return _emit(doc, EXIT_OK, args.format)
 
+def _slice_complete(slice_doc):
+    """No current data-slice producer proves source-to-target value flow.
+
+    Zero *observed* alias/indirect counts only describe a bounded VEX/CFG
+    survey.  They cannot establish absence of unresolved dependencies, nor
+    authenticate a source-to-target proof.  Keep this gate fail-closed until a
+    verified dependency artifact and its validator are implemented.
+    """
+    return False
+
 def cmd_query_slice(args):
     binary = args.binary
     bad = _check_binary(binary)
@@ -349,22 +969,29 @@ def cmd_query_slice(args):
         msgs = [d.get("message", "") for d in slice_doc.get("diagnostics", [])] or ["rat-slice reported error"]
         return _emit(*_query_error("slice", "input_invalid", "; ".join(msgs), EXIT_INPUT), args.format)
     s = slice_doc.get("summary", {})
-    unresolved = bool(s.get("unresolved_aliases", 0)) or s.get("unresolved_indirect_calls", 0) == 1
-    status = "partial" if unresolved or slice_doc.get("status") == "partial" else "ok"
-    # C9: `claim` is a heuristic label, never a fact -- it must not appear in `facts`.
-    facts = {"target": s.get("target"), "within_function": s.get("within_function"), "interproc": s.get("interproc")}
-    heuristics = {"claim": s.get("claim")}
+    complete = _slice_complete(slice_doc)
+    status = "ok" if complete else "partial"
+    within_function = dict(s.get("within_function") or {})
+    loop_analysis = within_function.pop("loop_analysis", None)
+    facts = {"target": s.get("target"), "within_function": within_function, "interproc": s.get("interproc")}
+    heuristics = {"claim": s.get("claim"), "source_to_target_proven": False}
+    if loop_analysis is not None:
+        heuristics["loop_analysis"] = loop_analysis
     diagnostics = []
     for d in slice_doc.get("diagnostics", []):
         msg = d.get("message", "")
         code_tag = "dependency_missing" if "angr dependency missing" in msg else "partial"
         diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
+    if slice_doc.get("status") == "ok":
+        diagnostics.append({"code": "partial", "severity": "warning",
+                            "message": "bounded VEX/CFG survey only; source-to-target value flow has not been proven"})
     doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
                            artifacts=slice_doc.get("artifacts", []),
-                           coverage={"complete": not unresolved,
-                                     "scope": "backward-data-slice depth=%s" % (s.get("interproc") or {}).get("depth"),
+                           coverage={"complete": complete,
+                                     "scope": "backward-data-dependency depth=%s (bounded VEX/CFG survey)" % (s.get("interproc") or {}).get("depth"),
                                      "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
-                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls")}},
+                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls"),
+                                                 "source_to_target_proof": "not-available"}},
                            diagnostics=diagnostics,
                            provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
                                        "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
@@ -372,6 +999,9 @@ def cmd_query_slice(args):
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_dyn(rest):
+    if rest and rest[0] == "session":
+        from ratlib.gdb_session import main as session_main
+        return session_main(rest[1:])
     code, out, err = _run_subprocess([os.path.join(BIN, "rat-dyn")] + rest)
     sys.stdout.write(out); sys.stderr.write(err)
     return code
@@ -394,8 +1024,12 @@ def cmd_cache_stats(args):
 
 def cmd_selftest(_args=None):
     r = route_fn(profile={"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
-    assert r["subroute"] == "pwn-rop", r
-    validate(r, "rat.route-result/v1")
+    assert "stack-overwrite-candidate" in r["dimensions"]["vulnerability_surfaces"], r
+    assert r["commitment"] == "provisional" and r["skill"] is None, r
+    validate(r, "rat.route-result/v2")
+    pwn_card = project_pwn_capability({"imports": ["gets"], "facts": [{"kind": "elf.nx", "value": True}]})
+    assert "pwn-rop" in pwn_card["heuristics"]["leads"], pwn_card
+    assert "verified_primitive" not in pwn_card["facts"], pwn_card
     q = _query_envelope("selftest", status="ok", facts={}, heuristics={}, artifacts=[],
                          coverage={"complete": True, "scope": "selftest", "omitted": None},
                          diagnostics=[], provenance={"cache": {"hit": False}})
@@ -403,6 +1037,14 @@ def cmd_selftest(_args=None):
     c = {"schema": "rat.cache-stats/v1", "store": "/tmp/x", "total_entries": 0, "by_backend": {},
          "oldest_produced_at": None, "newest_produced_at": None}
     validate(c, "rat.cache-stats/v1")
+    b = {"schema": "rat.brief-card/v1", "binary": "x", "binary_sha256": None,
+         "capabilities": {"angr": False}, "route": r,
+         "skill_path": None,
+         "track_summary": {"pwn": {"protections": {}, "sinks": []},
+                           "rev": {"top_interesting": [], "evasion": [], "platform": "elf"}},
+         "libc": {"supplied": None}, "budget_tokens": 1500, "truncated": [],
+         "side_effects": ["route-assessment + governor.checked appended"]}
+    validate(b, "rat.brief-card/v1")
     check = check_progress([False] * 5)
     assert check["stuck"] is True, check
     kept, truncated, omitted = truncate_by_item([1, 2, 3], 1)
@@ -415,44 +1057,67 @@ def cmd_selftest(_args=None):
     return EXIT_OK
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="rat")
+    p = argparse.ArgumentParser(
+        prog="rat", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="rat — single front door thin dispatcher (route/brief/query/dyn/verify/state/cache).",
+        epilog="side effect: `rat route`/`rat brief` append a route-assessment note plus governor.checked;\n"
+               "every `rat query ...` appends governor.checked to challenge STATE. These are\n"
+               "bookkeeping, not solving progress; see doctrine/SOLVABILITY.md.")
     sub = p.add_subparsers(dest="command")
 
-    pr = sub.add_parser("route")
+    pr = sub.add_parser("route", help="project route evidence; optionally commit one Skill from cited STATE observations")
     pr.add_argument("binary"); pr.add_argument("--store"); pr.add_argument("--fast", action="store_true")
+    pr.add_argument("--skill", choices=sorted(ROUTE_SKILLS),
+                    help="commit one route-specific Skill after runtime/structural evidence exists")
+    pr.add_argument("--skill-evidence", action="append", default=[], metavar="OBS_ID",
+                    help="active derived/direct STATE observation supporting --skill (repeatable)")
+    pr.add_argument("--skill-reason",
+                    help="short evidence-linked reason for committing --skill")
     pr.add_argument("--format", choices=("text", "json"), default="text")
 
-    pq = sub.add_parser("query")
+    pb = sub.add_parser("brief", help="one-shot startup briefing card (doctor+route+recon/revq+libc, budgeted)")
+    pb.add_argument("binary"); pb.add_argument("--store"); pb.add_argument("--fast", action="store_true")
+    pb.add_argument("--libc"); pb.add_argument("--budget-tokens", type=int, default=1500)
+    pb.add_argument("--format", choices=("text", "json"), default="text")
+
+    pq = sub.add_parser("query", help="bounded read-only queries (graph|func|oracle|pwn|pattern|slice) over cached artifacts")
     qsub = pq.add_subparsers(dest="subcommand")
-    pf = qsub.add_parser("func")
+    pg = qsub.add_parser("graph", help="global, bounded projection of revq's recovered function call map")
+    pg.add_argument("binary"); pg.add_argument("--store"); pg.add_argument("--fast", action="store_true")
+    pg.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pg.add_argument("--max-nodes", type=int, default=64)
+    pg.add_argument("--format", choices=("text", "json"), default="text")
+    pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
     pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     pf.add_argument("--format", choices=("text", "json"), default="text")
-    po = qsub.add_parser("oracle")
+    po = qsub.add_parser("oracle", help="success/failure string candidates + symsolve auto-connect")
     po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
     po.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     po.add_argument("--format", choices=("text", "json"), default="text")
-    ps = qsub.add_parser("slice")
+    pp = qsub.add_parser("pwn", help="static PWN capability card from profile facts; never claims runtime primitive PASS")
+    pp.add_argument("binary"); pp.add_argument("--store"); pp.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pp.add_argument("--format", choices=("text", "json"), default="text")
+    pt = qsub.add_parser("pattern", help="source-bound hypothesis aids for provisional Router v2 leads")
+    pt.add_argument("binary"); pt.add_argument("--store"); pt.add_argument("--fast", action="store_true")
+    pt.add_argument("--budget-bytes", type=int, default=8192); pt.add_argument("--max-cards", type=int, default=3)
+    pt.add_argument("--expect-source", action="append", default=[], metavar="PATH=SHA256")
+    pt.add_argument("--format", choices=("text", "json"), default="text")
+    ps = qsub.add_parser("slice", help="backward data slice to an input sink (delegates rat-slice)")
     ps.add_argument("binary"); ps.add_argument("--backward", required=True); ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--source", default="stdin"); ps.add_argument("--store")
     ps.add_argument("--format", choices=("text", "json"), default="text")
 
-    # dyn/verify/state-compact forward an open-ended, flag-first argv to a
-    # legacy tool; argparse.REMAINDER mis-parses a leading option-like token
-    # (e.g. "--budget-tokens" with nothing before it), so main() intercepts
-    # these three by slicing sys.argv directly (same convention bin/state's
-    # own top-level dispatch uses) before this parser ever sees them. These
-    # placeholders exist only so `--help` lists the subcommands.
-    sub.add_parser("dyn", add_help=False)
-    sub.add_parser("verify", add_help=False)
-    sub.add_parser("state", add_help=False)
+    sub.add_parser("dyn", add_help=False, help="rat-dyn trace; `rat dyn session` opens optional local GDB/MI session")
+    sub.add_parser("verify", add_help=False, help="forward argv to rat-verify (deterministic verification)")
+    sub.add_parser("state", add_help=False, help="`rat state compact ...` -> state compact (token-bounded view)")
 
-    pcache = sub.add_parser("cache")
+    pcache = sub.add_parser("cache", help="cache/index inspection")
     cachesub = pcache.add_subparsers(dest="subcommand")
-    pcachestats = cachesub.add_parser("stats")
+    pcachestats = cachesub.add_parser("stats", help="cache entry counts by backend + age")
     pcachestats.add_argument("--store"); pcachestats.add_argument("--format", choices=("text", "json"), default="text")
 
-    sub.add_parser("selftest")
+    sub.add_parser("selftest", help="in-process route/query/brief/governor self-check")
     return p
 
 def main(argv=None):
@@ -460,8 +1125,6 @@ def main(argv=None):
     if not argv:
         build_parser().print_help()
         return EXIT_USAGE
-    # Manual argv slicing for the pure forwarding subcommands -- see the
-    # comment in build_parser() on why these bypass argparse.REMAINDER.
     if argv[0] == "selftest":
         return cmd_selftest()
     if argv[0] == "dyn":
@@ -474,9 +1137,13 @@ def main(argv=None):
     p = build_parser()
     args = p.parse_args(argv)
     if args.command == "route": return cmd_route(args)
+    if args.command == "brief": return cmd_brief(args)
     if args.command == "query":
+        if args.subcommand == "graph": return cmd_query_graph(args)
         if args.subcommand == "func": return cmd_query_func(args)
         if args.subcommand == "oracle": return cmd_query_oracle(args)
+        if args.subcommand == "pwn": return cmd_query_pwn(args)
+        if args.subcommand == "pattern": return cmd_query_pattern(args)
         if args.subcommand == "slice": return cmd_query_slice(args)
         p.parse_args(["query", "--help"]); return EXIT_USAGE
     if args.command == "cache":
@@ -490,4 +1157,10 @@ def main(argv=None):
     return EXIT_USAGE
 
 if __name__ == "__main__":
+    argv = sys.argv[1:]
+    rev_command = (argv[:1] in (["route"], ["brief"])
+                   or (len(argv) > 1 and argv[0] == "query"
+                       and argv[1] in {"graph", "func", "oracle", "pattern", "slice"}))
+    if rev_command and "--fast" not in argv and "--help" not in argv and "-h" not in argv:
+        reexec_for_angr(__file__, argv)
     sys.exit(main())

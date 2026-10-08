@@ -44,6 +44,7 @@ kernel/dumps/
 kernel/logs/
 # Python venv
 .venv/
+.venv-angr/
 venv/
 # 로컬 전용 계획/설계 문서 (레포 실행경로에서 미참조 — 세션 인수인계용, 커밋 안 함)
 /plans/
@@ -52,3 +53,4 @@ venv/
 # 내부 벤치마크·A/B 측정 하니스와 측정 결과물 (kit 사용자에겐 불필요 — 개발 측정용)
 /benchmarks/
 /tests/telemetry/
+.claude/settings.local.json

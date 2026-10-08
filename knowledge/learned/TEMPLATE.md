@@ -24,7 +24,7 @@
 
 ## Evidence
 
-- `STATE.jsonl` event:
+- typed `.rat/events/STATE.v2.jsonl` event:
 - Artifact / environment digest:
 - Reproduction command or evidence file:
 

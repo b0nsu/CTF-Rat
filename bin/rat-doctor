@@ -16,13 +16,17 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from ratlib.angr_runtime import configured_python
 
 TOOLS = {
     "file": ("file",), "binutils": ("readelf", "objdump"), "gdb": ("gdb",),
     "ghidra": ("analyzeHeadless",), "wine": ("wine", "wine64"),
-    "qemu": ("qemu-x86_64", "qemu-i386", "qemu-aarch64", "qemu-arm"),
 }
 MODULES = {"angr": "angr", "pwntools": "pwn", "qiling": "qiling"}
+QEMU_BY_ARCH = {
+    "x86_64": "qemu-x86_64", "x86": "qemu-i386",
+    "aarch64": "qemu-aarch64", "arm": "qemu-arm",
+}
 
 
 def sha256(path):
@@ -42,8 +46,38 @@ def executable(names):
 
 
 def module(name, import_name):
+    if name in {"angr", "qiling"}:
+        try:
+            interpreter = configured_python()
+        except ValueError as exc:
+            return {"status": "unavailable", "version": None, "reason": str(exc)}
+        if interpreter and os.path.abspath(interpreter) != os.path.abspath(sys.executable):
+            try:
+                probe = subprocess.run(
+                    [interpreter, "-c",
+                     "import importlib,importlib.metadata,sys; importlib.import_module(sys.argv[1]); print(importlib.metadata.version(sys.argv[2]))",
+                     import_name, name], capture_output=True, text=True, timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                return {"status": "unavailable", "version": None,
+                        "reason": "native-angr environment probe failed"}
+            if probe.returncode == 0:
+                return {"status": "available", "version": probe.stdout.strip()}
+            return {"status": "unavailable", "version": None,
+                    "reason": "module unavailable in native-angr environment"}
     try:
         if importlib.util.find_spec(import_name) is None:
+            if name == "pwntools":
+                root = os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+                pwn_python = os.path.join(root, ".venv", "bin", "python")
+                if os.path.isfile(pwn_python) and os.access(pwn_python, os.X_OK):
+                    try:
+                        probe = subprocess.run(
+                            [pwn_python, "-c", "import importlib,importlib.metadata; importlib.import_module('pwn'); print(importlib.metadata.version('pwntools'))"],
+                            capture_output=True, text=True, timeout=15)
+                    except (OSError, subprocess.TimeoutExpired):
+                        probe = None
+                    if probe is not None and probe.returncode == 0:
+                        return {"status": "available", "version": probe.stdout.strip()}
             return {"status": "unavailable", "version": None, "reason": "module not installed"}
         try: version = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError: version = "unknown"
@@ -75,9 +109,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not os.path.isfile(args.binary):
         print("rat-doctor: binary is missing or not a regular file", file=sys.stderr); return 4
-    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
-    capabilities.update({name: module(name, import_name) for name, import_name in MODULES.items()})
     fmt = format_info(args.binary)
+    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
+    capabilities["qemu"] = executable((QEMU_BY_ARCH[fmt["architecture"]],)) if fmt["architecture"] in QEMU_BY_ARCH else {
+        "status": "unavailable", "path": None, "version": None,
+        "reason": "no qemu-user mapping for artifact architecture",
+    }
+    capabilities.update({name: module(name, import_name) for name, import_name in MODULES.items()})
     routes = {
         "native": {"status": "available" if fmt["host_executable"] else "unavailable", "reason": None if fmt["host_executable"] else "foreign or unsupported format"},
         "gdb": {"status": "available" if fmt["host_executable"] and capabilities["gdb"]["status"] == "available" else "unavailable"},

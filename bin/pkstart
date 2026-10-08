@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
-# pkstart <name> [binary_path] : 새/held-out 문제 원샷 온보딩 (solve dir + recon + STATE 정적 시드)
+# pkstart <name> [binary_path] : 새/held-out 문제 원샷 온보딩 (solve dir + recon + STATE v2 시드)
 set -e
 N="${1:?usage: pkstart <name> [binary_path]}"; SRC="${2:-}"
 D="$CTF_HOME/solve/${N}"
@@ -15,5 +15,6 @@ state init "$N" >/dev/null 2>&1 || true
 echo "$R" | grep -aE 'PROT|SINK|EXEC|WIN|HEAP|libc|TRIAGE' | while IFS= read -r line; do
   state note "recon: $(echo "$line" | sed 's/^[[:space:]]*//')" >/dev/null 2>&1 || true
 done
-state next "decomp $B <func> -> vuln 도출 -> primitive 실증 -> state offset/ok/no 기록하며 진행" >/dev/null 2>&1 || true
-echo "[pkstart] STATE 시드 완료. 다음: state show; decomp $B"
+state hypothesis "recon output is triage context only; confirm with typed observations/findings before reuse" >/dev/null 2>&1 || true
+state next "decomp $B <func> -> rat.observation/v1 evidence -> state event append -> finding/primitive typed lifecycle" >/dev/null 2>&1 || true
+echo "[pkstart] STATE v2 시드 완료. 다음: state show; state compact; decomp $B"

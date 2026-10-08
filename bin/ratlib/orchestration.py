@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .artifact import get, put_bytes
-from .state_v2 import Stream
+from .state_v2 import Stream, trusted_producer_for_build
 
 PHASES = tuple("solve-P%d" % n for n in range(6))
 ROLES = {"orchestrator", "static-scout", "dynamic-scout", "hypothesis",
@@ -116,8 +116,9 @@ def _primitive(root, primitive_id, input_digest, environment_digest):
         raise GateError("primitive environment/input mismatch")
     return p
 def _verify_records(root, lineage_id=None):
-    stale={e["payload"].get("verification_id") for e in Stream(root).read() if e["type"]=="verification.staled"}
-    records=[e["payload"] for e in Stream(root).read() if e["type"]=="verification.recorded" and e["payload"].get("verification_id") not in stale]
+    events=Stream(root).read()
+    stale={e["payload"].get("verification_id") for e in events if e["type"]=="verification.staled"}
+    records=[e["payload"] for e in events if e["type"]=="verification.recorded" and e["payload"].get("verification_id") not in stale]
     return records if lineage_id is None else [r for r in records if r.get("lineage_id")==lineage_id]
 def _require_active_evidence(root, evidence_ids):
     if not isinstance(evidence_ids,list) or not evidence_ids or not all(isinstance(i,str) and i for i in evidence_ids): raise GateError("evidence IDs are required")
@@ -361,6 +362,12 @@ def _verification_report(root, report_digest):
     producer=report["producer"]
     if not isinstance(producer,dict) or set(producer)!={"tool","build_digest"} or producer["tool"]!="rat-verify" or not isinstance(producer["build_digest"],str) or not producer["build_digest"].startswith("sha256:"):
         raise GateError("verification report producer provenance is invalid")
+    # A tool-label string plus a well-formed sha256 prefix is not proof of origin --
+    # any JSON with the right shape could set both. Resolve the build_digest against
+    # the same content-addressed trust registry SELF evidence uses (state_v2) and
+    # require it to actually name the rat-verify producer, not merely look like one.
+    if trusted_producer_for_build(producer["build_digest"])!="rat-verify":
+        raise GateError("verification report build_digest is not a trusted rat-verify build")
     if not all(isinstance(provenance[k],str) and provenance[k] for k in provenance) or not provenance["trace_digest"].startswith("sha256:") or not provenance["environment_digest"].startswith("sha256:"):
         raise GateError("verification report digest provenance is invalid")
     return report
@@ -370,6 +377,7 @@ def record_verification(root, report_digest, evidence_ids):
     """Record a verifier-produced result and promote only an authenticated PASS."""
     root=_root(root); report=_verification_report(root,report_digest); provenance=report["provenance"]
     verdict=report["verdict"]; task=None
+    primitive_revision=None
     if verdict=="pass":
         if not report["environment_match"]: raise GateError("verification PASS requires a matching environment")
         _require_active_evidence(root,list(evidence_ids))
@@ -378,8 +386,8 @@ def record_verification(root, report_digest, evidence_ids):
             raise GateError("verification must be linked to completed exploit and its primitive")
         if task.get("environment_digest")!=provenance["environment_digest"]:
             raise GateError("verification report environment does not match exploit task")
-        _primitive(root,provenance["primitive_id"],task.get("input_digest"),task.get("environment_digest"))
-    record={"verification_id":_id("verify"),"report_digest":report_digest,"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":report["environment_match"],"exploit_task_id":provenance["exploit_task_id"],"primitive_id":provenance["primitive_id"],"trace_digest":provenance["trace_digest"],"producer_build_digest":report["producer"]["build_digest"],"exploit_phase_attempt_id":task.get("phase_attempt_id") if task else None,"lineage_id":task.get("lineage_id") if task else _lineage(root)}
+        primitive_revision=_primitive(root,provenance["primitive_id"],task.get("input_digest"),task.get("environment_digest")).get("revision")
+    record={"verification_id":_id("verify"),"report_digest":report_digest,"verdict":verdict,"evidence_ids":list(evidence_ids),"environment_match":report["environment_match"],"exploit_task_id":provenance["exploit_task_id"],"primitive_id":provenance["primitive_id"],"primitive_revision":primitive_revision,"trace_digest":provenance["trace_digest"],"producer_build_digest":report["producer"]["build_digest"],"exploit_phase_attempt_id":task.get("phase_attempt_id") if task else None,"lineage_id":task.get("lineage_id") if task else _lineage(root)}
     Stream(root).append("verification.recorded",record)
     return record
 def context_bundle(root, checkpoint_id, phase, budget):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -115,15 +116,25 @@ def _limit_preexec(limits: ResourceLimits, existing_processes: int):
             cpu_hard = min(cpu_hard, inherited_cpu_hard)
         cpu_soft = min(limits.cpu_seconds, cpu_hard)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_soft, cpu_hard))
-        resource.setrlimit(resource.RLIMIT_AS, (limits.address_space_bytes, limits.address_space_bytes))
+        # macOS neither enforces RLIMIT_AS nor accepts setting it when the inherited
+        # soft limit is RLIM_INFINITY (setrlimit raises "current limit exceeds
+        # maximum limit"), which would kill every spawn from preexec_fn. Skip it
+        # there; the CPU/time limits still bound the child.
+        if sys.platform != "darwin":
+            resource.setrlimit(resource.RLIMIT_AS, (limits.address_space_bytes, limits.address_space_bytes))
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.file_size_bytes, limits.file_size_bytes))
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
         # RLIMIT_NPROC is per real UID, not per child. Preserve room for the
         # user's existing processes and cap this invocation's additional tree.
-        _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        wanted = existing_processes + limits.processes
-        ceiling = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
-        resource.setrlimit(resource.RLIMIT_NPROC, (ceiling, hard))
+        # macOS has no /proc to count existing processes from, so the ceiling
+        # would be computed as just `limits.processes` — a per-UID cap far below
+        # the user's real process count that makes every fork fail with
+        # EAGAIN/BlockingIOError. Skip NPROC there (CPU/time limits still bound).
+        if sys.platform != "darwin":
+            _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+            wanted = existing_processes + limits.processes
+            ceiling = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+            resource.setrlimit(resource.RLIMIT_NPROC, (ceiling, hard))
         resource.setrlimit(resource.RLIMIT_CORE, (limits.core_bytes, limits.core_bytes))
     return apply_limits
 
@@ -143,7 +154,10 @@ def _writer(pipe, data: bytes) -> None:
     except (BrokenPipeError, OSError):
         pass
     finally:
-        pipe.close()
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError):
+            pass
 
 
 def _terminate_group(proc: subprocess.Popen, grace_seconds: float) -> None:
@@ -165,6 +179,38 @@ def _terminate_group(proc: subprocess.Popen, grace_seconds: float) -> None:
 def _minimal_environment() -> dict[str, str]:
     allow = {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR"}
     return {key: value for key, value in os.environ.items() if key in allow}
+
+
+def spawn_owned(argv: Sequence[str], *, cwd: Optional[str] = None,
+                env: Optional[Mapping[str, str]] = None,
+                limits: ResourceLimits = ResourceLimits()) -> subprocess.Popen:
+    """Spawn a long-lived local tool with the same argv/environment/limit policy as run().
+
+    The caller owns the returned process group and must call terminate_owned().
+    """
+    if not argv or not all(isinstance(arg, str) and arg for arg in argv):
+        raise ValueError("argv must be non-empty strings")
+    child_env = _minimal_environment()
+    if env is not None:
+        child_env.update(env)
+    return subprocess.Popen(list(argv), cwd=cwd, env=child_env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                            start_new_session=True,
+                            preexec_fn=_limit_preexec(limits, _user_process_count()) if os.name == "posix" else None)
+
+
+def terminate_owned(proc: subprocess.Popen, grace_seconds: float = 1.0) -> None:
+    _terminate_group(proc, grace_seconds)
+    try:
+        proc.wait(timeout=grace_seconds + 1)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
 
 def _guard_target(target: Sequence[str], ctf_home: Optional[str]) -> None:

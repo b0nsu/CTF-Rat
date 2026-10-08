@@ -8,8 +8,8 @@
 1. **통째 로드 금지.** pwn=`knowledge/ctf-skills/*.md`(~9000줄), rev=`knowledge/ctf-reverse/*.md`(~9400줄). triage로 확정된 **1개 파일만**.
 2. **큰 읽기는 subagent(Task)에 위임** → 결론(관련 기법명·전제·완화조건·코드 스니펫)만 회수. 메인 컨텍스트에 원문 붙이지 말 것.
 3. 각 파일 첫머리에 **Table of Contents** 있음 → 먼저 ToC만 grep(`grep -m30 '^##' <file>`)해 섹션 특정 후, 그 섹션만 발췌.
-4. **오프셋/gadget/상수는 여기서 recall 금지** — 전부 바이너리·gdb 실측 후 `state offset`. 문서 값은 개념 예시일 뿐.
-5. glibc 게이팅은 **how2heap(버전태그) 우선**, ctf-skills는 폭 보강.
+4. **오프셋/gadget/상수는 여기서 recall 금지** — 전부 바이너리·gdb 실측 후 evidence-backed typed STATE v2 observation으로 기록한다. 문서 값은 개념 예시일 뿐.
+5. glibc 게이팅은 **레포 내 `reference/glibc/`(버전 표, list) 우선** — 1차 grounding. how2heap은 미vendoring 외부 옵션이므로 clone 돼 있을 때만 폭 보강, ctf-skills는 개념 보강.
 6. 이 라우터는 외부 상호작용·결과 획득을 위한 실행 지침을 자동으로 불러오지 않는다. 고위험 실행·격리 경계·kernel 자료는 기본 경로에서 제외한다.
 
 ## 소스 3축
@@ -19,7 +19,8 @@
 | ctf-reverse | `knowledge/ctf-reverse/` (vendored, MIT) | **rev**: anti-analysis·언어별(Go/Rust/.NET…)·RE 패턴·VM·툴(Ghidra/angr/frida/qemu) |
 | ctf-writeup adapter | `knowledge/ctf-writeup/SKILL.md` (repo-owned, upstream-derived MIT) | local STATE·attestation·writeupcheck 통합 절차 |
 | locally learned | `knowledge/learned/` (repo-owned) | 로컬 증거에서 일반화한 candidate/validated/reused 패턴 |
-| how2heap | 외부: github.com/shellphish/how2heap (선택 clone) | glibc 버전별 heap 정밀(safe-linking/hook/tcache 게이팅) |
+| reference/glibc | `reference/glibc/`(list·SOURCES·glibc-fetch, repo-owned) | **glibc 버전 게이팅 1차** (tcache/safe-linking/hook 동작이 버전별로 갈릴 때 먼저 확인) |
+| how2heap | 외부: github.com/shellphish/how2heap (**미vendoring, 선택 clone 시에만**) | how2heap PoC 예제로 폭 보강 (없으면 reference/glibc + ctf-skills로 대체) |
 | kernel env | `kernel/` + `ctf-skills/kernel*.md` | 커널 (환경이 상위, md는 개념 참조) |
 
 ## triage class → 파일 라우팅
@@ -29,7 +30,7 @@
 | leak 또는 제어흐름 재구성 | 바이너리의 로컬 RE 및 `overflow-basics.md` | — |
 | stack pivot / SROP / 고급 제어흐름 기법 | 기본 라우팅 제외 | — |
 | format string (GOT/fmt leak/%n) | `ctf-skills/format-string.md` | — |
-| heap glibc (tcache/fastbin/UAF/overlap/House of *) | **how2heap(버전 확정 후)** | `ctf-skills/heap-techniques.md`, `heap-techniques-2.md` |
+| heap glibc (tcache/fastbin/UAF/overlap/House of *) | **`reference/glibc/`(버전 확정 후)** | `ctf-skills/heap-techniques.md`, `heap-techniques-2.md`; how2heap(clone 시) |
 | FSOP / _IO_FILE / House of Apple2 / vtable | `ctf-skills/heap-fsop.md` | `heap-techniques.md`(Apple2 절) |
 | non-glibc heap (musl / nginx pool / talloc) | `ctf-skills/heap-techniques-2.md` | — |
 | seccomp / 격리 경계 | 기본 라우팅 제외; 로컬 정책 분석과 차단 원인만 기록 | — |

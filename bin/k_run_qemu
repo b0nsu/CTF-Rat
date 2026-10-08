@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
-# run_qemu.sh — QEMU boot wrapper for kernel-pwn (HANDOFF item 2)
+# k_run_qemu — QEMU boot wrapper for kernel-pwn (HANDOFF item 2)
 # ---------------------------------------------------------------------------
 # Kernel-side sibling of the $CTF_HOME/bin/ wrapper convention: instead of the LLM
 # typing a 12-flag qemu-system-x86_64 line by hand, it invokes this. Boots a
 # challenge kernel + initramfs with the gdbstub open (:1234), backgrounds QEMU,
 # and sends the console to a LOG FILE (not the terminal) — same "big output ->
-# file, grep it" rule as decomp/gdbq/dump_heap.
+# file, grep it" rule as decomp/gdbq/k_dump_heap.
 #
 # Usage:
-#   run_qemu.sh [-k bzImage] [-i initramfs] [options]
+#   k_run_qemu [-k bzImage] [-i initramfs] [options]
 #
 #   -k, --kernel FILE   bzImage / vmlinuz (auto-detected in cwd if omitted)
 #   -i, --initrd FILE   initramfs image  (auto-detected in cwd if omitted)
@@ -40,7 +40,7 @@ KERNEL=""; INITRD=""; APPEND=""; DEBUG=0; HALT=0
 MEM="256M"; PORT="1234"; SMP="1"; CPU="kvm64,+smep,+smap"
 FG=0; EXTRA=""; LOG="./qemu.log"; DRY=0
 
-die(){ echo "run_qemu.sh: $*" >&2; exit 1; }
+die(){ echo "k_run_qemu: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
