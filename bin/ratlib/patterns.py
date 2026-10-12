@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 
 
 # Exact headings in repo-owned hot-path cards. No vendored examples or executable
@@ -40,6 +41,106 @@ def _section(source: str, heading: str) -> str:
         raise ValueError("missing or ambiguous section: " + marker)
     end = next((i for i in range(starts[0] + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
     return "\n".join(lines[starts[0] + 1:end]).strip()
+
+
+
+# Learned lessons remain advisory data, never proof for the current challenge.
+# INDEX.md is the small lookup index maintained by pklearn; do not scan all
+# knowledge files or include candidate/unverified lessons in automatic retrieval.
+_TICK = chr(96)
+_LESSON_ROW = re.compile(
+    r"^\|\s*\[[^\]]+\]\(((?:pwn|rev)/[a-z0-9][a-z0-9_.-]*\.md)\)"
+    r"\s*\|\s*" + _TICK + r"(validated|reused)" + _TICK + r"\s*\|"
+)
+
+
+def _contained_path(root, relative):
+    root = os.path.realpath(root)
+    resolved = os.path.realpath(os.path.join(root, relative))
+    if os.path.commonpath([root, resolved]) != root:
+        raise ValueError("lesson or evidence path escapes repository")
+    return resolved
+
+
+def _file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _learned_candidates(leads, *, root):
+    """Read only index-listed, proof-bound lessons matching explicit Router leads."""
+    index_root = os.path.join(root, "knowledge", "learned")
+    index_path = os.path.join(index_root, "INDEX.md")
+    if not os.path.isfile(index_path):
+        return [], []
+    try:
+        with open(index_path, encoding="utf-8") as stream:
+            rows = stream.read(131072).splitlines()
+    except (OSError, UnicodeError):
+        return [], [{"code": "learned_index_invalid", "severity": "warning",
+                     "message": "learned index could not be read"}]
+    results, diagnostics = [], []
+    for row in rows:
+        match = _LESSON_ROW.match(row)
+        if not match:
+            continue
+        lesson_rel, indexed_status = match.groups()
+        try:
+            lesson_path = _contained_path(index_root, lesson_rel)
+            if not os.path.isfile(lesson_path) or os.path.getsize(lesson_path) > 65536:
+                raise ValueError("lesson missing or exceeds read budget")
+            with open(lesson_path, encoding="utf-8") as stream:
+                source = stream.read()
+            status = re.search(r"(?m)^- Status: " + _TICK + r"(validated|reused)" + _TICK + r"\s*$", source)
+            domain = re.search(r"(?m)^- Domain: (pwn|rev)\s*$", source)
+            lead_match = re.search(r"(?m)^- Router lead: " + _TICK + r"([a-z-]+)" + _TICK + r"\s*$", source)
+            if not status or not domain or not lead_match:
+                continue  # Old lessons without explicit applicability remain opt-in.
+            lead = lead_match.group(1)
+            if lead not in leads:
+                continue
+            if status.group(1) != indexed_status or domain.group(1) != lesson_rel.split("/", 1)[0]:
+                raise ValueError("index and lesson metadata disagree")
+            if PATTERNS[lead][0].split("-", 1)[0] != domain.group(1):
+                raise ValueError("lesson domain does not match Router lead")
+            proof = re.search(
+                r"(?m)^- Validated evidence: " + _TICK + r"(sha256:[0-9a-f]{64})" + _TICK + r" \(([^()\n]+)\)\s*$",
+                source,
+            )
+            if not proof:
+                raise ValueError("validated evidence binding missing")
+            evidence_path = _contained_path(root, proof.group(2))
+            if not os.path.isfile(evidence_path) or _file_digest(evidence_path) != proof.group(1):
+                raise ValueError("validated evidence missing or changed")
+            summary = _section(source, "Summary")
+            applicability = _section(source, "Applicability")
+            failure = _section(source, "Failure conditions and counterexamples")
+            if not all([summary.strip(), applicability.strip(), failure.strip()]) or any(
+                "<TODO" in section for section in (summary, applicability, failure)
+            ):
+                raise ValueError("unfinished lesson content")
+            rel = "knowledge/learned/" + lesson_rel
+            results.append((lead, {
+                "id": "learned:" + lesson_rel[:-3],
+                "kind": "hypothesis-aid",
+                "source": {"path": rel, "digest": _file_digest(lesson_path),
+                           "evidence_digest": proof.group(1)},
+                "selection": {"lead": lead, "signals": [],
+                              "rule": "explicit Router lead; verified local lesson"},
+                "premise": applicability[:400],
+                "refutation": failure[:400],
+                "next_experiment": "check applicability with a bounded local probe",
+                "excerpt": {"summary": summary[:400]},
+                "lesson_status": indexed_status,
+                "direct_evidence": False,
+            }))
+        except (OSError, UnicodeError, ValueError) as exc:
+            diagnostics.append({"code": "learned_source_invalid", "severity": "warning",
+                                "message": "%s: %s" % (lesson_rel, exc)})
+    return sorted(results, key=lambda item: (item[0], item[1]["id"])), diagnostics
 
 
 def project_patterns(leads, signals, *, root: str, budget_bytes: int = 8192, max_cards: int = 3,
@@ -120,4 +221,20 @@ def project_patterns(leads, signals, *, root: str, budget_bytes: int = 8192, max
                 diagnostics.append({"code": "card_limit", "severity": "warning",
                                     "message": "additional matching leads omitted at max_cards=%d" % max_cards})
             break
+    # Learned lessons share the same card and byte caps as static Skill cards.
+    # No lesson is injected unless it names the current Router lead explicitly.
+    if len(cards) < max_cards:
+        learned, issues = _learned_candidates(set(matched_leads), root=root)
+        diagnostics.extend(issues)
+        for _lead, card in learned:
+            import json
+            size = len(json.dumps(card, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            if used + size > budget_bytes:
+                diagnostics.append({"code": "budget_omitted", "severity": "warning",
+                                    "message": "%s omitted: card exceeds budget" % card["id"]})
+                continue
+            cards.append(card)
+            used += size
+            if len(cards) >= max_cards:
+                break
     return cards, diagnostics
