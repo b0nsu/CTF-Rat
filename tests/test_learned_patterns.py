@@ -27,7 +27,8 @@ class LearnedPatternRetrieval(unittest.TestCase):
             file.write(b"locally reproduced fixture\n")
 
     def lesson(self, status="validated", index_status=None, lead="checker", proof_digest=None):
-        digest = proof_digest or "sha256:" + hashlib.sha256(open(self.proof, "rb").read()).hexdigest()
+        with open(self.proof, "rb") as evidence:
+            digest = proof_digest or "sha256:" + hashlib.sha256(evidence.read()).hexdigest()
         source = (
             "# Checker experience\n\n"
             "- Status: `%s`\n- Domain: rev\n- Router lead: `%s`\n\n"
@@ -99,7 +100,7 @@ class LearnedPatternRetrieval(unittest.TestCase):
 
     def test_budget_is_shared_with_static_cards(self):
         self.lesson()
-        base, _ = project_patterns(["checker"], [], root=self.root, max_cards=1)
+        base, _ = project_patterns(["checker"], [{"kind": "checker-function"}], root=self.root, max_cards=1)
         size = len(json.dumps(base[0], ensure_ascii=False, sort_keys=True).encode("utf-8"))
         cards, diagnostics = self.query(budget_bytes=size + 1)
         self.assertEqual(len(cards), 1)
