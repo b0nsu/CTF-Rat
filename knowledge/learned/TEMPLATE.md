@@ -2,6 +2,7 @@
 
 - Status: `candidate`
 - Domain: <pwn / rev>
+- Router lead: `<TODO: exact Router v2 lead>`
 - Source challenge:
 
 ## Summary

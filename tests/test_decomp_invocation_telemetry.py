@@ -11,9 +11,45 @@ ROOT = os.path.abspath(os.path.join(BIN, ".."))
 sys.path.insert(0, BIN)
 
 from ratlib.metrics import aggregate, iter_tool_results, benchmark_envelope_observations
+from ratlib.decomp_cache import write_meta
 
 
 class DecompInvocationTelemetryTests(unittest.TestCase):
+    def test_bad_instruction_in_named_cached_function_is_partial(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as out:
+                out.write(b"fixture-binary")
+            ghidra = os.path.join(d, "ghidra")
+            os.makedirs(os.path.join(ghidra, "Ghidra"))
+            with open(os.path.join(ghidra, "Ghidra", "application.properties"), "w") as out:
+                out.write("application.version=fixture-1\n")
+            cache = binary + ".decomp"
+            os.makedirs(cache)
+            with open(os.path.join(cache, "_index.txt"), "w") as out:
+                out.write("00100000\tmain\t10\n")
+            with open(os.path.join(cache, "main.c"), "w") as out:
+                out.write("/* WARNING: Bad instruction */\nvoid main(void) { halt_baddata(); }\n")
+            write_meta(cache, binary, ghidra, os.path.join(BIN, "ghidra_scripts"), "complete")
+            fake_bin = os.path.join(d, "fake-bin")
+            os.makedirs(fake_bin)
+            timeout = os.path.join(fake_bin, "timeout")
+            with open(timeout, "w") as out:
+                out.write('#!/usr/bin/env bash\nshift 3\nexec "$@"\n')
+            os.chmod(timeout, 0o755)
+            result = subprocess.run(
+                [os.path.join(BIN, "decomp"), "--format", "json", binary, "main"],
+                env=dict(os.environ, CTF_HOME=ROOT, GHIDRA_HOME=ghidra,
+                         XDG_CONFIG_HOME=os.path.join(d, "xdg"),
+                         PATH=fake_bin + os.pathsep + os.environ.get("PATH", "")),
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "partial")
+            self.assertIn("bad-instruction", result.stderr)
+            self.assertIn("objdump -d --start-address", result.stderr)
+            self.assertIn("0x400000", result.stderr)
+            self.assertEqual(list(iter_tool_results(os.path.join(d, ".rat")))[0]["status"], "partial")
+
     def test_cli_miss_and_hit_are_persisted_as_tool_result_invocations(self):
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")

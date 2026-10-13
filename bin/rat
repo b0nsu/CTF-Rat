@@ -28,6 +28,7 @@ from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
 from ratlib.state_v2 import Stream
+from ratlib.kernel_identity import inspect as inspect_kernel
 
 DEFAULT_BUDGET_BYTES = 16384
 
@@ -208,6 +209,8 @@ def _load_revq_module():
     return _REVQ_MODULE
 
 def _gather_revq(binary, fast, store):
+    if inspect_kernel(binary)["kind"] in {"bzimage", "linux-boot-image"}:
+        raise RuntimeError("Linux boot image: extract vmlinux before ELF analysis (Linux scripts/extract-vmlinux)")
     mod = _load_revq_module()
     # revq's extract_* helpers call die()/sys.exit() on missing angr / wrong
     # format when used as a standalone CLI -- reinterpret as a catchable
@@ -285,14 +288,19 @@ def _doctor_capabilities(binary):
         return {"native": False, "angr": False, "ghidra": False}
 
 def _gather_profile(binary, store):
+    identity = inspect_kernel(binary)
+    if identity["kind"] in {"bzimage", "linux-boot-image"}:
+        return {"artifact_identity": identity, "imports": [], "facts": []}
     code, out, _ = _run_subprocess([os.path.join(BIN, "rat-profile"), binary, "--store", store, "--format", "json"])
     if code != 0:
-        return None
+        return {"artifact_identity": identity} if identity["kind"] == "vmlinux" else None
     try:
         digest = json.loads(out)["artifacts"][0]["digest"]
-        return json.loads(artifact_get(digest, root=store))
+        profile = json.loads(artifact_get(digest, root=store))
+        profile["artifact_identity"] = identity
+        return profile
     except Exception:
-        return None
+        return {"artifact_identity": identity} if identity["kind"] == "vmlinux" else None
 
 # ---- Progress Novelty Governor wiring -- route/query plus canonical STATE evidence ----
 # The solving STATE lives next to the challenge binary (dirname(binary)/.rat),
@@ -776,7 +784,7 @@ def cmd_query_func(args):
          ("strings", card["facts"]["strings"]), ("call_sites", card["facts"]["call_sites"]),
          ("compare_sites", card["facts"]["compare_sites"])], budget)
     callers_omit, callees_omit, strings_omit = omit["callers"], omit["callees"], omit["strings"]
-    facts = {**card["facts"], **kept}
+    facts = {"function": card["function"], **card["facts"], **kept}
     unresolved = card["unresolved"]
     status = "partial" if unresolved or truncated else "ok"
     diagnostics = [{"code": "partial", "severity": "warning", "message": u["detail"]} for u in unresolved]
