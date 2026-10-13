@@ -74,19 +74,20 @@ def recommend(events, fallback="re-route-or-deep-escalate"):
     observed_ids = {e.get("payload", {}).get("observation_id") for e in events
                     if e.get("type") == "observation.recorded"}
     observed_ids.difference_update(state["invalidated"])
-    for event in reversed(events):
-        if event.get("type") != "unknown.recorded":
-            continue
-        p = event.get("payload") or {}
-        evidence = p.get("evidence_observation_ids") or []
-        if evidence and all(x in observed_ids for x in evidence):
-            return {"action": "low-cost-discriminator", "basis": ["observation:" + x for x in evidence]}
+    # A stale environment can invalidate a chain; check it before continuing.
     for key, p in sorted(state["findings"].items()):
-        if p["class"] in {"env", "environment"} and p["state"] in {"stale", "invalidated"} and p["evidence"]:
+        if (p["class"] in {"env", "environment"}
+                and p["state"] in {"stale", "invalidated"} and p["evidence"]):
             return {"action": "verify-environment", "basis": ["finding:" + key]}
+
+    # An active, evidence-linked PASS is more actionable than a general unknown.
+    # This advice does not replace the strict primitive or completion gates.
     for key, p in sorted(state["primitives"].items()):
-        if p["status"] in {"pass", "consumed"} and p["evidence"]:
+        if (p["status"] in {"pass", "consumed"} and p["evidence"]
+                and all(x in observed_ids for x in p["evidence"])):
             return {"action": "focused-deep", "basis": ["primitive:" + key]}
+
+    # Refutations should not be masked by a prior, unrelated unknown.
     for key, p in sorted(state["findings"].items()):
         if p["state"] in {"refuted", "invalidated"} and p["evidence"]:
             return {"action": "re-route", "basis": ["finding:" + key]}
@@ -94,7 +95,16 @@ def recommend(events, fallback="re-route-or-deep-escalate"):
         if evidence and all(x in observed_ids for x in evidence):
             return {"action": "re-route", "basis": ["route:" + fingerprint] +
                     ["observation:" + x for x in evidence]}
-    # Notes, including unknowns, do not supply a reliable evidence link.
+
+    # Evidence-linked unknowns still warrant a bounded discriminator when
+    # no stronger continuation or invalidation signal remains.
+    for event in reversed(events):
+        if event.get("type") != "unknown.recorded":
+            continue
+        p = event.get("payload") or {}
+        evidence = p.get("evidence_observation_ids") or []
+        if evidence and all(x in observed_ids for x in evidence):
+            return {"action": "low-cost-discriminator", "basis": ["observation:" + x for x in evidence]}
     return {"action": fallback, "basis": []}
 
 def check_progress(recent_novelty_flags, *, window=DEFAULT_WINDOW):
