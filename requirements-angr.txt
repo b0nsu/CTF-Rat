@@ -1,4 +1,6 @@
 # Native symbolic engine, isolated from the pwntools environment.
 angr==9.2.223
+# pyvex 9.2.223 uses ConstBitStream, which bitstring 5 removed.
+bitstring==4.4.0
 unicorn==2.1.4
 qiling==1.4.6
