@@ -29,6 +29,12 @@ if [ "$NAME" = "." ] || [ "$NAME" = ".." ] || [ "${#NAME}" -gt 128 ] ||
   exit 2
 fi
 [ -f "$BIN" ] || { echo "[newchal:err] binary not found: $BIN" >&2; exit 4; }
+ARTIFACT_KIND="$(PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$BIN" <<'PY'
+import sys
+from ratlib.kernel_identity import inspect
+print(inspect(sys.argv[1])["kind"])
+PY
+)"
 if [ -n "$LIBC" ] && [ ! -f "$LIBC" ]; then
   echo "[newchal:err] libc not found: $LIBC" >&2; exit 4
 fi
@@ -100,7 +106,7 @@ if [ -n "$DOCKER_SRC" ] && [ ! -f ./Dockerfile ]; then
   cp "$DOCKER_SRC" ./Dockerfile 2>/dev/null || true
 fi
 # pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
-if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
+if [ -n "$LIBC" ] && [[ "$ARTIFACT_KIND" != bzimage && "$ARTIFACT_KIND" != linux-boot-image && "$ARTIFACT_KIND" != vmlinux ]] && command -v pwninit >/dev/null; then
   echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
   # `timeout` is GNU coreutils; macOS ships it as `gtimeout`. If neither exists,
   # run pwninit unbounded (it's optional) rather than failing the scaffold.
@@ -117,9 +123,16 @@ if [ -n "$LIBC" ] && command -v pwninit >/dev/null; then
     echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → reference/glibc/ 에서 libc 버전 수동 매칭 후 patchelf 필요 (reference/glibc/SOURCES 참조)"
   fi
 fi
-python3 - "$D" "$BN" "$HOST" "$PORT" <<'PY'
+python3 - "$D" "$BN" "$HOST" "$PORT" "$ARTIFACT_KIND" <<'PY'
 import sys,os
-D,BN,HOST,PORT=sys.argv[1:5]
+D,BN,HOST,PORT,KIND=sys.argv[1:6]
+if KIND in {"bzimage", "linux-boot-image", "vmlinux"}:
+    open(os.path.join(D,"exploit.py"),"w").write(
+        '#!/usr/bin/env python3\n'
+        '# Kernel artifact: configure the provided boot/initramfs harness before execution.\n'
+        '# Inspect symbols in extracted vmlinux; record runtime evidence before exploitation.\n'
+        'raise SystemExit("Configure the challenge kernel harness first (see run.json)")\n')
+    raise SystemExit(0)
 exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
 haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
 remote_branch = ('    if args.REMOTE: return remote(%r, %s)\n' % (HOST, PORT)) if HOST else ''
@@ -156,5 +169,18 @@ except (OSError, ValueError) as exc:
     raise SystemExit(2)
 PY
 echo "=== libcgate ==="; "$CTF/bin/libcgate" "." | tee -a state.md || true
-echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC_ABS:+./libc.so.6} | tee -a state.md
-echo; echo "[+] $D 생성. 다음: cd $D; decomp ./$BN <func>"
+if [[ "$ARTIFACT_KIND" = bzimage || "$ARTIFACT_KIND" = linux-boot-image || "$ARTIFACT_KIND" = vmlinux ]]; then
+  PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "./$BN" <<'PY' | tee -a state.md
+import json,sys
+from ratlib.kernel_identity import inspect
+identity=inspect(sys.argv[1])
+print("[newchal] 커널 이미지 (%s): 일반 ELF recon 생략" % identity["kind"])
+print(json.dumps(identity,ensure_ascii=False,sort_keys=True))
+if identity["kind"] != "vmlinux":
+    print("[newchal] Linux scripts/extract-vmlinux로 ELF vmlinux를 추출한 뒤 함수 조회. 부팅 환경은 별도 확인 필요.")
+PY
+  echo "[+] $D 생성. 다음: cd $D; rat route ./$BN --fast"
+else
+  echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC_ABS:+./libc.so.6} | tee -a state.md
+  echo; echo "[+] $D 생성. 다음: cd $D; decomp ./$BN <func>"
+fi

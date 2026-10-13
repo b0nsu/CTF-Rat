@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# recon <binary> [libc.so.6] [--format text|json] — 정적 프로파일 + 보수적 triage (확실한 것만 FAST)
+# recon <binary> [libc.so.6] [--format text|json] — 정적 프로파일 + callsite attention
 import sys, os, re, glob, json
 from ratlib.runner import run
 def sh(argv):
@@ -96,35 +96,21 @@ def main():
         if vmish:   print("SIGNAL VM?  : interpreter/opcode 문자열 감지")
         if stripped: print("[!] stripped — 심볼기반 신호(win/함수명) 신뢰 불가, triage 확신도 하향")
 
-    # ---------- 보수적 triage: 확실할 때만 🟢 ----------
+    # Import/protection facts locate inspection work; they do not establish an
+    # exploit technique or justify FAST/high confidence, even with a win symbol.
     tier="🟠 HARD"; techs=[]; why=[]; conf="낮음"
-    fast = (not e.canary) and dangerous
-    if winsyms and fast and not e.pie and not stripped:
-        tier="🟢 FAST"; conf="높음"; techs=["ret2win"]; why=["win 심볼 + overflow sink + no PIE/canary"]
-    elif fast and has_system and binsh:
-        tier="🟢 FAST"; conf="높음"; techs=["ret2 system('/bin/sh')"]; why=["overflow + system+/bin/sh"]
-    elif fast and libc_ver:
-        tier="🟡 STANDARD"; conf="중간"; techs=["ret2libc + one_gadget","leak→libc"]; why=["overflow + libc(%s)"%libc_ver]
-    elif fast:
-        tier="🟡 STANDARD"; conf="중간"; techs=["ROP (leak 필요)"]; why=["overflow, canary/libc 확인 필요"]
+    if dangerous:
+        tier="🟡 STANDARD"; why.append("input/copy imports: inspect bounds and destination; overwrite unverified")
     if heapfns:
-        if libc_ver and tuple(map(int, libc_ver.split('.'))) < (2,32):
-            tier="🟡 STANDARD"; conf="중간"; techs=["tcache poisoning / fastbin dup","__free_hook/__malloc_hook overwrite"]
-            why=["heap + glibc %s (<2.32: hooks 존재, safe-linking 없음)"%libc_ver]
-        else:
-            tier="🟠 HARD"; conf="낮음"; techs=["FSOP / House of *","tcache + safe-linking 우회"]
-            why=["heap + glibc %s (>=2.32: safe-linking; >=2.34: hooks 제거)"%(libc_ver or '미상')]
-    if fmtfns and not dangerous and not heapfns:
-        techs.append("format-string 후보 (decomp로 printf(user) 확인 — 정적 확신 불가)"); why.append("printf 계열 존재")
+        tier="🟡 STANDARD"; why.append("allocator imports: inspect application lifetimes; reuse/overlap unverified")
+    if fmtfns:
+        tier="🟡 STANDARD"; why.append("printf-family imports: inspect format arguments; attacker control unverified")
     if seccomp:
-        techs.append("seccomp → ORW shellcode/ROP"); why.append("seccomp 필터 (seccomp-tools dump)")
+        why.append("seccomp imports: inspect actual filter before choosing an execution path")
     if vmish and nfunc>25:
-        tier="🟠 HARD"; conf="낮음"; techs=["custom VM: RE 선행"]; why=["인터프리터 구조 추정"]
+        why.append("interpreter/opcode strings: inspect dispatch structure; VM unverified")
 
-    rec = {"🟢 FAST":"SOLVE (확신 — 먼저)", "🟡 STANDARD":"SOLVE (작업 필요)",
-           "🟠 HARD":"후순위 (확신 낮음)"}[tier]
-    if stripped and tier=="🟢 FAST":
-        tier="🟡 STANDARD"; conf="중간"; rec="SOLVE (stripped라 확신 하향)"
+    rec = "callsite 확인 필요 (취약점 미확인)" if why else "정적 단서 부족 — bounded 조회 필요"
     techs=list(dict.fromkeys(techs))
     if fmt == "json":
         # machine-facing view: same facts/triage, no Korean text to grep/sed.
@@ -149,9 +135,15 @@ def main():
                        "techniques": techs, "why": list(dict.fromkeys(why))},
         }, ensure_ascii=False)); return 0
     print("-"*60)
-    print("[ROUTE] TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
-    print("  추정 기법:", "; ".join(dict.fromkeys(techs)) or "미상 — decomp 로 vuln 확인")
-    print("  근거    :", "; ".join(why) or "정적 신호 부족")
+    print("[ATTENTION] TRIAGE: %s  | 확신도: %s  → %s" % (tier, conf, rec))
+    print("  추정 기법: 미확인 — import/protection만으로 기법을 추정하지 않음")
+    attention=[]
+    if dangerous: attention.append("입력/복사 호출의 길이·목적지 확인 필요")
+    if heapfns: attention.append("할당/해제 호출의 수명·재사용 확인 필요")
+    if fmtfns: attention.append("printf 계열 format 인자 확인 필요")
+    if seccomp: attention.append("실제 seccomp 필터 확인 필요")
+    if vmish and nfunc>25: attention.append("dispatch 구조 확인 필요")
+    print("  근거    :", "; ".join(attention) or "정적 신호 부족")
     print("  다음    : decomp %s <func> → vuln 확정 → state show/compact에 typed v2 증거 기록" % path)
     print("="*60)
     return 0

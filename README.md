@@ -164,13 +164,46 @@ Config precedence: CLI > env vars (`CTFD_URL` / `CTFD_TOKEN`) > dotenv (`--env`,
 ```sh
 revq <bin>                     # summary + INTERESTING (check-routine candidates) + EVASION (anti-debug/packing)
 revq <bin> --func <name>       # single-function neighborhood card (saves context before decompiling)
-decomp <func>                  # Ghidra headless decompile cache
+decomp <bin> <func>             # Bash executable: Ghidra headless decompile cache
+mod2solve system.json           # solve matrix @ x = target modulo 2**bits; verify against original inputs
 symsolve.py <bin> --find-str Correct --stdin 16 --printable   # recover input, re-run the real binary to verify
 vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 ```
 
 > [!TIP]
 > `revq` addresses = angr's load base (PIE `0x400000`) → feed them straight into `symsolve --find <addr>`.
+
+`decomp` is a Bash script: invoke `bin/decomp <bin> <func>` directly or with
+`bash bin/decomp <bin> <func>`. Python tools such as `revq` accept
+`python3 bin/revq ...`; `python3 bin/decomp ...` does not. Bad-instruction output
+from a cached function is marked `partial` with a bounded `objdump` diagnostic;
+compare revq's mapped address with the ELF VMA before disassembly.
+
+For Linux boot images, `newchal` skips generic ELF recon and `rat route` reports
+the kernel identity and the prerequisite to extract ELF `vmlinux` using Linux
+`scripts/extract-vmlinux`. Symbol-bearing kernels use bounded ELF metadata in
+`revq` (including executable NOTYPE symbols), without a whole-kernel CFG.
+This establishes artifact identity only; boot environment and primitives still
+require evidence. Ghidra imports of kernels or files at least 16 MiB require
+`decomp --allow-full-analysis --timeout SEC BIN [FUNC]`; cached function reads
+remain available. Initial import analyzes and exports the whole program.
+
+`rat-adapt --root` names the artifact store, normally `<challenge>/.rat`.
+Omitting it uses `./.rat`. A challenge root containing `.rat` is rejected before
+execution with the corrected store path, so evidence cannot silently land in a
+different store from STATE.
+
+`mod2solve` is a Python executable with no solver dependency. Its JSON input is
+`{"bits":8,"matrix":[[3,2],[0,1]],"target":[19,5]}`. Run
+`python3 bin/mod2solve system.json`; it returns a solution vector, `solution_hex`
+for byte-sized moduli, the original inputs and file digest, and an independent
+`matrix @ solution` check. Status distinguishes `unique`, `multiple`, and
+`inconsistent`; exit codes are 0 for a solution, 1 for no solution, and 2 for
+invalid input. Even pivots and rectangular systems are supported (up to 256
+rows/columns and 64 modulus bits). For a non-unique system, one representative
+is returned; byte/printable constraints are not imposed. This verifies the
+equation only: validate the recovered input with the challenge's concrete
+verifier before recording solve evidence.
 
 </details>
 

@@ -97,6 +97,9 @@ def parser() -> argparse.ArgumentParser:
     source.add_argument("--file", help="read text or raw bytes from a file")
     source.add_argument("--bytes", help="interpret one hex byte sequence as a packed pointer")
     result.add_argument("--raw", action="store_true", help="treat --file/stdin as packed bytes")
+    result.add_argument("--partial", action="store_true",
+                        help="read one 1-8 byte pointer via --bytes/--raw; assume unobserved high bytes "
+                             "are zero (64-bit x86, little-endian, width 8 only)")
     result.add_argument("--bits", type=int, choices=(32, 64), default=64)
     result.add_argument("--arch", choices=("auto", "x86", "arm", "aarch64", "generic"), default="auto",
                         help="address-layout profile; auto currently assumes x86 for compatibility")
@@ -123,18 +126,33 @@ def read_input(args) -> bytes:
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
     try:
-        data = read_input(args)
         arch = "x86" if args.arch == "auto" else args.arch
         width = args.width or args.bits // 8
+        if args.partial:
+            if args.text is not None or not (args.raw or args.bytes is not None):
+                raise ValueError("--partial requires --bytes or --raw file/stdin input")
+            if args.bits != 64 or arch != "x86" or args.endian != "little" or width != 8:
+                raise ValueError("--partial requires 64-bit x86, little-endian, width 8")
+        data = read_input(args)
         items = []
         if args.raw or args.bytes is not None:
-            if len(data) < width:
-                raise ValueError("need at least %d packed bytes" % width)
-            for offset in range(0, len(data) - width + 1, width):
-                raw = data[offset:offset + width]
+            if args.partial:
+                if not 1 <= len(data) <= width:
+                    raise ValueError("--partial requires exactly one pointer of 1-8 observed bytes")
+                chunks = [(0, data)]
+            else:
+                if len(data) < width:
+                    raise ValueError("need at least %d packed bytes" % width)
+                chunks = ((offset, data[offset:offset + width])
+                          for offset in range(0, len(data) - width + 1, width))
+            for offset, raw in chunks:
                 value = int.from_bytes(raw, args.endian)
                 item = candidate(value, raw.hex(), args.bits, arch, args.chunk)
                 item["byte_offset"] = offset
+                if len(raw) < width:
+                    item["observed_byte_count"] = len(raw)
+                    item["missing_byte_count"] = width - len(raw)
+                    item["completion_assumption"] = "zero-extension"
                 items.append(item)
         else:
             text = data.decode("utf-8", errors="replace")
@@ -163,9 +181,14 @@ def main(argv=None) -> int:
         else:
             print("candidates=%d usable=%d" % (report["candidate_count"], report["usable_count"]))
             for item in items:
+                detail = "marker" if item["checks"]["marker_like"] else ""
+                if "completion_assumption" in item:
+                    detail += " observed=%d/%d assumption=%s" % (
+                        item["observed_byte_count"], width, item["completion_assumption"],
+                    )
                 print("%s %-19s %-20s %s" % (
                     item["disposition"], item["hex"], ",".join(item["classification"]),
-                    "marker" if item["checks"]["marker_like"] else "",
+                    detail.strip(),
                 ))
         return 0 if items else 1
     except (OSError, ValueError) as exc:
