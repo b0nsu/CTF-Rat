@@ -71,6 +71,7 @@ def _draft(chal_dir, domain, view):
     L.append("")
     L.append("- Status: `candidate`")
     L.append("- Domain: %s" % (domain or "<TODO: pwn / rev>"))
+    L.append("- Router lead: `<TODO: exact Router v2 lead>`")
     L.append("- Source challenge: %s" % chal)
     L.append("")
     L.append("## Summary")

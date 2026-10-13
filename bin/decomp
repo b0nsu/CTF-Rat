@@ -32,13 +32,14 @@ mkdir -p "$XDG_CONFIG_HOME"
 if [ -z "${JAVA_TOOL_OPTIONS:-}" ]; then
   export JAVA_TOOL_OPTIONS="-XX:-TieredCompilation"
 fi
-REFRESH=0; TIMEOUT_SEC=120; FORMAT=text; positional=()
+REFRESH=0; TIMEOUT_SEC=120; FORMAT=text; ALLOW_FULL_ANALYSIS=0; positional=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --refresh) REFRESH=1 ;;
+    --allow-full-analysis) ALLOW_FULL_ANALYSIS=1 ;;
     --timeout) shift; TIMEOUT_SEC="${1:-}" ;;
     --format) shift; FORMAT="${1:-}" ;;
-    -h|--help) echo "usage: decomp [--refresh] [--timeout SEC] [--format text|json] BIN [FUNC]"; exit 0 ;;
+    -h|--help) echo "usage: decomp [--refresh] [--allow-full-analysis] [--timeout SEC] [--format text|json] BIN [FUNC]"; echo "Large/kernel cold imports require --allow-full-analysis; first import analyzes and exports the whole program."; exit 0 ;;
     *) positional+=("$1") ;;
   esac
   shift
@@ -82,10 +83,17 @@ record_decomp_invocation(){
 }
 trap record_decomp_invocation EXIT
 emit_file(){
+  local result_status=ok
+  if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$1"; then
+    result_status=partial
+    DECOMP_RESULT_STATUS=partial
+    echo "[!] Ghidra bad-instruction: 결과 partial. revq 함수 주소와 ELF VMA를 대조한 뒤 objdump -d --start-address=<FILE_VADDR> --stop-address=<END> 사용 (PIE revq 기본 load base=0x400000; file VADDR와 구분)." >&2
+    echo "RAT_STATUS=partial RAT_EXIT=0" >&2
+  fi
   if [ "$FORMAT" = json ]; then
-    python3 - "$1" <<'PY'
+    python3 - "$1" "$result_status" <<'PY'
 import json,sys
-print(json.dumps({'schema':'rat.decomp-result/v1','status':'ok','source':'decompile','content':open(sys.argv[1],errors='replace').read()}))
+print(json.dumps({'schema':'rat.decomp-result/v1','status':sys.argv[2],'source':'decompile','content':open(sys.argv[1],errors='replace').read()}))
 PY
   else
     cat "$1"
@@ -98,7 +106,31 @@ reseal_decomp_cache(){
   python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null 2>&1
 }
 
+check_import_scope(){
+  local import_scope
+  import_scope="$(PYTHONPATH="$CTF_HOME/bin${PYTHONPATH:+:$PYTHONPATH}" python3 - "$BIN" <<'PY'
+import os,sys
+from ratlib.kernel_identity import inspect
+identity=inspect(sys.argv[1])
+if identity['kind'] in {'bzimage','linux-boot-image'}:
+    print('boot-image')
+elif identity['kind']=='vmlinux' or os.path.getsize(sys.argv[1]) >= 16*1024*1024:
+    print('whole-program')
+PY
+)"
+  if [ "$import_scope" = boot-image ]; then
+    echo "[!] Linux 부트 이미지: scripts/extract-vmlinux로 ELF를 먼저 추출하세요." >&2
+    echo "RAT_STATUS=error RAT_EXIT=2" >&2
+    exit 2
+  elif [ "$import_scope" = whole-program ] && [ "$ALLOW_FULL_ANALYSIS" -eq 0 ]; then
+    echo "[!] Ghidra import는 전체 프로그램 분석을 실행합니다 (최초 캐시는 전체 함수 export도 포함). 커널/16MiB 이상 이미지는 decomp --allow-full-analysis --timeout <SEC> <BIN> [FUNC]로 명시적 예산을 지정하세요. 심볼 조회는 rat query func <BIN> <FUNC> --fast를 사용하세요." >&2
+    echo "RAT_STATUS=error RAT_EXIT=2" >&2
+    exit 2
+  fi
+}
+
 if [ "$REFRESH" -eq 1 ] && [ -d "$CACHE" ]; then
+  check_import_scope
   mv "$CACHE" "$CACHE.stale.$(date +%s)"
 fi
 if [ -f "$CACHE/_index.txt" ]; then
@@ -114,12 +146,14 @@ if [ -f "$CACHE/_index.txt" ]; then
   elif [ "$cache_rc" -eq 0 ]; then
     DECOMP_CACHE_STATE=hit
   elif [ "$cache_rc" -ne 0 ]; then
+    check_import_scope
     echo "[!] decomp cache $cache_state: 재분석 필요" >&2
     mv "$CACHE" "$CACHE.$cache_state.$(date +%s)"
   fi
 fi
 if [ ! -f "$CACHE/_index.txt" ]; then
-  echo "[*] Ghidra headless 디컴파일 (최초 1회, ~30-90s)..." >&2
+  check_import_scope
+  echo "[*] Ghidra headless 전체 분석/export (timeout=${TIMEOUT_SEC}s)..." >&2
   [ -x "$GHIDRA/support/analyzeHeadless" ] || {
     echo "[!] Ghidra 없음: GHIDRA_HOME=$GHIDRA" >&2
     echo "RAT_STATUS=dependency_missing RAT_EXIT=3" >&2
@@ -221,6 +255,7 @@ else
     printf -v gh "FUN_%08x.c" "$addr"
     DECOMP_CACHE_STATE=miss
     if [ -x "$GHIDRA/support/analyzeHeadless" ]; then
+      check_import_scope
       echo "[*] '$FUNC' 함수 캐시 없음; Ghidra one-shot create/decompile 시도 $(printf '0x%x' "$addr")" >&2
       proj="$(mktemp -d)"
       one_log="$CACHE/.ghidra-one-$(printf '%x' "$addr").log"

@@ -10,6 +10,7 @@ CRYPTO=("aes","des","rc4","md5","sha","base64","xor","rsa","hmac","crc")
 COMPARE={"strcmp","strncmp","memcmp","strcasecmp","strncasecmp","strstr","strcoll","bcmp","wcscmp","wcsncmp"}
 SUCCESS=re.compile(r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b|flag\{",re.I)
 FAILURE=re.compile(r"incorrect|wrong|denied|reject(?:ed)?|invalid|fail(?:ed|ure)?|try\s*again",re.I)
+PROMPT=re.compile(r"\b(?:input|flag|password|key)\s*[:>]",re.I)
 DIMS=("vulnerability_surfaces","program_shapes","obstacles","constraints")
 STRONG_OVERFLOW_IMPORTS=STRONG
 WEAK_OVERFLOW_IMPORTS=OVERFLOW-STRONG
@@ -30,6 +31,15 @@ def _oracle(revq,name):
     return ({"success_count":len(good),"failure_count":len(bad),"success":good[:2],"failure":bad[:2]} if good and bad else None)
 def _blob(revq):
     return " ".join(s.get("val","") for s in (revq or {}).get("strings",[]) or [] if isinstance(s,dict)).lower()
+def runtime_context(names):
+    """Named runtime markers are context, never a vulnerability exclusion."""
+    markers={
+        "nim": lambda n: n in {"NimMain", "NimMainModule", "nimGCref", "nimGCunref", "nimRegisterGlobalMarker"} or n.startswith("NimMainInner"),
+        "go": lambda n: n.startswith(("runtime.", "runtime·", "go.itab.", "go:itab.")),
+        "rust": lambda n: n.startswith(("rust_begin_unwind", "__rust_alloc", "__rust_dealloc")) or bool(re.match(r"_ZN\d+(?:std|core|alloc)\d",n)),
+    }
+    return [{"runtime":kind,"symbols":sorted({n for n in names if test(n)})[:4]}
+            for kind,test in sorted(markers.items()) if any(test(n) for n in names)]
 def _add(items,value):
     if value not in items: items.append(value)
 def _sig(items,kind,value,quality):
@@ -78,6 +88,26 @@ def route(*,profile=None,revq=None,interesting=None):
     imports=set((profile or {}).get("imports",[]) or [])|set((revq or {}).get("imports",[]) or [])
     dimensions={name:[] for name in DIMS}; signals=[]; unresolved=[]; leads=[]; actions=[]
     capabilities={"profile":profile is not None,"revq":revq is not None}; is_pe=(revq or {}).get("platform")=="pe"
+    function_names={f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)}
+    identity=(profile or {}).get("artifact_identity") or (revq or {}).get("artifact_identity") or {}
+    kernel_image=identity.get("kind") in {"bzimage","linux-boot-image","vmlinux"}
+    if kernel_image:
+        _sig(signals,"kernel-image",identity,"fact")
+        _add(dimensions["program_shapes"],"kernel-image"); _add(leads,"kernel")
+        _add(unresolved,"kernel identity does not establish the boot environment or an exploitation primitive")
+        boot=identity["kind"] != "vmlinux"
+        if boot:
+            _add(dimensions["obstacles"],"compressed-kernel")
+            _add(unresolved,"extract an ELF vmlinux with Linux scripts/extract-vmlinux before function analysis; extraction tool availability is unverified")
+        actions.append(_action("extract-vmlinux" if boot else "rat query func",
+                               identity.get("path","<boot-image>") if boot else next((n for n in ("copy_process","start_kernel") if n in function_names or n in identity.get("kernel_symbols",[])),"<kernel-symbol-or-address>"),
+                               ["kernel-image"],"kernel structure supplies the prerequisite for bounded analysis",
+                               resolves=["ELF vmlinux required before function analysis" if boot else "inspect the selected kernel function using recovered symbols"],
+                               expected_evidence="structured-static",cost="medium" if boot else "low",blocking=True))
+    runtimes=runtime_context(imports|function_names)
+    if runtimes:
+        _sig(signals,"runtime-symbols",runtimes,"heuristic")
+        _add(unresolved,"runtime symbols can explain copy and allocator imports; application callsites remain unverified")
     if is_pe:
         _sig(signals,"pe-platform","PE/Windows","fact"); _add(dimensions["constraints"],"pe-windows")
         actions.append(_action("solve/_template/rev/qiling_trace.py","pe-dynamic-emulation-rootfs-required",["pe-platform"],
@@ -122,14 +152,17 @@ def route(*,profile=None,revq=None,interesting=None):
                                    expected_evidence="structured-static"))
     hits=sorted(imports&OVERFLOW)
     if hits:
-        _sig(signals,"overflow-imports",hits,"fact" if imports&STRONG else "heuristic"); _add(dimensions["vulnerability_surfaces"],"stack-overwrite-candidate"); _add(leads,"stack-overwrite")
+        _sig(signals,"overflow-imports",hits,"fact" if imports&STRONG else "heuristic")
+        runtime_copy=bool(runtimes) and set(hits)=={"memcpy"}
+        if not runtime_copy:
+            _add(dimensions["vulnerability_surfaces"],"stack-overwrite-candidate"); _add(leads,"stack-overwrite")
         _add(unresolved,"prove a concrete overwrite or PC-control primitive; import presence is insufficient")
         if _fact(profile,"elf.nx") is True: _sig(signals,"elf-nx",True,"fact"); _add(dimensions["constraints"],"nx")
         if not is_pe:
-            actions.append(_action("rat query pwn","inspect-bounded-input-callsite-then-measure-overwrite",["overflow-imports"],
-                                   "an input sink requires callsite inspection before a crash probe",
+            actions.append(_action("rat query pwn","inspect-runtime-copy-callsite-before-overwrite-probe" if runtime_copy else "inspect-bounded-input-callsite-then-measure-overwrite",["overflow-imports","runtime-symbols"] if runtime_copy else ["overflow-imports"],
+                                   "runtime copy imports require application-callsite confirmation" if runtime_copy else "an input sink requires callsite inspection before a crash probe",
                                    resolves=["whether input reaches an overwrite-capable callsite before measuring PC control"],
-                                   expected_evidence="structured-static"))
+                                   expected_evidence="structured-static",specificity="general" if runtime_copy else "bounded"))
     checker=[]; checker_evidence={}
     for item in interesting or []:
         if not isinstance(item,dict) or not _func(revq,item.get("func")): continue
@@ -139,6 +172,18 @@ def route(*,profile=None,revq=None,interesting=None):
             if compares: _sig(signals,"compare-calls",{"func":name,"calls":compares},"fact"); ev.append("compare-calls")
             if oracle: _sig(signals,"checker-oracle-strings",{"func":name,**oracle},"heuristic"); ev.append("checker-oracle-strings")
             checker_evidence[name]=ev
+    # Compilers may inline comparisons or hide application logic under an entry
+    # point absent from INTERESTING. Prompts plus rejection text justify bounded
+    # inspection, but prove neither an oracle nor a length/table comparison.
+    strings=[s.get("val","") for s in (revq or {}).get("strings",[]) or [] if isinstance(s,dict)]
+    prompts=sorted({s for s in strings if PROMPT.search(s)})
+    failures=sorted({s for s in strings if FAILURE.search(s)})
+    if not checker and prompts and failures:
+        entry=next((n for n in ("NimMainModule","main","main.main") if n in function_names),None)
+        if entry:
+            checker.append(entry)
+            _sig(signals,"checker-prompt-strings",{"scope":"binary","entry_candidate":entry,"prompts":prompts[:2],"failure":failures[:2]},"heuristic")
+            checker_evidence[entry]=["checker-prompt-strings"]
     if checker:
         _add(dimensions["program_shapes"],"checker"); _add(leads,"checker"); _add(unresolved,"checker semantics and success/failure oracle remain unverified")
         target=sorted(set(checker))[0]; actions.append(_action("rat query func",target,checker_evidence[target],
@@ -147,14 +192,14 @@ def route(*,profile=None,revq=None,interesting=None):
                                expected_evidence="structured-static",specificity="concrete"))
     names=" ".join(f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)).lower(); blob=_blob(revq)
     vh=sorted({h for h in VM if h in names or h in blob})
-    if vh:
+    if vh and not kernel_image:
         _sig(signals,"vm-dispatch-hint",vh,"heuristic"); _add(dimensions["program_shapes"],"vm-candidate"); _add(leads,"vm"); _add(unresolved,"VM hints do not prove a dispatch loop or bytecode semantics")
         actions.append(_action("solve/_template/rev/vmlift.py --disasm","prove-dispatch-loop-before-vm-lift",["vm-dispatch-hint"],
                                "VM hints require dispatch-loop confirmation",
                                resolves=["whether a dispatch loop and bytecode semantics exist"],
                                expected_evidence="structured-static",cost="medium"))
     ch=sorted({h for h in CRYPTO if h in blob})
-    if ch or (interesting and not checker):
+    if (ch or (interesting and not checker)) and not kernel_image:
         if ch: _sig(signals,"crypto-hint",ch,"heuristic")
         _add(dimensions["program_shapes"],"oracle-needed"); _add(leads,"oracle-discovery"); _add(unresolved,"a success/failure oracle must be bounded before symbolic execution")
         actions.append(_action("rat query oracle","success-failure-oracle-before-symbolic",["crypto-hint"] if ch else [],
