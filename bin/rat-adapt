@@ -3,7 +3,7 @@
 import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib.contracts import PROOF_MODES, execute, prepare_proof_invocation, record_proof_observation
-p=argparse.ArgumentParser(); p.add_argument("--root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60)
+p=argparse.ArgumentParser(); p.add_argument("--root", help="artifact-store directory (normally <challenge>/.rat), not the challenge root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60)
 p.add_argument("--fresh",action="store_true",help="execute a new verifier invocation instead of reusing capture cache")
 p.add_argument("--direct-subject",help="path (must be one of --input) this invocation measures; "
     "opts the run into direct-evidence issuance when it is a real measurement mode of a trusted "
@@ -29,6 +29,8 @@ if not a.proof and a.tool=="gdbq" and args[:1]==["--batch"]:
         p.error("gdbq --batch requires exactly one command file and --direct-subject")
     args=[a.direct_subject,"source "+args[1]]
 root=os.path.abspath(a.root or os.path.join(os.getcwd(),".rat"))
+if os.path.basename(os.path.realpath(root)) != ".rat" and os.path.isdir(os.path.join(root,".rat")):
+    p.error("--root names the artifact store, not the challenge root; use --root " + os.path.join(root,".rat"))
 inputs=list(a.input)
 if a.proof_input and a.proof_input not in inputs:
     inputs.append(a.proof_input)

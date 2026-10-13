@@ -21,6 +21,7 @@ class RouterV2(unittest.TestCase):
         self.assertIn("checker",doc["dimensions"]["program_shapes"])
         self.assertIsNone(doc["decision"])
         self.assertEqual(doc["commitment"],"provisional")
+        validate(doc,"rat.route-result/v2")
         self.assertEqual({item["query"] for item in doc["next"]},{"rat query func","rat query pwn"})
 
     def test_observation_order_does_not_change_meaning(self):
@@ -38,6 +39,7 @@ class RouterV2(unittest.TestCase):
 
     def test_independent_fact_backed_leads_do_not_force_recommendation(self):
         doc=route(profile={"imports":["malloc","free","printf","read"]})
+        validate(doc,"rat.route-result/v2")
         self.assertIsNone(doc["decision"])
         self.assertEqual(doc["commitment"],"provisional")
         self.assertEqual({a["target"] for a in doc["next"] if a["query"]=="rat query pwn"},
@@ -57,6 +59,41 @@ class RouterV2(unittest.TestCase):
 
     def test_no_evidence_is_unknown(self):
         doc=route(); self.assertEqual(doc["commitment"],"unknown"); self.assertIsNone(doc["decision"])
+
+    def test_nim_prompt_and_rejection_outweigh_runtime_memcpy(self):
+        rev={"functions":[{"name":"NimMainModule","calls":[],"strings":[]}],
+             "strings":[{"val":"input > "},{"val":"Flag:"},{"val":"Wrong!"}]}
+        doc=route(profile={"imports":["memcpy"]},revq=rev)
+        validate(doc,"rat.route-result/v2")
+        self.assertEqual(doc["decision"]["action"],"rat query func")
+        self.assertEqual(doc["decision"]["target"],"NimMainModule")
+        self.assertEqual(doc["decision"]["evidence_quality"],"heuristic")
+        self.assertNotIn("stack-overwrite-candidate",doc["dimensions"]["vulnerability_surfaces"])
+        self.assertIn("checker",doc["leads"])
+        self.assertTrue(any(s["kind"]=="overflow-imports" for s in doc["signals"]))
+        self.assertIsNone(doc["skill"])
+
+    def test_runtime_does_not_hide_strong_overwrite_or_other_leads(self):
+        for marker in ("NimMainModule","runtime.main","__rust_alloc"):
+            doc=route(profile={"imports":["memcpy","gets","malloc","free"]},
+                      revq={"functions":[{"name":marker}]})
+            validate(doc,"rat.route-result/v2")
+            self.assertTrue(any(s["kind"]=="runtime-symbols" for s in doc["signals"]))
+            self.assertIn("stack-overwrite",doc["leads"])
+            self.assertIn("heap-lifetime",doc["leads"])
+
+    def test_unscoped_strings_do_not_invent_a_checker_function(self):
+        doc=route(profile={"imports":["memcpy"]},
+                  revq={"functions":[{"name":"somewhere"}],"strings":[{"val":"Flag:"},{"val":"Wrong!"}]})
+        self.assertNotIn("checker",doc["leads"])
+        self.assertIn("stack-overwrite",doc["leads"])
+
+    def test_runtime_name_or_prompt_alone_does_not_prove_a_checker(self):
+        for strings in ([],[{"val":"input > "}],[{"val":"Wrong!"}]):
+            doc=route(profile={"imports":["memcpy"]},
+                      revq={"functions":[{"name":"NimMainModule"}],"strings":strings})
+            self.assertNotIn("checker",doc["leads"])
+            self.assertIsNone(doc["skill"])
 
     def test_old_fields_are_rejected_with_regeneration_command(self):
         doc=route(); doc["confidence"]=.5

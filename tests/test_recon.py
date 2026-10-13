@@ -92,7 +92,7 @@ class ReconTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PE/Windows", result.stdout)
 
-    def test_stripped_fast_candidate_downgrades_confidence_with_tier(self):
+    def test_stripped_imports_only_offer_low_confidence_inspection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             fixture = root / "a.out"
@@ -117,8 +117,8 @@ class ReconTests(unittest.TestCase):
             result = self.run_recon(root, fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TRIAGE: 🟡 STANDARD", result.stdout)
-        self.assertIn("확신도: 중간", result.stdout)
-        self.assertNotIn("STANDARD  | 확신도: 높음", result.stdout)
+        self.assertIn("확신도: 낮음", result.stdout)
+        self.assertNotIn("ret2", result.stdout)
 
 
     def test_format_json_emits_machine_view_without_korean_text(self):
@@ -152,6 +152,9 @@ class ReconTests(unittest.TestCase):
         self.assertIn(doc["triage"]["tier"], {"fast", "standard", "hard"})
         self.assertTrue(doc["triage"]["prior_only"])
         self.assertEqual(doc["triage"]["canonical_router"], "rat route")
+        self.assertEqual(doc["triage"]["techniques"], [])
+        self.assertEqual(doc["triage"]["confidence_key"], "low")
+        self.assertNotEqual(doc["triage"]["tier"], "fast")
         # language-agnostic keys let a machine consumer branch without parsing Korean
         self.assertIn(doc["triage"]["confidence_key"], {"low", "mid", "high"})
         self.assertIn(doc["triage"]["recommendation_key"], {"solve", "deprioritize"})
@@ -177,6 +180,32 @@ class ReconTests(unittest.TestCase):
             result = self.run_recon(root, fixture, "--format", "json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(_json.loads(result.stdout)["status"], "pe")
+
+    def test_benign_allocator_imports_do_not_predict_heap_exploitation(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fixture = root / "game"
+            fixture.write_bytes(b"ELF")
+            (root / "pwn.py").write_text(
+                "class _Context: log_level = None\ncontext = _Context()\n"
+                "class ELF:\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        self.symbols={'malloc':1,'free':2,'scanf':3,'printf':4}\n"
+                "        self.plt={}; self.functions={}\n"
+                "        self.pie=True; self.canary=True; self.nx=True; self.relro='Full'\n")
+            for name, output in (("file", "ELF 64-bit executable, stripped"), ("strings", "game")):
+                tool = root / name
+                tool.write_text("#!/usr/bin/env sh\nprintf '%s\\n' '" + output + "'\n")
+                tool.chmod(0o755)
+            result = self.run_recon(root, fixture, "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["signals"]["heap_funcs"], ["free", "malloc"])
+        self.assertEqual(doc["triage"]["techniques"], [])
+        self.assertEqual(doc["triage"]["confidence_key"], "low")
+        self.assertNotIn("FSOP", result.stdout)
+        self.assertNotIn("tcache", result.stdout)
 
 
 if __name__ == "__main__":

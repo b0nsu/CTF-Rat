@@ -71,22 +71,43 @@ def snapshot_digest(events):
 def recommend(events, fallback="re-route-or-deep-escalate"):
     """Evidence-linked advice; never an executable command."""
     state = evidence_snapshot(events)
-    observed_ids = {e.get("payload", {}).get("observation_id") for e in events
-                    if e.get("type") == "observation.recorded"}
-    observed_ids.difference_update(state["invalidated"])
-    for event in reversed(events):
-        if event.get("type") != "unknown.recorded":
-            continue
-        p = event.get("payload") or {}
-        evidence = p.get("evidence_observation_ids") or []
-        if evidence and all(x in observed_ids for x in evidence):
-            return {"action": "low-cost-discriminator", "basis": ["observation:" + x for x in evidence]}
+    # Stream validation and typed SELF PASS remain authoritative. For advice,
+    # use explicit observation quality/validity when present. Legacy synthetic
+    # events without this metadata retain A1 advisory compatibility.
+    observations = {p["observation_id"]: p for e in events
+                    if e.get("type") == "observation.recorded"
+                    for p in [e.get("payload") or {}] if p.get("observation_id")}
+    observed_ids = set(observations) - set(state["invalidated"])
+    observed_ids = {oid for oid in observed_ids
+                    if (observations[oid].get("validity") or {}).get("state", "active") == "active"}
+    direct_ids = {oid for oid in observed_ids
+                  if (observations[oid].get("quality") or {}).get("level", "direct") == "direct"}
+
+    # A stale environment can invalidate a chain; check it before continuing.
+    # Invalidated observations can justify an environment recheck, but an
+    # observation ID which was never recorded cannot.
     for key, p in sorted(state["findings"].items()):
-        if p["class"] in {"env", "environment"} and p["state"] in {"stale", "invalidated"} and p["evidence"]:
+        if (p["class"] in {"env", "environment"}
+                and p["state"] in {"stale", "invalidated"}
+                and any(x in observations for x in p["evidence"])):
             return {"action": "verify-environment", "basis": ["finding:" + key]}
+
+    # An active, direct-evidence-linked PASS is more actionable than a
+    # general unknown. A refuted finding citing the *same active observation*
+    # is a conflicting premise, however: recommend a re-route before reuse.
+    # Shared evidence is a conservative conflict signal, NOT proof of semantic
+    # dependency. There is no typed unknown->primitive dependency contract.
     for key, p in sorted(state["primitives"].items()):
-        if p["status"] in {"pass", "consumed"} and p["evidence"]:
+        if (p["status"] in {"pass", "consumed"} and p["evidence"]
+                and all(x in direct_ids for x in p["evidence"])):
+            for finding_id, finding in sorted(state["findings"].items()):
+                if (finding["state"] in {"refuted", "invalidated"}
+                        and set(finding["evidence"]) & set(p["evidence"]) & observed_ids):
+                    return {"action": "re-route", "basis": ["finding:" + finding_id,
+                                                               "primitive:" + key]}
             return {"action": "focused-deep", "basis": ["primitive:" + key]}
+
+    # Refutations should not be masked by a prior, unrelated unknown.
     for key, p in sorted(state["findings"].items()):
         if p["state"] in {"refuted", "invalidated"} and p["evidence"]:
             return {"action": "re-route", "basis": ["finding:" + key]}
@@ -94,7 +115,16 @@ def recommend(events, fallback="re-route-or-deep-escalate"):
         if evidence and all(x in observed_ids for x in evidence):
             return {"action": "re-route", "basis": ["route:" + fingerprint] +
                     ["observation:" + x for x in evidence]}
-    # Notes, including unknowns, do not supply a reliable evidence link.
+
+    # Evidence-linked unknowns still warrant a bounded discriminator when
+    # no stronger continuation or invalidation signal remains.
+    for event in reversed(events):
+        if event.get("type") != "unknown.recorded":
+            continue
+        p = event.get("payload") or {}
+        evidence = p.get("evidence_observation_ids") or []
+        if evidence and all(x in observed_ids for x in evidence):
+            return {"action": "low-cost-discriminator", "basis": ["observation:" + x for x in evidence]}
     return {"action": fallback, "basis": []}
 
 def check_progress(recent_novelty_flags, *, window=DEFAULT_WINDOW):

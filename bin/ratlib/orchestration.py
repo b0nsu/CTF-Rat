@@ -196,6 +196,56 @@ def finish_phase(root, phase, terminal=False):
     return _checkpoint(root,"phase-exit",phase)
 
 @_serialized
+def reusable_scout_result(root, contract, *, checkpoint_id, inputs, dependencies=()):
+    """Read-only reuse of artifact-backed output from the SAME P1 evidence epoch.
+
+    This does not create a new task, emit STATE events, or promote a finding.
+    The caller may skip a duplicate scout only after an explicit HIT.
+    """
+    root = _root(root)
+    validate_contract(contract)
+    if contract["role"] not in {"static-scout", "dynamic-scout"} or contract["phase"] != "solve-P1":
+        raise GateError("scout reuse is restricted to read-only solve-P1 roles")
+    if _state(root) != "solve-P1" or not checkpoint_id:
+        return None
+    if not os.path.isfile(os.path.join(root, ".rat", "checkpoints", checkpoint_id + ".json")):
+        return None
+    lineage, attempt, run_id = _lineage(root), _active_attempt(root, "solve-P1"), _run_id(root)
+    if not lineage or not attempt:
+        return None
+    if dependencies:
+        try:
+            _require_active_evidence(root, list(dependencies))
+        except GateError:
+            return None
+    for task in sorted(_tasks(root), key=lambda item: item.get("task_id", "")):
+        if (task.get("status") != "completed" or task.get("role") != contract["role"]
+                or task.get("lineage_id") != lineage or task.get("phase_attempt_id") != attempt
+                or task.get("run_id") != run_id or task.get("checkpoint_id") != checkpoint_id
+                or task.get("contract") != contract or task.get("inputs") != list(inputs)
+                or task.get("dependencies") != list(dependencies)):
+            continue
+        output = task.get("output")
+        if not _valid_output(root, task, output):
+            continue
+        # Reuse only bounded, immutable artifact references, not unstructured
+        # summaries or a large raw scout transcript in task.output.
+        digests = list(output["outputs"].values())
+        if not digests or any(not isinstance(item, str) or not item.startswith("sha256:")
+                              for item in digests):
+            continue
+        try:
+            for digest in digests:
+                get(digest, root=os.path.join(root, ".rat"))
+        except (OSError, ValueError, RuntimeError):
+            continue
+        return {"reused": True, "task_id": task["task_id"],
+                "checkpoint_id": checkpoint_id, "evidence_ids": output["evidence_ids"],
+                "artifacts": dict(output["outputs"])}
+    return None
+
+
+@_serialized
 def start_task(root, contract, *, checkpoint_id, inputs, dependencies=(), primitive_id=None, input_digest=None, environment_digest=None, child_pid=None):
     root=_root(root); validate_contract(contract); phase=_state(root)
     if phase!=contract["phase"]: raise GateError("contract phase is not active")

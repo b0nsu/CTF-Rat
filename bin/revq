@@ -51,6 +51,7 @@ from ratlib.evasion import (
     render_legacy as _render_legacy_evasion,
 )
 from ratlib.runner import run
+from ratlib.kernel_identity import inspect as inspect_kernel, SCHEMA as KERNEL_IDENTITY_SCHEMA
 
 SCHEMA = 5
 REVQ_POLICY = "sha256:" + hashlib.sha256(
@@ -1000,6 +1001,14 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
 
 
 def load_or_extract(binpath, want_engine, refresh, index_root=None):
+    identity = inspect_kernel(binpath, include_symbols=True)
+    kernel = identity["kind"] == "vmlinux"
+    if identity["kind"] in {"bzimage", "linux-boot-image"}:
+        die("Linux 부트 이미지: scripts/extract-vmlinux로 ELF vmlinux를 먼저 추출하세요")
+    # Kernel symbol recovery is metadata-only. Do not silently start CFGFast
+    # over the whole kernel even when angr happens to be provisioned.
+    if kernel:
+        want_engine = "binutils"
     cp = cache_path(binpath)
     cur_sha = sha256(binpath)
     if not refresh and os.path.isfile(cp):
@@ -1008,6 +1017,8 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
                 rev = json.load(f)
             if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
                     and _has_current_evasion_contract(rev)
+                    and (not kernel or ((rev.get("artifact_identity") or {}).get("kind") == "vmlinux"
+                                        and (rev.get("artifact_identity") or {}).get("schema") == KERNEL_IDENTITY_SCHEMA))
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
                 idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
@@ -1023,7 +1034,19 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
         except Exception:
             pass
 
-    rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
+    if kernel:
+        functions = identity.pop("functions", [])
+        for f in functions:
+            f.update(nblocks=0,ninstr=0,count_quality="unavailable",calls=[],strings=[],ncallers=0)
+        rev = {"schema": SCHEMA, "engine": "binutils", "platform": "elf",
+               "arch": {62:"amd64",3:"i386",183:"aarch64"}.get(identity.get("machine"),"?"),
+               "pie": False, "stripped": not bool(functions), "functions": functions,
+               "strings": [], "imports": [], "analysis_complete": False,
+               "functions_filtered": 0, "artifact_identity": identity,
+               "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
+               "evasion_signals": [], "evasion": []}
+    else:
+        rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
     rev["bin"] = binpath
     rev["sha256"] = cur_sha
     rev["generated_at"] = now_iso()

@@ -262,7 +262,8 @@ def route_result(d):
         if not isinstance(action,Mapping) or {"query","target","evidence","rule"}-set(action): raise ValidationError("invalid route action")
     decision=d["decision"]
     if decision is not None and (not isinstance(decision,Mapping) or {"action","target","evidence","rule"}-set(decision)): raise ValidationError("invalid route decision")
-    if decision is None and d["commitment"] not in {"unknown","committed"}: raise ValidationError("missing decision requires unknown or committed commitment")
+    # Competing independent probes intentionally leave decision unset while
+    # retaining provisional leads. Commitment describes evidence, not ranking.
     assessment=d.get("skill_assessment")
     if d["commitment"]=="committed":
         if d.get("input_digest") is None: raise ValidationError("committed route requires input_digest")
