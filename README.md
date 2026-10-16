@@ -218,7 +218,7 @@ By default `pkflag` uses `solve/<active-challenge>/FLAG_FORMAT` (from `ctfguard`
 
 ```sh
 ctfguard begin example
-pkflag --set 'DH\\{[A-Za-z0-9_]+\\}' # set this challenge's format
+pkflag --set 'DH\{[A-Za-z0-9_]+\}' # set this challenge's format
 pkflag --show                          # show this challenge's format
 pkflag 'DH{example_candidate}'         # format-only check
 pkflag --global --show                 # explicitly inspect legacy global format
