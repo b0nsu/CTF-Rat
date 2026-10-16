@@ -267,16 +267,18 @@ def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
     payload = copy.deepcopy(payload)
     extra_inputs = list(extra_inputs)
     extra_keys = set()
+    extra_names = set()
     for role, path in extra_inputs:
         if role not in {"image", "runner", "extra"}:
             raise ValueError("unsupported additional artifact role: %s" % role)
         key = (role, os.path.basename(path))
-        if key in extra_keys or not os.path.isfile(path):
+        if key in extra_keys or key[1] in extra_names or not os.path.isfile(path):
             raise ValueError("duplicate or missing additional artifact: %s" % key[1])
         extra_keys.add(key)
+        extra_names.add(key[1])
     inputs = [item for item in payload["inputs"]
               if item.get("role") not in ("binary", "libc")
-              and (item.get("role"), item.get("name")) not in extra_keys]
+              and item.get("name") not in extra_names]
     inputs.append(_input("binary", binary))
     if libc:
         inputs.append(_input("libc", libc, "libc.so.6"))
