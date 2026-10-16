@@ -4,6 +4,42 @@ Code inspected against GitHub `main` at
 `517964d3c379c53754123ea6da2d87714342ee4e`. The fixes in this working tree
 address the operational reports; they are not model solve-rate measurements.
 
+## Heap/runtime follow-ups (#104–#107; 2026-10-16)
+
+These are bounded regression and diagnostic changes, **not** a claim that the
+reporter's original DreamHack challenge was replayed or fixed.
+
+- **#104:** `pwn-heap` PIVOT and the existing `rat query pattern` path now
+  describe the *conditional* unsorted-bin split/refill mismatch. Static heap
+  imports do **not** imply this failure; confirm allocation provenance in
+  the live, libc-matched state before changing an exploit plan.
+- **#105:** `rat dyn session heap` reads an operator-selected, owned stopped
+  inferior. It supports only the pinned `glibc-2.35-x86_64` layout, at most
+  1024 bytes per snapshot and up to 256 bytes per GDB/MI request.
+  Incomplete reads remain `partial` and only candidate artifacts are captured.
+  The session does **not** yet support interactive stdin or arbitrary-PID attach.
+- **#106:** `rat-dyn --stderr-mode pipe|devnull|stdout` exposes three
+  explicitly named child stderr topologies through the existing subprocess
+  runner. Default remains `pipe` (separate stdout/stderr PIPE). `stdout`
+  merges into the bounded stdout capture; `devnull` drops child stderr.
+  Neither mode is the same as pwntools' default stdout PTY.
+  Nondefault modes get distinct execution environment digests; a diagnostic
+  trace with suppressed/merged stderr cannot establish default-PIPE
+  verification equivalence. The reporter's 0/3 versus 3/3 SIGSEGV mechanism
+  remains **UNVERIFIED**: compare fixed binary/libc/input, stdout/stderr
+  topology, launch flags, crash site and allocator snapshots in a matrix.
+- **#107:** the existing `pwn-heap` Pattern Card describes a conditional
+  `sequential_round_trips * measured_RTT` latency floor. It encourages
+  reducing required operations and only pipelines when protocol semantics
+  permit it; no unsupported remote batching helper was added.
+
+Focused regression commands (run on a machine with repository dependencies):
+
+```sh
+python3 -m unittest tests.test_heap_snapshot_v21 tests.test_runner_stdio_topology \
+  tests.test_gdb_session_v21 tests.test_patterns_v21
+```
+
 ## Operational reports
 
 - [#82](https://github.com/b0nsu/CTF-Rat/issues/82): permit a provisional route
