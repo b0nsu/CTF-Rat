@@ -328,7 +328,11 @@ def dyn(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
     except ValueError as exc: return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=[str(exc)],started=started),a)
-    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout,stderr_mode=a.stderr_mode)
+    mode=getattr(a,"stderr_mode","pipe")
+    if a.break_loc and mode!="pipe":
+        return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,
+                             diagnostics=["nondefault stderr topology cannot be matched by the separate GDB breakpoint run"],started=started),a)
+    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout,stderr_mode=mode)
     out=p.stdout.preview; err=p.stderr.preview; events=[{"event":"process.exit","exit_code":p.exit_code,"signal":p.signal,"timed_out":p.timed_out}]
     registers={}
     # GDB is optional.  A requested breakpoint is either observed structurally
@@ -347,7 +351,7 @@ def dyn(a):
     for marker in sc.get("markers",[]):
         events.append({"event":"marker","marker":marker,"observed":marker.encode() in out+err})
     status="timeout" if p.timed_out else ("ok" if p.exit_code==0 else "partial")
-    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc,stderr_mode=a.stderr_mode),"stdio":{"stdin":"pipe","stdout":"pipe","stderr":a.stderr_mode},"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
+    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc,stderr_mode=mode),"stdio":{"stdin":"pipe","stdout":"pipe","stderr":mode},"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
     return emit(envelope("rat-dyn",a.binary,a,{"exit":p.exit_code,"signal":p.signal,"trace_span":len(events),"hit_counts":{"breakpoint":int(any(e["event"]=="breakpoint" and e.get("hit") for e in events))},"register_observations":len(registers),"memory_observations":0,"last_event":events[-1]["event"],"dropped_events":0,"scenario_step":sc.get("name","run")},arts,status=status,diagnostics=(["wall timeout; last stable event retained"] if p.timed_out else []),code=p.exit_code if not p.timed_out else EXIT_TIMEOUT,started=started),a)
 def _verify_conditions(expected, process, scenario_doc):
     if "exit_code" in expected and process.exit_code != expected["exit_code"]: return False
