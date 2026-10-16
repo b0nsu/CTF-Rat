@@ -181,6 +181,15 @@ if identity["kind"] != "vmlinux":
 PY
   echo "[+] $D 생성. 다음: cd $D; rat route ./$BN --fast"
 else
-  echo "=== recon ==="; "$CTF/bin/recon" "./$BN" ${LIBC_ABS:+./libc.so.6} | tee -a state.md
-  echo; echo "[+] $D 생성. 다음: cd $D; decomp ./$BN <func>"
+  # The first user-facing classification must come from the canonical
+  # evidence-first router, not the independent legacy recon tier heuristic.
+  echo "=== rat route (provisional evidence) ==="
+  if "$CTF/bin/rat" route "./$BN" --fast 2>&1 | tee -a state.md; then
+    echo; echo "[+] $D 생성. 다음: cd $D; 위 ROUTE의 RECOMMENDED/CANDIDATES 확인"
+  else
+    # Keep the scaffold usable, but do not silently fall back to recon or
+    # mistake a failed route query for a verified challenge classification.
+    echo "[newchal] ROUTE UNKNOWN: rat route 실패; 초기 유형/기법 미확인 (legacy recon 대체 판정 없음)" | tee -a state.md
+    echo "[+] $D 생성. 다음: cd $D; rat route ./$BN --fast 재시도"
+  fi
 fi
