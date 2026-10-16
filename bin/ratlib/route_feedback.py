@@ -83,7 +83,10 @@ def _valid_refutation(action, value):
                         and isinstance(site.get("max_input_length"), int)
                         and 0 <= site["max_input_length"] <= site["destination_size"]
                         for site in sites))
-    return value.get("conclusion") == "premise-refuted"
+    # A free-form conclusion plus an unrelated direct measurement is not a
+    # deterministic refutation of heap, format, checker, or other premises.
+    # Those families need their own bounded, machine-checkable validators.
+    return False
 
 
 def load_feedback(state_dir, binary_digest, actions):
