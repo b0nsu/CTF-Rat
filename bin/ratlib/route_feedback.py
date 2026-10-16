@@ -17,7 +17,12 @@ def record_query_result(state_dir, binary_digest, doc):
     query result. Keeping it out prevents repeated identical probes from
     minting fresh result artifacts when the governor first reports stuck.
     """
-    doc["provenance"] = {**doc["provenance"], "binary_sha256": binary_digest}
+    # Never relabel an analysis result with the *current* file digest. The
+    # binary can be replaced between analysis and persistence; laundering the
+    # digest here would make stale facts resolve a new binary's probe.
+    measured = (doc.get("provenance") or {}).get("binary_sha256")
+    if not binary_digest or measured != binary_digest:
+        raise ValueError("query result binary digest does not match the measured artifact")
     validate(doc, "rat.query-result/v1")
     stored = {key: value for key, value in doc.items() if key != "governor"}
     raw = json.dumps(stored, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
