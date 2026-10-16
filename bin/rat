@@ -444,7 +444,9 @@ def cmd_route(args):
     caps = _doctor_capabilities(binary)
     profile = _gather_profile(binary, store)
     try:
-        blob_spec = normalize_blob_spec(binary, arch=args.arch, base=args.base, entry=args.entry)
+        blob_spec = normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None))
     except ValueError as exc:
         result = route_fn(profile=profile)
         result.setdefault("diagnostics", []).append({
@@ -784,7 +786,9 @@ def cmd_query_graph(args):
     started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store,
-                                 load_spec=normalize_blob_spec(binary, arch=args.arch, base=args.base, entry=args.entry))
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
         # The ranking is heuristic; only recovered names/addresses/edges are facts.
         graph = project_graph(rev, interesting=mod.compute_interesting(rev),
                               budget_bytes=args.budget_bytes, max_nodes=args.max_nodes)
@@ -820,7 +824,9 @@ def cmd_query_func(args):
     revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store,
-                                 load_spec=normalize_blob_spec(binary, arch=args.arch, base=args.base, entry=args.entry))
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
     except Exception as exc:
         return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     card = mod.compute_function_card(rev, name)
@@ -955,7 +961,9 @@ def cmd_query_oracle(args):
     revq_started_monotonic = time.monotonic()
     try:
         mod, rev = _gather_revq(binary, args.fast, store,
-                                 load_spec=normalize_blob_spec(binary, arch=args.arch, base=args.base, entry=args.entry))
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
