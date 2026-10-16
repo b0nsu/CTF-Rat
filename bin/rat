@@ -30,6 +30,7 @@ from ratlib.schema import validate
 from ratlib.state_v2 import Stream
 from ratlib.kernel_identity import inspect as inspect_kernel
 from ratlib.raw_loader import inspect_raw, load_spec as normalize_blob_spec
+from ratlib.run_manifest import read as read_run_manifest
 
 DEFAULT_BUDGET_BYTES = 16384
 
@@ -587,6 +588,8 @@ def _render_brief_text(card):
         L.append("SHA256      %s" % card["binary_sha256"])
     caps = card["capabilities"]
     L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
+    for hint in (card.get("environment") or {}).get("qemu", []):
+        L.append("QEMU        %s: %s" % (hint["name"], hint["command"]))
     r = card["route"]
     decision = r.get("decision") or {}
     L += ["", "COMMITMENT  %s" % r.get("commitment", "unknown")]
@@ -645,6 +648,9 @@ def _bound_brief_to_budget(card, budget_tokens, *, render=None):
     render = render or _render_brief_text
     def over():
         return len(render(card).encode()) > budget_bytes
+    if over() and card.get("environment"):
+        card["environment"] = {}
+        card["truncated"].append("environment")
     if over():
         card["libc"] = {"supplied": None, "sha256": None, "reference_match": None,
                         "match_method": None, "note": "trimmed for budget"}
@@ -693,6 +699,9 @@ def cmd_brief(args):
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
+        if (profile or {}).get("artifact_identity", {}).get("kind") in {
+                "boot-sector-candidate", "disk-image-candidate"}:
+            raise RuntimeError("raw image requires explicit load hints for executable analysis")
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
         _record_revq_invocation(mod, binary, fast, store, rev,
@@ -721,6 +730,19 @@ def cmd_brief(args):
         "side_effects": ["rat brief appended route-assessment note + governor.checked to STATE."],
         "diagnostics": diagnostics,
     }
+    # Read only a matching, hash-bound solve manifest; never execute its runner.
+    manifest_path = os.path.join(os.path.dirname(os.path.realpath(binary)), "run.json")
+    if os.path.isfile(manifest_path):
+        try:
+            manifest = read_run_manifest(manifest_path)
+            if any(i.get("role") == "binary" and i.get("sha256") == card["binary_sha256"]
+                   for i in manifest["inputs"]):
+                hints = manifest.get("environment", {}).get("qemu_launch_hints", [])
+                card["environment"] = {"qemu": [
+                    {"name": h.get("name", "?"), "command": c.get("line", "")[:320]}
+                    for h in hints[:2] for c in h.get("commands", [])[:2]]}
+        except (ValueError, OSError):
+            pass
     if revq_error:
         card["side_effects"].append("revq analysis unavailable; brief is partial: %s" % revq_error)
         diagnostics.append({"code": "analysis_failed", "severity": "warning",
