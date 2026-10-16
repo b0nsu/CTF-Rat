@@ -82,6 +82,17 @@ class RouteFeedbackTests(unittest.TestCase):
         self.assertEqual(original, imported)
         self.assertEqual(Stream(self.tmp.name).read(), [])
 
+    def test_revq_bare_hex_digest_is_normalized_without_changing_source(self):
+        card = _card(self.digest)
+        card["provenance"]["binary_sha256"] = self.digest.split(":", 1)[1]
+        digest = record_query_result(self.tmp.name, self.digest, card)
+        from ratlib.artifact import get
+        stored = json.loads(get(digest, root=Stream(self.tmp.name).root))
+        self.assertEqual(stored["provenance"]["binary_sha256"], self.digest)
+        self.assertEqual(card["provenance"]["binary_sha256"], self.digest.split(":", 1)[1])
+        after = self._route()
+        self.assertEqual(after["feedback"][0]["status"], "resolved")
+
     def test_frontdoor_changed_binary_marks_query_partial_without_feedback(self):
         rat = _rat()
         stale = _card("sha256:" + "b" * 64)
