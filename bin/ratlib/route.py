@@ -261,8 +261,10 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
             # remains useful after its first inspection.
             if action["query"]=="rat query func":
                 unresolved=[u for u in unresolved if u!="checker semantics and success/failure oracle remain unverified"]
+                _add(unresolved,"comparison sites and success/failure string xrefs are candidates; executable branch semantics remain unverified")
             elif action["query"]=="rat query oracle":
                 unresolved=[u for u in unresolved if u!="a success/failure oracle must be bounded before symbolic execution"]
+                _add(unresolved,"success/failure string xrefs are candidate oracle sites, not executable branch proof")
                 if "oracle-needed" in dimensions["program_shapes"]: dimensions["program_shapes"].remove("oracle-needed")
                 if "oracle-discovery" in leads: leads.remove("oracle-discovery")
         elif status=="refuted":
