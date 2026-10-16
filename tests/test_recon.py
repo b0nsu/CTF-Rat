@@ -216,17 +216,17 @@ class ReconTests(unittest.TestCase):
             fixture = root / "checker"
             fixture.write_bytes(b"ELF")
             (root / "pwn.py").write_text(
-                "class _Context: log_level = None\\ncontext = _Context()\\n"
-                "class ELF:\\n"
-                "    def __init__(self, *args, **kwargs):\\n"
-                "        self.symbols={'memcpy':1,'memcmp':2,'main':3}\\n"
-                "        self.plt={}; self.functions={f'step_{i}': i for i in range(10)}\\n"
-                "        self.pie=False; self.canary=False; self.nx=True; self.relro='Partial'\\n")
+                "class _Context: log_level = None\ncontext = _Context()\n"
+                "class ELF:\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        self.symbols={'memcpy':1,'memcmp':2,'main':3}\n"
+                "        self.plt={}; self.functions={f'step_{i}': i for i in range(10)}\n"
+                "        self.pie=False; self.canary=False; self.nx=True; self.relro='Partial'\n")
             file_tool = root / "file"
-            file_tool.write_text("#!/bin/sh\\nprintf '%s\\\\n' 'ELF 64-bit, not stripped'\\n")
+            file_tool.write_text("#!/bin/sh\nprintf '%s\\\n' 'ELF 64-bit, not stripped'\n")
             file_tool.chmod(0o755)
             strings_tool = root / "strings"
-            strings_tool.write_text("#!/bin/sh\\nprintf 'Correct!\\\\nWrong!\\\\n'\\n")
+            strings_tool.write_text("#!/bin/sh\nprintf 'Correct!\\\nWrong!\\\n'\n")
             strings_tool.chmod(0o755)
             machine = self.run_recon(root, fixture, "--format", "json")
             human = self.run_recon(root, fixture)
