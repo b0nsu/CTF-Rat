@@ -71,7 +71,7 @@ class RawAndMultiArtifactTests(unittest.TestCase):
     def test_project_blob_opts_are_explicit(self):
         with tempfile.TemporaryDirectory() as root:
             binary = Path(root) / "stage"
-            binary.write_bytes(b"\\x90" * 16)
+            binary.write_bytes(bytes([0x90]) * 16)
             calls = []
             class FakeAngr:
                 @staticmethod
