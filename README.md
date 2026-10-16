@@ -213,6 +213,19 @@ verifier before recording solve evidence.
 
 `pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope` / `pwnclean` / `pkflag`
 
+`pkflag` checks **format only**; `REAL` is not proof of executable-oracle success.
+By default `pkflag` uses `solve/<active-challenge>/FLAG_FORMAT` (from `ctfguard`'s `ACTIVE.json`, or the current `solve/<challenge>` directory). A stale repository-global `FLAG_FORMAT` is **not** used implicitly. With no challenge format, a generic `NAME{...}` heuristic applies.
+
+```sh
+ctfguard begin example
+pkflag --set 'DH\\{[A-Za-z0-9_]+\\}' # set this challenge's format
+pkflag --show                          # show this challenge's format
+pkflag 'DH{example_candidate}'         # format-only check
+pkflag --global --show                 # explicitly inspect legacy global format
+```
+
+Use `--chal example` to select a challenge explicitly. `--global --set` is available only for deliberate legacy-global configuration; `pkselftest` no longer writes the repository setting.
+
 </details>
 
 <details>
