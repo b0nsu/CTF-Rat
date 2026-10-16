@@ -1,24 +1,176 @@
 #!/usr/bin/env python3
-# flag 포맷 검증 + placeholder 배제. 당일: pkflag --set '<정규식>' -> ~/ctf/FLAG_FORMAT 저장.
-#   pkflag <candidate> -> REAL / FAKE / NO_MATCH (REAL이면 exit 0)
-import sys, os, re
-FF=os.path.join((os.environ.get("CTF_HOME") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "FLAG_FORMAT")
-FAKE=re.compile(r'fake|test|example|dummy|sample|placeholder|redacted|your.?flag|change.?me|x{4,}', re.I)
-def main():
-    a=sys.argv[1:]
-    if a and a[0]=="--set":
-        open(FF,"w").write(a[1] if len(a)>1 else ""); print("[pkflag] 포맷 설정:", a[1] if len(a)>1 else "(빈값)"); return
-    if a and a[0]=="--show":
-        print(open(FF).read().strip() if os.path.exists(FF) else "(미설정)"); return
-    if not a:
-        print("usage: pkflag <flag> | pkflag --set '<regex>' | pkflag --show"); return
-    cand=a[0]
-    fmt=open(FF).read().strip() if os.path.exists(FF) else ""
-    fake=bool(FAKE.search(cand))
-    m=bool(re.search(fmt,cand)) if fmt else bool(re.search(r'^[A-Za-z0-9_]{1,}\{.+\}$',cand))
-    verdict="REAL" if (m and not fake) else ("FAKE(placeholder)" if fake else "NO_MATCH(포맷 불일치)")
-    print("candidate: %s"%cand)
-    print("format   : %s"%(fmt or "(미설정 — heuristic FMT{...})"))
-    print("=> %s"%verdict)
-    sys.exit(0 if verdict=="REAL" else 1)
-main()
+"""Check a candidate's flag *format* (not whether a challenge accepts it).
+
+Formats are challenge-local by default. The historical repository-global
+FLAG_FORMAT is only consulted when the caller explicitly supplies --global.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+GENERIC_FORMAT = re.compile(r"[A-Za-z0-9_]+\{.+\}\Z", re.DOTALL)
+# Deliberately narrow: "test" inside a real flag (e.g. "contest") is not
+# proof that the entire candidate is a placeholder.
+PLACEHOLDER_BODY = re.compile(
+    r"(?:fake(?:[_-]?flag)?|test(?:[_-]?flag)?|example(?:[_-]?flag)?|"
+    r"dummy(?:[_-]?flag)?|sample(?:[_-]?flag)?|placeholder|redacted|"
+    r"your[_-]?flag|change[_-]?me|x{4,})\Z", re.IGNORECASE
+)
+
+
+class FlagConfigError(ValueError):
+    pass
+
+
+def ctf_home():
+    return Path(os.environ.get("CTF_HOME") or Path(__file__).resolve().parent.parent).resolve()
+
+
+def challenge_slug(raw):
+    if not isinstance(raw, str) or not SLUG.fullmatch(raw) or raw in {".", ".."}:
+        raise FlagConfigError("invalid challenge name; expected a safe ASCII slug")
+    return raw
+
+
+def active_challenge(home):
+    try:
+        with (home / "ACTIVE.json").open(encoding="utf-8") as stream:
+            record = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as exc:
+        raise FlagConfigError("cannot read ACTIVE.json: %s" % exc) from exc
+    if not isinstance(record, dict) or "chal" not in record:
+        raise FlagConfigError("ACTIVE.json is missing chal")
+    return challenge_slug(record["chal"])
+
+
+def cwd_challenge(home):
+    root = home / "solve"
+    try:
+        parts = Path.cwd().resolve().relative_to(root).parts
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    return challenge_slug(parts[0])
+
+
+def format_path(home, requested, global_scope):
+    if global_scope:
+        if requested:
+            raise FlagConfigError("--global and --chal cannot be combined")
+        return home / "FLAG_FORMAT", "repo-global (explicit)"
+
+    active = active_challenge(home)
+    cwd = cwd_challenge(home)
+    if active and cwd and active != cwd:
+        raise FlagConfigError("active challenge %r differs from cwd challenge %r" % (active, cwd))
+    if requested:
+        requested = challenge_slug(requested)
+        if active and requested != active:
+            raise FlagConfigError("requested challenge %r differs from active %r" % (requested, active))
+        if cwd and requested != cwd:
+            raise FlagConfigError("requested challenge %r differs from cwd %r" % (requested, cwd))
+
+    chal = requested or active or cwd
+    if not chal:
+        return None, "unscoped (generic only)"
+    solve = home / "solve"
+    location = solve / chal
+    if solve.is_symlink() or location.is_symlink():
+        raise FlagConfigError("challenge format directory cannot be a symlink")
+    # No implicit scaffold creation: a typo must not start a new challenge.
+    if not location.is_dir() or not location.resolve().is_relative_to(solve.resolve()):
+        raise FlagConfigError("challenge directory not found under solve/: %s" % chal)
+    return location / "FLAG_FORMAT", "challenge:%s" % chal
+
+
+def configured_pattern(path):
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise FlagConfigError("cannot read %s: %s" % (path, exc)) from exc
+
+
+def compile_pattern(text):
+    if not text:
+        raise FlagConfigError("empty format; specify a non-empty regular expression")
+    try:
+        return re.compile(text)
+    except re.error as exc:
+        raise FlagConfigError("invalid format regex: %s" % exc) from exc
+
+
+def placeholder(candidate):
+    if "{" not in candidate or not candidate.endswith("}"):
+        return False
+    body = candidate.split("{", 1)[1][:-1]
+    return PLACEHOLDER_BODY.fullmatch(body) is not None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("candidate", nargs="?", help="candidate flag (not an oracle check)")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--set", metavar="REGEX", help="store a format for the selected challenge")
+    action.add_argument("--show", action="store_true", help="show the selected format")
+    parser.add_argument("--chal", metavar="NAME", help="select a challenge explicitly")
+    parser.add_argument("--global", dest="global_scope", action="store_true",
+                        help="explicitly operate on the legacy repository-global format")
+    args = parser.parse_args(argv)
+    if args.candidate is not None and (args.set is not None or args.show):
+        parser.error("candidate cannot be combined with --set or --show")
+    if args.candidate is None and args.set is None and not args.show:
+        parser.print_usage(sys.stderr)
+        return 2
+
+    try:
+        path, scope = format_path(ctf_home(), args.chal, args.global_scope)
+        if args.set is not None:
+            compile_pattern(args.set)
+            if path is None:
+                raise FlagConfigError("no challenge selected; run ctfguard begin or pass --chal (or --global explicitly)")
+            # Replace rather than follow any existing FLAG_FORMAT symlink.
+            tmp = path.with_name(path.name + ".tmp.%d" % os.getpid())
+            try:
+                tmp.write_text(args.set + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            print("[pkflag] format set (%s): %s" % (scope, args.set))
+            if args.global_scope:
+                print("[pkflag:warn] repo-global format affects legacy consumers; default checks ignore it", file=sys.stderr)
+            return 0
+        fmt = configured_pattern(path)
+        if args.show:
+            print(fmt or "(미설정)")
+            return 0
+        if fmt:
+            matcher = compile_pattern(fmt)
+            matched = matcher.fullmatch(args.candidate) is not None
+        else:
+            matched = GENERIC_FORMAT.fullmatch(args.candidate) is not None
+        fake = placeholder(args.candidate)
+        verdict = "REAL" if matched and not fake else ("FAKE(placeholder)" if fake else "NO_MATCH(포맷 불일치)")
+        print("candidate: %s" % args.candidate)
+        print("format   : %s" % (fmt or "(미설정 — heuristic FMT{...})"))
+        print("scope    : %s" % scope)
+        print("=> %s" % verdict)
+        print("note     : format-only; REAL is not executable-oracle verification")
+        return 0 if verdict == "REAL" else 1
+    except (FlagConfigError, OSError) as exc:
+        print("[pkflag:err] %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
