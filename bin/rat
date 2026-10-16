@@ -437,6 +437,25 @@ def _query_error(query, code, message, exit_code):
                            provenance={"cache": {"hit": False}})
     return doc, exit_code
 
+def _record_query_feedback(binary, doc):
+    """Keep an analyzed card usable but never resolve probes with stale input."""
+    try:
+        record_query_result(_state_dir(binary), _file_sha256(binary), doc)
+    except ValueError as exc:
+        doc["status"] = "partial"
+        doc["coverage"]["complete"] = False
+        omitted = doc["coverage"].get("omitted")
+        if isinstance(omitted, list):
+            if "stale_cache" not in omitted:
+                omitted.append("stale_cache")
+        elif omitted is None:
+            doc["coverage"]["omitted"] = ["stale_cache"]
+        else:
+            doc["coverage"]["omitted"] = {"previous": omitted, "stale_cache": True}
+        doc["diagnostics"].append({
+            "code": "stale_cache", "severity": "warning", "message": str(exc),
+        })
+
 # ---- subcommands ----
 def cmd_route(args):
     binary = args.binary
@@ -816,7 +835,7 @@ def cmd_query_func(args):
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
     doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
-    record_query_result(_state_dir(binary), _file_sha256(binary), doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_pwn(args):
@@ -852,7 +871,7 @@ def cmd_query_pwn(args):
         budget_bytes=budget,
     )
     doc = _governor_wrap(_state_dir(binary), "query:pwn", {"facts": facts, "heuristics": card["heuristics"]}, doc)
-    record_query_result(_state_dir(binary), _file_sha256(binary), doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 
@@ -955,7 +974,7 @@ def cmd_query_oracle(args):
                            provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
     doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
-    record_query_result(_state_dir(binary), _file_sha256(binary), doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def _slice_complete(slice_doc):
