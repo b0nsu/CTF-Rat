@@ -73,6 +73,28 @@ class RouteFeedbackTests(unittest.TestCase):
         return route(revq=self.rev, interesting=self.interesting, binary_digest=self.digest,
                      probe_feedback=feedback)
 
+    def test_cross_binary_result_cannot_be_relabelled_or_persisted(self):
+        original = _card(self.digest)
+        imported = json.loads(json.dumps(original))
+        foreign_digest = "sha256:" + "a" * 64
+        with self.assertRaisesRegex(ValueError, "digest does not match"):
+            record_query_result(self.tmp.name, foreign_digest, original)
+        self.assertEqual(original, imported)
+        self.assertEqual(Stream(self.tmp.name).read(), [])
+
+    def test_frontdoor_changed_binary_marks_query_partial_without_feedback(self):
+        rat = _rat()
+        stale = _card("sha256:" + "b" * 64)
+        rat._record_query_feedback(self.binary, stale)
+        self.assertEqual(stale["status"], "partial")
+        self.assertFalse(stale["coverage"]["complete"])
+        self.assertTrue(any(d["code"] == "stale_cache" for d in stale["diagnostics"]))
+        from ratlib.schema import validate
+        validate(stale, "rat.query-result/v1")
+        self.assertFalse(any(e["type"] == "note.recorded" and
+                             e["payload"].get("kind") == "route-query-result"
+                             for e in Stream(self.tmp.name).read()))
+
     def test_route_query_route_resolves_exact_checker_probe(self):
         before = self._route()
         pid = before["decision"]["probe_id"]
