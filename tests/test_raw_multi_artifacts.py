@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
-from ratlib.raw_loader import inspect_raw, load_spec
+from ratlib.raw_loader import inspect_raw, load_spec, project
 from ratlib.route import route
 from ratlib.run_manifest import materialize_for_solve, read
 
@@ -67,6 +67,39 @@ class RawAndMultiArtifactTests(unittest.TestCase):
                                      "base_addr": 4096, "entry_point": 4096}
         doc = route(profile=profile)
         self.assertTrue(any(x["kind"] == "operator-blob-map" for x in doc["signals"]))
+
+    def test_project_blob_opts_are_explicit(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "stage"
+            binary.write_bytes(b"\\x90" * 16)
+            calls = []
+            class FakeAngr:
+                @staticmethod
+                def Project(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    return object()
+            class FakeArchinfo:
+                @staticmethod
+                def arch_from_id(value):
+                    return "archinfo:" + value
+            with mock.patch.dict(sys.modules, {"angr": FakeAngr, "archinfo": FakeArchinfo}):
+                project(str(binary), None)
+                project(str(binary), load_spec(binary, arch="i386", base="0x1000", entry="0x1000"))
+            self.assertNotIn("main_opts", calls[0][1])
+            self.assertEqual(calls[1][1]["main_opts"]["arch"], "archinfo:X86")
+            self.assertEqual(calls[1][1]["main_opts"]["base_addr"], 4096)
+
+    def test_rat_route_raw_file_returns_next_loader_prerequisite(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "drive0"
+            boot_sector(binary)
+            result = subprocess.run([str(BIN / "rat"), "route", str(binary), "--fast",
+                                     "--format", "json"], capture_output=True, text=True, timeout=40)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            doc = json.loads(result.stdout)
+            self.assertIn("raw-artifact", doc["leads"])
+            self.assertEqual(doc["commitment"], "provisional")
+            self.assertTrue(any("arch" in x["target"] for x in doc["next"]))
 
     def test_manifest_multi_inputs_qemu_hints_and_idempotence(self):
         with tempfile.TemporaryDirectory() as root:
