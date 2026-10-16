@@ -217,7 +217,7 @@ def _qemu_launch_hints(path: str) -> dict[str, Any]:
         if not re.search(r"\bqemu-system-[A-Za-z0-9_-]+\b", line):
             continue
         commands.append({"line": line.strip()[:2048],
-                         "requires_shell_resolution": "$" in line or "\`" in line})
+                         "requires_shell_resolution": "$" in line or chr(96) in line})
         if len(commands) == 4:
             break
     return {"source_sha256": sha256_file(path), "status": "static-hint",
