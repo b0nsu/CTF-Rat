@@ -103,6 +103,8 @@ class RouteFeedbackTests(unittest.TestCase):
         self.assertFalse(any(action["probe_id"] == pid for action in after["next"]))
         self.assertEqual(after["feedback"][0]["status"], "resolved")
         self.assertNotIn("checker semantics and success/failure oracle remain unverified", after["unresolved"])
+        self.assertTrue(any("executable branch semantics remain unverified" in item
+                            for item in after["unresolved"]))
         self.assertEqual(after, self._route())
 
     def test_partial_mismatch_and_stale_result_cannot_resolve(self):
