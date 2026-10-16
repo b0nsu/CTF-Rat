@@ -91,6 +91,21 @@ def route(*,profile=None,revq=None,interesting=None):
     function_names={f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)}
     identity=(profile or {}).get("artifact_identity") or (revq or {}).get("artifact_identity") or {}
     kernel_image=identity.get("kind") in {"bzimage","linux-boot-image","vmlinux"}
+    if identity.get("kind") in {"boot-sector-candidate", "disk-image-candidate"}:
+        kind = identity["kind"]
+        _sig(signals, "raw-artifact", {"kind": kind, "size": identity.get("size")}, "heuristic")
+        _add(dimensions["program_shapes"], kind)
+        _add(leads, "raw-artifact")
+        if (profile or {}).get("blob_load_spec"):
+            _sig(signals, "operator-blob-map", (profile or {})["blob_load_spec"], "fact")
+            _add(unresolved, "raw mapping is operator-supplied; runtime execution mode and loaded stage remain unverified")
+        else:
+            _add(unresolved, "raw executable architecture, load base and entry are not established by boot/disk signatures")
+            actions.append(_action("rat route", "--arch ARCH --base ADDR --entry ADDR",
+                                   ["raw-artifact"], "requires explicit raw executable mapping before CFG",
+                                   resolves=["which byte range is executable at which address"],
+                                   expected_evidence="operator-supplied-loader-parameters",
+                                   cost="low", blocking=True))
     if kernel_image:
         _sig(signals,"kernel-image",identity,"fact")
         _add(dimensions["program_shapes"],"kernel-image"); _add(leads,"kernel")
