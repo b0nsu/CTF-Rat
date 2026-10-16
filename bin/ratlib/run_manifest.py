@@ -205,6 +205,25 @@ def _input(role: str, path: str, name: Optional[str] = None) -> dict[str, Any]:
             "sha256": sha256_file(path), "size": os.path.getsize(path)}
 
 
+def _qemu_launch_hints(path: str) -> dict[str, Any]:
+    """Statically inspect a bounded runner; never execute uploaded code."""
+    if os.path.getsize(path) > 64 * 1024:
+        return {"source_sha256": sha256_file(path), "status": "unresolved",
+                "reason": "runner exceeds inspection budget"}
+    with open(path, "r", encoding="utf-8", errors="replace") as source:
+        script = source.read().replace(chr(92) + chr(10), " ")
+    commands = []
+    for line in script.splitlines():
+        if not re.search(r"\bqemu-system-[A-Za-z0-9_-]+\b", line):
+            continue
+        commands.append({"line": line.strip()[:2048],
+                         "requires_shell_resolution": "$" in line or "\`" in line})
+        if len(commands) == 4:
+            break
+    return {"source_sha256": sha256_file(path), "status": "static-hint",
+            "commands": commands, "not_executed": True}
+
+
 def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str]) -> dict[str, Any]:
     timestamp = now_iso()
     inputs = [_input("binary", binary)]
@@ -232,7 +251,7 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
 
 def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
                           binary: str, libc: Optional[str], remote: Optional[str],
-                          owner_path: str) -> dict[str, Any]:
+                          owner_path: str, extra_inputs=()) -> dict[str, Any]:
     """Preserve one run identity while making solve/run.json the authoritative copy."""
     incoming = read(source) if source else None
     existing = read(destination) if os.path.isfile(destination) else None
@@ -246,10 +265,28 @@ def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
     else:
         payload = incoming or existing or new_direct(name, binary, libc, remote)
     payload = copy.deepcopy(payload)
-    inputs = [item for item in payload["inputs"] if item.get("role") not in ("binary", "libc")]
+    extra_inputs = list(extra_inputs)
+    extra_keys = set()
+    for role, path in extra_inputs:
+        if role not in {"image", "runner", "extra"}:
+            raise ValueError("unsupported additional artifact role: %s" % role)
+        key = (role, os.path.basename(path))
+        if key in extra_keys or not os.path.isfile(path):
+            raise ValueError("duplicate or missing additional artifact: %s" % key[1])
+        extra_keys.add(key)
+    inputs = [item for item in payload["inputs"]
+              if item.get("role") not in ("binary", "libc")
+              and (item.get("role"), item.get("name")) not in extra_keys]
     inputs.append(_input("binary", binary))
     if libc:
         inputs.append(_input("libc", libc, "libc.so.6"))
+    for role, path in extra_inputs:
+        inputs.append(_input(role, path))
+    if extra_inputs:
+        qemu = [_qemu_launch_hints(path) | {"name": os.path.basename(path)}
+                for role, path in extra_inputs if role == "runner"]
+        if qemu:
+            payload.setdefault("environment", {})["qemu_launch_hints"] = qemu
     payload["inputs"] = inputs
     payload["updated_at"] = now_iso()
     payload["manifest_owner"] = {"kind": "solve", "path": owner_path}
