@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 
 from .artifact import get, put_bytes
@@ -21,10 +22,15 @@ def record_query_result(state_dir, binary_digest, doc):
     # binary can be replaced between analysis and persistence; laundering the
     # digest here would make stale facts resolve a new binary's probe.
     measured = (doc.get("provenance") or {}).get("binary_sha256")
+    # revq emits a bare hex digest; the artifact/STATE contracts use sha256:hex.
+    # Canonicalization is safe only after the actual measured bytes match.
+    if isinstance(measured, str) and re.fullmatch(r"[0-9a-f]{64}", measured):
+        measured = "sha256:" + measured
     if not binary_digest or measured != binary_digest:
         raise ValueError("query result binary digest does not match the measured artifact")
     validate(doc, "rat.query-result/v1")
     stored = {key: value for key, value in doc.items() if key != "governor"}
+    stored["provenance"] = {**doc["provenance"], "binary_sha256": binary_digest}
     raw = json.dumps(stored, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     stream = Stream(state_dir)
     artifact = put_bytes(raw, root=stream.root, kind="query-result", media_type="application/json",
