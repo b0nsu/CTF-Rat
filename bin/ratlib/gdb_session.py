@@ -27,6 +27,9 @@ _STARTED_WORKERS = {}
 ID = re.compile(r"gdb_[0-9a-f]{32}\Z")
 ADDR = re.compile(r"(?:0x[0-9a-fA-F]+|[0-9]+)\Z")
 SYMBOL = re.compile(r"[A-Za-z_][A-Za-z0-9_:.]*\Z")
+# Explicitly version-gated: never interpret an unknown allocator layout as facts.
+HEAP_LAYOUT = "glibc-2.35-x86_64"
+HEAP_READ_CAP = 1024
 
 
 class ConnectionLostError(RuntimeError):
@@ -282,7 +285,91 @@ def _capture(config, history, mi):
     return {"digest": record["digest"], "kind": record["kind"], "size": record["size"]}
 
 
+
+def _heap_snapshot(mi, params, timeout):
+    """Read a bounded, explicitly versioned glibc layout from the owned inferior.
+
+    All addresses are supplied by the operator after checking the active libc.
+    These are candidate observations, not allocator invariants or primitive proof.
+    """
+    if params.get("layout") != HEAP_LAYOUT:
+        raise ValueError("heap snapshot requires --layout glibc-2.35-x86_64")
+    locations = {}
+    for name in ("tcache", "arena", "chunk"):
+        value = params.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not ADDR.fullmatch(value):
+            raise ValueError("%s must be a numeric address" % name)
+        addr = int(value, 0) if value.lower().startswith("0x") else int(value)
+        if not 0 < addr < (1 << 64) or addr % 8:
+            raise ValueError("%s must be a nonzero, aligned 64-bit address" % name)
+        locations[name] = addr
+    if not locations:
+        raise ValueError("heap snapshot needs --tcache, --arena or --chunk")
+    # tcache_perthread_struct: 64 uint16 counts followed by 64 pointers.
+    # malloc_state: top/last_remainder/bins[0:2] at offsets 0x60..0x7f.
+    sizes = {"tcache": 640, "arena": 32, "chunk": 32}
+    offsets = {"tcache": 0, "arena": 0x60, "chunk": 0}
+    if sum(sizes[k] for k in locations) > HEAP_READ_CAP:
+        raise ValueError("heap snapshot exceeds read cap")
+    deadline = time.monotonic() + timeout
+    snapshot = {"layout": HEAP_LAYOUT, "scope": "local-owned-inferior",
+                "direct_evidence": False, "regions": {}, "unresolved": []}
+    for name, base in locations.items():
+        start = base + offsets[name]
+        raw = bytearray()
+        while len(raw) < sizes[name]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"status": "timeout", "snapshot": snapshot,
+                        "diagnostic": "heap snapshot exceeded action deadline"}
+            count = min(256, sizes[name] - len(raw))
+            result = mi.command("-data-read-memory-bytes %#x %d" % (start + len(raw), count),
+                                timeout=remaining)
+            contents = re.findall(r'contents="([0-9a-fA-F]+)"', result.get("mi_result") or "")
+            if result.get("status") != "ok" or not contents:
+                snapshot["unresolved"].append({"region": name, "reason": "memory read unavailable"})
+                break
+            try:
+                data = bytes.fromhex("".join(contents))
+            except ValueError:
+                data = b""
+            if len(data) != count:
+                snapshot["unresolved"].append({"region": name, "reason": "short or malformed memory read"})
+                break
+            raw.extend(data)
+        if len(raw) != sizes[name]:
+            continue
+        u64 = lambda i: int.from_bytes(raw[i:i+8], "little")
+        if name == "tcache":
+            counts = [int.from_bytes(raw[2*i:2*i+2], "little") for i in range(64)]
+            entries = [u64(128 + 8*i) for i in range(64)]
+            snapshot["regions"][name] = {
+                "address": "%#x" % base,
+                "bins": [{"index": i, "count": counts[i], "head": "%#x" % entries[i]}
+                         for i in range(64) if counts[i] or entries[i]],
+                "coverage": "64 bins; zero bins omitted"}
+        elif name == "arena":
+            snapshot["regions"][name] = {
+                "address": "%#x" % base,
+                "top": "%#x" % u64(0), "last_remainder": "%#x" % u64(8),
+                "unsorted_fd": "%#x" % u64(16), "unsorted_bk": "%#x" % u64(24)}
+        else:
+            encoded = u64(16)
+            snapshot["regions"][name] = {
+                "address": "%#x" % base, "prev_size": "%#x" % u64(0),
+                "size_field": "%#x" % u64(8), "encoded_fd": "%#x" % encoded,
+                "candidate_decoded_fd": "%#x" % (encoded ^ ((base + 16) >> 12)),
+                "bk": "%#x" % u64(24),
+                "warning": "fd decoding applies only to a freed safe-linked chunk"}
+    status = "partial" if snapshot["unresolved"] else "ok"
+    return {"status": status, "snapshot": snapshot}
+
+
 def _inspect(mi, action, params, timeout=10):
+    if action == "heap":
+        return _heap_snapshot(mi, params, timeout)
     if action == "break":
         target = params.get("target", "")
         if not (ADDR.fullmatch(target) or SYMBOL.fullmatch(target)):
@@ -446,10 +533,13 @@ def main(argv=None):
     p.add_argument("--total-timeout", type=int, default=120); p.add_argument("--idle-timeout", type=int, default=30)
     p.add_argument("--action-timeout", type=int, default=10)
     p.add_argument("--output-cap", type=int, default=8192)
-    for name in ("status", "break", "continue", "registers", "memory", "mappings", "capture", "close"):
+    for name in ("status", "break", "continue", "registers", "memory", "heap", "mappings", "capture", "close"):
         p = sub.add_parser(name); p.add_argument("binary"); p.add_argument("session_id")
         if name == "break": p.add_argument("target")
         if name == "memory": p.add_argument("address"); p.add_argument("count", type=int)
+        if name == "heap":
+            p.add_argument("--layout", required=True)
+            for field in ("tcache", "arena", "chunk"): p.add_argument("--" + field)
     args = parser.parse_args(argv)
     try:
         if args.action == "start":
@@ -457,7 +547,7 @@ def main(argv=None):
                            idle_timeout=args.idle_timeout, action_timeout=args.action_timeout,
                            output_cap=args.output_cap)
         else:
-            params = {key: getattr(args, key) for key in ("target", "address", "count") if hasattr(args, key)}
+            params = {key: getattr(args, key) for key in ("target", "address", "count", "layout", "tcache", "arena", "chunk") if hasattr(args, key)}
             result = request(args.binary, args.session_id, args.action, **params)
     except ConnectionLostError as exc:
         result = {"status": "connection_lost", "error": str(exc)}
