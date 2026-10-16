@@ -157,6 +157,30 @@ class RouteFeedbackTests(unittest.TestCase):
                           probe_feedback=load_feedback(other, self.digest, initial["next"]))
         self.assertEqual(left, right)
 
+    def test_free_form_refutation_cannot_erase_unrelated_lead(self):
+        profile = {"imports": ["malloc", "free"]}
+        initial = route(profile=profile, binary_digest=self.digest)
+        heap = next(action for action in initial["next"] if action["query"] == "rat query pwn")
+        stream = Stream(self.tmp.name)
+        unrelated = direct_evidence_envelope(root=stream.root, producer="gdbq",
+                                             measurement=b"unrelated debugger observation",
+                                             subject_digest=self.digest)
+        stream.append("observation.recorded", {
+            "observation_id": "unsupported-refutation",
+            "kind": "route.probe.refutation",
+            "subject": {"binary_digest": self.digest},
+            "quality": {"level": "direct"}, "validity": {"state": "active"},
+            "evidence": [unrelated],
+            "value": {"binary_digest": self.digest, "probe_id": heap["probe_id"],
+                      "premise": heap["resolves"][0], "coverage_complete": True,
+                      "conclusion": "premise-refuted"},
+        })
+        feedback = load_feedback(self.tmp.name, self.digest, initial["next"])
+        self.assertNotIn(heap["probe_id"], feedback)
+        after = route(profile=profile, binary_digest=self.digest, probe_feedback=feedback)
+        self.assertIn("heap-lifetime", after["leads"])
+        self.assertIn(heap["probe_id"], {a["probe_id"] for a in after["next"]})
+
     def test_safe_input_refutation_preserves_independent_heap_lead(self):
         profile = {"imports": ["read", "malloc", "free"]}
         initial = route(profile=profile, binary_digest=self.digest)
