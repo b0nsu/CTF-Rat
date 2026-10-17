@@ -82,11 +82,17 @@ else
 fi
 printf '{"t":"offset","k":"legacy","v":"0xdead","src":"selftest"}\n' > STATE.jsonl
 $VENV -c "import pwnstage;assert 'legacy' not in pwnstage.offsets()" 2>/dev/null && ok "legacy offset isolation" || no "legacy offset isolation"
-# T3 pkflag real vs fake
-pkflag --set 'DH\{[0-9a-f]{4,}\}' >/dev/null 2>&1
-pkflag 'DH{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no
-pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
-[ "$R1" = ok ] && [ "$R2" = ok ] && ok "pkflag real/fake" || no "pkflag real/fake"
+# T3 pkflag scoped format / placeholder; never mutate repository FLAG_FORMAT.
+mkdir -p "$T/solve/pkflag-selftest" "$T/solve/pkflag-other"
+printf '{"chal":"pkflag-selftest"}\n' > "$T/ACTIVE.json"
+CTF_HOME="$T" pkflag --set 'DH\{[0-9a-f]{4,}\}' >/dev/null 2>&1
+CTF_HOME="$T" pkflag 'DH{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no
+CTF_HOME="$T" pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
+[ "$R1" = ok ] && [ "$R2" = ok ] && ok "pkflag real/fake (isolated)" || no "pkflag real/fake (isolated)"
+printf '{"chal":"pkflag-other"}\n' > "$T/ACTIVE.json"
+CTF_HOME="$T" pkflag 'DH{vm_handlers_are_easy_order_is_key}' >/dev/null 2>&1 && R3=ok || R3=no
+[ "$R3" = ok ] && [ ! -f "$T/solve/pkflag-other/FLAG_FORMAT" ] && ok "pkflag challenge scope" || no "pkflag challenge scope"
+rm -f "$T/ACTIVE.json"
 # T4 pwnkit snapscript + pwnclean --kv filter
 $VENV -c "import pwnkit;print(pwnkit.snapscript([('a','0x1')]).strip())" 2>/dev/null | grep -q 'SNAP a=' && ok "pwnkit.snapscript" || no "pwnkit.snapscript"
 printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/dev/null | grep -q 'SNAP r=0x401234' && ok "pwnclean --kv filter" || no "pwnclean --kv filter"
