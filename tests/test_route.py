@@ -61,6 +61,18 @@ class RouterV2(unittest.TestCase):
     def test_no_evidence_is_unknown(self):
         doc=route(); self.assertEqual(doc["commitment"],"unknown"); self.assertIsNone(doc["decision"])
 
+    def test_crypto_hint_reports_string_source_without_matching_desktop_path(self):
+        rev={"strings":[{"addr":0x1000,"val":r"C:\Users\dev\Desktop\sample.pdb"},
+                        {"addr":0x2000,"val":"AES-256 key required"}]}
+        doc=route(revq=rev)
+        hints=[s for s in doc["signals"] if s["kind"]=="crypto-hint"]
+        self.assertEqual(len(hints),1)
+        self.assertEqual(hints[0]["value"],[{"algorithm":"aes","matched_text":"AES",
+                                                "source":"revq.strings","string":"AES-256 key required",
+                                                "address":0x2000}])
+        only_path=route(revq={"strings":rev["strings"][:1]})
+        self.assertFalse(any(s["kind"]=="crypto-hint" for s in only_path["signals"]))
+
     def test_nim_prompt_and_rejection_outweigh_runtime_memcpy(self):
         rev={"functions":[{"name":"NimMainModule","calls":[],"strings":[]}],
              "strings":[{"val":"input > "},{"val":"Flag:"},{"val":"Wrong!"}]}

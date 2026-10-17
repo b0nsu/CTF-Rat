@@ -8,7 +8,8 @@ from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 HEAP={"malloc","free","calloc","realloc"}; STRONG={"gets","strcpy","strcat","sprintf","scanf","__isoc99_scanf","__isoc99_sscanf"}
 OVERFLOW=STRONG|{"read","memcpy","fgets","fread"}; FORMAT={"printf","fprintf","dprintf","syslog"}; INPUT={"read","gets","scanf","fgets"}
 KERNEL={"copy_from_user","copy_to_user","kmalloc","kfree","module_init","module_exit"}; VM=("vm","opcode","bytecode","dispatch","interpreter")
-CRYPTO=("aes","des","rc4","md5","sha","base64","xor","rsa","hmac","crc")
+CRYPTO_TOKEN=re.compile(r"(?<![A-Za-z0-9])(?:aes|des|rc4|md5|sha(?:1|224|256|384|512|3)?|base64|xor|rsa|hmac|crc(?:32|64)?)(?![A-Za-z0-9])",re.I)
+PATH_STRING=re.compile(r"^(?:[A-Za-z]:[\\/]|/|\\\\)")
 COMPARE={"strcmp","strncmp","memcmp","strcasecmp","strncasecmp","strstr","strcoll","bcmp","wcscmp","wcsncmp"}
 SUCCESS=re.compile(r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b|flag\{",re.I)
 FAILURE=re.compile(r"incorrect|wrong|denied|reject(?:ed)?|invalid|fail(?:ed|ure)?|try\s*again",re.I)
@@ -33,6 +34,19 @@ def _oracle(revq,name):
     return ({"success_count":len(good),"failure_count":len(bad),"success":good[:2],"failure":bad[:2]} if good and bad else None)
 def _blob(revq):
     return " ".join(s.get("val","") for s in (revq or {}).get("strings",[]) or [] if isinstance(s,dict)).lower()
+def _crypto_matches(revq):
+    matches=[]
+    for item in (revq or {}).get("strings",[]) or []:
+        if not isinstance(item,dict) or not isinstance(item.get("val"),str): continue
+        value=item["val"]
+        if PATH_STRING.match(value): continue
+        for match in CRYPTO_TOKEN.finditer(value):
+            evidence={"algorithm":match.group().lower(),"matched_text":match.group(),
+                      "source":"revq.strings","string":value[:120]}
+            if isinstance(item.get("addr"),int): evidence["address"]=item["addr"]
+            if evidence not in matches: matches.append(evidence)
+            if len(matches)>=3: return matches
+    return matches
 def runtime_context(names):
     """Named runtime markers are context, never a vulnerability exclusion."""
     markers={
@@ -129,6 +143,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
     imports=set((profile or {}).get("imports",[]) or [])|set((revq or {}).get("imports",[]) or [])
     dimensions={name:[] for name in DIMS}; signals=[]; unresolved=[]; leads=[]; actions=[]
     capabilities={"profile":profile is not None,"revq":revq is not None}; is_pe=(revq or {}).get("platform")=="pe"
+    is_wasm=(revq or {}).get("platform")=="wasm"
     function_names={f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)}
     identity=(profile or {}).get("artifact_identity") or (revq or {}).get("artifact_identity") or {}
     kernel_image=identity.get("kind") in {"bzimage","linux-boot-image","vmlinux"}
@@ -155,6 +170,20 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
                                "PE execution requires the bounded Windows emulation path",
                                resolves=["whether the artifact can execute through the bounded PE emulation path"],
                                expected_evidence="runtime-direct",cost="medium",blocking=True))
+    if is_wasm:
+        _sig(signals,"wasm-platform","WebAssembly core v1","fact")
+        _add(dimensions["program_shapes"],"wasm-module")
+        _add(dimensions["constraints"],"wasm-runtime-required")
+        _add(leads,"rev")
+        _add(unresolved,"Wasm section inventory does not establish function behavior or a success oracle")
+        actions.append(_action("rat-wasm inspect",(revq or {}).get("bin") or "<module>",["wasm-platform"],
+                               "bounded Wasm structure inspection precedes runtime verification",
+                               resolves=["which exported functions and imports are present"],
+                               expected_evidence="structured-static",blocking=True))
+        actions.append(_action("rat-wasm verify","--stdin-file <input> --expect-stdout <literal>",["wasm-platform"],
+                               "independent Wasmtime execution is required for a concrete oracle",
+                               resolves=["whether a concrete input satisfies the module oracle"],
+                               expected_evidence="independent-runtime-result",cost="medium"))
     typed=(revq or {}).get("evasion_signals",[]) if (revq or {}).get("evasion_signal_schema")==EVASION_SIGNAL_SCHEMA else []
     packing=next((s for s in typed if isinstance(s,dict) and s.get("kind")=="packer-section" and s.get("quality")=="fact"),None)
     packing=packing or next((s for s in typed if isinstance(s,dict) and s.get("kind")=="high-entropy" and s.get("quality")=="heuristic"),None)
@@ -166,7 +195,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
                                resolves=["whether packing is active and unpacking is required before deeper analysis"],
                                expected_evidence="runtime-direct",blocking=True))
     hits=sorted(imports&KERNEL)
-    if hits and not is_pe:
+    if hits and not is_pe and not is_wasm:
         _sig(signals,"kernel-imports",hits,"fact"); _add(dimensions["program_shapes"],"kernel-candidate"); _add(leads,"kernel")
         _add(unresolved,"kernel imports do not prove a kernel artifact or target environment")
         actions.append(_action("rat query pwn","confirm-kernel-artifact-and-environment-before-kernel-tooling",["kernel-imports"],
@@ -177,7 +206,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
     if hits:
         _sig(signals,"heap-imports",hits,"fact"); _add(dimensions["vulnerability_surfaces"],"heap-lifetime-candidate"); _add(leads,"heap-lifetime")
         _add(unresolved,"allocator imports do not prove attacker-controlled lifetime, reuse, or overlap")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-bounded-allocator-callsites-and-lifetimes",["heap-imports"],
                                    "allocator use calls for bounded lifetime inspection",
                                    resolves=["whether allocator lifetime, reuse, or overlap is attacker-controlled"],
@@ -186,7 +215,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
     if fh and ih:
         _sig(signals,"format-input-imports",sorted(set(fh+ih)),"fact"); _add(dimensions["vulnerability_surfaces"],"format-string-candidate"); _add(leads,"format-string")
         _add(unresolved,"prove attacker control reaches a format argument")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-bounded-format-callsites-before-runtime-probe",["format-input-imports"],
                                    "format and input imports justify callsite inspection",
                                    resolves=["whether attacker-controlled data reaches a format argument"],
@@ -199,7 +228,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
             _add(dimensions["vulnerability_surfaces"],"stack-overwrite-candidate"); _add(leads,"stack-overwrite")
         _add(unresolved,"prove a concrete overwrite or PC-control primitive; import presence is insufficient")
         if _fact(profile,"elf.nx") is True: _sig(signals,"elf-nx",True,"fact"); _add(dimensions["constraints"],"nx")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-runtime-copy-callsite-before-overwrite-probe" if runtime_copy else "inspect-bounded-input-callsite-then-measure-overwrite",["overflow-imports","runtime-symbols"] if runtime_copy else ["overflow-imports"],
                                    "runtime copy imports require application-callsite confirmation" if runtime_copy else "an input sink requires callsite inspection before a crash probe",
                                    resolves=["whether input reaches an overwrite-capable callsite before measuring PC control"],
@@ -240,7 +269,7 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
                                "VM hints require dispatch-loop confirmation",
                                resolves=["whether a dispatch loop and bytecode semantics exist"],
                                expected_evidence="structured-static",cost="medium"))
-    ch=sorted({h for h in CRYPTO if h in blob})
+    ch=_crypto_matches(revq)
     if (ch or (interesting and not checker)) and not kernel_image:
         if ch: _sig(signals,"crypto-hint",ch,"heuristic")
         _add(dimensions["program_shapes"],"oracle-needed"); _add(leads,"oracle-discovery"); _add(unresolved,"a success/failure oracle must be bounded before symbolic execution")
