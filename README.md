@@ -179,6 +179,13 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 from a cached function is marked `partial` with a bounded `objdump` diagnostic;
 compare revq's mapped address with the ELF VMA before disassembly.
 
+For WebAssembly core modules, `rat route` and `revq` expose a bounded section
+inventory. Use `rat-wasm inspect BIN --func INDEX` for one function body digest
+and `rat-wasm verify BIN --stdin-file INPUT --expect-stdout LITERAL` for an
+independent Wasmtime execution (optional setup in SETUP §9). This does not
+promote a solve or primitive. Use `rat-capture --limit N -- TOOL ...` instead
+of piping tool output through `head` when the original exit code matters.
+
 For Linux boot images, `newchal` skips generic ELF recon and `rat route` reports
 the kernel identity and the prerequisite to extract ELF `vmlinux` using Linux
 `scripts/extract-vmlinux`. Symbol-bearing kernels use bounded ELF metadata in

@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Bounded Wasm inventory and independent Wasmtime concrete execution."""
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.artifact import put_bytes
+from ratlib.runner import ResourceLimits, run
+from ratlib.state_v2 import Stream
+from ratlib.wasm import inspect
+
+
+def _digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def _execute(module_path, stdin_path, invoke):
+    """Child process: runner owns time/resource bounds; no result is a solve claim."""
+    try:
+        import wasmtime
+    except ImportError:
+        print(json.dumps({"runtime_status": "dependency_missing", "diagnostic": "install wasmtime in the active Python environment"}))
+        return 3
+    try:
+        with tempfile.TemporaryDirectory(prefix="rat-wasm-") as scratch:
+            config = wasmtime.Config()
+            config.consume_fuel = True
+            engine = wasmtime.Engine(config)
+            store = wasmtime.Store(engine)
+            store.set_fuel(10_000_000)
+            module = wasmtime.Module.from_file(engine, module_path)
+            wasi = wasmtime.WasiConfig()
+            wasi.stdin_file = stdin_path
+            stdout_path = os.path.join(scratch, "stdout")
+            stderr_path = os.path.join(scratch, "stderr")
+            wasi.stdout_file = stdout_path
+            wasi.stderr_file = stderr_path
+            store.set_wasi(wasi)
+            linker = wasmtime.Linker(engine)
+            linker.define_wasi()
+            instance = linker.instantiate(store, module)
+            name = invoke or "_start"
+            func = instance.exports(store).get(name)
+            if not isinstance(func, wasmtime.Func):
+                raise ValueError("exported function %r unavailable; select --invoke" % name)
+            if func.type(store).params:
+                raise ValueError("only zero-argument exports are supported")
+            result = func(store)
+            with open(stdout_path, "rb") as fh:
+                output = fh.read(65537)
+            with open(stderr_path, "rb") as fh:
+                errors = fh.read(4097)
+            payload = {"runtime_status": "executed", "engine": "wasmtime",
+                       "engine_version": importlib.metadata.version("wasmtime"),
+                       "invoke": name, "return_value": result,
+                       "stdout": output[:65536].decode("utf-8", "replace"),
+                       "stderr": errors[:4096].decode("utf-8", "replace"),
+                       "output_truncated": len(output) > 65536 or len(errors) > 4096}
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+    except Exception as exc:
+        print(json.dumps({"runtime_status": "error", "engine": "wasmtime",
+                          "diagnostic": "%s: %s" % (type(exc).__name__, str(exc)[:500])}))
+        return 1
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["_execute"]:
+        return _execute(args[1], args[2], None if args[3] == "-" else args[3])
+    parser = argparse.ArgumentParser(prog="rat-wasm")
+    sub = parser.add_subparsers(dest="command", required=True)
+    inventory = sub.add_parser("inspect", help="bounded core-module structure inventory")
+    inventory.add_argument("module")
+    inventory.add_argument("--func", type=int, help="defined function index")
+    verify = sub.add_parser("verify", help="concrete execution with independent Wasmtime engine")
+    verify.add_argument("module")
+    verify.add_argument("--stdin-file", required=True)
+    verify.add_argument("--expect-stdout", required=True, help="literal expected stdout fragment")
+    verify.add_argument("--invoke", help="zero-argument exported function (default _start)")
+    verify.add_argument("--timeout", type=float, default=10)
+    verify.add_argument("--record-state-dir", help="record heuristic observation with Wasmtime provenance")
+    ns = parser.parse_args(args)
+    try:
+        document = inspect(ns.module)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"status": "error", "diagnostic": str(exc)}))
+        return 4
+    if ns.command == "inspect":
+        if ns.func is not None:
+            found = next((f for f in document["functions"] if f["index"] == ns.func), None)
+            if found is None:
+                print(json.dumps({"status": "error", "diagnostic": "defined function index not found"}))
+                return 4
+            document = {"schema": document["schema"], "format": document["format"],
+                        "sha256": document["sha256"], "function": found,
+                        "exports": [e for e in document["exports"] if e["kind"] == 0 and e["index"] == ns.func],
+                        "coverage": document["coverage"]}
+        else:
+            for key, cap in (("imports", 64), ("exports", 64), ("functions", 64)):
+                values = document[key]
+                document[key + "_total"] = len(values)
+                document[key + "_omitted"] = max(0, len(values) - cap)
+                document[key] = values[:cap]
+        print(json.dumps(document, ensure_ascii=False))
+        return 0
+    if not os.path.isfile(ns.stdin_file) or not ns.expect_stdout or not 0 < ns.timeout <= 60:
+        print(json.dumps({"status": "error", "diagnostic": "input file, expected stdout and timeout are required"}))
+        return 2
+    result = run([sys.executable, os.path.realpath(__file__), "_execute",
+                  os.path.realpath(ns.module), os.path.realpath(ns.stdin_file), ns.invoke or "-"],
+                 timeout_seconds=ns.timeout, preview_bytes=100000, max_output_bytes=100000,
+                 limits=ResourceLimits(address_space_bytes=16 * 1024 ** 3),
+                 tool_version="wasmtime-concrete")
+    try:
+        measured = json.loads(result.stdout.preview) if not result.stdout.truncated else {}
+    except (ValueError, UnicodeDecodeError):
+        measured = {}
+    complete = (result.exit_code == 0 and measured.get("runtime_status") == "executed"
+                and not measured.get("output_truncated")
+                and not result.stdout.truncated and not result.stderr.truncated)
+    passed = complete and ns.expect_stdout in measured.get("stdout", "")
+    doc = {"schema": "rat.wasm-verification/v1", "status": "pass" if passed else "fail" if complete else "inconclusive",
+           "module_digest": document["sha256"], "input_digest": _digest(ns.stdin_file),
+           "expect_stdout": ns.expect_stdout, "engine": "wasmtime" if measured.get("engine") == "wasmtime" else None,
+           "runtime": measured, "exit_code": result.exit_code, "timed_out": result.timed_out,
+           "output_truncated": result.stdout.truncated or result.stderr.truncated,
+           "provenance": "independent-wasmtime-runtime; no primitive PASS or SOLVED promotion"}
+    if ns.record_state_dir:
+        try:
+            root = os.path.abspath(ns.record_state_dir)
+            saved = put_bytes(json.dumps(doc, sort_keys=True).encode(), kind="wasm-runtime-result",
+                              media_type="application/json", logical_name="wasm-runtime.json",
+                              root=os.path.join(root, ".rat"))
+            Stream(root).append("observation.recorded", {
+                "observation_id": "wasm_" + uuid.uuid4().hex,
+                "producer": {"role": "rat-wasm", "engine": "wasmtime"},
+                "subject": {"digest": document["sha256"]},
+                "kind": "rev.wasm.runtime-verification",
+                "value": {"status": doc["status"], "input_digest": doc["input_digest"]},
+                "evidence": [saved["digest"]], "quality": {"level": "heuristic"},
+                "validity": {"state": "active"},
+            })
+            doc["state_recorded"] = True
+        except (OSError, ValueError, RuntimeError) as exc:
+            doc["state_recorded"] = False
+            doc["recording_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:240])
+    print(json.dumps(doc, ensure_ascii=False))
+    if doc.get("state_recorded") is False:
+        return 3
+    return 0 if passed else 1 if complete else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

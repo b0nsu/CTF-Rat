@@ -449,6 +449,18 @@ def cmd_route(args):
                       "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = route_fn(profile=profile, revq=rev, interesting=interesting)
     result["input_digest"] = _file_sha256(binary)
+    if rev and rev.get("analysis_status") in {"partial", "complete-with-warnings"}:
+        result.setdefault("diagnostics", []).append({
+            "code": "analysis_partial" if rev["analysis_status"] == "partial" else "analysis_warning",
+            "severity": "warning",
+            "message": "; ".join(item.get("message", "") if isinstance(item, dict) else str(item)
+                                  for item in rev.get("analysis_diagnostics", [])[:3]) or "revq analysis is partial",
+        })
+    if rev and rev.get("platform") == "wasm" and importlib.util.find_spec("wasmtime") is None:
+        result.setdefault("diagnostics", []).append({
+            "code": "dependency_missing", "severity": "warning",
+            "message": "independent Wasm execution unavailable: install wasmtime in the rev Python environment (SETUP.md §9)",
+        })
     if fast and not args.fast:
         result.setdefault("diagnostics", []).append({
             "code": "dependency_missing",
@@ -675,6 +687,18 @@ def cmd_brief(args):
         rev, interesting = None, None
         revq_error = "%s: %s" % (type(exc).__name__, str(exc) or "no detail")
     route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    if rev and rev.get("analysis_status") in {"partial", "complete-with-warnings"}:
+        detail = "; ".join(item.get("message", "") if isinstance(item, dict) else str(item)
+                           for item in rev.get("analysis_diagnostics", [])[:3])
+        route.setdefault("diagnostics", []).append({
+            "code": "analysis_partial" if rev["analysis_status"] == "partial" else "analysis_warning",
+            "severity": "warning", "message": detail or "revq analysis is partial",
+        })
+    if rev and rev.get("platform") == "wasm" and importlib.util.find_spec("wasmtime") is None:
+        route.setdefault("diagnostics", []).append({
+            "code": "dependency_missing", "severity": "warning",
+            "message": "independent Wasm execution unavailable: install wasmtime in the rev Python environment (SETUP.md §9)",
+        })
     route["capabilities"] = {**route.get("capabilities", {}), **caps}
     state_dir = _state_dir(binary)
     _record_route_assessment(state_dir, "brief", route)
