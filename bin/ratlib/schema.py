@@ -260,10 +260,18 @@ def route_result(d):
         raise ValidationError("invalid route unresolved")
     for action in d["next"]:
         if not isinstance(action,Mapping) or {"query","target","evidence","rule"}-set(action): raise ValidationError("invalid route action")
+    statuses=d.get("probe_status",[])
+    if (not isinstance(statuses,list) or any(
+            not isinstance(item,Mapping) or not isinstance(item.get("probe_id"),str)
+            or item.get("status") not in {"pending","resolved","refuted","partial","stale"}
+            for item in statuses)):
+        raise ValidationError("invalid probe status")
+    if len({item["probe_id"] for item in statuses})!=len(statuses): raise ValidationError("duplicate probe status")
     decision=d["decision"]
     if decision is not None and (not isinstance(decision,Mapping) or {"action","target","evidence","rule"}-set(decision)): raise ValidationError("invalid route decision")
-    # Competing independent probes intentionally leave decision unset while
-    # retaining provisional leads. Commitment describes evidence, not ranking.
+    # Independent maximal actions may coexist without a unique recommendation.
+    if decision is None and d["commitment"]=="provisional" and not d["next"]:
+        raise ValidationError("provisional route requires a candidate action")
     assessment=d.get("skill_assessment")
     if d["commitment"]=="committed":
         if d.get("input_digest") is None: raise ValidationError("committed route requires input_digest")

@@ -30,11 +30,12 @@ class RouterV2(unittest.TestCase):
         profile["imports"].reverse(); b=route(profile=profile,revq=copy.deepcopy(rev_checker()),interesting=[{"func":"check","score":99}])
         self.assertEqual(a,b)
 
-    def test_checker_fact_dominates_heuristic_overflow_probe(self):
+    def test_mixed_checker_evidence_stays_heuristic_but_concrete_probe_dominates(self):
         doc=route(profile={"imports":["read"]},
                   revq=rev_checker(),interesting=[{"func":"check","score":9}])
         self.assertEqual(doc["decision"]["action"],"rat query func")
-        self.assertEqual(doc["decision"]["evidence_quality"],"fact")
+        self.assertEqual(doc["decision"]["evidence_quality"],"heuristic")
+        self.assertEqual(doc["decision"]["evidence_qualities"]["compare-calls"],"fact")
         self.assertEqual(doc["decision"]["specificity"],"concrete")
 
     def test_independent_fact_backed_leads_do_not_force_recommendation(self):

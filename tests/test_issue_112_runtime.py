@@ -59,6 +59,47 @@ class WasmPathTests(unittest.TestCase):
             self.assertEqual(inspected.returncode, 0, inspected.stderr)
             self.assertEqual(json.loads(inspected.stdout)["function"]["name"], "answer")
 
+    def test_wasm_route_brief_and_feedback_share_router_v2_schema(self):
+        from ratlib.route import route
+        from ratlib.route_feedback import load_feedback, record_query_result
+        from ratlib.schema import validate
+        with tempfile.TemporaryDirectory() as d:
+            module = Path(d) / "tiny.wasm"
+            module.write_bytes(MINIMAL_WASM)
+            env = dict(os.environ, CTF_HOME=str(ROOT), PYTHONPATH=str(BIN))
+            route_call = subprocess.run([sys.executable, str(BIN / "rat"), "route", str(module),
+                                         "--format", "json"], env=env, capture_output=True,
+                                        text=True, timeout=20)
+            brief_call = subprocess.run([sys.executable, str(BIN / "rat"), "brief", str(module),
+                                         "--format", "json"], env=env, capture_output=True,
+                                        text=True, timeout=20)
+            self.assertEqual((route_call.returncode, brief_call.returncode), (0, 0),
+                             route_call.stderr + brief_call.stderr)
+            route_doc = json.loads(route_call.stdout)
+            brief_doc = json.loads(brief_call.stdout)
+            validate(route_doc, "rat.route-result/v2")
+            validate(brief_doc["route"], "rat.route-result/v2")
+            self.assertIn("wasm-platform", [signal["kind"] for signal in brief_doc["route"]["signals"]])
+            self.assertTrue(all(item["probe_id"].startswith("sha256:") for item in route_doc["next"]))
+
+            digest = route_doc["input_digest"]
+            profile = {"imports": ["read"]}
+            rev = {"platform": "wasm", "bin": str(module)}
+            first = route(profile=profile, revq=rev, binary_digest=digest)
+            card = {"schema": "rat.query-result/v1", "query": "pwn", "status": "ok",
+                    "facts": {"sinks": {"overflow_bounded": ["read"]}}, "heuristics": {},
+                    "artifacts": [], "coverage": {"complete": True, "scope": "binary-profile imports+protections",
+                                                 "omitted": None}, "diagnostics": [],
+                    "provenance": {"binary_sha256": digest, "cache": {"hit": False}}}
+            record_query_result(d, digest, card)
+            feedback = load_feedback(d, digest, first["next"])
+            after = route(profile=profile, revq=rev, binary_digest=digest, probe_feedback=feedback)
+            validate(after, "rat.route-result/v2")
+            self.assertEqual(feedback, {})
+            self.assertIn("wasm-platform", [signal["kind"] for signal in after["signals"]])
+            self.assertIn("rat-wasm inspect", [item["query"] for item in after["next"]])
+            self.assertNotIn("pwncrash", [item["query"] for item in after["next"]])
+
     @unittest.skipUnless(importlib.util.find_spec("wasmtime"), "optional independent Wasmtime engine")
     def test_wasmtime_execution_and_state_provenance(self):
         import wasmtime
