@@ -38,7 +38,9 @@ for line in sys.stdin:
     elif '-data-list-register-values' in line:
         print(token+'^done,register-values=[{number="0",value="0x1234"},{number="1",value="0x123456789abcdef0"}]', flush=True)
     elif '-data-read-memory-bytes' in line:
-        print(token+'^done,memory=[{begin="0x1000",contents="41424344"}]', flush=True)
+        addr, count = line.split()[-2:]
+        payload = "41424344" if addr == "0x1000" and count == "4" else "00"*int(count)
+        print(token+'^done,memory=[{begin="'+addr+'",contents="'+payload+'"}]', flush=True)
     elif '-break-insert' in line:
         print(token+'^done,bkpt={number="1"}', flush=True)
     elif 'catch exec' in line:
@@ -100,6 +102,22 @@ class GdbSessionProtocol(unittest.TestCase):
         self.assertEqual(gdb_session.request(self.binary, sid, "close")["status"], "closed")
         time.sleep(0.1)
         self.assertFalse(os.path.exists(sock))
+
+    def test_heap_snapshot_is_read_only_candidate_in_session(self):
+        start = gdb_session.start(self.binary, self.scenario, idle_timeout=5)
+        sid = start["session_id"]
+        self.addCleanup(lambda: gdb_session.request(self.binary, sid, "close"))
+        output = gdb_session.request(self.binary, sid, "heap",
+                                     layout="glibc-2.35-x86_64", tcache="0x500000")
+        self.assertEqual(output["status"], "ok", output)
+        self.assertEqual(output["observation"]["result"]["snapshot"]["regions"]["tcache"]["bins"], [])
+        capture = gdb_session.request(self.binary, sid, "capture")
+        artifact = json.loads(get(capture["artifact"]["digest"], root=os.path.join(self.tmp.name, ".rat")))
+        self.assertEqual(artifact["observations"][0]["action"], "heap")
+        self.assertFalse(artifact["direct_evidence"])
+        rejected = gdb_session.request(self.binary, sid, "heap", layout="glibc-2.39-x86_64",
+                                       tcache="0x500000")
+        self.assertEqual(rejected["status"], "error")
 
     def test_missing_gdb_and_invalid_input(self):
         with patch("ratlib.gdb_session.shutil.which", return_value=None):
