@@ -120,15 +120,21 @@ printf 'print("local fixture")\n' > solve_local.py
 pkshare --handoff >/dev/null 2>&1 && [ -f HANDOFF.md ] && writeupcheck HANDOFF.md --strict >/dev/null 2>&1 && ok "pkshare HANDOFF.md" || no "pkshare HANDOFF.md"
 # T7 libcgate provenance audit
 libcgate --selftest >/dev/null 2>&1 && ok "libcgate selftest" || no "libcgate selftest"
-# T8 decomp cache lookup: revq sub_40xxxx alias -> Ghidra FUN_0010xxxx
-touch ./m
-mkdir -p ./m.decomp
-printf '00101234\tFUN_00101234\t1\n' > ./m.decomp/_index.txt
-printf 'decompiled alias ok\n' > ./m.decomp/FUN_00101234.c
-if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+# T8 decomp cache lookup: a measured PIE image base maps revq to Ghidra.
+if ! command -v cc >/dev/null 2>&1; then
+  skip "decomp revq/Ghidra addr alias (cc dependency 없음)"
+elif ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
   skip "decomp revq/Ghidra addr alias (timeout dependency 없음)"
 else
-  "$CTF_HOME/bin/decomp" ./m sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
+  printf 'int main(){return 0;}\n' > ./pie.c
+  cc -fPIE -pie ./pie.c -o ./pie 2>/dev/null || no "decomp PIE fixture build"
+  if [ -x ./pie ]; then
+    mkdir -p ./pie.decomp
+    printf '00101234\tFUN_00101234\t1\n' > ./pie.decomp/_index.txt
+    printf 'decompiled alias ok\n' > ./pie.decomp/FUN_00101234.c
+    printf '{"image_base":"100000","discovered":1,"exported":1,"failed":[]}\n' > ./pie.decomp/.rat-decomp-status.json
+    "$CTF_HOME/bin/decomp" ./pie sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
+  fi
 fi
 if ! command -v cc >/dev/null 2>&1; then
   skip "decomp disassembly fallback (cc dependency 없음)"
@@ -140,9 +146,9 @@ else
   printf 'int main(){return 0;}\n' > ./m2.c
   mkdir -p ./m2.decomp
   printf '' > ./m2.decomp/_index.txt
-  cc ./m2.c -o ./m2 2>/dev/null || { no "decomp fallback fixture build"; }
+  cc -no-pie ./m2.c -o ./m2 2>/dev/null || { no "decomp fallback fixture build"; }
   if [ -x ./m2 ]; then
-    "$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
+    GHIDRA_HOME="$T/no-ghidra" "$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
   fi
 fi
 # T9 bounded Qiling transport + optional dependency status

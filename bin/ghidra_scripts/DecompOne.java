@@ -97,10 +97,13 @@ public class DecompOne extends GhidraScript {
                 throw new IllegalStateException("decompile failed: " + err);
             }
             String name = function.getName();
-            write(new File(output, safeName(name) + ".c"),
+            String outputName = function.getEntryPoint().toString().replaceAll("[^A-Za-z0-9_.-]", "_")
+                + "_" + safeName(name);
+            write(new File(output, outputName + ".c"),
                 result.getDecompiledFunction().getC());
             upsertIndex(new File(output, "_index.txt"),
-                function.getEntryPoint() + "\t" + name + "\t" + function.getBody().getNumAddresses(),
+                function.getEntryPoint() + "\t" + name + "\t" + function.getBody().getNumAddresses()
+                    + "\t" + outputName,
                 function.getEntryPoint().toString());
         } finally {
             decompiler.dispose();
