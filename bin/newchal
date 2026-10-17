@@ -184,8 +184,26 @@ else
   # The first user-facing classification must come from the canonical
   # evidence-first router, not the independent legacy recon tier heuristic.
   echo "=== rat route (provisional evidence) ==="
-  if "$CTF/bin/rat" route "./$BN" 2>&1 | tee -a state.md; then
-    echo; echo "[+] $D 생성. 다음: cd $D; 위 ROUTE의 RECOMMENDED/CANDIDATES 확인"
+  ROUTE_RESULT="$(mktemp)"
+  trap 'rm -f -- "$ROUTE_RESULT"' EXIT
+  if "$CTF/bin/rat" route "./$BN" --format json 2>&1 | tee -a state.md "$ROUTE_RESULT"; then
+    if python3 - "$ROUTE_RESULT" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        route = json.load(fh)
+    degraded = any(item.get("code") == "analysis_failed"
+                   for item in route.get("diagnostics", []))
+except (OSError, ValueError, AttributeError, TypeError):
+    degraded = True
+raise SystemExit(1 if degraded else 0)
+PY
+    then
+      echo; echo "[+] $D 생성. 다음: cd $D; 위 ROUTE의 next 후보 확인"
+    else
+      echo "[newchal] ROUTE UNKNOWN: rat route 분석 실패 또는 결과 파싱 실패; 초기 유형/기법 미확인" | tee -a state.md
+      echo "[+] $D 생성. 다음: cd $D; rat route ./$BN 재시도"
+    fi
   else
     # Keep the scaffold usable, but do not silently fall back to recon or
     # mistake a failed route query for a verified challenge classification.

@@ -20,7 +20,8 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
         path.write_text(source, encoding="utf-8")
         path.chmod(0o755)
 
-    def _run_scaffold(self, route_rc, artifact_bytes=b"\x7fELFtest-fixture"):
+    def _run_scaffold(self, route_rc, artifact_bytes=b"\x7fELFtest-fixture",
+                      analysis_failed=False):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             home = root / "ctf-home"
@@ -45,8 +46,11 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
             self._executable(bin_dir / "rat",
                              "#!/bin/sh\n"
                              "printf '%s\\n' \"$@\" > \"$RAT_ARGS\"\n"
-                             "echo 'COMMITMENT  provisional'\n"
-                             "echo 'LEADS       checker, vm'\n"
+                             "if [ \"$ROUTE_ANALYSIS_FAILED\" = 1 ]; then\n"
+                             "  echo '{\"commitment\":\"unknown\",\"diagnostics\":[{\"code\":\"analysis_failed\"}]}'\n"
+                             "else\n"
+                             "  echo '{\"commitment\":\"provisional\",\"diagnostics\":[]}'\n"
+                             "fi\n"
                              "if [ \"$ROUTE_RC\" -ne 0 ]; then echo 'route unavailable' >&2; fi\n"
                              "exit \"$ROUTE_RC\"\n")
 
@@ -55,7 +59,8 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
             args_file = root / "rat-args"
             env = os.environ.copy()
             env.update({"CTF_HOME": str(home), "RAT_ARGS": str(args_file),
-                        "ROUTE_RC": str(route_rc)})
+                        "ROUTE_RC": str(route_rc),
+                        "ROUTE_ANALYSIS_FAILED": "1" if analysis_failed else "0"})
             proc = subprocess.run(
                 ["bash", str(bin_dir / "newchal"), "vm-fixture", str(artifact)],
                 cwd=str(root), env=env, capture_output=True, text=True, timeout=30,
@@ -69,16 +74,17 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
     def test_newchal_uses_canonical_route_not_recon(self):
         proc, args, state, manifest = self._run_scaffold(0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(args, ["route", "./chall"])
+        self.assertEqual(args, ["route", "./chall", "--format", "json"])
         self.assertTrue(manifest)
         self.assertIn("=== rat route (provisional evidence) ===", proc.stdout)
-        self.assertIn("COMMITMENT  provisional", state)
+        self.assertIn('"commitment":"provisional"', state)
+        self.assertNotIn("ROUTE UNKNOWN", state)
         self.assertNotIn("LEGACY_RECON_INVOKED", proc.stdout + state)
 
     def test_route_failure_keeps_scaffold_but_does_not_fallback_to_recon(self):
         proc, args, state, manifest = self._run_scaffold(2)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(args, ["route", "./chall"])
+        self.assertEqual(args, ["route", "./chall", "--format", "json"])
         self.assertTrue(manifest)
         self.assertIn("route unavailable", state)
         self.assertIn("ROUTE UNKNOWN", proc.stdout)
@@ -88,8 +94,17 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
     def test_pe_artifact_does_not_force_elf_only_fast_route(self):
         proc, args, state, manifest = self._run_scaffold(0, b"MZ" + b"\0" * 62)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(args, ["route", "./chall"])
+        self.assertEqual(args, ["route", "./chall", "--format", "json"])
         self.assertTrue(manifest)
+
+    def test_route_exit_zero_with_analysis_failure_is_degraded(self):
+        proc, args, state, manifest = self._run_scaffold(0, analysis_failed=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(args, ["route", "./chall", "--format", "json"])
+        self.assertTrue(manifest)
+        self.assertIn('"code":"analysis_failed"', state)
+        self.assertIn("ROUTE UNKNOWN", proc.stdout)
+        self.assertIn("ROUTE UNKNOWN", state)
 
 
 if __name__ == "__main__":
