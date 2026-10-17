@@ -1,12 +1,15 @@
 """Deterministic Router v2: project evidence, expose candidate probes, recommend only on dominance."""
 from __future__ import annotations
+import hashlib
+import json
 import re
 from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 
 HEAP={"malloc","free","calloc","realloc"}; STRONG={"gets","strcpy","strcat","sprintf","scanf","__isoc99_scanf","__isoc99_sscanf"}
 OVERFLOW=STRONG|{"read","memcpy","fgets","fread"}; FORMAT={"printf","fprintf","dprintf","syslog"}; INPUT={"read","gets","scanf","fgets"}
 KERNEL={"copy_from_user","copy_to_user","kmalloc","kfree","module_init","module_exit"}; VM=("vm","opcode","bytecode","dispatch","interpreter")
-CRYPTO=("aes","des","rc4","md5","sha","base64","xor","rsa","hmac","crc")
+CRYPTO_TOKEN=re.compile(r"(?<![A-Za-z0-9])(?:aes|des|rc4|md5|sha(?:1|224|256|384|512|3)?|base64|xor|rsa|hmac|crc(?:32|64)?)(?![A-Za-z0-9])",re.I)
+PATH_STRING=re.compile(r"^(?:[A-Za-z]:[\\/]|/|\\\\)")
 COMPARE={"strcmp","strncmp","memcmp","strcasecmp","strncasecmp","strstr","strcoll","bcmp","wcscmp","wcsncmp"}
 SUCCESS=re.compile(r"correct|success|granted|accept(?:ed)?|congrat|nice|good\s*job|unlock|welcome|\bvalid\b|flag\{",re.I)
 FAILURE=re.compile(r"incorrect|wrong|denied|reject(?:ed)?|invalid|fail(?:ed|ure)?|try\s*again",re.I)
@@ -31,6 +34,19 @@ def _oracle(revq,name):
     return ({"success_count":len(good),"failure_count":len(bad),"success":good[:2],"failure":bad[:2]} if good and bad else None)
 def _blob(revq):
     return " ".join(s.get("val","") for s in (revq or {}).get("strings",[]) or [] if isinstance(s,dict)).lower()
+def _crypto_matches(revq):
+    matches=[]
+    for item in (revq or {}).get("strings",[]) or []:
+        if not isinstance(item,dict) or not isinstance(item.get("val"),str): continue
+        value=item["val"]
+        if PATH_STRING.match(value): continue
+        for match in CRYPTO_TOKEN.finditer(value):
+            evidence={"algorithm":match.group().lower(),"matched_text":match.group(),
+                      "source":"revq.strings","string":value[:120]}
+            if isinstance(item.get("addr"),int): evidence["address"]=item["addr"]
+            if evidence not in matches: matches.append(evidence)
+            if len(matches)>=3: return matches
+    return matches
 def runtime_context(names):
     """Named runtime markers are context, never a vulnerability exclusion."""
     markers={
@@ -45,15 +61,26 @@ def _add(items,value):
 def _sig(items,kind,value,quality):
     item={"kind":kind,"value":value,"quality":quality}
     if item not in items: items.append(item)
-def _action(query,target,evidence,rule,*,resolves,expected_evidence,cost="low",specificity="bounded",blocking=False):
+def _action(query,target,evidence,rule,*,resolves,expected_evidence,cost="low",specificity="bounded",blocking=False,candidate_imports=None):
     return {"query":query,"target":target,"evidence":sorted(set(evidence)),"rule":rule,
             "resolves":sorted(set(resolves)),"expected_evidence":expected_evidence,
-            "cost":cost,"specificity":specificity,"blocking":bool(blocking)}
+            "cost":cost,"specificity":specificity,"blocking":bool(blocking),
+            **({"candidate_imports":sorted(set(candidate_imports))} if candidate_imports else {})}
 
 def _evidence_quality(action,signal_quality):
     ranks=[QUALITY_RANK.get(signal_quality.get(kind,"unknown"),0) for kind in action["evidence"]]
-    rank=max(ranks) if ranks else 0
+    # Every named signal is a premise of this action. One fact cannot upgrade
+    # the other, still-heuristic premises.
+    rank=min(ranks) if ranks else 0
     return next(name for name,value in QUALITY_RANK.items() if value==rank)
+
+PROBE_RULE_VERSION="route-probe/v1"
+def probe_id(binary_digest,action):
+    identity={"version":PROBE_RULE_VERSION,"binary_digest":binary_digest,
+              **{key:action[key] for key in ("query","target","rule","expected_evidence","resolves")},
+              "candidate_imports":action.get("candidate_imports",[])}
+    raw=json.dumps(identity,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+    return "sha256:"+hashlib.sha256(raw).hexdigest()
 
 def _dominates(left,right):
     """Pareto dominance over semantic probe properties, never tool-category priority.
@@ -83,11 +110,40 @@ def _recommend(actions):
     maximal=[a for a in actions if not any(_dominates(other,a) for other in actions if other is not a)]
     return maximal[0] if len(maximal)==1 else None
 
-def route(*,profile=None,revq=None,interesting=None):
+def _pwn_followup(action, revq, binary_digest, signal_quality):
+    """Offer one bounded experiment after an import/protection card is inspected."""
+    target=action["target"]
+    if target=="inspect-bounded-input-callsite-then-measure-overwrite":
+        followup=_action("pwncrash","<bin> --pattern-length 256",action["evidence"],
+                         "reproduce the selected local input path with cyclic data and measure PC control",
+                         resolves=["whether the selected input path gives a reproducible crash and PC control"],
+                         expected_evidence="runtime-direct",cost="medium")
+    elif target in {"inspect-bounded-format-callsites-before-runtime-probe",
+                  "inspect-bounded-allocator-callsites-and-lifetimes"}:
+        sinks=FORMAT if "format" in target else HEAP
+        callers=sorted((f for f in (revq or {}).get("functions",[]) or []
+                        if isinstance(f,dict) and _calls(revq,f.get("name")) & sinks),
+                       key=lambda f:(str(f.get("name","")),str(f.get("addr",""))))
+        caller=callers[0].get("name") if callers else ("<format-caller>" if "format" in target else "<allocator-caller>")
+        followup=_action("decomp","<bin> " + caller,action["evidence"],
+                         "inspect one selected caller for attacker-controlled format arguments or allocation lifetime",
+                         resolves=action["resolves"],expected_evidence="structured-static",
+                         cost="medium",specificity="concrete" if callers else "bounded",
+                         blocking=not bool(callers))
+    else:
+        return None
+    followup["source_probe_id"]=action["probe_id"]
+    followup["probe_id"]=probe_id(binary_digest,followup)
+    followup["evidence_quality"]=_evidence_quality(followup,signal_quality)
+    followup["evidence_qualities"]={kind:signal_quality.get(kind,"unknown") for kind in followup["evidence"]}
+    return followup
+
+def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_feedback=None):
     """Project observations into candidate probes; never choose a challenge class."""
     imports=set((profile or {}).get("imports",[]) or [])|set((revq or {}).get("imports",[]) or [])
     dimensions={name:[] for name in DIMS}; signals=[]; unresolved=[]; leads=[]; actions=[]
     capabilities={"profile":profile is not None,"revq":revq is not None}; is_pe=(revq or {}).get("platform")=="pe"
+    is_wasm=(revq or {}).get("platform")=="wasm"
     function_names={f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)}
     identity=(profile or {}).get("artifact_identity") or (revq or {}).get("artifact_identity") or {}
     kernel_image=identity.get("kind") in {"bzimage","linux-boot-image","vmlinux"}
@@ -114,6 +170,20 @@ def route(*,profile=None,revq=None,interesting=None):
                                "PE execution requires the bounded Windows emulation path",
                                resolves=["whether the artifact can execute through the bounded PE emulation path"],
                                expected_evidence="runtime-direct",cost="medium",blocking=True))
+    if is_wasm:
+        _sig(signals,"wasm-platform","WebAssembly core v1","fact")
+        _add(dimensions["program_shapes"],"wasm-module")
+        _add(dimensions["constraints"],"wasm-runtime-required")
+        _add(leads,"rev")
+        _add(unresolved,"Wasm section inventory does not establish function behavior or a success oracle")
+        actions.append(_action("rat-wasm inspect",(revq or {}).get("bin") or "<module>",["wasm-platform"],
+                               "bounded Wasm structure inspection precedes runtime verification",
+                               resolves=["which exported functions and imports are present"],
+                               expected_evidence="structured-static",blocking=True))
+        actions.append(_action("rat-wasm verify","--stdin-file <input> --expect-stdout <literal>",["wasm-platform"],
+                               "independent Wasmtime execution is required for a concrete oracle",
+                               resolves=["whether a concrete input satisfies the module oracle"],
+                               expected_evidence="independent-runtime-result",cost="medium"))
     typed=(revq or {}).get("evasion_signals",[]) if (revq or {}).get("evasion_signal_schema")==EVASION_SIGNAL_SCHEMA else []
     packing=next((s for s in typed if isinstance(s,dict) and s.get("kind")=="packer-section" and s.get("quality")=="fact"),None)
     packing=packing or next((s for s in typed if isinstance(s,dict) and s.get("kind")=="high-entropy" and s.get("quality")=="heuristic"),None)
@@ -125,7 +195,7 @@ def route(*,profile=None,revq=None,interesting=None):
                                resolves=["whether packing is active and unpacking is required before deeper analysis"],
                                expected_evidence="runtime-direct",blocking=True))
     hits=sorted(imports&KERNEL)
-    if hits and not is_pe:
+    if hits and not is_pe and not is_wasm:
         _sig(signals,"kernel-imports",hits,"fact"); _add(dimensions["program_shapes"],"kernel-candidate"); _add(leads,"kernel")
         _add(unresolved,"kernel imports do not prove a kernel artifact or target environment")
         actions.append(_action("rat query pwn","confirm-kernel-artifact-and-environment-before-kernel-tooling",["kernel-imports"],
@@ -136,7 +206,7 @@ def route(*,profile=None,revq=None,interesting=None):
     if hits:
         _sig(signals,"heap-imports",hits,"fact"); _add(dimensions["vulnerability_surfaces"],"heap-lifetime-candidate"); _add(leads,"heap-lifetime")
         _add(unresolved,"allocator imports do not prove attacker-controlled lifetime, reuse, or overlap")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-bounded-allocator-callsites-and-lifetimes",["heap-imports"],
                                    "allocator use calls for bounded lifetime inspection",
                                    resolves=["whether allocator lifetime, reuse, or overlap is attacker-controlled"],
@@ -145,7 +215,7 @@ def route(*,profile=None,revq=None,interesting=None):
     if fh and ih:
         _sig(signals,"format-input-imports",sorted(set(fh+ih)),"fact"); _add(dimensions["vulnerability_surfaces"],"format-string-candidate"); _add(leads,"format-string")
         _add(unresolved,"prove attacker control reaches a format argument")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-bounded-format-callsites-before-runtime-probe",["format-input-imports"],
                                    "format and input imports justify callsite inspection",
                                    resolves=["whether attacker-controlled data reaches a format argument"],
@@ -158,11 +228,12 @@ def route(*,profile=None,revq=None,interesting=None):
             _add(dimensions["vulnerability_surfaces"],"stack-overwrite-candidate"); _add(leads,"stack-overwrite")
         _add(unresolved,"prove a concrete overwrite or PC-control primitive; import presence is insufficient")
         if _fact(profile,"elf.nx") is True: _sig(signals,"elf-nx",True,"fact"); _add(dimensions["constraints"],"nx")
-        if not is_pe:
+        if not is_pe and not is_wasm:
             actions.append(_action("rat query pwn","inspect-runtime-copy-callsite-before-overwrite-probe" if runtime_copy else "inspect-bounded-input-callsite-then-measure-overwrite",["overflow-imports","runtime-symbols"] if runtime_copy else ["overflow-imports"],
                                    "runtime copy imports require application-callsite confirmation" if runtime_copy else "an input sink requires callsite inspection before a crash probe",
                                    resolves=["whether input reaches an overwrite-capable callsite before measuring PC control"],
-                                   expected_evidence="structured-static",specificity="general" if runtime_copy else "bounded"))
+                                   expected_evidence="structured-static",specificity="general" if runtime_copy else "bounded",
+                                   candidate_imports=hits))
     checker=[]; checker_evidence={}
     for item in interesting or []:
         if not isinstance(item,dict) or not _func(revq,item.get("func")): continue
@@ -198,7 +269,7 @@ def route(*,profile=None,revq=None,interesting=None):
                                "VM hints require dispatch-loop confirmation",
                                resolves=["whether a dispatch loop and bytecode semantics exist"],
                                expected_evidence="structured-static",cost="medium"))
-    ch=sorted({h for h in CRYPTO if h in blob})
+    ch=_crypto_matches(revq)
     if (ch or (interesting and not checker)) and not kernel_image:
         if ch: _sig(signals,"crypto-hint",ch,"heuristic")
         _add(dimensions["program_shapes"],"oracle-needed"); _add(leads,"oracle-discovery"); _add(unresolved,"a success/failure oracle must be bounded before symbolic execution")
@@ -221,17 +292,80 @@ def route(*,profile=None,revq=None,interesting=None):
         if QUALITY_RANK.get(quality,0)>QUALITY_RANK.get(signal_quality.get(kind,"unknown"),0):
             signal_quality[kind]=quality
     for action in next_actions:
+        action["probe_id"]=probe_id(binary_digest,action)
         action["evidence_quality"]=_evidence_quality(action,signal_quality)
+        action["evidence_qualities"]={kind:signal_quality.get(kind,"unknown") for kind in action["evidence"]}
+    feedback=[]; probe_status=[]; remaining=[]
+    for action in next_actions:
+        result=(probe_feedback or {}).get(action["probe_id"])
+        if not result:
+            probe_status.append({"probe_id":action["probe_id"],"status":"pending"})
+            remaining.append(action); continue
+        status=result.get("status")
+        if status not in {"resolved","refuted","partial","stale"}:
+            probe_status.append({"probe_id":action["probe_id"],"status":"pending"})
+            remaining.append(action); continue
+        entry={"probe_id":action["probe_id"],"status":status,
+               "artifact_digest":result.get("artifact_digest"),
+               "observation_id":result.get("observation_id"),
+               "reason":result.get("reason","")}
+        feedback.append(entry); probe_status.append(entry)
+        if status in {"partial","stale"}:
+            action["feedback_reason"]=result.get("reason",status)
+            followup=(_pwn_followup(action,revq,binary_digest,signal_quality)
+                      if action["query"]=="rat query pwn" else None)
+            if followup:
+                remaining.append(followup)
+                probe_status.append({"probe_id":followup["probe_id"],"status":"pending"})
+            else:
+                remaining.append(action)
+            continue
+        if status=="resolved":
+            # The named premise was inspected, but a structural checker lead
+            # remains useful after its first inspection.
+            if action["query"]=="rat query func":
+                unresolved=[u for u in unresolved if u!="checker semantics and success/failure oracle remain unverified"]
+                _add(unresolved,"comparison sites and success/failure string xrefs are candidates; executable branch semantics remain unverified")
+            elif action["query"]=="rat query oracle":
+                unresolved=[u for u in unresolved if u!="a success/failure oracle must be bounded before symbolic execution"]
+                _add(unresolved,"success/failure string xrefs are candidate oracle sites, not executable branch proof")
+                if "oracle-needed" in dimensions["program_shapes"]: dimensions["program_shapes"].remove("oracle-needed")
+                if "oracle-discovery" in leads: leads.remove("oracle-discovery")
+        elif status=="refuted":
+            families={
+                "rat query func":("checker","checker","checker semantics and success/failure oracle remain unverified"),
+                "rat query oracle":("oracle-discovery","oracle-needed","a success/failure oracle must be bounded before symbolic execution"),
+            }
+            if action["query"]=="rat query pwn":
+                target=action["target"]
+                family=({"inspect-bounded-input-callsite-then-measure-overwrite":("stack-overwrite","stack-overwrite-candidate","prove a concrete overwrite or PC-control primitive; import presence is insufficient"),
+                         "inspect-bounded-format-callsites-before-runtime-probe":("format-string","format-string-candidate","prove attacker control reaches a format argument"),
+                         "inspect-bounded-allocator-callsites-and-lifetimes":("heap-lifetime","heap-lifetime-candidate","allocator imports do not prove attacker-controlled lifetime, reuse, or overlap")}).get(target)
+                dimension="vulnerability_surfaces"
+            else:
+                family=families.get(action["query"])
+                dimension="program_shapes"
+            if family:
+                lead,shape,premise=family
+                if lead in leads: leads.remove(lead)
+                if shape in dimensions[dimension]: dimensions[dimension].remove(shape)
+                unresolved=[u for u in unresolved if u!=premise]
+    next_actions=remaining
     signals.sort(key=lambda s:(s["kind"],repr(s["value"]),s["quality"])); [v.sort() for v in dimensions.values()]; leads.sort(); unresolved.sort()
-    chosen=_recommend(next_actions); decision=None
+    # A partial/stale probe stays visible, but an executor must not rerun it
+    # automatically merely because it was previously dominant.
+    chosen=_recommend([action for action in next_actions if not action.get("feedback_reason")]); decision=None
     if chosen:
         decision={"action":chosen["query"],"target":chosen["target"],"evidence":chosen["evidence"],
                   "rule":chosen["rule"],"resolves":chosen["resolves"],
                   "expected_evidence":chosen["expected_evidence"],"cost":chosen["cost"],
                   "specificity":chosen["specificity"],"blocking":chosen["blocking"],
-                  "evidence_quality":chosen["evidence_quality"]}
-    elif not next_actions:
+                  "evidence_quality":chosen["evidence_quality"],"evidence_qualities":chosen["evidence_qualities"],
+                  "probe_id":chosen["probe_id"]}
+    elif not next_actions and not feedback:
         unresolved.append("insufficient deterministic evidence to select a bounded first probe")
     return {"schema":"rat.route-result/v2","signals":signals,"dimensions":dimensions,"unresolved":unresolved,
             "next":next_actions,"capabilities":capabilities,"leads":leads,"decision":decision,
+            "feedback":sorted(feedback,key=lambda x:x["probe_id"]),
+            "probe_status":sorted(probe_status,key=lambda x:x["probe_id"]),
             "commitment":"provisional" if next_actions else "unknown","skill":None}

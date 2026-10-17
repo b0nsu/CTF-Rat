@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -132,6 +133,35 @@ class CorpusGateTests(unittest.TestCase):
 
 
 class ModeBLocalSmokeTests(unittest.TestCase):
+    def test_eval_resolves_quoted_agent_executable(self):
+        args = SimpleNamespace(agent="'/tmp/agent cli' --version", suite=None, corpus=None, id=None)
+        with mock.patch.object(RATBENCH, "_have", return_value=True) as have, \
+             mock.patch.object(RATBENCH, "_select_entries", side_effect=LookupError("no entry")), \
+             mock.patch("builtins.print"):
+            self.assertEqual(RATBENCH.cmd_eval(args), 4)
+        have.assert_called_once_with("/tmp/agent cli")
+
+    def test_eval_preflight_accepts_nested_shell_quoting(self):
+        command = r'''python3 -c 'print("ok")' "$(printf '"')"'''
+        shell = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+        self.assertEqual(shell.returncode, 0, shell.stderr)
+        self.assertEqual(shell.stdout, "ok\n")
+        args = SimpleNamespace(agent=command, suite=None, corpus=None, id=None)
+        with mock.patch.object(RATBENCH, "_have", return_value=True) as have, \
+             mock.patch.object(RATBENCH, "_select_entries", side_effect=LookupError("no entry")), \
+             mock.patch("builtins.print"):
+            self.assertEqual(RATBENCH.cmd_eval(args), 4)
+        have.assert_called_once_with("python3")
+
+    def test_eval_preflight_rejects_missing_executable(self):
+        args = SimpleNamespace(agent="no-such-agent-ctf-rat --version", suite=None,
+                               corpus=None, id=None)
+        with mock.patch.object(RATBENCH, "_have", return_value=False), \
+             mock.patch.object(RATBENCH, "_select_entries") as entries, \
+             mock.patch("builtins.print"):
+            self.assertEqual(RATBENCH.cmd_eval(args), 3)
+        entries.assert_not_called()
+
     def test_flag_paths_are_rejected(self):
         for path in ("flag", "flag.txt", "assets/secret.flag"):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "flag file"):

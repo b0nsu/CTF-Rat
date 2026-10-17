@@ -24,6 +24,10 @@ def envelope(**overrides):
     return doc
 
 class ToolResultSchema(unittest.TestCase):
+    def test_ok_envelope_without_result_class_is_unverified(self):
+        counts = aggregate([envelope()])["result_class_counts"]
+        self.assertEqual(counts, {"analysis-unverified": 1})
+
     def test_optional_telemetry_fields_are_accepted(self):
         validate(envelope())
 

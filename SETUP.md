@@ -124,3 +124,25 @@ dotnet tool install -g ilspycmd       # ILSpy CLI (.NET 디컴파일)  |  IL2CPP
 - **동적 정석 = `solve/_template/rev/qiling_trace.py`**(Qiling 에뮬, Wine 불필요). Windows **rootfs**(DLL) 필요 — 파일 상단 참고.
 - 분리 환경에서는 `.venv-angr/bin/python solve/_template/rev/qiling_trace.py <pe> --rootfs <dir>`로 실행한다.
 - 라우팅은 `knowledge/GROUNDING_INDEX.md`(PE/.NET 행), rev 지식은 `knowledge/ctf-reverse/`.
+
+## 9. WebAssembly rev 및 종료 코드 보존
+
+`rat route`와 `revq`는 core Wasm v1 모듈을 식별하고 제한된 섹션·함수 목록만 제공한다.
+실제 실행 검증이 필요하면 독립 Wasmtime 엔진을 rev 환경에 추가한다:
+
+```bash
+.venv-angr/bin/python -m pip install 'wasmtime>=38,<50'
+rat-wasm inspect ./chall.wasm --func 0
+rat-wasm verify ./chall.wasm --stdin-file candidate.bin --expect-stdout 'Correct!' --record-state-dir ./solve/chal
+```
+
+`rat-wasm verify`는 제한 시간·fuel 아래 실제 모듈을 실행하고 Wasmtime 출처와 입력·모듈
+해시를 기록한다. STATE 기록은 외부 런타임 결과를 별도 `rev.wasm.runtime-verification`
+observation으로 남긴다. 이 결과만으로 primitive PASS 또는 SOLVED가 되지 않는다.
+지원 범위는 core v1, WASI preview1, 인자 없는 export 호출이다. 컴포넌트 모델이나
+호스트별 import는 지원하지 않음을 명시적으로 진단한다.
+
+출력을 자를 때 `... | head` 대신 `rat-capture --limit 4096 -- <command> ...`를 사용한다.
+원래 명령의 종료 코드와 출력 잘림 여부가 `RAT_CAPTURE` 메타데이터와
+`rat-metrics`의 `result_class_counts`에 남는다. `--purpose help|source`로 비분석
+호출도 구분할 수 있다.

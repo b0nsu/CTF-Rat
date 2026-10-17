@@ -24,6 +24,20 @@ class PatternRetrieval(unittest.TestCase):
         self.assertTrue(all(c["kind"] == "hypothesis-aid" and not c["direct_evidence"] for c in first[0]))
         self.assertTrue(all(c["source"]["digest"].startswith("sha256:") for c in first[0]))
 
+    def test_heap_refill_and_remote_latency_are_advisory(self):
+        cards, diagnostics = project_patterns(
+            ["heap-lifetime"], [{"kind": "heap-imports"}], root=ROOT)
+        self.assertFalse(diagnostics)
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertFalse(card["direct_evidence"])
+        self.assertEqual(card["kind"], "hypothesis-aid")
+        pivot = card["excerpt"]["pivot"]
+        self.assertIn("unsorted-bin split", pivot)
+        self.assertIn("unexpected address", pivot)
+        self.assertIn("sequential_round_trips", pivot)
+        self.assertIn("server protocol actually accepts pipelining", pivot)
+
     def test_zero_budget_and_missing_source(self):
         self.assertEqual(project_patterns([], [], root=ROOT)[0], [])
         cards, issues = project_patterns(["format-string"], [], root=ROOT, budget_bytes=512)

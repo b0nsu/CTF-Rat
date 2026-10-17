@@ -73,6 +73,19 @@ class DecompPayloadIntegrityTests(unittest.TestCase):
                 fh.write("00002000\thelper\t8\n")
             self.assertEqual(validate(cache, binary, ghidra, scripts), (False, "corrupt"))
 
+    def test_modified_image_base_record_is_corrupt(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary, scripts, ghidra, cache = self.fixture(root)
+            status = os.path.join(cache, ".rat-decomp-status.json")
+            with open(status, "w", encoding="utf-8") as fh:
+                json.dump({"image_base": "100000", "discovered": 1,
+                           "exported": 1, "failed": []}, fh)
+            self.seal(binary, scripts, ghidra, cache)
+            with open(status, "w", encoding="utf-8") as fh:
+                json.dump({"image_base": "200000", "discovered": 1,
+                           "exported": 1, "failed": []}, fh)
+            self.assertEqual(validate(cache, binary, ghidra, scripts), (False, "corrupt"))
+
     def test_v1_metadata_is_stale_not_silently_accepted(self):
         with tempfile.TemporaryDirectory() as root:
             binary, scripts, ghidra, cache = self.fixture(root)
