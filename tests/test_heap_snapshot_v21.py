@@ -66,6 +66,23 @@ class HeapSnapshotTests(unittest.TestCase):
         self.assertNotIn("tcache", report["snapshot"]["regions"])
         self.assertEqual(report["snapshot"]["unresolved"][0]["region"], "tcache")
 
+    def test_mi_read_timeout_terminates_snapshot_as_timeout(self):
+        class TimedOutMI:
+            calls = 0
+
+            def command(self, command, timeout):
+                self.calls += 1
+                return {"status": "timeout", "mi_result": None}
+
+        mi = TimedOutMI()
+        report = gdb_session._heap_snapshot(mi, {"layout": "glibc-2.35-x86_64",
+                                                 "tcache": "0x500000", "chunk": "0x700000"}, 5)
+        self.assertEqual(report["status"], "timeout")
+        self.assertEqual(mi.calls, 1)
+        self.assertEqual(report["snapshot"]["unresolved"],
+                         [{"region": "tcache", "reason": "memory read timed out"}])
+        self.assertNotIn("chunk", report["snapshot"]["regions"])
+
     def test_unsupported_layout_and_foreign_or_unaligned_addresses_rejected(self):
         for params in (
             {"layout": "glibc-2.39-x86_64", "tcache": "0x500000"},

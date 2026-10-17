@@ -327,6 +327,10 @@ def _heap_snapshot(mi, params, timeout):
             count = min(256, sizes[name] - len(raw))
             result = mi.command("-data-read-memory-bytes %#x %d" % (start + len(raw), count),
                                 timeout=remaining)
+            if result.get("status") == "timeout":
+                snapshot["unresolved"].append({"region": name, "reason": "memory read timed out"})
+                return {"status": "timeout", "snapshot": snapshot,
+                        "diagnostic": "heap memory read timed out"}
             contents = re.findall(r'contents="([0-9a-fA-F]+)"', result.get("mi_result") or "")
             if result.get("status") != "ok" or not contents:
                 snapshot["unresolved"].append({"region": name, "reason": "memory read unavailable"})
