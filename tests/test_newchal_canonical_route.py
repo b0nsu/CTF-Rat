@@ -20,7 +20,7 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
         path.write_text(source, encoding="utf-8")
         path.chmod(0o755)
 
-    def _run_scaffold(self, route_rc):
+    def _run_scaffold(self, route_rc, artifact_bytes=b"\x7fELFtest-fixture"):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             home = root / "ctf-home"
@@ -51,7 +51,7 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
                              "exit \"$ROUTE_RC\"\n")
 
             artifact = root / "chall"
-            artifact.write_bytes(b"\x7fELFtest-fixture")
+            artifact.write_bytes(artifact_bytes)
             args_file = root / "rat-args"
             env = os.environ.copy()
             env.update({"CTF_HOME": str(home), "RAT_ARGS": str(args_file),
@@ -66,10 +66,10 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
                     state.read_text() if state.exists() else "",
                     manifest.exists())
 
-    def test_newchal_uses_canonical_fast_route_not_recon(self):
+    def test_newchal_uses_canonical_route_not_recon(self):
         proc, args, state, manifest = self._run_scaffold(0)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(args, ["route", "./chall", "--fast"])
+        self.assertEqual(args, ["route", "./chall"])
         self.assertTrue(manifest)
         self.assertIn("=== rat route (provisional evidence) ===", proc.stdout)
         self.assertIn("COMMITMENT  provisional", state)
@@ -78,12 +78,18 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
     def test_route_failure_keeps_scaffold_but_does_not_fallback_to_recon(self):
         proc, args, state, manifest = self._run_scaffold(2)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(args, ["route", "./chall", "--fast"])
+        self.assertEqual(args, ["route", "./chall"])
         self.assertTrue(manifest)
         self.assertIn("route unavailable", state)
         self.assertIn("ROUTE UNKNOWN", proc.stdout)
         self.assertIn("ROUTE UNKNOWN", state)
         self.assertNotIn("LEGACY_RECON_INVOKED", proc.stdout + state)
+
+    def test_pe_artifact_does_not_force_elf_only_fast_route(self):
+        proc, args, state, manifest = self._run_scaffold(0, b"MZ" + b"\0" * 62)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(args, ["route", "./chall"])
+        self.assertTrue(manifest)
 
 
 if __name__ == "__main__":
