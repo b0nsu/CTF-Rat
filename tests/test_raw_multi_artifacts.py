@@ -1,5 +1,6 @@
 """Raw-code loading and multi-artifact ingestion regressions (#101 / #103)."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,36 @@ def boot_sector(path):
 
 
 class RawAndMultiArtifactTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("angr"), "native angr environment required")
+    def test_native_blob_cfg_route_and_function_card(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary = Path(root) / "raw-code"
+            binary.write_bytes(bytes.fromhex("b82a000000c3"))  # mov eax, 42; ret
+            common = ["--arch", "i386", "--base", "0x1000", "--entry", "0x1000"]
+            env = dict(os.environ, CTF_HOME=str(ROOT), PYTHONPATH=str(BIN))
+            def call(*args):
+                result = subprocess.run([sys.executable, *map(str, args)], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            rev = call(BIN / "revq", binary, *common, "--format", "json")
+            self.assertEqual((rev["engine"], rev["arch"]), ("angr", "X86"))
+            self.assertEqual(rev["functions"][0]["addr"], 0x1000)
+            self.assertEqual(rev["functions"][0]["ninstr"], 2)
+            route_doc = call(BIN / "rat", "route", binary, *common, "--format", "json")
+            self.assertIn("raw-artifact", route_doc["leads"])
+            self.assertIn("operator-blob-map", {item["kind"] for item in route_doc["signals"]})
+            self.assertTrue(any(item["query"] == "rat query func" for item in route_doc["next"]))
+            card = call(BIN / "rat", "query", "func", binary, "0x1000", *common,
+                        "--format", "json")
+            self.assertEqual(card["status"], "partial")
+            self.assertIn("operator_blob_map", card["coverage"]["omitted"]["unresolved"])
+            self.assertNotIn("decomp", card["heuristics"]["next"])
+            shifted = call(BIN / "revq", binary, "--arch", "i386", "--base", "0x2000",
+                           "--entry", "0x2000", "--format", "json")
+            self.assertEqual(shifted["functions"][0]["addr"], 0x2000)
+            self.assertEqual(len(list(Path(root).glob("raw-code.revq.json.blob-*"))), 2)
+
     def test_boot_disk_and_unknown_hints(self):
         with tempfile.TemporaryDirectory() as root:
             boot = Path(root) / "drive0"

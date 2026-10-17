@@ -38,6 +38,10 @@ is incompatible with blob hints. The binary digest and normalized load spec
 both contribute to cache identity. Query commands need the **same** spec to
 recover the intended address space; the route does not silently persist or
 invent loader parameters.
+Even when a raw stage has no boot or disk signature, the route records the
+operator-supplied mapping and offers a bounded entry-function query. The
+function card keeps the runtime load address unresolved and does not suggest
+the ELF/PE decompiler for raw code.
 
 ## Scaffold a floppy/image set
 

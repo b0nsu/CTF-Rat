@@ -91,15 +91,25 @@ def route(*,profile=None,revq=None,interesting=None):
     function_names={f.get("name","") for f in (revq or {}).get("functions",[]) or [] if isinstance(f,dict)}
     identity=(profile or {}).get("artifact_identity") or (revq or {}).get("artifact_identity") or {}
     kernel_image=identity.get("kind") in {"bzimage","linux-boot-image","vmlinux"}
+    blob_map=(profile or {}).get("blob_load_spec")
+    if blob_map:
+        _sig(signals,"operator-blob-map",blob_map,"fact")
+        _add(dimensions["program_shapes"],"raw-code-mapping")
+        _add(leads,"raw-artifact")
+        _add(unresolved,"raw mapping is operator-supplied; runtime execution mode and loaded stage remain unverified")
+        actions.append(_action("rat query func",
+                               "%#x --arch %s --base %#x --entry %#x" %
+                               (blob_map["entry_point"],blob_map["arch"],
+                                blob_map["base_addr"],blob_map["entry_point"]),
+                               ["operator-blob-map"],"inspect the explicitly mapped entry only",
+                               resolves=["what static instructions are decoded at the operator-selected entry"],
+                               expected_evidence="structured-static",blocking=True))
     if identity.get("kind") in {"boot-sector-candidate", "disk-image-candidate"}:
         kind = identity["kind"]
         _sig(signals, "raw-artifact", {"kind": kind, "size": identity.get("size")}, "heuristic")
         _add(dimensions["program_shapes"], kind)
         _add(leads, "raw-artifact")
-        if (profile or {}).get("blob_load_spec"):
-            _sig(signals, "operator-blob-map", (profile or {})["blob_load_spec"], "fact")
-            _add(unresolved, "raw mapping is operator-supplied; runtime execution mode and loaded stage remain unverified")
-        else:
+        if not blob_map:
             _add(unresolved, "raw executable architecture, load base and entry are not established by boot/disk signatures")
             actions.append(_action("rat route", "--arch ARCH --base ADDR --entry ADDR",
                                    ["raw-artifact"], "requires explicit raw executable mapping before CFG",

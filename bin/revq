@@ -874,6 +874,8 @@ def compute_function_card(rev, target):
         unresolved.append({"kind": "compare_length", "detail": "%d comparison lengths remain unresolved" % len(unresolved_lengths)})
     if rev.get("engine") != "angr":
         unresolved.append({"kind": "engine_limited", "detail": "binutils engine: calls/xrefs may be incomplete"})
+    if rev.get("load_spec"):
+        unresolved.append({"kind": "operator_blob_map", "detail": "raw-code mapping is operator-supplied; runtime stage and load address are unverified"})
     if callers_truncated or callees_truncated or strings_truncated:
         unresolved.append({"kind": "truncated", "detail": "callers/callees/strings capped at %d" % _CAP})
     return {
@@ -891,7 +893,8 @@ def compute_function_card(rev, target):
             "detector_version": INTERESTING_DETECTOR_VERSION,
         },
         "unresolved": unresolved,
-        "next": "decomp %s %s" % (rev.get("bin", "?"), name),
+        "next": ("verify the loaded raw-code stage and mapping before runtime analysis"
+                 if rev.get("load_spec") else "decomp %s %s" % (rev.get("bin", "?"), name)),
         "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"), "engine": rev.get("engine")},
     }
 
