@@ -109,6 +109,19 @@ class PkflagTests(unittest.TestCase):
         self.assertEqual(self.run_flag("--set", HEX).returncode, 2)
         self.assertEqual(self.run_flag("--show").returncode, 2)
 
+    def test_symlinked_format_file_cannot_import_another_scope(self):
+        target = self.home / "FLAG_FORMAT"
+        fmt = self.home / "solve" / "alpha" / "FLAG_FORMAT"
+        fmt.symlink_to(target)
+        for args in (("DH{deadbeef}",), ("--show",)):
+            with self.subTest(args=args):
+                result = self.run_flag(*args)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("symlink", result.stderr)
+        self.assertEqual(self.run_flag("--set", r"DH\{[A-Za-z0-9_]+\}").returncode, 0)
+        self.assertFalse(fmt.is_symlink())
+        self.assertEqual(target.read_text().strip(), HEX)
+
 
 if __name__ == "__main__":
     unittest.main()

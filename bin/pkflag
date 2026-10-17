@@ -94,7 +94,11 @@ def configured_pattern(path):
     if path is None:
         return ""
     try:
-        return path.read_text(encoding="utf-8").strip()
+        if path.is_symlink():
+            raise FlagConfigError("format file cannot be a symlink: %s" % path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), encoding="utf-8") as stream:
+            return stream.read().strip()
     except FileNotFoundError:
         return ""
     except OSError as exc:
