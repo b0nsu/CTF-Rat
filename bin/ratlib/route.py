@@ -1,5 +1,7 @@
 """Deterministic Router v2: project evidence, expose candidate probes, recommend only on dominance."""
 from __future__ import annotations
+import hashlib
+import json
 import re
 from ratlib.evasion import SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA
 
@@ -45,15 +47,26 @@ def _add(items,value):
 def _sig(items,kind,value,quality):
     item={"kind":kind,"value":value,"quality":quality}
     if item not in items: items.append(item)
-def _action(query,target,evidence,rule,*,resolves,expected_evidence,cost="low",specificity="bounded",blocking=False):
+def _action(query,target,evidence,rule,*,resolves,expected_evidence,cost="low",specificity="bounded",blocking=False,candidate_imports=None):
     return {"query":query,"target":target,"evidence":sorted(set(evidence)),"rule":rule,
             "resolves":sorted(set(resolves)),"expected_evidence":expected_evidence,
-            "cost":cost,"specificity":specificity,"blocking":bool(blocking)}
+            "cost":cost,"specificity":specificity,"blocking":bool(blocking),
+            **({"candidate_imports":sorted(set(candidate_imports))} if candidate_imports else {})}
 
 def _evidence_quality(action,signal_quality):
     ranks=[QUALITY_RANK.get(signal_quality.get(kind,"unknown"),0) for kind in action["evidence"]]
-    rank=max(ranks) if ranks else 0
+    # Every named signal is a premise of this action. One fact cannot upgrade
+    # the other, still-heuristic premises.
+    rank=min(ranks) if ranks else 0
     return next(name for name,value in QUALITY_RANK.items() if value==rank)
+
+PROBE_RULE_VERSION="route-probe/v1"
+def probe_id(binary_digest,action):
+    identity={"version":PROBE_RULE_VERSION,"binary_digest":binary_digest,
+              **{key:action[key] for key in ("query","target","rule","expected_evidence","resolves")},
+              "candidate_imports":action.get("candidate_imports",[])}
+    raw=json.dumps(identity,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
+    return "sha256:"+hashlib.sha256(raw).hexdigest()
 
 def _dominates(left,right):
     """Pareto dominance over semantic probe properties, never tool-category priority.
@@ -83,7 +96,35 @@ def _recommend(actions):
     maximal=[a for a in actions if not any(_dominates(other,a) for other in actions if other is not a)]
     return maximal[0] if len(maximal)==1 else None
 
-def route(*,profile=None,revq=None,interesting=None):
+def _pwn_followup(action, revq, binary_digest, signal_quality):
+    """Offer one bounded experiment after an import/protection card is inspected."""
+    target=action["target"]
+    if target=="inspect-bounded-input-callsite-then-measure-overwrite":
+        followup=_action("pwncrash","<bin> --pattern-length 256",action["evidence"],
+                         "reproduce the selected local input path with cyclic data and measure PC control",
+                         resolves=["whether the selected input path gives a reproducible crash and PC control"],
+                         expected_evidence="runtime-direct",cost="medium")
+    elif target in {"inspect-bounded-format-callsites-before-runtime-probe",
+                  "inspect-bounded-allocator-callsites-and-lifetimes"}:
+        sinks=FORMAT if "format" in target else HEAP
+        callers=sorted((f for f in (revq or {}).get("functions",[]) or []
+                        if isinstance(f,dict) and _calls(revq,f.get("name")) & sinks),
+                       key=lambda f:(str(f.get("name","")),str(f.get("addr",""))))
+        caller=callers[0].get("name") if callers else ("<format-caller>" if "format" in target else "<allocator-caller>")
+        followup=_action("decomp","<bin> " + caller,action["evidence"],
+                         "inspect one selected caller for attacker-controlled format arguments or allocation lifetime",
+                         resolves=action["resolves"],expected_evidence="structured-static",
+                         cost="medium",specificity="concrete" if callers else "bounded",
+                         blocking=not bool(callers))
+    else:
+        return None
+    followup["source_probe_id"]=action["probe_id"]
+    followup["probe_id"]=probe_id(binary_digest,followup)
+    followup["evidence_quality"]=_evidence_quality(followup,signal_quality)
+    followup["evidence_qualities"]={kind:signal_quality.get(kind,"unknown") for kind in followup["evidence"]}
+    return followup
+
+def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_feedback=None):
     """Project observations into candidate probes; never choose a challenge class."""
     imports=set((profile or {}).get("imports",[]) or [])|set((revq or {}).get("imports",[]) or [])
     dimensions={name:[] for name in DIMS}; signals=[]; unresolved=[]; leads=[]; actions=[]
@@ -162,7 +203,8 @@ def route(*,profile=None,revq=None,interesting=None):
             actions.append(_action("rat query pwn","inspect-runtime-copy-callsite-before-overwrite-probe" if runtime_copy else "inspect-bounded-input-callsite-then-measure-overwrite",["overflow-imports","runtime-symbols"] if runtime_copy else ["overflow-imports"],
                                    "runtime copy imports require application-callsite confirmation" if runtime_copy else "an input sink requires callsite inspection before a crash probe",
                                    resolves=["whether input reaches an overwrite-capable callsite before measuring PC control"],
-                                   expected_evidence="structured-static",specificity="general" if runtime_copy else "bounded"))
+                                   expected_evidence="structured-static",specificity="general" if runtime_copy else "bounded",
+                                   candidate_imports=hits))
     checker=[]; checker_evidence={}
     for item in interesting or []:
         if not isinstance(item,dict) or not _func(revq,item.get("func")): continue
@@ -221,17 +263,80 @@ def route(*,profile=None,revq=None,interesting=None):
         if QUALITY_RANK.get(quality,0)>QUALITY_RANK.get(signal_quality.get(kind,"unknown"),0):
             signal_quality[kind]=quality
     for action in next_actions:
+        action["probe_id"]=probe_id(binary_digest,action)
         action["evidence_quality"]=_evidence_quality(action,signal_quality)
+        action["evidence_qualities"]={kind:signal_quality.get(kind,"unknown") for kind in action["evidence"]}
+    feedback=[]; probe_status=[]; remaining=[]
+    for action in next_actions:
+        result=(probe_feedback or {}).get(action["probe_id"])
+        if not result:
+            probe_status.append({"probe_id":action["probe_id"],"status":"pending"})
+            remaining.append(action); continue
+        status=result.get("status")
+        if status not in {"resolved","refuted","partial","stale"}:
+            probe_status.append({"probe_id":action["probe_id"],"status":"pending"})
+            remaining.append(action); continue
+        entry={"probe_id":action["probe_id"],"status":status,
+               "artifact_digest":result.get("artifact_digest"),
+               "observation_id":result.get("observation_id"),
+               "reason":result.get("reason","")}
+        feedback.append(entry); probe_status.append(entry)
+        if status in {"partial","stale"}:
+            action["feedback_reason"]=result.get("reason",status)
+            followup=(_pwn_followup(action,revq,binary_digest,signal_quality)
+                      if action["query"]=="rat query pwn" else None)
+            if followup:
+                remaining.append(followup)
+                probe_status.append({"probe_id":followup["probe_id"],"status":"pending"})
+            else:
+                remaining.append(action)
+            continue
+        if status=="resolved":
+            # The named premise was inspected, but a structural checker lead
+            # remains useful after its first inspection.
+            if action["query"]=="rat query func":
+                unresolved=[u for u in unresolved if u!="checker semantics and success/failure oracle remain unverified"]
+                _add(unresolved,"comparison sites and success/failure string xrefs are candidates; executable branch semantics remain unverified")
+            elif action["query"]=="rat query oracle":
+                unresolved=[u for u in unresolved if u!="a success/failure oracle must be bounded before symbolic execution"]
+                _add(unresolved,"success/failure string xrefs are candidate oracle sites, not executable branch proof")
+                if "oracle-needed" in dimensions["program_shapes"]: dimensions["program_shapes"].remove("oracle-needed")
+                if "oracle-discovery" in leads: leads.remove("oracle-discovery")
+        elif status=="refuted":
+            families={
+                "rat query func":("checker","checker","checker semantics and success/failure oracle remain unverified"),
+                "rat query oracle":("oracle-discovery","oracle-needed","a success/failure oracle must be bounded before symbolic execution"),
+            }
+            if action["query"]=="rat query pwn":
+                target=action["target"]
+                family=({"inspect-bounded-input-callsite-then-measure-overwrite":("stack-overwrite","stack-overwrite-candidate","prove a concrete overwrite or PC-control primitive; import presence is insufficient"),
+                         "inspect-bounded-format-callsites-before-runtime-probe":("format-string","format-string-candidate","prove attacker control reaches a format argument"),
+                         "inspect-bounded-allocator-callsites-and-lifetimes":("heap-lifetime","heap-lifetime-candidate","allocator imports do not prove attacker-controlled lifetime, reuse, or overlap")}).get(target)
+                dimension="vulnerability_surfaces"
+            else:
+                family=families.get(action["query"])
+                dimension="program_shapes"
+            if family:
+                lead,shape,premise=family
+                if lead in leads: leads.remove(lead)
+                if shape in dimensions[dimension]: dimensions[dimension].remove(shape)
+                unresolved=[u for u in unresolved if u!=premise]
+    next_actions=remaining
     signals.sort(key=lambda s:(s["kind"],repr(s["value"]),s["quality"])); [v.sort() for v in dimensions.values()]; leads.sort(); unresolved.sort()
-    chosen=_recommend(next_actions); decision=None
+    # A partial/stale probe stays visible, but an executor must not rerun it
+    # automatically merely because it was previously dominant.
+    chosen=_recommend([action for action in next_actions if not action.get("feedback_reason")]); decision=None
     if chosen:
         decision={"action":chosen["query"],"target":chosen["target"],"evidence":chosen["evidence"],
                   "rule":chosen["rule"],"resolves":chosen["resolves"],
                   "expected_evidence":chosen["expected_evidence"],"cost":chosen["cost"],
                   "specificity":chosen["specificity"],"blocking":chosen["blocking"],
-                  "evidence_quality":chosen["evidence_quality"]}
-    elif not next_actions:
+                  "evidence_quality":chosen["evidence_quality"],"evidence_qualities":chosen["evidence_qualities"],
+                  "probe_id":chosen["probe_id"]}
+    elif not next_actions and not feedback:
         unresolved.append("insufficient deterministic evidence to select a bounded first probe")
     return {"schema":"rat.route-result/v2","signals":signals,"dimensions":dimensions,"unresolved":unresolved,
             "next":next_actions,"capabilities":capabilities,"leads":leads,"decision":decision,
+            "feedback":sorted(feedback,key=lambda x:x["probe_id"]),
+            "probe_status":sorted(probe_status,key=lambda x:x["probe_id"]),
             "commitment":"provisional" if next_actions else "unknown","skill":None}

@@ -132,6 +132,23 @@ no new analysis). Static routing leaves `skill=null`; after an active derived/di
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
 
+Each routed probe has a stable ID bound to the binary digest and expected evidence.
+`rat query func`, `rat query oracle`, and `rat query pwn` save hash-checked result
+artifacts with active STATE observations. A later `rat route` consumes matching
+results: a complete checker card with comparison sites and both oracle branches
+retires that probe, while partial or invalidated evidence keeps it pending with
+an explicit reason and suspends automatic re-query. After `rat route BIN` →
+`rat query pwn BIN` → `rat route BIN`, a stack candidate advances to a local
+`pwncrash` control measurement; format and heap candidates advance to one
+bounded `decomp BIN CALLER` inspection. A caller named by `revq` is selected
+when available; otherwise the placeholder in `next.target` must be replaced
+with a recovered caller. Independent leads can leave `decision=null`; choose
+one of the listed experiments. Import-only PWN cards never prove a safe or
+vulnerable callsite.
+An active `route.probe.refutation` observation can refute an exact probe; for
+bounded `read`/`fgets` input callsites the current validator has no independent
+exhaustive inventory, so it does not accept a safe-callsite refutation.
+
 `rat query pattern <bin>` returns at most three source-bound hypothesis aids for
 coexisting Router v2 leads. `rat dyn session` optionally keeps one local GDB
 process for sequential observations; see [GDB session usage](docs/GDB_SESSION.md).

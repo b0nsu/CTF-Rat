@@ -25,6 +25,7 @@ from ratlib.governor import check_progress, snapshot_digest, recommend
 from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
                           STRONG_OVERFLOW_IMPORTS as route_mod_STRONG,
                           WEAK_OVERFLOW_IMPORTS as route_mod_WEAK)
+from ratlib.route_feedback import load_feedback, record_query_result
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
 from ratlib.state_v2 import Stream
@@ -97,6 +98,11 @@ def _render_route_text(doc):
     unresolved = doc.get("unresolved") or []
     if unresolved:
         lines += ["", "UNRESOLVED"] + ["  - %s" % item for item in unresolved]
+    feedback = doc.get("feedback") or []
+    if feedback:
+        lines += ["", "PROBE FEEDBACK"]
+        lines += ["  %s %s (%s)" % (item["probe_id"][:19], item["status"], item.get("reason", ""))
+                  for item in feedback]
     diagnostics = doc.get("diagnostics") or []
     if diagnostics:
         lines += ["", "DIAGNOSTICS"] + ["  - %s" % item.get("message", "") for item in diagnostics]
@@ -312,6 +318,14 @@ def _gather_profile(binary, store):
 def _state_dir(binary):
     return os.path.dirname(os.path.realpath(binary))
 
+def _route_with_feedback(binary, profile, rev, interesting):
+    digest = _file_sha256(binary)
+    kwargs = {"profile": profile, "revq": rev, "interesting": interesting,
+              "binary_digest": digest}
+    initial = route_fn(**kwargs)
+    feedback = load_feedback(_state_dir(binary), digest, initial["next"])
+    return route_fn(**kwargs, probe_feedback=feedback) if feedback else initial
+
 def _select_route_skill(state_dir, result, skill, evidence_ids, reason, *, binary_digest=None):
     """Commit one route-specific Skill only from active non-heuristic STATE evidence."""
     evidence_ids = list(dict.fromkeys(evidence_ids or []))
@@ -381,7 +395,8 @@ def _record_route_assessment(state_dir, source, result, *,
     core = {"decision": result.get("decision"), "commitment": result.get("commitment"),
             "leads": result.get("leads", []), "skill": result.get("skill"),
             "input_digest": result.get("input_digest"),
-            "dimensions": result.get("dimensions", {}), "unresolved": result.get("unresolved", [])}
+            "dimensions": result.get("dimensions", {}), "unresolved": result.get("unresolved", []),
+            "probe_status": result.get("probe_status", [])}
     if result.get("skill"):
         core["skill_evidence_observation_ids"] = sorted(set(skill_evidence_observation_ids or []))
         core["skill_reason"] = (skill_reason or "").strip()
@@ -422,6 +437,25 @@ def _query_error(query, code, message, exit_code):
                            provenance={"cache": {"hit": False}})
     return doc, exit_code
 
+def _record_query_feedback(binary, doc):
+    """Keep an analyzed card usable but never resolve probes with stale input."""
+    try:
+        record_query_result(_state_dir(binary), _file_sha256(binary), doc)
+    except ValueError as exc:
+        doc["status"] = "partial"
+        doc["coverage"]["complete"] = False
+        omitted = doc["coverage"].get("omitted")
+        if isinstance(omitted, list):
+            if "stale_cache" not in omitted:
+                omitted.append("stale_cache")
+        elif omitted is None:
+            doc["coverage"]["omitted"] = ["stale_cache"]
+        else:
+            doc["coverage"]["omitted"] = {"previous": omitted, "stale_cache": True}
+        doc["diagnostics"].append({
+            "code": "stale_cache", "severity": "warning", "message": str(exc),
+        })
+
 # ---- subcommands ----
 def cmd_route(args):
     binary = args.binary
@@ -447,7 +481,7 @@ def cmd_route(args):
         rev, interesting = None, None
         revq_error = {"code": "analysis_failed",
                       "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
-    result = route_fn(profile=profile, revq=rev, interesting=interesting)
+    result = _route_with_feedback(binary, profile, rev, interesting)
     result["input_digest"] = _file_sha256(binary)
     if fast and not args.fast:
         result.setdefault("diagnostics", []).append({
@@ -674,7 +708,7 @@ def cmd_brief(args):
     except Exception as exc:
         rev, interesting = None, None
         revq_error = "%s: %s" % (type(exc).__name__, str(exc) or "no detail")
-    route = route_fn(profile=profile, revq=rev, interesting=interesting)
+    route = _route_with_feedback(binary, profile, rev, interesting)
     route["capabilities"] = {**route.get("capabilities", {}), **caps}
     state_dir = _state_dir(binary)
     _record_route_assessment(state_dir, "brief", route)
@@ -801,6 +835,7 @@ def cmd_query_func(args):
                            provenance={**card["provenance"], "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
     doc = _governor_wrap(_state_dir(binary), "query:func", {"query": query, "facts": facts}, doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def cmd_query_pwn(args):
@@ -836,6 +871,7 @@ def cmd_query_pwn(args):
         budget_bytes=budget,
     )
     doc = _governor_wrap(_state_dir(binary), "query:pwn", {"facts": facts, "heuristics": card["heuristics"]}, doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 
@@ -938,6 +974,7 @@ def cmd_query_oracle(args):
                            provenance={"binary_sha256": rev.get("sha256"), "cache": {"hit": rev.get("cache_state") == "hit"}},
                            budget_bytes=budget)
     doc = _governor_wrap(_state_dir(binary), "query:oracle", {"facts": facts, "heuristics": heuristics}, doc)
+    _record_query_feedback(binary, doc)
     return _emit(doc, EXIT_OK, args.format)
 
 def _slice_complete(slice_doc):
@@ -1069,8 +1106,9 @@ def build_parser():
         prog="rat", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="rat — single front door thin dispatcher (route/brief/query/dyn/verify/state/cache).",
         epilog="side effect: `rat route`/`rat brief` append a route-assessment note plus governor.checked;\n"
-               "every `rat query ...` appends governor.checked to challenge STATE. These are\n"
-               "bookkeeping, not solving progress; see doctrine/SOLVABILITY.md.")
+               "every `rat query ...` appends governor.checked. func/oracle/pwn queries also persist\n"
+               "a hash-checked result and active STATE observation for routing feedback.\n"
+               "See doctrine/SOLVABILITY.md for progress rules.")
     sub = p.add_subparsers(dest="command")
 
     pr = sub.add_parser("route", help="project route evidence; optionally commit one Skill from cited STATE observations")
