@@ -192,7 +192,7 @@ class RouteFeedbackTests(unittest.TestCase):
         self.assertIn("heap-lifetime", after["leads"])
         self.assertIn(heap["probe_id"], {a["probe_id"] for a in after["next"]})
 
-    def test_safe_input_refutation_preserves_independent_heap_lead(self):
+    def test_one_safe_input_callsite_cannot_refute_unenumerated_sinks(self):
         profile = {"imports": ["read", "malloc", "free"]}
         initial = route(profile=profile, binary_digest=self.digest)
         stack = next(a for a in initial["next"] if a["target"].startswith("inspect-bounded-input"))
@@ -210,10 +210,11 @@ class RouteFeedbackTests(unittest.TestCase):
                       "reason": "bounded read fits the destination"},
         })
         feedback = load_feedback(self.tmp.name, self.digest, initial["next"])
+        self.assertNotIn(stack["probe_id"], feedback)
         after = route(profile=profile, binary_digest=self.digest, probe_feedback=feedback)
-        self.assertNotIn("stack-overwrite", after["leads"])
+        self.assertIn("stack-overwrite", after["leads"])
         self.assertIn("heap-lifetime", after["leads"])
-        self.assertNotIn(stack["probe_id"], {a["probe_id"] for a in after["next"]})
+        self.assertIn(stack["probe_id"], {a["probe_id"] for a in after["next"]})
         stream.append("evidence.invalidated", {"observation_ids": ["safe-read"], "reason": "retracted"})
         feedback = load_feedback(self.tmp.name, self.digest, initial["next"])
         self.assertNotIn(stack["probe_id"], feedback)

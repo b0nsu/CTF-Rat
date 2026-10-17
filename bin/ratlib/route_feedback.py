@@ -79,16 +79,11 @@ def _valid_refutation(action, value):
             or value.get("premise") not in action["resolves"]):
         return False
     if action["target"] == "inspect-bounded-input-callsite-then-measure-overwrite":
-        sites = value.get("callsites")
-        imports = set(action.get("candidate_imports") or [])
-        return (isinstance(sites, list) and bool(sites)
-                and bool(imports) and imports <= {"read", "fgets"}
-                and imports <= {site.get("sink") for site in sites if isinstance(site, dict)}
-                and all(isinstance(site, dict) and site.get("sink") in {"read", "fgets"}
-                        and isinstance(site.get("destination_size"), int)
-                        and isinstance(site.get("max_input_length"), int)
-                        and 0 <= site["max_input_length"] <= site["destination_size"]
-                        for site in sites))
+        # Import names do not enumerate callsites. A supplied list of safe
+        # reads cannot rule out a second, omitted read in the same binary.
+        # Keep this lead until a separate exhaustive callsite inventory can
+        # bind every measured site to the binary.
+        return False
     # A free-form conclusion plus an unrelated direct measurement is not a
     # deterministic refutation of heap, format, checker, or other premises.
     # Those families need their own bounded, machine-checkable validators.
