@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -675,7 +676,11 @@ def cmd_eval(args):
     import tempfile
     if not args.agent:
         print("[ratbench:err] eval requires --agent \"<cli command template>\" (use {dir} placeholder)", file=sys.stderr); return 2
-    agent_bin = args.agent.split()[0]
+    try:
+        agent_bin = shlex.split(args.agent)[0]
+    except (ValueError, IndexError):
+        print("[ratbench:err] eval requires a valid agent command", file=sys.stderr)
+        return 2
     if not _have(agent_bin):
         print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
         return 3

@@ -132,6 +132,14 @@ class CorpusGateTests(unittest.TestCase):
 
 
 class ModeBLocalSmokeTests(unittest.TestCase):
+    def test_eval_resolves_quoted_agent_executable(self):
+        args = SimpleNamespace(agent="'/tmp/agent cli' --version", suite=None, corpus=None, id=None)
+        with mock.patch.object(RATBENCH, "_have", return_value=True) as have, \
+             mock.patch.object(RATBENCH, "_select_entries", side_effect=LookupError("no entry")), \
+             mock.patch("builtins.print"):
+            self.assertEqual(RATBENCH.cmd_eval(args), 4)
+        have.assert_called_once_with("/tmp/agent cli")
+
     def test_flag_paths_are_rejected(self):
         for path in ("flag", "flag.txt", "assets/secret.flag"):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "flag file"):
