@@ -96,6 +96,34 @@ def _recommend(actions):
     maximal=[a for a in actions if not any(_dominates(other,a) for other in actions if other is not a)]
     return maximal[0] if len(maximal)==1 else None
 
+def _pwn_followup(action, revq, binary_digest, signal_quality):
+    """Offer one bounded experiment after an import/protection card is inspected."""
+    target=action["target"]
+    if target=="inspect-bounded-input-callsite-then-measure-overwrite":
+        followup=_action("pwncrash","<bin> --pattern-length 256",action["evidence"],
+                         "reproduce the selected local input path with cyclic data and measure PC control",
+                         resolves=["whether the selected input path gives a reproducible crash and PC control"],
+                         expected_evidence="runtime-direct",cost="medium")
+    elif target in {"inspect-bounded-format-callsites-before-runtime-probe",
+                  "inspect-bounded-allocator-callsites-and-lifetimes"}:
+        sinks=FORMAT if "format" in target else HEAP
+        callers=sorted((f for f in (revq or {}).get("functions",[]) or []
+                        if isinstance(f,dict) and _calls(revq,f.get("name")) & sinks),
+                       key=lambda f:(str(f.get("name","")),str(f.get("addr",""))))
+        caller=callers[0].get("name") if callers else ("<format-caller>" if "format" in target else "<allocator-caller>")
+        followup=_action("decomp","<bin> " + caller,action["evidence"],
+                         "inspect one selected caller for attacker-controlled format arguments or allocation lifetime",
+                         resolves=action["resolves"],expected_evidence="structured-static",
+                         cost="medium",specificity="concrete" if callers else "bounded",
+                         blocking=not bool(callers))
+    else:
+        return None
+    followup["source_probe_id"]=action["probe_id"]
+    followup["probe_id"]=probe_id(binary_digest,followup)
+    followup["evidence_quality"]=_evidence_quality(followup,signal_quality)
+    followup["evidence_qualities"]={kind:signal_quality.get(kind,"unknown") for kind in followup["evidence"]}
+    return followup
+
 def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_feedback=None):
     """Project observations into candidate probes; never choose a challenge class."""
     imports=set((profile or {}).get("imports",[]) or [])|set((revq or {}).get("imports",[]) or [])
@@ -255,7 +283,14 @@ def route(*,profile=None,revq=None,interesting=None,binary_digest=None,probe_fee
         feedback.append(entry); probe_status.append(entry)
         if status in {"partial","stale"}:
             action["feedback_reason"]=result.get("reason",status)
-            remaining.append(action); continue
+            followup=(_pwn_followup(action,revq,binary_digest,signal_quality)
+                      if action["query"]=="rat query pwn" else None)
+            if followup:
+                remaining.append(followup)
+                probe_status.append({"probe_id":followup["probe_id"],"status":"pending"})
+            else:
+                remaining.append(action)
+            continue
         if status=="resolved":
             # The named premise was inspected, but a structural checker lead
             # remains useful after its first inspection.

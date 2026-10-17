@@ -113,6 +113,7 @@ class RouteFeedbackTests(unittest.TestCase):
         after = self._route()
         self.assertFalse(any(action["probe_id"] == pid for action in after["next"]))
         self.assertEqual(after["feedback"][0]["status"], "resolved")
+        self.assertEqual(after["commitment"], "unknown")
         self.assertNotIn("checker semantics and success/failure oracle remain unverified", after["unresolved"])
         self.assertTrue(any("executable branch semantics remain unverified" in item
                             for item in after["unresolved"]))
@@ -233,9 +234,60 @@ class RouteFeedbackTests(unittest.TestCase):
         record_query_result(self.tmp.name, self.digest, _pwn_card(self.digest))
         feedback = load_feedback(self.tmp.name, self.digest, before["next"])
         after = route(profile=profile, binary_digest=self.digest, probe_feedback=feedback)
+        self.assertEqual(after["feedback"][0]["status"], "partial")
+        self.assertEqual(after["next"][0]["query"], "pwncrash")
+        self.assertEqual(after["next"][0]["source_probe_id"], before["next"][0]["probe_id"])
+        self.assertEqual(after["decision"]["action"], "pwncrash")
+        self.assertEqual(after["commitment"], "provisional")
+        self.assertIn("stack-overwrite", after["leads"])
+
+    def test_competing_pwn_followups_keep_both_leads_without_forced_decision(self):
+        profile = {"imports": ["malloc", "free", "printf", "read"]}
+        before = route(profile=profile, binary_digest=self.digest)
+        record_query_result(self.tmp.name, self.digest, _pwn_card(self.digest))
+        feedback = load_feedback(self.tmp.name, self.digest, before["next"])
+        after = route(profile=profile, binary_digest=self.digest, probe_feedback=feedback)
+        from ratlib.schema import validate
+        validate(after, "rat.route-result/v2")
+        self.assertEqual({item["query"] for item in after["next"]}, {"pwncrash", "decomp"})
+        self.assertEqual(len(after["next"]), 3)
         self.assertIsNone(after["decision"])
-        self.assertEqual(after["next"][0]["probe_id"], before["next"][0]["probe_id"])
-        self.assertIn("does not establish", after["next"][0]["feedback_reason"])
+        self.assertEqual(after["commitment"], "provisional")
+        self.assertEqual({"heap-lifetime", "format-string", "stack-overwrite"}, set(after["leads"]))
+
+    def test_pwn_followup_selects_recovered_format_caller(self):
+        profile = {"imports": ["printf", "read"]}
+        rev = {"functions": [{"name": "main", "calls": ["printf"]}]}
+        before = route(profile=profile, revq=rev, binary_digest=self.digest)
+        record_query_result(self.tmp.name, self.digest, _pwn_card(self.digest))
+        feedback = load_feedback(self.tmp.name, self.digest, before["next"])
+        after = route(profile=profile, revq=rev, binary_digest=self.digest, probe_feedback=feedback)
+        self.assertIn("<bin> main", [item["target"] for item in after["next"]
+                                      if item["query"] == "decomp"])
+
+    def test_frontdoor_route_pwn_query_route_reaches_runtime_probe(self):
+        rat = _rat()
+        profile = {"imports": ["read"], "facts": [], "binary_sha256": self.digest}
+        rev = {"imports": [], "functions": [], "strings": [], "sha256": self.digest}
+        mod = SimpleNamespace(compute_interesting=lambda _: [])
+        args = SimpleNamespace(binary=self.binary, store=None, fast=True, format="json")
+        qargs = SimpleNamespace(**vars(args), budget_bytes=16384)
+        with patch.object(rat, "_doctor_capabilities", return_value={"angr": False}), \
+             patch.object(rat, "_gather_profile", return_value=profile), \
+             patch.object(rat, "_gather_revq", return_value=(mod, rev)), \
+             patch.object(rat, "_record_revq_invocation"), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(rat.cmd_route(args), 0)
+            first = json.loads(output.getvalue().splitlines()[-1])
+            output.seek(0); output.truncate(0)
+            self.assertEqual(rat.cmd_query_pwn(qargs), 0)
+            output.seek(0); output.truncate(0)
+            self.assertEqual(rat.cmd_route(args), 0)
+            last = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(first["decision"]["action"], "rat query pwn")
+        self.assertEqual(last["decision"]["action"], "pwncrash")
+        self.assertEqual(last["next"][0]["source_probe_id"], first["decision"]["probe_id"])
+        self.assertEqual(last["feedback"][0]["status"], "partial")
 
     def test_frontdoor_route_query_route_updates_decision_and_governor(self):
         rat = _rat()
