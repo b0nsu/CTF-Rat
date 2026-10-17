@@ -94,9 +94,17 @@ def load_feedback(state_dir, binary_digest, actions):
     """Read only matching, hash-checked results; invalidated observations fail closed."""
     stream = Stream(state_dir)
     events = stream.read()
-    view = stream.view()
-    notes = [e["payload"] for e in events if e["type"] == "note.recorded"
-             and e["payload"].get("kind") == "route-query-result"]
+    # Use the same validated event snapshot for notes and observations. A
+    # second Stream.read() can observe a different STATE revision mid-route.
+    view = stream._materialize(events)
+    notes_by_query = {}
+    for event in events:
+        if event["type"] != "note.recorded":
+            continue
+        note = event["payload"]
+        if (note.get("kind") == "route-query-result"
+                and note.get("binary_digest") == binary_digest):
+            notes_by_query.setdefault(note.get("query"), []).append(note)
     invalid = {oid for oid, obs in view.get("observations", {}).items()
                if obs.get("validity", {}).get("state") != "active"}
     results = {}
@@ -106,9 +114,7 @@ def load_feedback(state_dir, binary_digest, actions):
                  else "oracle" if action["query"] == "rat query oracle"
                  else "pwn" if action["query"] == "rat query pwn" else None)
         candidates = []
-        for note in notes:
-            if note.get("query") != query or note.get("binary_digest") != binary_digest:
-                continue
+        for note in notes_by_query.get(query, ()):
             digest = note.get("artifact_digest")
             observation = view.get("observations", {}).get(note.get("observation_id"))
             if (not observation or observation.get("validity", {}).get("state") != "active"
