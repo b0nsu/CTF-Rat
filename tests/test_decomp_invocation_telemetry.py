@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
@@ -11,10 +12,51 @@ ROOT = os.path.abspath(os.path.join(BIN, ".."))
 sys.path.insert(0, BIN)
 
 from ratlib.metrics import aggregate, iter_tool_results, benchmark_envelope_observations
-from ratlib.decomp_cache import write_meta
+from ratlib.decomp_cache import write_meta, record_invocation
 
 
 class DecompInvocationTelemetryTests(unittest.TestCase):
+    def test_cli_ghidra_failure_is_recorded_with_exit_70(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as out:
+                out.write(b"fixture-binary")
+            ghidra = os.path.join(d, "ghidra")
+            os.makedirs(os.path.join(ghidra, "support"))
+            os.makedirs(os.path.join(ghidra, "Ghidra"))
+            with open(os.path.join(ghidra, "Ghidra", "application.properties"), "w") as out:
+                out.write("application.version=fixture-1\n")
+            analyze = os.path.join(ghidra, "support", "analyzeHeadless")
+            with open(analyze, "w") as out:
+                out.write("#!/bin/sh\nexit 11\n")
+            os.chmod(analyze, 0o755)
+            result = subprocess.run([os.path.join(BIN, "decomp"), binary, "main"],
+                                    env=dict(os.environ, CTF_HOME=ROOT, GHIDRA_HOME=ghidra,
+                                             XDG_CONFIG_HOME=os.path.join(d, "xdg")),
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 70, result.stderr)
+            docs = list(iter_tool_results(os.path.join(d, ".rat")))
+            self.assertEqual(len(docs), 1)
+            self.assertEqual((docs[0]["status"], docs[0]["exit"]["code"]), ("error", 70))
+
+    def test_failed_invocation_keeps_original_exit_and_is_not_an_analysis_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = os.path.join(d, "chall")
+            with open(binary, "wb") as out:
+                out.write(b"fixture-binary")
+            ghidra = os.path.join(d, "ghidra")
+            os.makedirs(os.path.join(ghidra, "Ghidra"))
+            with open(os.path.join(ghidra, "Ghidra", "application.properties"), "w") as out:
+                out.write("application.version=fixture-1\n")
+            self.assertTrue(record_invocation(
+                binary + ".decomp", binary, ghidra, os.path.join(BIN, "ghidra_scripts"),
+                "miss", "error", "function", "foo", "2026-10-17T00:00:00+00:00",
+                time.monotonic_ns(), 70, "call-failed"))
+            docs = list(iter_tool_results(os.path.join(d, ".rat")))
+            self.assertEqual(len(docs), 1)
+            self.assertEqual((docs[0]["status"], docs[0]["exit"]["code"]), ("error", 70))
+            self.assertEqual(aggregate(docs)["result_class_counts"], {"call-failed": 1})
+
     def test_bad_instruction_in_named_cached_function_is_partial(self):
         with tempfile.TemporaryDirectory() as d:
             binary = os.path.join(d, "chall")
