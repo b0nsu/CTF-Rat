@@ -3,7 +3,7 @@
 import sys, os, json, fcntl, time, uuid
 from ratlib.runner import run
 from ratlib.state_v2 import Stream, migrate_v1, revise_finding, revise_primitive, consume_primitive, cursor as event_cursor, trusted_offset_inputs, project_trusted_offsets, FAILURE_CLASSES
-from ratlib.compact import budget_compact
+from ratlib.compact import budget_compact, bounded_delta_bytes
 from ratlib.schema import validate, ValidationError
 STATE = "STATE.jsonl"
 CTF_HOME = os.environ.get("CTF_HOME", os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")))
@@ -286,9 +286,8 @@ def main():
         p=argparse.ArgumentParser(prog="state delta"); p.add_argument("--after"); p.add_argument("--until"); p.add_argument("--max-bytes",type=int,default=32768); ns=p.parse_args(a[1:])
         def cur(v): return json.loads(v) if v else None
         try:
-            ev=stream_for(fpath).delta(cur(ns.after),cur(ns.until)); raw=json.dumps(ev,ensure_ascii=False).encode()
-            if len(raw)>ns.max_bytes: raw=json.dumps({"events":ev[-10:],"truncated":True},ensure_ascii=False).encode()
-            print(raw.decode())
+            ev=stream_for(fpath).delta(cur(ns.after),cur(ns.until))
+            print(bounded_delta_bytes(ev, ns.max_bytes).decode())
         except ValueError as e: print("[state:err] %s"%e,file=sys.stderr); raise SystemExit(2)
         return
     if a[0] == "compact":
