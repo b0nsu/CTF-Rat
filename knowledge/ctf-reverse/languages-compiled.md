@@ -77,7 +77,6 @@ for fn in data.get('UserFunctions', []):
 **Ghidra with golang-loader:**
 ```bash
 # Install: Ghidra → Window → Script Manager → search "golang"
-# Or use: https://github.com/getCUJO/ThreatFox/tree/main/ghidra-golang
 # Recovers function names, string references, interface tables
 ```
 
@@ -286,14 +285,19 @@ nm binary | c++filt | grep "main"
 ```c
 struct RustVec {
     void *ptr;      // heap pointer
-    uint64 cap;     // capacity
     uint64 len;     // length
+    uint64 cap;     // capacity
 };
+// NOTE: field order (ptr, len, cap) vs (ptr, cap, len) is NOT
+// guaranteed by the Rust ABI and varies by compiler version —
+// confirm against the Vec constructor and its callers in
+// disassembly before trusting offsets.
 ```
 
 **String / &str:**
 ```text
-# String (owned): {ptr, capacity, length} — 24 bytes, heap-allocated
+# String (owned): {ptr, length, capacity} — 24 bytes, heap-allocated
+# (same caveat as Vec: field order is compiler-dependent, verify in disassembly)
 # &str (borrowed): {ptr, length} — 16 bytes, can point anywhere
 
 # In decompilation, look for:
@@ -324,7 +328,6 @@ cargo install cargo-bloat
 cargo bloat --release -n 50
 
 # Ghidra Rust helper scripts
-# https://github.com/AmateursCTF/ghidra-rust (community scripts for Rust RE)
 ```
 
 **Key insight:** Rust panic messages are goldmines — they contain source file paths, line numbers, and descriptive error strings even in release builds. Always `strings binary | grep "panicked"` first. Rust's monomorphization means generic functions get duplicated per type — expect many similar-looking functions.
@@ -592,7 +595,9 @@ fn bad<T>(v: T) -> &'static T {
 
 fn main() {
     let aliased: &'static Vec<u8> = bad(vec![1u8, 2, 3]);
-    // Reinterpret the Vec as its raw header: (ptr, len, cap)
+    // Reinterpret the Vec as its raw header (field order is
+    // compiler-dependent — NOT guaranteed by the Rust ABI;
+    // confirm against the constructor/callers for this toolchain)
     let header: &(usize, usize, usize) =
         unsafe { std::mem::transmute(aliased) };
     println!("ptr={:#x} len={} cap={}", header.0, header.1, header.2);
