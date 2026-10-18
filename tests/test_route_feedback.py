@@ -106,6 +106,23 @@ class RouteFeedbackTests(unittest.TestCase):
                              e["payload"].get("kind") == "route-query-result"
                              for e in Stream(self.tmp.name).read()))
 
+    def test_feedback_uses_one_snapshot_and_scopes_query_notes(self):
+        record_query_result(self.tmp.name, self.digest, _card(self.digest))
+        record_query_result(self.tmp.name, self.digest, _pwn_card(self.digest))
+        initial = route(revq=self.rev, interesting=self.interesting,
+                        binary_digest=self.digest)
+        original_read = Stream.read
+        reads = []
+
+        def counted_read(instance):
+            reads.append(instance.path)
+            return original_read(instance)
+
+        with patch.object(Stream, "read", counted_read):
+            feedback = load_feedback(self.tmp.name, self.digest, initial["next"])
+        self.assertEqual(len(reads), 1, "routing feedback should read STATE only once")
+        self.assertEqual(feedback[initial["decision"]["probe_id"]]["status"], "resolved")
+
     def test_route_query_route_resolves_exact_checker_probe(self):
         before = self._route()
         pid = before["decision"]["probe_id"]
