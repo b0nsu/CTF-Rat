@@ -102,3 +102,43 @@ def budget_compact(view, *, budget_tokens=None, cursor=None):
                  "truncated": truncated, "omitted_counts": omitted_counts, "cursor": cursor}
     return {**projected, "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens(projected),
             "budget_exceeded_by_critical_tiers": critical_tokens > budget_tokens}
+
+
+def bounded_delta_bytes(events, max_bytes):
+    """Serialize STATE delta within the *actual* byte cap, including a newline.
+
+    A complete response retains the legacy JSON-array contract. Overflow pages
+    contain the earliest contiguous events (not the newest ten) and a cursor
+    accepted by Stream.delta(after=...), so no events are silently skipped.
+    If even one event cannot fit, fail instead of returning a non-progressing
+    page or violating the caller's output budget.
+    """
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ValueError("--max-bytes must be positive")
+
+    def encode(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+
+    full = encode(events)
+    if len(full) + 1 <= max_bytes:
+        return full
+
+    page = []
+    result = None
+    for event in events:
+        candidate = page + [event]
+        payload = {
+            "events": candidate,
+            "truncated": True,
+            "omitted_count": len(events) - len(candidate),
+            "next_cursor": {"stream_id": event["stream_id"], "seq": event["seq"]},
+        }
+        encoded = encode(payload)
+        if len(encoded) + 1 > max_bytes:
+            break
+        page = candidate
+        result = encoded
+
+    if result is None:
+        raise ValueError("--max-bytes is too small for one STATE event and pagination metadata")
+    return result
