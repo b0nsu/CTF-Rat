@@ -34,6 +34,8 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
 
             (module_dir / "kernel_identity.py").write_text(
                 'def inspect(path):\n    return {"kind": "elf"}\n', encoding="utf-8")
+            (module_dir / "raw_loader.py").write_text(
+                'def inspect_raw(path):\n    return {"kind": "unknown"}\n', encoding="utf-8")
             (module_dir / "run_manifest.py").write_text(
                 'from pathlib import Path\n'
                 'def materialize_for_solve(source, destination, **kwargs):\n'

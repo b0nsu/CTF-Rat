@@ -30,6 +30,8 @@ from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
 from ratlib.state_v2 import Stream
 from ratlib.kernel_identity import inspect as inspect_kernel
+from ratlib.raw_loader import inspect_raw, load_spec as normalize_blob_spec
+from ratlib.run_manifest import read as read_run_manifest
 
 DEFAULT_BUDGET_BYTES = 16384
 
@@ -214,7 +216,7 @@ def _load_revq_module():
         _REVQ_MODULE = mod
     return _REVQ_MODULE
 
-def _gather_revq(binary, fast, store):
+def _gather_revq(binary, fast, store, load_spec=None):
     if inspect_kernel(binary)["kind"] in {"bzimage", "linux-boot-image"}:
         raise RuntimeError("Linux boot image: extract vmlinux before ELF analysis (Linux scripts/extract-vmlinux)")
     mod = _load_revq_module()
@@ -222,7 +224,8 @@ def _gather_revq(binary, fast, store):
     # format when used as a standalone CLI -- reinterpret as a catchable
     # error when loaded in-process so one binary's degradation can't kill rat.
     try:
-        rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False, index_root=store)
+        rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False,
+                                  index_root=store, load_spec=load_spec)
     except SystemExit as exc:
         raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
     return mod, rev
@@ -240,7 +243,8 @@ def _record_revq_invocation(mod, binary, fast, store, rev, started_at,
         requested_engine = "binutils" if fast else "angr"
         current_sha = rev.get("sha256") or mod.sha256(binary)
         _, cache_key = mod._canonical_index(
-            binary, rev.get("engine") or requested_engine, current_sha, store)
+            binary, rev.get("engine") or requested_engine, current_sha, store,
+            rev.get("load_spec"))
         parameters = {
             "requested_engine": requested_engine,
             "effective_engine": rev.get("engine") or requested_engine,
@@ -248,6 +252,7 @@ def _record_revq_invocation(mod, binary, fast, store, rev, started_at,
             "operation": operation,
             "requested": requested,
             "frontdoor": "rat",
+            "load_spec": rev.get("load_spec"),
         }
         mod._persist_invocation(
             binary, current_sha, requested_engine, False, rev, cache_key, store,
@@ -295,6 +300,10 @@ def _doctor_capabilities(binary):
 
 def _gather_profile(binary, store):
     identity = inspect_kernel(binary)
+    if identity["kind"] == "unknown":
+        candidate = inspect_raw(binary)
+        if candidate["kind"] != "unknown":
+            identity = candidate
     if identity["kind"] in {"bzimage", "linux-boot-image"}:
         return {"artifact_identity": identity, "imports": [], "facts": []}
     code, out, _ = _run_subprocess([os.path.join(BIN, "rat-profile"), binary, "--store", store, "--format", "json"])
@@ -468,12 +477,32 @@ def cmd_route(args):
     store = resolve_index_root(binary, override=args.store)
     caps = _doctor_capabilities(binary)
     profile = _gather_profile(binary, store)
+    try:
+        blob_spec = normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None))
+    except ValueError as exc:
+        result = route_fn(profile=profile)
+        result.setdefault("diagnostics", []).append({
+            "code": "input_invalid", "severity": "error", "message": str(exc)})
+        return _emit(result, EXIT_INPUT, args.format)
+    if blob_spec and args.fast:
+        result = route_fn(profile=profile)
+        result.setdefault("diagnostics", []).append({
+            "code": "input_invalid", "severity": "error",
+            "message": "explicit raw mapping requires angr; remove --fast"})
+        return _emit(result, EXIT_INPUT, args.format)
+    if blob_spec and profile is not None:
+        profile["blob_load_spec"] = blob_spec
     fast = args.fast or not caps.get("angr", False)
     rev, interesting, revq_error = None, None, None
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
-        mod, rev = _gather_revq(binary, fast, store)
+        if not blob_spec and (profile or {}).get("artifact_identity", {}).get("kind") in {
+                "boot-sector-candidate", "disk-image-candidate"}:
+            raise RuntimeError("raw image needs explicit --arch/--base/--entry for executable CFG")
+        mod, rev = _gather_revq(binary, fast, store, load_spec=blob_spec)
         interesting = mod.compute_interesting(rev)
         _record_revq_invocation(mod, binary, fast, store, rev,
                                 revq_started_at, revq_started_monotonic, "route")
@@ -607,6 +636,8 @@ def _render_brief_text(card):
         L.append("SHA256      %s" % card["binary_sha256"])
     caps = card["capabilities"]
     L.append("CAPS        " + ", ".join("%s=%s" % (k, "ok" if v else "no") for k, v in caps.items()))
+    for hint in (card.get("environment") or {}).get("qemu", []):
+        L.append("QEMU        %s: %s" % (hint["name"], hint["command"]))
     r = card["route"]
     decision = r.get("decision") or {}
     L += ["", "COMMITMENT  %s" % r.get("commitment", "unknown")]
@@ -665,6 +696,9 @@ def _bound_brief_to_budget(card, budget_tokens, *, render=None):
     render = render or _render_brief_text
     def over():
         return len(render(card).encode()) > budget_bytes
+    if over() and card.get("environment"):
+        card["environment"] = {}
+        card["truncated"].append("environment")
     if over():
         card["libc"] = {"supplied": None, "sha256": None, "reference_match": None,
                         "match_method": None, "note": "trimmed for budget"}
@@ -713,6 +747,9 @@ def cmd_brief(args):
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
+        if (profile or {}).get("artifact_identity", {}).get("kind") in {
+                "boot-sector-candidate", "disk-image-candidate"}:
+            raise RuntimeError("raw image requires explicit load hints for executable analysis")
         mod, rev = _gather_revq(binary, fast, store)
         interesting = mod.compute_interesting(rev)
         _record_revq_invocation(mod, binary, fast, store, rev,
@@ -753,6 +790,47 @@ def cmd_brief(args):
         "side_effects": ["rat brief appended route-assessment note + governor.checked to STATE."],
         "diagnostics": diagnostics,
     }
+    # Read only a matching, hash-bound solve manifest; never execute its runner.
+    binary_dir = os.path.dirname(os.path.realpath(binary))
+    manifest_path = os.path.join(binary_dir, "run.json")
+    if os.path.isfile(manifest_path):
+        try:
+            manifest = read_run_manifest(manifest_path)
+            if any(i.get("role") == "binary" and i.get("sha256") == card["binary_sha256"]
+                   for i in manifest["inputs"]):
+                hints = manifest.get("environment", {}).get("qemu_launch_hints", [])
+                qemu = []
+                for hint in hints[:2]:
+                    if not isinstance(hint, dict):
+                        continue
+                    commands = hint.get("commands")
+                    if not isinstance(commands, list) or not commands:
+                        continue
+                    name = hint.get("name")
+                    record = next((item for item in manifest["inputs"]
+                                   if item.get("role") == "runner" and item.get("name") == name), None)
+                    runner = os.path.join(binary_dir, name) if isinstance(name, str) else None
+                    try:
+                        verified = (runner is not None and name not in (".", "..")
+                                    and os.path.basename(name) == name
+                                    and record is not None
+                                    and record.get("sha256") == hint.get("source_sha256")
+                                    and not os.path.islink(runner) and os.path.isfile(runner)
+                                    and os.path.getsize(runner) <= 64 * 1024
+                                    and _file_sha256(runner) == hint.get("source_sha256"))
+                    except OSError:
+                        verified = False
+                    if not verified:
+                        diagnostics.append({"code": "stale_artifact", "severity": "warning",
+                                            "message": "QEMU runner %s is missing or changed; hint omitted" % str(name)[:80]})
+                        continue
+                    qemu.extend({"name": name, "command": command["line"][:320]}
+                                for command in commands[:2]
+                                if isinstance(command, dict) and isinstance(command.get("line"), str))
+                if qemu:
+                    card["environment"] = {"qemu": qemu}
+        except (ValueError, OSError, TypeError, AttributeError):
+            pass
     if revq_error:
         card["side_effects"].append("revq analysis unavailable; brief is partial: %s" % revq_error)
         diagnostics.append({"code": "analysis_failed", "severity": "warning",
@@ -793,7 +871,10 @@ def cmd_query_graph(args):
     started_at = datetime.now(timezone.utc).isoformat()
     started_monotonic = time.monotonic()
     try:
-        mod, rev = _gather_revq(binary, args.fast, store)
+        mod, rev = _gather_revq(binary, args.fast, store,
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
         # The ranking is heuristic; only recovered names/addresses/edges are facts.
         graph = project_graph(rev, interesting=mod.compute_interesting(rev),
                               budget_bytes=args.budget_bytes, max_nodes=args.max_nodes)
@@ -828,7 +909,10 @@ def cmd_query_func(args):
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
-        mod, rev = _gather_revq(binary, args.fast, store)
+        mod, rev = _gather_revq(binary, args.fast, store,
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
     except Exception as exc:
         return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     card = mod.compute_function_card(rev, name)
@@ -964,7 +1048,10 @@ def cmd_query_oracle(args):
     revq_started_at = datetime.now(timezone.utc).isoformat()
     revq_started_monotonic = time.monotonic()
     try:
-        mod, rev = _gather_revq(binary, args.fast, store)
+        mod, rev = _gather_revq(binary, args.fast, store,
+                                 load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
+                                        base=getattr(args, "base", None),
+                                        entry=getattr(args, "entry", None)))
     except Exception as exc:
         return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
     oracle = mod.compute_oracle(rev)
@@ -1137,6 +1224,8 @@ def build_parser():
 
     pr = sub.add_parser("route", help="project route evidence; optionally commit one Skill from cited STATE observations")
     pr.add_argument("binary"); pr.add_argument("--store"); pr.add_argument("--fast", action="store_true")
+    for flag in ("arch", "base", "entry"):
+        pr.add_argument("--" + flag, help="explicit raw-code loader hint")
     pr.add_argument("--skill", choices=sorted(ROUTE_SKILLS),
                     help="commit one route-specific Skill after runtime/structural evidence exists")
     pr.add_argument("--skill-evidence", action="append", default=[], metavar="OBS_ID",
@@ -1154,15 +1243,21 @@ def build_parser():
     qsub = pq.add_subparsers(dest="subcommand")
     pg = qsub.add_parser("graph", help="global, bounded projection of revq's recovered function call map")
     pg.add_argument("binary"); pg.add_argument("--store"); pg.add_argument("--fast", action="store_true")
+    for flag in ("arch", "base", "entry"):
+        pg.add_argument("--" + flag, help="explicit raw-code loader hint")
     pg.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     pg.add_argument("--max-nodes", type=int, default=64)
     pg.add_argument("--format", choices=("text", "json"), default="text")
     pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
     pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    for flag in ("arch", "base", "entry"):
+        pf.add_argument("--" + flag, help="explicit raw-code loader hint")
     pf.add_argument("--format", choices=("text", "json"), default="text")
     po = qsub.add_parser("oracle", help="success/failure string candidates + symsolve auto-connect")
     po.add_argument("binary"); po.add_argument("--store"); po.add_argument("--fast", action="store_true")
+    for flag in ("arch", "base", "entry"):
+        po.add_argument("--" + flag, help="explicit raw-code loader hint")
     po.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     po.add_argument("--format", choices=("text", "json"), default="text")
     pp = qsub.add_parser("pwn", help="static PWN capability card from profile facts; never claims runtime primitive PASS")
