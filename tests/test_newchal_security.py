@@ -83,5 +83,87 @@ class NewchalSecurityTests(unittest.TestCase):
                 self.assertFalse((home / "solve" / ("bad_%d" % index)).exists())
 
 
+class NewchalReservedNameTests(unittest.TestCase):
+    """R1-3: the main artifact must not claim a reserved scaffold basename, and a
+    rejection must leave any existing solve files untouched."""
+
+    def _kit(self, base):
+        home = base / "kit"
+        tools = home / "bin"
+        modules = tools / "ratlib"
+        template = home / "solve" / "_template"
+        modules.mkdir(parents=True)
+        template.mkdir(parents=True)
+        shutil.copy2(ROOT / "bin" / "newchal", tools / "newchal")
+        (template / "state.md").write_text("# {{NAME}}\nbinary={{BIN}}\nremote={{REMOTE}}\n", encoding="utf-8")
+        (modules / "kernel_identity.py").write_text('def inspect(path): return {"kind": "elf"}\n', encoding="utf-8")
+        (modules / "raw_loader.py").write_text('def inspect_raw(path): return {"kind": "unknown"}\n', encoding="utf-8")
+        (modules / "run_manifest.py").write_text(
+            'from pathlib import Path\n'
+            'def materialize_for_solve(source, destination, **kwargs):\n'
+            '    Path(destination).write_text("{}\\n")\n', encoding="utf-8")
+        for name in ("ctfguard", "libcgate", "recon"):
+            path = tools / name
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+        route = tools / "rat"
+        route.write_text('#!/bin/sh\necho \'{"diagnostics":[]}\'\n', encoding="utf-8")
+        route.chmod(0o755)
+        return home, tools
+
+    def test_reserved_main_artifact_names_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home, tools = self._kit(base)
+            env = {**os.environ, "CTF_HOME": str(home)}
+            for reserved in ("exploit.py", "run.json", "state.md", "Dockerfile", "libc.so.6"):
+                binary = base / reserved
+                binary.write_bytes(b"\x7fELFfixture")
+                name = "resv_" + reserved.replace(".", "_")
+                result = subprocess.run(
+                    ["bash", str(tools / "newchal"), name, str(binary)],
+                    env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, (reserved, result.stdout, result.stderr))
+                self.assertIn("reserved", result.stderr)
+                self.assertFalse((home / "solve" / name).exists())
+
+    def test_rejection_preserves_existing_solve_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home, tools = self._kit(base)
+            env = {**os.environ, "CTF_HOME": str(home)}
+            # Pre-existing solve dir with a hand-written exploit.
+            solve = home / "solve" / "keep"
+            solve.mkdir(parents=True)
+            exploit = solve / "exploit.py"
+            exploit.write_text("# my work\n", encoding="utf-8")
+            before = exploit.read_bytes()
+            binary = base / "exploit.py"   # reserved name -> must reject
+            binary.write_bytes(b"\x7fELFfixture")
+            result = subprocess.run(
+                ["bash", str(tools / "newchal"), "keep", str(binary)],
+                env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(exploit.read_bytes(), before)
+
+    def test_artifact_colliding_with_main_binary_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home, tools = self._kit(base)
+            env = {**os.environ, "CTF_HOME": str(home)}
+            binary = base / "chall"
+            binary.write_bytes(b"\x7fELFfixture")
+            # Separate dir so the --artifact source basename equals the binary's.
+            other = base / "d"
+            other.mkdir()
+            dup = other / "chall"
+            dup.write_bytes(b"decoy")
+            result = subprocess.run(
+                ["bash", str(tools / "newchal"), "dup", str(binary), "--artifact", "extra=%s" % dup],
+                env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("colliding", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

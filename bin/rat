@@ -27,6 +27,7 @@ from ratlib.route import (route as route_fn, SKILLS as ROUTE_SKILLS,
                           STRONG_OVERFLOW_IMPORTS as route_mod_STRONG,
                           WEAK_OVERFLOW_IMPORTS as route_mod_WEAK)
 from ratlib.route_feedback import load_feedback, record_query_result
+from ratlib.analysis import normalize_import
 from ratlib.runner import EXIT_OK, EXIT_USAGE, EXIT_DEPENDENCY, EXIT_INPUT
 from ratlib.schema import validate
 from ratlib.state_v2 import Stream
@@ -625,7 +626,9 @@ def _libc_match(binary_dir, libc_path, db_path=None):
 
 def _pwn_summary(profile):
     facts = {f.get("kind"): f.get("value") for f in (profile or {}).get("facts", []) or []}
-    imports = set((profile or {}).get("imports", []) or [])
+    # Normalize here too: a profile cached before import normalization may still
+    # carry `@GLIBC...` suffixes that would miss the clean sink spellings.
+    imports = {normalize_import(i) for i in ((profile or {}).get("imports", []) or [])}
     prot = {k: facts.get(k) for k in ("elf.nx", "elf.pie", "elf.canary", "elf.relro") if k in facts}
     sinks = sorted(imports & (route_mod_STRONG | route_mod_WEAK | {"printf", "fprintf", "malloc", "free", "system"}))
     return {"protections": prot, "sinks": sinks}

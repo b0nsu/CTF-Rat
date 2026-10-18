@@ -105,6 +105,25 @@ if [[ ! "$BN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [ "${#BN}" -gt 128 ]; then
 fi
 LIBC_ABS=""
 if [ -n "$LIBC" ]; then LIBC_ABS="$(resolve_path "$LIBC")"; fi
+# Reserved destination basenames the scaffold itself writes/produces. The main
+# artifact must not claim one of these, or scaffolding would silently overwrite
+# the operator's binary (or vice versa). libc.so.6 is reserved because --libc is
+# copied to that fixed name. (R1-3)
+RESERVED_NAMES=("run.json" "exploit.py" "state.md" "Dockerfile" "libc.so.6")
+for reserved in "${RESERVED_NAMES[@]}"; do
+  if [ "$BN" = "$reserved" ]; then
+    echo "[newchal:err] main artifact basename collides with reserved scaffold file: $BN" >&2
+    exit 2
+  fi
+done
+# A separate --libc input lands at ./libc.so.6; if the binary is also libc.so.6
+# the two destinations collide (already caught above), and if --libc's own source
+# basename equals the binary basename that too would clobber. Guard the binary
+# vs the libc destination explicitly.
+if [ -n "$LIBC_ABS" ] && [ "$BN" = "libc.so.6" ]; then
+  echo "[newchal:err] main artifact cannot be named libc.so.6 alongside --libc" >&2
+  exit 2
+fi
 # Validate additional inputs before writing to solve/.
 EXTRA_FILES=()
 EXTRA_NAMES=("$(basename "$BIN_ABS")" "$(basename "$BIN_ABS")_patched" "libc.so.6" "run.json" "exploit.py" "state.md" "Dockerfile")

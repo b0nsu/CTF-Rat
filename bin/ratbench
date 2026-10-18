@@ -35,6 +35,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -80,6 +81,14 @@ def _selected_suite_doc(entries):
 
 def _command_digest(command):
     return "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _file_digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
 
 
 def _flag_claimed(entry, agent_out):
@@ -267,6 +276,9 @@ def _compile(entry, workdir):
     return out if os.path.isfile(out) else None
 
 
+_FLAG_REGEX_OUTPUT_CAP = 1 << 16  # 64 KiB; a flag line is tiny, anything larger is anomalous
+
+
 def _verify_flag_regex(entry, binpath):
     if binpath is None:
         return "skipped", "no gcc/binary"
@@ -274,12 +286,25 @@ def _verify_flag_regex(entry, binpath):
     try:
         p = subprocess.run([binpath], input=stdin, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "verify-fail", "binary timed out"
     except Exception as exc:
         return "error", str(exc)
-    out = p.stdout.decode(errors="replace")
+    raw = p.stdout or b""
+    # Honest-mode: a non-zero exit is not a success even if the pattern appears,
+    # and a flood of output is anomalous, not a pass.  Bound the stored detail.
+    if len(raw) > _FLAG_REGEX_OUTPUT_CAP:
+        return "verify-fail", "output exceeded %d bytes (%d)" % (_FLAG_REGEX_OUTPUT_CAP, len(raw))
+    if p.returncode != 0:
+        return "verify-fail", "binary exit %d (not a success)" % p.returncode
+    out = raw.decode(errors="replace")
     if re.search(entry["verify"]["pattern"], out):
-        return "pass", out.strip().splitlines()[-1] if out.strip() else ""
+        last = out.strip().splitlines()[-1] if out.strip() else ""
+        return "pass", last[:200]
     return "fail", "pattern %r not in output" % entry["verify"]["pattern"]
+
+
+_SYMSOLVE_OUTPUT_CAP = 1 << 20  # 1 MiB of child stdout is more than enough for a human trace
 
 
 def _verify_symsolve(entry, binpath):
@@ -290,19 +315,45 @@ def _verify_symsolve(entry, binpath):
     v = entry["verify"]
     python = _angr_python()
     sym = os.path.join(ctf_home(), "bin", "symsolve")
-    cmd = [sym, binpath, "--find-str", v["find_str"],
-           "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)), "--printable"]
-    try:
-        env = os.environ.copy()
-        env["RAT_ANGR_PYTHON"] = python
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=180, env=env)
-    except Exception as exc:
-        return "error", str(exc)
-    out = p.stdout.decode(errors="replace")
-    if v["expected"] in out:
-        return "pass", v["expected"]
-    return "fail", "expected %r not recovered" % v["expected"]
+    with tempfile.TemporaryDirectory() as td:
+        result_path = os.path.join(td, "result.json")
+        cmd = [sym, binpath, "--find-str", v["find_str"],
+               "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)),
+               "--printable", "--result", result_path]
+        try:
+            env = os.environ.copy()
+            env["RAT_ANGR_PYTHON"] = python
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=180, env=env)
+        except subprocess.TimeoutExpired:
+            return "fail", "symsolve timed out"
+        except Exception as exc:
+            return "error", str(exc)
+        # Honest-mode: never trust stdout substrings.  Require (1) clean exit,
+        # (2) a well-formed result contract, (3) concrete_verify == pass,
+        # (4) the recovered solution to actually contain the expected answer.
+        if p.returncode != 0:
+            return "verify-fail", "symsolve exit %d (not a verified success)" % p.returncode
+        try:
+            with open(result_path, encoding="utf-8") as fh:
+                res = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return "verify-fail", "missing/malformed symsolve result: %s" % exc
+        if res.get("schema") != "rat.symsolve-result/v1":
+            return "verify-fail", "unexpected symsolve result schema %r" % res.get("schema")
+        if res.get("concrete_verify") != "pass" or not res.get("verified"):
+            return "verify-fail", "concrete_verify=%r (expected pass)" % res.get("concrete_verify")
+        # The expected plaintext must appear in a recovered symbol value.
+        expected = v["expected"]
+        recovered = []
+        for hexval in (res.get("solutions") or {}).values():
+            try:
+                recovered.append(bytes.fromhex(hexval))
+            except (ValueError, TypeError):
+                continue
+        if not any(expected.encode() in r for r in recovered):
+            return "verify-fail", "expected %r not in recovered solution" % expected
+        return "pass", expected
 
 
 def _verify(entry, binpath):
@@ -407,10 +458,50 @@ def _reject_external_symlinks(src):
                 raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % path)
 
 
+def _tracked_relpaths(src_root):
+    """Set of Git-tracked paths (relative to src_root), or None if this is not a
+    usable git checkout.  Used to keep ignored/untracked local files (e.g.
+    `knowledge/learned/{pwn,rev}/*.md`) out of the Mode B agent export (R1-1)."""
+    if not os.path.isdir(os.path.join(src_root, ".git")) and not os.path.exists(os.path.join(src_root, ".git")):
+        return None
+    try:
+        p = subprocess.run(["git", "-C", src_root, "ls-files", "-z"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    return {os.path.normpath(x) for x in p.stdout.decode("utf-8", "replace").split("\0") if x}
+
+
+def _copy_tracked_dir(src, dst_root, name, tracked, src_root):
+    """Copy only Git-tracked files under `name` into dst_root/name.  Fails closed
+    on symlink escape.  Untracked/ignored files are silently excluded."""
+    import shutil
+    rel_prefix = os.path.relpath(src, src_root)
+    copied = 0
+    for directory, subdirs, files in os.walk(src, followlinks=False):
+        for fname in files:
+            path = os.path.join(directory, fname)
+            rel = os.path.normpath(os.path.relpath(path, src_root))
+            if rel not in tracked:
+                continue  # untracked or gitignored -> never exported
+            if os.path.islink(path):
+                root = os.path.realpath(src)
+                if os.path.commonpath((root, os.path.realpath(path))) != root:
+                    raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % path)
+            target = os.path.join(dst_root, os.path.relpath(path, src_root))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(path, target)
+            copied += 1
+    return copied
+
+
 def _copy_runtime_export(dst_root):
     import shutil
     src_root = ctf_home()
     os.makedirs(dst_root, exist_ok=True)
+    tracked = _tracked_relpaths(src_root)
     for name in _RUNTIME_FILES:
         src = os.path.join(src_root, name)
         if os.path.isfile(src):
@@ -418,17 +509,45 @@ def _copy_runtime_export(dst_root):
                 target = os.path.realpath(src)
                 if target not in {os.path.realpath(os.path.join(src_root, item)) for item in _RUNTIME_FILES}:
                     raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % src)
+            if tracked is not None and os.path.normpath(name) not in tracked:
+                continue  # local-only top-level file: do not export
             shutil.copy2(src, os.path.join(dst_root, name))
     for name in _RUNTIME_DIRS:
         src = os.path.join(src_root, name)
         if os.path.isdir(src):
             _reject_external_symlinks(src)
-            shutil.copytree(src, os.path.join(dst_root, name), symlinks=False)
+            if tracked is not None:
+                _copy_tracked_dir(src, dst_root, name, tracked, src_root)
+            else:
+                # Not a git checkout (fresh unpack): fall back to a full copy but
+                # drop known local-only state so the agent tree stays answer-free.
+                shutil.copytree(src, os.path.join(dst_root, name), symlinks=False,
+                                ignore=_local_only_ignore)
     template = os.path.join(src_root, "solve", "_template")
     if os.path.isdir(template):
         _reject_external_symlinks(template)
         os.makedirs(os.path.join(dst_root, "solve"), exist_ok=True)
-        shutil.copytree(template, os.path.join(dst_root, "solve", "_template"), symlinks=False)
+        if tracked is not None:
+            _copy_tracked_dir(template, dst_root, os.path.join("solve", "_template"), tracked, src_root)
+        else:
+            shutil.copytree(template, os.path.join(dst_root, "solve", "_template"),
+                            symlinks=False, ignore=_local_only_ignore)
+
+
+def _local_only_ignore(directory, names):
+    """copytree ignore callback for the non-git fallback: drop private state and
+    distilled local lessons that must never reach the agent workspace."""
+    drop = set()
+    for n in names:
+        if n == ".rat" or n.endswith(".env"):
+            drop.add(n)
+    # Distilled lesson files live under knowledge/learned/{pwn,rev}; they are
+    # gitignored and must not be exported even without a git index.
+    base = os.path.basename(os.path.normpath(directory))
+    parent = os.path.basename(os.path.dirname(os.path.normpath(directory)))
+    if parent == "learned" and base in ("pwn", "rev"):
+        drop.update(n for n in names if n.endswith(".md"))
+    return drop
 
 
 def _flag_named_path(path):
@@ -474,22 +593,7 @@ def _prepare_eval_workspace(entry, sandbox):
     chal_dir = os.path.join(kit_root, "solve", entry["id"])
     os.makedirs(chal_dir, exist_ok=True)
 
-    binary_rel = entry.get("binary")
-    if binary_rel:
-        binary = _fixture_file(entry, binary_rel)
-        truth = {os.path.realpath(os.path.join(fixture_root, entry.get("source", "src.c"))),
-                 os.path.realpath(os.path.join(fixture_root, entry.get("route_fixture", "route.json")))}
-        if binary in truth:
-            raise ValueError("ground-truth file cannot be used as Mode B binary")
-        target = os.path.join(chal_dir, os.path.basename(binary_rel))
-        shutil.copy2(binary, target)
-    else:
-        built = _compile(entry, chal_dir)
-        if built is None:
-            raise RuntimeError("cannot materialize runtime binary (gcc/source unavailable)")
-        target = os.path.join(chal_dir, "chall")
-        os.replace(built, target)
-
+    chal_real = os.path.realpath(chal_dir)
     forbidden = {
         _runtime_fixture_relpath(entry.get("source", "src.c")),
         _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
@@ -498,6 +602,39 @@ def _prepare_eval_workspace(entry, sandbox):
         os.path.realpath(os.path.join(fixture_root, relpath))
         for relpath in forbidden
     }
+
+    # Compute every destination (binary + runtime files) up front so a collision
+    # -- the binary and a runtime file landing on the same path, or one nested
+    # inside another -- is rejected before any copy runs (R1-2).  `claimed` maps a
+    # normalized destination realpath to its origin label for diagnostics.
+    claimed = {}
+    def _claim(dst_real, label):
+        for other in claimed:
+            if dst_real == other:
+                raise ValueError("Mode B destination collision: %s and %s target %s"
+                                 % (label, claimed[other], dst_real))
+            # parent/child nesting is also a collision (a file cannot be both a
+            # directory and a regular file).
+            a, b = sorted((dst_real, other))
+            if b.startswith(a + os.sep):
+                raise ValueError("Mode B destination nests: %s (%s) under %s (%s)"
+                                 % (b, label, a, claimed[a if a == other else other]))
+        claimed[dst_real] = label
+
+    binary_rel = entry.get("binary")
+    binary_src = None
+    if binary_rel:
+        binary_src = _fixture_file(entry, binary_rel)
+        truth = {os.path.realpath(os.path.join(fixture_root, entry.get("source", "src.c"))),
+                 os.path.realpath(os.path.join(fixture_root, entry.get("route_fixture", "route.json")))}
+        if binary_src in truth:
+            raise ValueError("ground-truth file cannot be used as Mode B binary")
+        target = os.path.join(chal_dir, os.path.basename(binary_rel))
+    else:
+        target = os.path.join(chal_dir, "chall")
+    _claim(os.path.realpath(target), "binary")
+
+    runtime_plan = []  # (src, dst) computed and validated before any copy
     for relpath in entry.get("runtime_files", []) or []:
         normalized = _runtime_fixture_relpath(relpath)
         if normalized in forbidden:
@@ -508,10 +645,29 @@ def _prepare_eval_workspace(entry, sandbox):
         if src in forbidden_targets:
             raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
         dst = os.path.realpath(os.path.join(chal_dir, normalized))
-        if os.path.commonpath((os.path.realpath(chal_dir), dst)) != os.path.realpath(chal_dir):
+        if os.path.commonpath((chal_real, dst)) != chal_real:
             raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
+        _claim(dst, "runtime_file %s" % relpath)
+        runtime_plan.append((src, dst))
+
+    # Now materialize: binary first, then runtime files onto non-colliding paths.
+    if binary_rel:
+        shutil.copy2(binary_src, target)
+    else:
+        built = _compile(entry, chal_dir)
+        if built is None:
+            raise RuntimeError("cannot materialize runtime binary (gcc/source unavailable)")
+        os.replace(built, target)
+    binary_digest_before = _file_digest(target)
+
+    for src, dst in runtime_plan:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
+
+    # The binary must be byte-identical after runtime files were staged: a
+    # collision would have changed it (defence in depth beyond the pre-checks).
+    if _file_digest(target) != binary_digest_before:
+        raise RuntimeError("Mode B binary was modified after runtime-file staging")
 
     # Explicit invariant: the agent export never contains the benchmark tree.
     if os.path.exists(os.path.join(kit_root, "bench")):

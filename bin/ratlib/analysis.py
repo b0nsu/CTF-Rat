@@ -148,6 +148,70 @@ def _profile_cache_lookup(r, bdig, environment, dependencies=None):
         return idx,keys,profile_doc,(profile_art,strings_art),pe.get("source_invocation")
     except Exception:
         return None,None,None,None,None
+def normalize_import(name):
+    """Canonical import name: drop ELF version suffixes (`gets@GLIBC_2.2.5`,
+    `gets@@GLIBC_2.2.5`) so a single spelling feeds both the dangerous-import
+    signal and downstream sink matching (rat `_pwn_summary`)."""
+    if not name: return name
+    return name.split("@",1)[0]
+def _elf_header_type(readelf_h):
+    """Return 'exec' | 'dyn' | None from `readelf -h` ELF header `Type:` line.
+    We read the real header field rather than substring-matching the whole
+    dump, where 'DYN' also appears inside 'DYNAMIC' for non-PIE binaries."""
+    for line in readelf_h.splitlines():
+        s=line.strip()
+        if s.startswith("Type:"):
+            val=s.split(":",1)[1].strip().upper()
+            if val.startswith("EXEC"): return "exec"
+            if val.startswith("DYN"): return "dyn"
+            if val.startswith("REL"): return "rel"
+            if val.startswith("CORE"): return "core"
+            return None
+    return None
+def _elf_protections(readelf_h, readelf_l):
+    """PIE/NX/RELRO from the ELF header type and program headers.
+    PIE is true only for an executable ET_DYN (interp present); a non-PIE
+    ET_EXEC with a DYNAMIC segment is not PIE.  Returns (facts, pie_known)."""
+    etype=_elf_header_type(readelf_h)
+    facts=[]
+    # PIE: executable DYN only.  ET_EXEC -> False; unknown header -> omit.
+    if etype=="exec":
+        facts.append({"kind":"elf.pie","value":False,"quality":"direct"})
+    elif etype=="dyn":
+        facts.append({"kind":"elf.pie","value":True,"quality":"direct"})
+    # NX: a GNU_STACK program header whose flags lack 'E' (executable).
+    stack_lines=[ln for ln in readelf_l.splitlines() if "GNU_STACK" in ln]
+    if stack_lines:
+        flags=_phdr_flags(stack_lines[0])
+        facts.append({"kind":"elf.nx","value":"E" not in flags,"quality":"direct"})
+    else:
+        # No GNU_STACK header: toolchain default is a non-exec stack on modern
+        # ld, but we cannot prove it from headers -> report unknown by omission.
+        pass
+    # RELRO: GNU_RELRO program header present (full vs partial not distinguished
+    # here; BIND_NOW would require .dynamic FLAGS parsing).
+    facts.append({"kind":"elf.relro","value":any("GNU_RELRO" in ln for ln in readelf_l.splitlines()),"quality":"direct"})
+    return facts, etype in ("exec","dyn")
+def _phdr_flags(line):
+    """Extract the flag column (e.g. 'RW', 'RWE', 'R E') from a `readelf -lW`
+    program-header line.  Flags are single letters among R/W/E after the sizes."""
+    m=re.search(r"0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+([RWE ]{1,3})\s+0x",line)
+    if m: return m.group(1).replace(" ","")
+    # Fallback: last run of R/W/E letters before the alignment column.
+    m=re.search(r"\b([RWE]{1,3})\b\s+0x[0-9a-fA-F]+\s*$",line.strip())
+    return m.group(1) if m else ""
+def _elf_undefined_imports(readelf_s):
+    """Collect only UND dynamic symbols (external imports) from `readelf -sW`,
+    normalized to drop version suffixes and deduplicated, order-stable."""
+    out=[]; seen=set()
+    for line in readelf_s.splitlines():
+        # Symbol-table rows: "<num>: <value> <size> <type> <bind> <vis> UND <name>"
+        m=re.match(r"\s*\d+:\s+[0-9a-fA-F]+\s+\d+\s+\S+\s+\S+\s+\S+\s+UND\s+(\S+)",line)
+        if not m: continue
+        name=normalize_import(m.group(1))
+        if not name or name in seen: continue
+        seen.add(name); out.append(name)
+    return out
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
     r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary); environment=profile_environment(a); dependencies=_profile_dependency_identity()
@@ -167,18 +231,28 @@ def profile(a):
     else:
         cache_state="miss"; facts=[]; signals=[]; routes=[]
         fileout=command(["file","--",a.binary],a.timeout).stdout.preview.decode(errors="replace").strip()
-        readelf=command(["readelf","-hW","-lW","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
-        is_elf=fileout.startswith("ELF ")
+        # `file` prepends "<path>: " to the description; the path is the operator's,
+        # not evidence, so detect ELF from the description after the first ": ".
+        file_desc=fileout.split(": ",1)[1] if ": " in fileout else fileout
+        readelf_h=command(["readelf","-hW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        readelf_l=command(["readelf","-lW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        readelf_s=command(["readelf","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        is_elf=file_desc.startswith("ELF ") or _elf_header_type(readelf_h) in ("exec","dyn","rel","core")
         facts.append({"kind":"format","value":fileout,"quality":"direct"})
         if is_elf:
-            facts.extend([{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
-        imports=re.findall(r"\b(?:UND\s+)?([_A-Za-z][\w@.]*)$",readelf,re.M)
+            prot_facts,_=_elf_protections(readelf_h,readelf_l)
+            facts.extend(prot_facts)
+        imports=_elf_undefined_imports(readelf_s) if is_elf else []
         strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        import_set=set(imports)
         for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
-            if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
+            if api in import_set: signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
         if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
         arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
-    is_elf=next((f["value"] for f in facts if f["kind"]=="format"),"").startswith("ELF ")
+    # ELF is proven by a recorded protection fact (elf.pie/nx/relro), which is
+    # only emitted for an ELF; this survives both miss and hit paths without
+    # re-parsing the path-prefixed `file` string.
+    is_elf=any(f["kind"].startswith("elf.") for f in facts)
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
     doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state

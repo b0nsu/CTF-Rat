@@ -476,6 +476,82 @@ class RatbenchIsolationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "escapes CTF_HOME"):
                     ratbench._prepare_eval_workspace(entry, os.path.join(root, "sandbox"))
 
+    def _git_root(self, root):
+        import subprocess
+        subprocess.run(["git", "init", "-q", root], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", root, "config", "user.name", "t"], check=True)
+
+    def test_mode_b_export_excludes_untracked_local_lessons(self):
+        """R1-1: a gitignored local lesson must not reach the agent export."""
+        import subprocess
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            self._git_root(root)
+            os.makedirs(os.path.join(root, "knowledge", "learned", "pwn"))
+            os.makedirs(os.path.join(root, "bin"))
+            with open(os.path.join(root, ".gitignore"), "w") as fh:
+                fh.write("knowledge/learned/pwn/*.md\n")
+            tracked = os.path.join(root, "knowledge", "GROUNDING_INDEX.md")
+            with open(tracked, "w") as fh:
+                fh.write("# index\n")
+            with open(os.path.join(root, "bin", "rat"), "w") as fh:
+                fh.write("#!/bin/sh\n")
+            with open(os.path.join(root, "knowledge", "learned", "pwn", ".gitkeep"), "w") as fh:
+                fh.write("")
+            subprocess.run(["git", "-C", root, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "init"], check=True)
+            # Plant an ignored local-only lesson AFTER the commit.
+            leak = os.path.join(root, "knowledge", "learned", "pwn", "SECRET.md")
+            with open(leak, "w") as fh:
+                fh.write("local only lesson\n")
+            kit = os.path.join(sandbox, "kit")
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                ratbench._copy_runtime_export(kit)
+            self.assertFalse(os.path.exists(
+                os.path.join(kit, "knowledge", "learned", "pwn", "SECRET.md")))
+            self.assertTrue(os.path.exists(os.path.join(kit, "knowledge", "GROUNDING_INDEX.md")))
+            self.assertTrue(os.path.exists(os.path.join(kit, "bin", "rat")))
+
+    def test_mode_b_rejects_runtime_file_colliding_with_binary(self):
+        """R1-2: a runtime_file whose destination equals the binary's is refused
+        before any copy, so the binary is never overwritten."""
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            fixture = os.path.join(root, "bench", "artifacts", "case")
+            os.makedirs(os.path.join(root, "bin"))
+            os.makedirs(os.path.join(fixture, "artifacts"))
+            # binary at artifacts/chall; a sibling runtime file literally named chall.
+            with open(os.path.join(fixture, "artifacts", "chall"), "wb") as fh:
+                fh.write(b"REAL-BINARY")
+            with open(os.path.join(fixture, "chall"), "wb") as fh:
+                fh.write(b"DECOY")
+            entry = {
+                "id": "case", "dir": "bench/artifacts/case", "binary": "artifacts/chall",
+                "runtime_files": ["chall"],
+            }
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                with self.assertRaisesRegex(ValueError, "collision"):
+                    ratbench._prepare_eval_workspace(entry, sandbox)
+
+    def test_mode_b_accepts_binary_with_noncolliding_runtime_file(self):
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            fixture = os.path.join(root, "bench", "artifacts", "case")
+            os.makedirs(os.path.join(root, "bin"))
+            os.makedirs(fixture)
+            with open(os.path.join(fixture, "chall"), "wb") as fh:
+                fh.write(b"REAL-BINARY")
+            with open(os.path.join(fixture, "input.txt"), "wb") as fh:
+                fh.write(b"runtime input")
+            entry = {"id": "case", "dir": "bench/artifacts/case", "binary": "chall",
+                     "runtime_files": ["input.txt"]}
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                kit_root, chal_dir, binary = ratbench._prepare_eval_workspace(entry, sandbox)
+            with open(binary, "rb") as fh:
+                self.assertEqual(fh.read(), b"REAL-BINARY")
+            self.assertTrue(os.path.isfile(os.path.join(chal_dir, "input.txt")))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -657,5 +657,111 @@ class ModeBV2RecordTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "bench", "LEADERBOARD.v3.md")))
 
 
+import shutil
+
+
+@unittest.skipUnless(shutil.which("gcc"), "gcc required for flag-regex verify fixture")
+class FlagRegexVerifyHonesty(unittest.TestCase):
+    """R0-2: flag-regex must require a clean exit and a bounded output, never a
+    pattern match on failing/huge output."""
+
+    def _build(self, body):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        src = os.path.join(d, "f.c")
+        with open(src, "w") as fh:
+            fh.write(body)
+        exe = os.path.join(d, "f")
+        subprocess.run(["gcc", "-w", "-O0", src, "-o", exe], check=True)
+        return exe
+
+    def test_pattern_match_with_nonzero_exit_is_not_success(self):
+        exe = self._build('#include <stdio.h>\nint main(){puts("FLAG{x}");return 1;}\n')
+        entry = {"verify": {"kind": "flag-regex", "pattern": r"FLAG\{.+\}"}}
+        status, detail = RATBENCH._verify_flag_regex(entry, exe)
+        self.assertEqual(status, "verify-fail")
+        self.assertIn("exit 1", detail)
+
+    def test_clean_exit_and_match_passes(self):
+        exe = self._build('#include <stdio.h>\nint main(){puts("FLAG{ok}");return 0;}\n')
+        entry = {"verify": {"kind": "flag-regex", "pattern": r"FLAG\{.+\}"}}
+        status, detail = RATBENCH._verify_flag_regex(entry, exe)
+        self.assertEqual(status, "pass")
+
+    def test_output_flood_is_rejected(self):
+        # Prints far more than the cap, then exits 0 with the pattern present.
+        exe = self._build('#include <stdio.h>\nint main(){for(long i=0;i<200000;i++)puts("FLAG{x}");return 0;}\n')
+        entry = {"verify": {"kind": "flag-regex", "pattern": r"FLAG\{.+\}"}}
+        status, detail = RATBENCH._verify_flag_regex(entry, exe)
+        self.assertEqual(status, "verify-fail")
+        self.assertIn("exceeded", detail)
+
+
+class SymsolveVerifyHonesty(unittest.TestCase):
+    """R0-3: symsolve-restore must require exit 0 + a result contract with
+    concrete_verify==pass + the expected plaintext in a recovered solution.
+    Fake successes (stdout string with exit 1, missing/mismatched contract) fail."""
+
+    ENTRY = {"verify": {"kind": "symsolve-restore", "expected": "s3cr3t",
+                        "find_str": "FLAG", "avoid_str": "Wrong", "stdin_len": 6}}
+
+    def _patched(self, returncode, result_doc):
+        """Run _verify_symsolve with subprocess.run and angr stubbed so we drive
+        only the consumer-side contract checks deterministically."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def ctx():
+            def fake_run(cmd, **kw):
+                # cmd carries "--result <path>"; write the fixture doc there.
+                rp = cmd[cmd.index("--result") + 1]
+                if result_doc is not None:
+                    with open(rp, "w") as fh:
+                        json.dump(result_doc, fh)
+                return SimpleNamespace(returncode=returncode, stdout=b"FLAG recovered: s3cr3t\n")
+            with mock.patch.object(RATBENCH.subprocess, "run", fake_run), \
+                 mock.patch.object(RATBENCH, "_have_angr", return_value=True), \
+                 mock.patch.object(RATBENCH, "_angr_python", return_value="python3"):
+                yield
+        return ctx()
+
+    def _good_doc(self, **over):
+        doc = {"schema": "rat.symsolve-result/v1", "found": True,
+               "concrete_verify": "pass", "verified": True,
+               "solutions": {"stdin": b"s3cr3t".hex()}}
+        doc.update(over)
+        return doc
+
+    def test_stdout_string_with_nonzero_exit_is_not_success(self):
+        with self._patched(1, self._good_doc()):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+
+    def test_missing_result_contract_fails(self):
+        with self._patched(0, None):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+
+    def test_concrete_verify_mismatch_fails(self):
+        with self._patched(0, self._good_doc(concrete_verify="fail", verified=False)):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+
+    def test_skipped_verify_is_not_success(self):
+        with self._patched(0, self._good_doc(concrete_verify="skipped", verified=False)):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+
+    def test_wrong_solution_fails_even_if_contract_passes(self):
+        with self._patched(0, self._good_doc(solutions={"stdin": b"wrong!".hex()})):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+
+    def test_full_pass_contract_and_solution(self):
+        with self._patched(0, self._good_doc()):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "pass")
+
+
 if __name__ == "__main__":
     unittest.main()
