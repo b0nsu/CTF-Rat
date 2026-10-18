@@ -450,6 +450,28 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertEqual(doc["ground_truth"]["corpus"], "private")
         self.assertEqual(doc["ground_truth"]["capabilities"], ["stack-overflow"])
         self.assertFalse(doc["ground_truth"]["redistributable"])
+
+    def test_output_overflow_override_is_not_verified_even_with_prior_completion(self):
+        # R2-5 (re-open #2): on an output flood cmd_eval passes an overridden
+        # completion (verified=False) and flag_claimed=False; the v3 record must not
+        # report a verified/solved outcome even though a verification event exists.
+        events = [
+            {"type": "verification.recorded", "at": "2026-08-29T00:00:05+00:00",
+             "payload": {"verification_id": "verify_1"}},
+        ]
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-test", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:06+00:00",
+            agent_rc=125, flag_claimed=False,
+            completion={"verified": False, "reason": "output cap exceeded; run untrusted",
+                        "verification_id": "verify_1"},
+            events=events, primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance(), routing_metrics=_routing(),
+        )
+        RATBENCH.validate(doc, "rat.benchmark-result/v3")
+        self.assertNotEqual(doc["outcome"], "verified")
+        self.assertFalse(doc["metrics"]["correctness"]["verified_solve"])
         self.assertEqual(doc["provenance"], _provenance())
         self.assertEqual(doc["routing"], _routing())
 
@@ -814,21 +836,21 @@ class SymsolveVerifyHonesty(unittest.TestCase):
     ENTRY = {"verify": {"kind": "symsolve-restore", "expected": "s3cr3t",
                         "find_str": "FLAG", "avoid_str": "Wrong", "stdin_len": 6}}
 
-    def _patched(self, returncode, result_doc):
-        """Run _verify_symsolve with subprocess.run and angr stubbed so we drive
-        only the consumer-side contract checks deterministically."""
+    def _patched(self, returncode, result_doc, overflow=False):
+        """Run _verify_symsolve with the bounded child runner and angr stubbed so we
+        drive only the consumer-side contract checks deterministically."""
         import contextlib
 
         @contextlib.contextmanager
         def ctx():
-            def fake_run(cmd, **kw):
+            def fake_run_capped(cmd, **kw):
                 # cmd carries "--result <path>"; write the fixture doc there.
                 rp = cmd[cmd.index("--result") + 1]
                 if result_doc is not None:
                     with open(rp, "w") as fh:
                         json.dump(result_doc, fh)
-                return SimpleNamespace(returncode=returncode, stdout=b"FLAG recovered: s3cr3t\n")
-            with mock.patch.object(RATBENCH.subprocess, "run", fake_run), \
+                return (returncode, b"FLAG recovered: s3cr3t\n", overflow)
+            with mock.patch.object(RATBENCH, "_run_capped", fake_run_capped), \
                  mock.patch.object(RATBENCH, "_have_angr", return_value=True), \
                  mock.patch.object(RATBENCH, "_angr_python", return_value="python3"):
                 yield
@@ -870,6 +892,30 @@ class SymsolveVerifyHonesty(unittest.TestCase):
         with self._patched(0, self._good_doc()):
             status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
         self.assertEqual(status, "pass")
+
+    def test_non_object_result_is_verify_fail_not_crash(self):
+        # R0-3 (re-open #3): a list/null/string top-level result must be a bounded
+        # verify-fail, never an AttributeError.
+        for doc in ([], None, "nope", 42):
+            with self.subTest(doc=doc):
+                with self._patched(0, doc):
+                    status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+                self.assertEqual(status, "verify-fail")
+
+    def test_non_object_solutions_is_verify_fail_not_crash(self):
+        # R0-3 (re-open #3): solutions must be an object; a list would crash on
+        # .values() otherwise.
+        with self._patched(0, self._good_doc(solutions=[b"s3cr3t".hex()])):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+        self.assertIn("solutions", detail)
+
+    def test_symsolve_output_overflow_is_verify_fail(self):
+        # R2-5 (re-open #5): symsolve child output flood -> verify-fail, never pass.
+        with self._patched(0, self._good_doc(), overflow=True):
+            status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
+        self.assertEqual(status, "verify-fail")
+        self.assertIn("exceeded", detail)
 
 
 @unittest.skipUnless(RATBENCH._have("gcc"), "needs gcc to distinguish compile-failure from skip")

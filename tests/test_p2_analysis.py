@@ -180,6 +180,22 @@ class ProfileElfProtections(unittest.TestCase):
   _,prof=self._profile(exe,"--no-cache")
   facts={f["kind"]:f["value"] for f in prof["facts"]}
   self.assertEqual(facts.get("elf.pie"),True)
+ def test_shared_object_not_claimed_as_pie(self):
+  # R0-1 (re-open #4): a shared library is ET_DYN with no INTERP; it must not be
+  # asserted as PIE, while NX/RELRO still report. PIE is omitted (unknown), not false.
+  libsrc=self.work/"lib.c"; libsrc.write_text("int add(int a,int b){return a+b;}\n")
+  so=self.work/"libfoo.so"
+  subprocess.run(["gcc","-shared","-fPIC",str(libsrc),"-o",str(so)],check=True)
+  p=subprocess.run([str(BIN/"rat-profile"),str(so),"--store",str(self.store),"--format","json","--no-cache"],
+                   text=True,capture_output=True)
+  self.assertEqual(p.returncode,0,p.stderr)
+  doc=json.loads(p.stdout); validate(doc,"rat.tool-result/v1")
+  get=__import__("ratlib.artifact",fromlist=["get"]).get
+  prof=json.loads(get(doc["artifacts"][0]["digest"],root=str(self.store)))
+  facts={f["kind"]:f["value"] for f in prof["facts"]}
+  self.assertNotIn("elf.pie",facts)  # ambiguous DYN-without-INTERP -> omitted
+  self.assertEqual(facts.get("elf.nx"),True)
+  self.assertIn("elf.relro",facts)
  def test_miss_and_hit_agree(self):
   exe=self._compile("c","-no-pie","-fno-pie")
   d1,p1=self._profile(exe); self.assertEqual(d1["cache_state"],"miss")

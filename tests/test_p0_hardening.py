@@ -513,6 +513,59 @@ class RatbenchIsolationTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(kit, "knowledge", "GROUNDING_INDEX.md")))
             self.assertTrue(os.path.exists(os.path.join(kit, "bin", "rat")))
 
+    def test_mode_b_export_does_not_follow_tracked_symlink_to_untracked_target(self):
+        """R1-1 (re-open #1): a tracked symlink whose target is untracked/gitignored
+        must not leak the target's content through shutil.copy2 following the link."""
+        import subprocess
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            self._git_root(root)
+            os.makedirs(os.path.join(root, "knowledge"))
+            os.makedirs(os.path.join(root, "bin"))
+            with open(os.path.join(root, ".gitignore"), "w") as fh:
+                fh.write("knowledge/local-secret.txt\n")
+            with open(os.path.join(root, "knowledge", "local-secret.txt"), "w") as fh:
+                fh.write("TOP SECRET LESSON\n")
+            os.symlink("local-secret.txt",
+                       os.path.join(root, "knowledge", "tracked-link.txt"))
+            with open(os.path.join(root, "bin", "rat"), "w") as fh:
+                fh.write("#!/bin/sh\n")
+            subprocess.run(["git", "-C", root, "add", "knowledge/tracked-link.txt",
+                            ".gitignore", "bin/rat"], check=True)
+            subprocess.run(["git", "-C", root, "commit", "-qm", "init"], check=True)
+            kit = os.path.join(sandbox, "kit")
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                ratbench._copy_runtime_export(kit)
+            linked = os.path.join(kit, "knowledge", "tracked-link.txt")
+            if os.path.exists(linked):
+                with open(linked) as fh:
+                    self.assertNotIn("SECRET", fh.read())  # must not leak target content
+            self.assertFalse(os.path.exists(
+                os.path.join(kit, "knowledge", "local-secret.txt")))
+
+    def test_non_git_export_excludes_gitignored_sentinel(self):
+        """R1-1 (re-open #1): without a git index, the fallback must still exclude
+        arbitrary .gitignored paths, not just a hardcoded denylist."""
+        ratbench = load_ratbench()
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as sandbox:
+            # No `git init` -> _tracked_relpaths returns None -> fallback path.
+            os.makedirs(os.path.join(root, "knowledge", "private"))
+            os.makedirs(os.path.join(root, "bin"))
+            with open(os.path.join(root, ".gitignore"), "w") as fh:
+                fh.write("knowledge/private/\n")
+            with open(os.path.join(root, "knowledge", "private", "ignored-sentinel.txt"), "w") as fh:
+                fh.write("local only\n")
+            with open(os.path.join(root, "knowledge", "GROUNDING_INDEX.md"), "w") as fh:
+                fh.write("# index\n")
+            with open(os.path.join(root, "bin", "rat"), "w") as fh:
+                fh.write("#!/bin/sh\n")
+            kit = os.path.join(sandbox, "kit")
+            with patch.object(ratbench, "ctf_home", return_value=root):
+                ratbench._copy_runtime_export(kit)
+            self.assertFalse(os.path.exists(
+                os.path.join(kit, "knowledge", "private", "ignored-sentinel.txt")))
+            self.assertTrue(os.path.exists(os.path.join(kit, "knowledge", "GROUNDING_INDEX.md")))
+
     def test_mode_b_rejects_runtime_file_colliding_with_binary(self):
         """R1-2: a runtime_file whose destination equals the binary's is refused
         before any copy, so the binary is never overwritten."""

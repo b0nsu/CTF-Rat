@@ -174,10 +174,15 @@ def _elf_protections(readelf_h, readelf_l):
     ET_EXEC with a DYNAMIC segment is not PIE.  Returns (facts, pie_known)."""
     etype=_elf_header_type(readelf_h)
     facts=[]
-    # PIE: executable DYN only.  ET_EXEC -> False; unknown header -> omit.
+    has_interp=any("INTERP" in ln for ln in readelf_l.splitlines())
+    # PIE: ET_EXEC -> False.  ET_DYN is PIE only when it is an *executable* DYN,
+    # evidenced by an INTERP program header; a shared object (.so) is ET_DYN with
+    # no INTERP and must not be asserted as PIE (R0-1).  An ET_DYN without INTERP
+    # is ambiguous (shared object vs static-PIE executable), so omit PIE rather
+    # than claim a direct fact.  Unknown header -> omit.
     if etype=="exec":
         facts.append({"kind":"elf.pie","value":False,"quality":"direct"})
-    elif etype=="dyn":
+    elif etype=="dyn" and has_interp:
         facts.append({"kind":"elf.pie","value":True,"quality":"direct"})
     # NX: a GNU_STACK program header whose flags lack 'E' (executable).
     stack_lines=[ln for ln in readelf_l.splitlines() if "GNU_STACK" in ln]
@@ -191,7 +196,7 @@ def _elf_protections(readelf_h, readelf_l):
     # RELRO: GNU_RELRO program header present (full vs partial not distinguished
     # here; BIND_NOW would require .dynamic FLAGS parsing).
     facts.append({"kind":"elf.relro","value":any("GNU_RELRO" in ln for ln in readelf_l.splitlines()),"quality":"direct"})
-    return facts, etype in ("exec","dyn")
+    return facts, etype=="exec" or (etype=="dyn" and has_interp)
 def _phdr_flags(line):
     """Extract the flag column (e.g. 'RW', 'RWE', 'R E') from a `readelf -lW`
     program-header line.  Flags are single letters among R/W/E after the sizes."""
