@@ -200,6 +200,162 @@ def copy_relocations(binary):
             for addr, symbol, kind in sorted(copies)], None
 
 
+
+def parse_from_image(from_line_text):
+    """Extract the image reference from a Dockerfile FROM line, preferring a
+    pinned @sha256 digest. Returns (reference, pinned_bool) or (None, False)."""
+    if not from_line_text:
+        return None, False
+    # drop leading FROM and any "--platform=..." / "AS name"
+    rest = from_line_text.strip()
+    rest = re.sub(r"^FROM\s+", "", rest, flags=re.I)
+    rest = re.sub(r"^--\S+\s+", "", rest)  # --platform=...
+    rest = re.split(r"\s+AS\s+", rest, flags=re.I)[0].strip()
+    token = rest.split()[0] if rest else ""
+    if not token or token.lower() == "scratch":
+        return None, False
+    # A digest pin is repo[:tag]@sha256:...  — keep the whole ref (docker accepts repo@sha256:)
+    m = re.search(r"@sha256:[0-9a-fA-F]{64}", token)
+    if m:
+        # docker create accepts "repo@sha256:..."; strip a tag before @ if both present
+        ref = re.sub(r":[^@/]+@sha256:", "@sha256:", token)
+        return ref, True
+    return token, False
+
+
+_LIBC_IN_IMAGE = (
+    "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6",
+    "/lib/i386-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6",
+    "/lib/libc.so.6",
+    "/usr/lib/libc.so.6",
+)
+_LOADER_IN_IMAGE = (
+    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/i386-linux-gnu/ld-linux.so.2",
+    "/usr/lib/i386-linux-gnu/ld-linux.so.2",
+    "/lib/ld-linux.so.2",
+    "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-aarch64.so.1",
+)
+
+
+def _build_id(path):
+    """Return the GNU build-id hex of an ELF, or None (readelf-based, bounded)."""
+    readelf = shutil.which("readelf")
+    if not readelf:
+        return None
+    try:
+        out = subprocess.run([readelf, "-n", "--", path], capture_output=True,
+                             text=True, timeout=10, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"Build ID:\s*([0-9a-f]+)", out.stdout)
+    return m.group(1) if m else None
+
+
+def _docker_cp_first(container, candidates, dest):
+    """Try docker cp for each candidate path; return the image path copied, or None."""
+    docker = shutil.which("docker")
+    for src_path in candidates:
+        try:
+            r = subprocess.run([docker, "cp", "%s:%s" % (container, src_path), dest],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and os.path.isfile(dest) and not os.path.islink(dest):
+            return src_path
+        # docker cp of a symlink target: if dest is a symlink or dir, clean up
+        if os.path.lexists(dest) and not os.path.isfile(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+    return None
+
+
+def extract_from_image(root):
+    """Extract libc/loader from the Dockerfile's pinned base image into ``root``
+    and record them as run.json inputs. Loud failure, never a host fallback.
+    Returns (text, exit_code)."""
+    root = os.path.abspath(root)
+    lines = ["== libcgate extract: %s ==" % root]
+    dockerfiles, _, _ = find_files(root)
+    if not dockerfiles:
+        return "\n".join(lines + ["ERROR: no Dockerfile found; nothing to extract."]), 1
+    dockerfile = dockerfiles[0]
+    ref, pinned = parse_from_image(from_line(dockerfile))
+    if not ref:
+        return "\n".join(lines + [
+            "ERROR: Dockerfile FROM did not yield an extractable image reference."]), 1
+    lines.append("FROM image: %s%s" % (ref, "" if pinned else "  (WARN: not @sha256-pinned)"))
+    docker = shutil.which("docker")
+    if not docker:
+        lines.append("ERROR: docker not available; cannot extract the challenge libc.")
+        lines.append("Do NOT assume the host libc matches. Install docker or supply libc/ld manually.")
+        return "\n".join(lines), 2
+    # create a container (pulls if needed) without running it
+    try:
+        created = subprocess.run([docker, "create", "--", ref], capture_output=True,
+                                 text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        lines.append("ERROR: docker create failed (%s). No host fallback." % type(exc).__name__)
+        return "\n".join(lines), 2
+    if created.returncode != 0:
+        lines.append("ERROR: docker create failed: %s" % created.stderr.strip()[:300])
+        lines.append("No host libc fallback; resolve image access and retry.")
+        return "\n".join(lines), 2
+    container = created.stdout.strip()
+    extracted = []
+    try:
+        libc_dest = os.path.join(root, "libc_docker.so.6")
+        libc_src = _docker_cp_first(container, _LIBC_IN_IMAGE, libc_dest)
+        if libc_src:
+            extracted.append(("libc", libc_dest, libc_src))
+        ld_dest = os.path.join(root, "ld_docker.so")
+        ld_src = _docker_cp_first(container, _LOADER_IN_IMAGE, ld_dest)
+        if ld_src:
+            extracted.append(("loader", ld_dest, ld_src))
+    finally:
+        subprocess.run([docker, "rm", "-f", "--", container], capture_output=True,
+                       text=True, timeout=60)
+    if not any(role == "libc" for role, _, _ in extracted):
+        lines.append("ERROR: could not extract libc.so.6 from the image (tried known paths).")
+        lines.append("No host libc fallback; inspect the image layout and extend the path list.")
+        return "\n".join(lines), 2
+    # describe + record as run.json inputs
+    manifest_path = os.path.join(root, "run.json")
+    recorded = []
+    for role, dest, src in extracted:
+        ver = libc_version(dest) if role == "libc" else None
+        bid = _build_id(dest)
+        lines.append("extracted %s: %s (from %s)%s%s" % (
+            role, os.path.relpath(dest, root), src,
+            "  glibc=%s" % ver if ver else "",
+            "  build-id=%s" % bid if bid else ""))
+    try:
+        from ratlib.run_manifest import read as _read, atomic_write as _write, _input as _mk_input
+        if os.path.isfile(manifest_path):
+            manifest = _read(manifest_path)
+            inputs = manifest.setdefault("inputs", [])
+            for role, dest, _src in extracted:
+                name = os.path.basename(dest)
+                inputs[:] = [i for i in inputs if not (i.get("role") == role and i.get("name") == name)]
+                inputs.append(_mk_input(role, dest))
+                recorded.append(name)
+            _write(manifest_path, manifest)
+            lines.append("recorded as run.json inputs: %s" % ", ".join(recorded))
+        else:
+            lines.append("NOTE: no run.json present; files written but not recorded as inputs.")
+    except Exception as exc:  # run_manifest optional; extraction already succeeded
+        lines.append("WARN: could not update run.json inputs (%s)." % type(exc).__name__)
+    return "\n".join(lines), 0
+
+
 def audit(root):
     root = os.path.abspath(root)
     old = os.getcwd()
@@ -227,7 +383,7 @@ def audit(root):
         else:
             lines.append("  - none")
             if dockerfiles:
-                warnings.append("Dockerfile exists but no extracted libc candidate was found in this directory.")
+                warnings.append("Dockerfile exists but no extracted libc candidate was found; run 'libcgate --extract' to pull it from the pinned image (no host fallback).")
 
         lines.append("loader candidates:")
         if loaders:
@@ -290,6 +446,32 @@ def selftest():
         assert "glibc=2.35" in out
         assert "host loader" in out
         assert rc == 1
+
+    # parse_from_image: prefer @sha256 pin, strip --platform/AS, reject scratch
+    ref, pinned = parse_from_image("FROM ubuntu:24.04@sha256:" + "a" * 64)
+    assert pinned and ref == "ubuntu@sha256:" + "a" * 64, ref
+    ref, pinned = parse_from_image("FROM --platform=linux/amd64 x:1@sha256:" + "b" * 64 + " AS base")
+    assert pinned and ref == "x@sha256:" + "b" * 64, ref
+    ref, pinned = parse_from_image("FROM ubuntu:22.04")
+    assert ref == "ubuntu:22.04" and not pinned, ref
+    assert parse_from_image("FROM scratch") == (None, False)
+
+    # extract-from-image is loud on missing Dockerfile and never falls back to host libc
+    with tempfile.TemporaryDirectory() as d:
+        out, rc = extract_from_image(d)
+        assert rc == 1 and "no Dockerfile" in out, (rc, out)
+    # when docker is absent, extraction fails loudly (exit 2) rather than guessing the host libc
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "Dockerfile"), "w") as f:
+            f.write("FROM ubuntu:22.04@sha256:" + "c" * 64 + "\n")
+        saved = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = ""  # hide docker/readelf/etc from shutil.which
+            out, rc = extract_from_image(d)
+        finally:
+            os.environ["PATH"] = saved
+        assert rc == 2 and "docker not available" in out and "host libc" in out, (rc, out)
+
     print("[libcgate] selftest ALL GREEN")
 
 
@@ -297,10 +479,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--extract", action="store_true",
+                    help="extract libc/ld from the Dockerfile pinned image into the challenge dir")
     args = ap.parse_args()
     if args.selftest:
         selftest()
         return 0
+    if args.extract:
+        out, rc = extract_from_image(args.path)
+        print(out)
+        return rc
     out, rc = audit(args.path)
     print(out)
     return rc
