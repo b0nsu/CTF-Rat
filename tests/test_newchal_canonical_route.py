@@ -109,5 +109,77 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
         self.assertIn("ROUTE UNKNOWN", state)
 
 
+class NewchalWasmScaffoldTests(unittest.TestCase):
+    """R2-7: a valid WebAssembly core module must take the Wasm branch and never
+    get a pwntools ELF() exploit template."""
+
+    @staticmethod
+    def _executable(path, source):
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+
+    def _scaffold_wasm(self, artifact_bytes):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "ctf-home"
+            bin_dir = home / "bin"
+            module_dir = bin_dir / "ratlib"
+            module_dir.mkdir(parents=True)
+            (module_dir / "__init__.py").write_text("", encoding="utf-8")
+            (home / "solve" / "_template").mkdir(parents=True)
+            (home / "solve" / "_template" / "state.md").write_text("# fixture\n")
+            shutil.copy2(ROOT / "bin" / "newchal", bin_dir / "newchal")
+            # Real wasm inspector; stubbed ELF/raw classifiers so classification
+            # falls through to the wasm check.
+            shutil.copy2(ROOT / "bin" / "ratlib" / "wasm.py", module_dir / "wasm.py")
+            (module_dir / "kernel_identity.py").write_text(
+                'def inspect(path):\n    return {"kind": "unknown"}\n', encoding="utf-8")
+            (module_dir / "raw_loader.py").write_text(
+                'def inspect_raw(path):\n    return {"kind": "unknown"}\n', encoding="utf-8")
+            (module_dir / "run_manifest.py").write_text(
+                'from pathlib import Path\n'
+                'def materialize_for_solve(source, destination, **kwargs):\n'
+                '    Path(destination).write_text("{}\\n")\n', encoding="utf-8")
+            self._executable(bin_dir / "ctfguard", "#!/bin/sh\nexit 0\n")
+            self._executable(bin_dir / "libcgate", "#!/bin/sh\nexit 0\n")
+            self._executable(bin_dir / "recon",
+                             "#!/bin/sh\necho LEGACY_RECON_INVOKED\nexit 97\n")
+            # If the ELF route branch is reached, this stub records that it was.
+            self._executable(bin_dir / "rat",
+                             "#!/bin/sh\necho RAT_ROUTE_INVOKED\nexit 0\n")
+
+            artifact = root / "mod.wasm"
+            artifact.write_bytes(artifact_bytes)
+            env = os.environ.copy()
+            env.update({"CTF_HOME": str(home)})
+            proc = subprocess.run(
+                ["bash", str(bin_dir / "newchal"), "wasm-fixture", str(artifact)],
+                cwd=str(root), env=env, capture_output=True, text=True, timeout=30,
+            )
+            exploit = home / "solve" / "wasm-fixture" / "exploit.py"
+            return proc, (exploit.read_text() if exploit.exists() else "")
+
+    def test_valid_wasm_takes_wasm_branch_without_elf(self):
+        proc, exploit = self._scaffold_wasm(b"\0asm\x01\0\0\0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WebAssembly core module", proc.stdout)
+        self.assertNotIn("RAT_ROUTE_INVOKED", proc.stdout)  # ELF route not taken
+        self.assertNotIn("LEGACY_RECON_INVOKED", proc.stdout)
+        self.assertTrue(exploit)
+        # No pwntools ELF() *loader call* in the generated exploit (the comment
+        # warning against ELF() is expected; the from pwn import * template is not).
+        self.assertNotIn("from pwn import", exploit)
+        self.assertNotIn('ELF("./', exploit)
+        self.assertIn("from ratlib import wasm", exploit)
+
+    def test_non_wasm_unknown_still_uses_elf_route(self):
+        # A non-ELF, non-WASM blob falls back to the ELF/route branch (unchanged).
+        proc, exploit = self._scaffold_wasm(b"not a wasm module at all")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RAT_ROUTE_INVOKED", proc.stdout)
+        self.assertNotIn("WebAssembly core module", proc.stdout)
+        self.assertIn('ELF("./', exploit)
+
+
 if __name__ == "__main__":
     unittest.main()

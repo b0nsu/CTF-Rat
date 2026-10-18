@@ -95,7 +95,12 @@ def validate_suite(doc):
             _relative_path(source, "source", entry_id)
         if binary:
             _relative_path(binary, "binary", entry_id)
-        for runtime_file in entry.get("runtime_files", []) or []:
+        runtime_files = entry.get("runtime_files", [])
+        if runtime_files is None:
+            runtime_files = []
+        if not isinstance(runtime_files, list) or any(not isinstance(rf, str) for rf in runtime_files):
+            raise SuiteValidationError("%s.runtime_files must be a list of strings" % entry_id)
+        for runtime_file in runtime_files:
             _relative_path(runtime_file, "runtime_files", entry_id)
 
         fetch = entry.get("fetch")
@@ -124,6 +129,38 @@ def validate_suite(doc):
         verify = entry.get("verify")
         if not isinstance(verify, Mapping) or verify.get("kind") not in VERIFY_KINDS:
             raise SuiteValidationError("%s.verify.kind is invalid" % entry_id)
+        verify_kind = verify.get("kind")
+        # Per-kind required fields.  ratbench's Mode A verifiers index these at run
+        # time (e.g. ``verify["pattern"]``/``verify["find_str"]``); a missing or
+        # mistyped field would otherwise surface as a late KeyError/char lookup
+        # inside a measured run instead of a load-time validation error (R2-6).
+        if verify_kind == "flag-regex":
+            pattern = verify.get("pattern")
+            if not isinstance(pattern, str) or not pattern:
+                raise SuiteValidationError(
+                    "%s.verify.pattern is required for flag-regex" % entry_id)
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise SuiteValidationError(
+                    "%s.verify.pattern is invalid: %s" % (entry_id, exc)) from exc
+            stdin = verify.get("stdin")
+            if stdin is not None and not isinstance(stdin, str):
+                raise SuiteValidationError("%s.verify.stdin must be a string" % entry_id)
+        elif verify_kind == "symsolve-restore":
+            for field in ("find_str", "expected"):
+                value = verify.get(field)
+                if not isinstance(value, str) or not value:
+                    raise SuiteValidationError(
+                        "%s.verify.%s is required for symsolve-restore" % (entry_id, field))
+            avoid_str = verify.get("avoid_str")
+            if avoid_str is not None and not isinstance(avoid_str, str):
+                raise SuiteValidationError("%s.verify.avoid_str must be a string" % entry_id)
+            stdin_len = verify.get("stdin_len")
+            if stdin_len is not None and (not isinstance(stdin_len, int)
+                                          or isinstance(stdin_len, bool) or stdin_len < 1):
+                raise SuiteValidationError(
+                    "%s.verify.stdin_len must be a positive integer" % entry_id)
         claim_pattern = verify.get("claim_pattern")
         if claim_pattern is not None:
             if not isinstance(claim_pattern, str) or not claim_pattern:

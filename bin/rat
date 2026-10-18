@@ -1313,7 +1313,14 @@ def build_parser():
 
     pcache = sub.add_parser("cache", help="cache/index inspection")
     cachesub = pcache.add_subparsers(dest="subcommand")
-    pcachestats = cachesub.add_parser("stats", help="cache entry counts by backend + age")
+    pcachestats = cachesub.add_parser(
+        "stats",
+        help="index-level cache entry counts by backend + age (NOT session hit/miss)",
+        description="Index-level stats only: entry counts by backend and age. "
+                    "Per-session cache hit/miss/ratio is request telemetry, not an "
+                    "index property; read it from rat-metrics (cache_hits/cache_misses/"
+                    "cache_hit_ratio, which is null when no cache request was recorded "
+                    "rather than 0). (R2-8)")
     pcachestats.add_argument("--store"); pcachestats.add_argument("--format", choices=("text", "json"), default="text")
 
     sub.add_parser("selftest", help="in-process route/query/brief/governor self-check")

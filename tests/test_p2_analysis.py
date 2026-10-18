@@ -124,6 +124,22 @@ class P2Analysis(unittest.TestCase):
   _,first=self.tool("rat-profile"); self.assertEqual(first["cache_state"],"miss")
   _,second=self.tool("rat-profile"); self.assertEqual(second["cache_state"],"hit")
   _,third=self.tool("rat-profile","--no-cache"); self.assertEqual(third["cache_state"],"miss")
+ @unittest.skipIf(os.geteuid()==0,"root bypasses directory write permissions")
+ def test_profile_readonly_store_fails_closed_without_traceback(self):
+  # R3-7: an unwritable default/override store must produce a bounded error
+  # envelope + non-zero exit, not a raw PermissionError traceback.
+  rod=tempfile.TemporaryDirectory(); ro=pathlib.Path(rod.name)
+  store=ro/".rat"
+  ro.chmod(0o555)
+  self.addCleanup(rod.cleanup)
+  self.addCleanup(lambda: ro.chmod(0o755))  # restore before cleanup can remove it
+  p=subprocess.run([str(BIN/"rat-profile"),str(self.exe),"--store",str(store),"--format","json"],
+                   text=True,capture_output=True)
+  self.assertNotEqual(p.returncode,0)
+  self.assertNotIn("Traceback",p.stderr)
+  doc=json.loads(p.stdout); validate(doc,"rat.tool-result/v1")
+  self.assertEqual(doc["status"],"error")
+  self.assertTrue(any("artifact store" in d.get("message","") for d in doc["diagnostics"]))
 @unittest.skipUnless(shutil.which("gcc"), "gcc required for ELF protection regression")
 class ProfileElfProtections(unittest.TestCase):
  """R0-1: ELF identification must not depend on `file`'s path prefix, PIE must

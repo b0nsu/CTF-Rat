@@ -22,6 +22,28 @@ class ArtifactMaterializationError(RuntimeError):
     pass
 
 
+# Pinned CTF binaries are small; cap the download well below anything that could
+# exhaust memory.  The pin (git_blob_sha1) is verified afterwards, but we must not
+# read an unbounded body into RAM before we can reject it (R2-5).
+_MAX_ARTIFACT_BYTES = 64 << 20  # 64 MiB
+
+
+def _read_capped(response, cap):
+    """Stream the body up to ``cap`` bytes; fail closed if the source exceeds it."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise ArtifactMaterializationError(
+                "artifact exceeds %d-byte download cap" % cap)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def git_blob_sha1(data):
     """Return the Git object id for one blob payload."""
     if not isinstance(data, (bytes, bytearray)):
@@ -102,7 +124,9 @@ def materialize_entry(entry, *, root, opener=None, timeout=60):
     try:
         response = opener(request, timeout=timeout)
         with response:
-            payload = response.read()
+            payload = _read_capped(response, _MAX_ARTIFACT_BYTES)
+    except ArtifactMaterializationError:
+        raise
     except Exception as exc:
         raise ArtifactMaterializationError(
             "%s artifact download failed: %s" % (entry["id"], exc)

@@ -42,7 +42,20 @@ import sys
 from ratlib.kernel_identity import inspect
 from ratlib.raw_loader import inspect_raw
 kind = inspect(sys.argv[1])["kind"]
-print(inspect_raw(sys.argv[1])["kind"] if kind == "unknown" else kind)
+if kind == "unknown":
+    # A valid WebAssembly core module is neither an ELF nor a raw/boot image; use
+    # the same validity check as ratlib.wasm.inspect so the scaffold does not apply
+    # pwntools ELF() to a Wasm target (R2-7). Fall back to raw-loader otherwise.
+    from ratlib import wasm
+    if wasm.is_wasm(sys.argv[1]):
+        try:
+            wasm.inspect(sys.argv[1])
+            kind = "wasm-core-v1"
+        except (OSError, ValueError):
+            kind = inspect_raw(sys.argv[1])["kind"]
+    else:
+        kind = inspect_raw(sys.argv[1])["kind"]
+print(kind)
 PY
 )"
 if [ -n "$LIBC" ] && [ ! -f "$LIBC" ]; then
@@ -164,7 +177,7 @@ if [ -n "$DOCKER_SRC" ] && [ ! -f ./Dockerfile ]; then
   cp "$DOCKER_SRC" ./Dockerfile 2>/dev/null || true
 fi
 # pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
-if [ -n "$LIBC" ] && [[ "$ARTIFACT_KIND" != bzimage && "$ARTIFACT_KIND" != linux-boot-image && "$ARTIFACT_KIND" != vmlinux ]] && command -v pwninit >/dev/null; then
+if [ -n "$LIBC" ] && [[ "$ARTIFACT_KIND" != bzimage && "$ARTIFACT_KIND" != linux-boot-image && "$ARTIFACT_KIND" != vmlinux && "$ARTIFACT_KIND" != wasm-core-v1 ]] && command -v pwninit >/dev/null; then
   echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
   # `timeout` is GNU coreutils; macOS ships it as `gtimeout`. If neither exists,
   # run pwninit unbounded (it's optional) rather than failing the scaffold.
@@ -190,6 +203,22 @@ if KIND in {"bzimage", "linux-boot-image", "vmlinux", "boot-sector-candidate", "
         '# Non-ELF artifact: configure the provided QEMU/boot harness before execution.\n'
         '# Record runtime evidence before analysis; see QEMU hints and digests in run.json.\n'
         'raise SystemExit("Configure the challenge execution harness first (see run.json)")\n')
+    raise SystemExit(0)
+if KIND == "wasm-core-v1":
+    # A WebAssembly core module is not an ELF; pwntools ELF() cannot load it.
+    # Scaffold a bounded inventory + runtime harness stub instead (R2-7).
+    open(os.path.join(D,"exploit.py"),"w").write(
+        '#!/usr/bin/env python3\n'
+        '# WebAssembly core module: NOT an ELF. Do not use pwntools ELF() here.\n'
+        '# Inventory the module (imports/exports/functions) with ratlib.wasm.inspect,\n'
+        '# then drive it through the challenge-provided runtime (wasmtime/node/browser).\n'
+        'import json, sys\n'
+        'sys.path.insert(0, "../../bin")  # CTF-Rat bin on PYTHONPATH\n'
+        'from ratlib import wasm\n'
+        'inv = wasm.inspect("./%s")\n'
+        'print(json.dumps(inv, ensure_ascii=False, indent=2))\n'
+        '# TODO: invoke exports via the provided runtime; see run.json for host wiring.\n'
+        'raise SystemExit("Configure the Wasm runtime harness first (see run.json)")\n' % BN)
     raise SystemExit(0)
 exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
 haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
@@ -256,6 +285,16 @@ if kind in {"bzimage", "linux-boot-image"}:
     print("[newchal] Linux scripts/extract-vmlinux로 ELF vmlinux를 추출한 뒤 함수 조회. 부팅 환경은 별도 확인 필요.")
 PY
   echo "[+] $D 생성. 다음: cd $D; rat route ./$BN"
+elif [[ "$ARTIFACT_KIND" = wasm-core-v1 ]]; then
+  # WebAssembly: bounded inventory instead of ELF recon/route (R2-7).
+  PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "./$BN" <<'PY' | tee -a state.md
+import json,sys
+from ratlib import wasm
+inv = wasm.inspect(sys.argv[1])
+print("[newchal] WebAssembly core module (%s): ELF recon/route 생략, pwntools ELF() 미적용" % inv["format"])
+print(json.dumps({k: inv[k] for k in ("format","sections") if k in inv}, ensure_ascii=False, sort_keys=True))
+PY
+  echo "[+] $D 생성. 다음: cd $D; exploit.py의 wasm.inspect 인벤토리 확인 후 제공된 런타임으로 구동"
 else
   # The first user-facing classification must come from the canonical
   # evidence-first router, not the independent legacy recon tier heuristic.

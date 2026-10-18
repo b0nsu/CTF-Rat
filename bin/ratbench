@@ -36,6 +36,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -57,6 +58,51 @@ def ctf_home():
 
 def _suite_path(override=None):
     return override or os.path.join(ctf_home(), "bench", "suite.json")
+
+
+# Run ids become result filenames, so they must be a short, path-safe ASCII slug.
+# Without this, ``--run-id ../../outside`` escapes bench/results and ``w`` mode
+# silently overwrites a prior result (R2-3).
+_RUN_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+class RunIdError(ValueError):
+    pass
+
+
+def _validate_run_id(run_id):
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise RunIdError(
+            "run-id must be a 1-64 char ASCII slug [A-Za-z0-9._-] starting alphanumeric")
+    # Defence in depth: reject anything that normalizes to a path component.
+    if run_id in (".", "..") or os.sep in run_id or (os.altsep and os.altsep in run_id):
+        raise RunIdError("run-id must not contain path separators")
+    return run_id
+
+
+def _results_dir():
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
+def _result_path(results_dir, run_id, suffix):
+    """Resolve a result path and prove it stays inside results_dir (R2-3)."""
+    root = os.path.realpath(results_dir)
+    path = os.path.realpath(os.path.join(root, run_id + suffix))
+    if os.path.dirname(path) != root:
+        raise RunIdError("result path escapes bench/results: %s" % run_id)
+    return path
+
+
+def _open_exclusive(path):
+    """Open a result file for exclusive creation; refuse to overwrite (R2-3)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as exc:
+        raise RunIdError("result already exists (refusing overwrite): %s"
+                         % os.path.basename(path)) from exc
+    return os.fdopen(fd, "w", encoding="utf-8")
 
 
 def _load_suite(path):
@@ -212,29 +258,87 @@ def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
                              cwd=cwd, env=env, timeout=timeout)
 
 
-def _run_process_tree(argv, *, cwd, env, timeout):
+# A misbehaving agent can flood stdout; cap it so a Mode B run cannot exhaust
+# host memory via ``communicate()``.  The cap is generous for real agent traces
+# but far below an OOM, and overflow is treated as a terminal condition for that
+# entry rather than a silently truncated "success" (R2-5).
+_AGENT_OUTPUT_CAP = 16 << 20  # 16 MiB
+
+
+def _killpg(process):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _read_capped(stream, cap, overflow):
+    """Read up to ``cap`` bytes, then set ``overflow`` and stop.  Runs in a reader
+    thread so the caller can still enforce the wall-clock timeout."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        if total + len(chunk) > cap:
+            chunks.append(chunk[: cap - total])
+            overflow.set()
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _run_process_tree(argv, *, cwd, env, timeout, output_cap=_AGENT_OUTPUT_CAP):
     process = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    stdout = b""
+    overflow = threading.Event()
+    captured = {}
+
+    def _reader():
+        try:
+            captured["data"] = _read_capped(process.stdout, output_cap, overflow)
+        finally:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
     try:
-        stdout, _ = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, _ = process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        if process.poll() is None:
-            stdout, _ = process.communicate()
+        _killpg(process)
+        reader.join(timeout=5)
+        stdout = captured.get("data", b"")
         raise subprocess.TimeoutExpired(argv, timeout, output=stdout)
+
+    # Process exited; drain the reader.  If it overflowed, the child may still be
+    # writing into a now-closed pipe -- tear down the whole group to be safe.
+    reader.join(timeout=5)
+    stdout = captured.get("data", b"")
+    if overflow.is_set():
+        _killpg(process)
+        raise OutputCapExceeded(argv, output_cap, stdout)
     return subprocess.CompletedProcess(argv, process.returncode, stdout, None)
+
+
+class OutputCapExceeded(RuntimeError):
+    """A child process wrote more than the allowed output cap (R2-5)."""
+
+    def __init__(self, argv, cap, output=b""):
+        super().__init__("child output exceeded %d bytes" % cap)
+        self.argv = argv
+        self.cap = cap
+        self.output = output
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +365,17 @@ def _check_route(entry):
 # ---------------------------------------------------------------------------
 # verify stage (runs the real fixture when toolchain is present)
 # ---------------------------------------------------------------------------
+class CompileError(RuntimeError):
+    """gcc is present and the source exists, but the fixture failed to build.
+
+    Distinct from a missing toolchain/source (``_compile`` returns ``None``): a
+    broken C fixture must surface as a ``verify-fail`` in CI, never as a quiet
+    ``skipped`` that hides a corrupt benchmark (R2-4)."""
+
+
 def _compile(entry, workdir):
     src = os.path.join(ctf_home(), entry["dir"], entry.get("source", "src.c"))
+    # Genuine absence of toolchain/source is a skip, not a failure.
     if not os.path.isfile(src) or not _have("gcc"):
         return None
     out = os.path.join(workdir, entry["id"])
@@ -271,9 +384,16 @@ def _compile(entry, workdir):
     cmd = ["gcc", "-w", "-O0", "-fno-stack-protector", "-no-pie", src, "-o", out]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except Exception:
-        return None
-    return out if os.path.isfile(out) else None
+    except subprocess.TimeoutExpired as exc:
+        raise CompileError("%s: gcc timed out" % entry["id"]) from exc
+    except subprocess.CalledProcessError as exc:
+        raise CompileError("%s: gcc exit %d" % (entry["id"], exc.returncode)) from exc
+    except OSError as exc:
+        # gcc disappeared/raced between the _have check and exec.
+        raise CompileError("%s: gcc could not run: %s" % (entry["id"], exc)) from exc
+    if not os.path.isfile(out):
+        raise CompileError("%s: gcc produced no output binary" % entry["id"])
+    return out
 
 
 _FLAG_REGEX_OUTPUT_CAP = 1 << 16  # 64 KiB; a flag line is tiny, anything larger is anomalous
@@ -371,7 +491,6 @@ def _verify(entry, binpath):
 # run
 # ---------------------------------------------------------------------------
 def cmd_run(args):
-    import tempfile
     try:
         entries = _select_entries(args)
     except SuiteValidationError as exc:
@@ -381,19 +500,53 @@ def cmd_run(args):
         print("[ratbench:err] %s" % exc, file=sys.stderr)
         return 4
     run_id = args.run_id or ("A-%d" % int(time.time()))
-    results_dir = os.path.join(ctf_home(), "bench", "results")
-    os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, run_id + ".jsonl")
-    workdir_ctx = tempfile.TemporaryDirectory()
-    workdir = workdir_ctx.name
+    try:
+        _validate_run_id(run_id)
+        results_dir = _results_dir()
+        out_path = _result_path(results_dir, run_id, ".jsonl")
+        # Reserve the result name up front with exclusive creation so a re-run of
+        # the same id fails before doing any work instead of overwriting (R2-3).
+        out_fh = _open_exclusive(out_path)
+    except RunIdError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        return _run_mode_a(args, entries, run_id, out_path, out_fh)
+    except BaseException:
+        # The result name was reserved with O_EXCL; drop the empty/partial file so
+        # a retry with the same id is not permanently blocked by a failed run.
+        try:
+            out_fh.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        raise
+
+
+def _run_mode_a(args, entries, run_id, out_path, out_fh):
+    import tempfile
+    with tempfile.TemporaryDirectory() as workdir:
+        return _run_mode_a_body(args, entries, run_id, out_path, out_fh, workdir)
+
+
+def _run_mode_a_body(args, entries, run_id, out_path, out_fh, workdir):
     n_fail = 0
     lines = []
     print("== ratbench Mode A: %s (%d entries) ==" % (run_id, len(entries)))
     for e in entries:
         t0 = time.time()
         route_ok, observed = _check_route(e)
-        binpath = _compile(e, workdir)
-        vstatus, vdetail = _verify(e, binpath)
+        try:
+            binpath = _compile(e, workdir)
+        except CompileError as exc:
+            # gcc present + source present but the fixture does not build: this is
+            # a broken benchmark, not an environment skip (R2-4).
+            binpath, vstatus, vdetail = None, "verify-fail", "fixture compile failed: %s" % exc
+        else:
+            vstatus, vdetail = _verify(e, binpath)
         elapsed_ms = int((time.time() - t0) * 1000)
         if not route_ok:
             outcome = "route-miss"
@@ -422,11 +575,10 @@ def cmd_run(args):
             vstatus, vdetail if vstatus != "pass" else "ok"))
     for rec in lines:
         validate(rec, "rat.bench-result/v2")
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with out_fh as fh:
         for rec in lines:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
     print("-- results: %s" % os.path.relpath(out_path, ctf_home()))
-    workdir_ctx.cleanup()
     if n_fail:
         print("-- %d entr%s FAILED (route-miss/verify-fail)" % (n_fail, "y" if n_fail == 1 else "ies"))
         return 1
@@ -893,10 +1045,42 @@ def cmd_eval(args):
         print("[ratbench:err] %s" % exc, file=sys.stderr)
         return 4
     run_id = args.run_id or ("B-%s-%d" % (os.path.basename(agent_bin), int(time.time())))
-    results_dir = os.path.join(ctf_home(), "bench", "results")
-    os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, run_id + ".jsonl")
-    v2_out_path = os.path.join(results_dir, run_id + ".benchmark-v3.jsonl")
+    try:
+        _validate_run_id(run_id)
+        results_dir = _results_dir()
+        out_path = _result_path(results_dir, run_id, ".jsonl")
+        v2_out_path = _result_path(results_dir, run_id, ".benchmark-v3.jsonl")
+        # Reserve both result names up front with exclusive creation so a re-run of
+        # the same id fails before any agent runs and both files stay consistent
+        # (R2-3).  If the second reservation fails, release the first.
+        out_fh = _open_exclusive(out_path)
+        try:
+            v2_out_fh = _open_exclusive(v2_out_path)
+        except RunIdError:
+            out_fh.close()
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+    except RunIdError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 2
+    def _release_reservations():
+        for fh, path in ((out_fh, out_path), (v2_out_fh, v2_out_path)):
+            try:
+                fh.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    class _ModeBAbort(Exception):
+        def __init__(self, code):
+            self.code = code
+
     lines = []
     v2_lines = []
     trace_enabled = _strace_usable()
@@ -906,97 +1090,112 @@ def cmd_eval(args):
         print("-- process telemetry: observer execve trace enabled")
     else:
         print("-- process telemetry: unavailable (process metrics remain null)")
-    for e in entries:
-        sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
-        try:
+    try:
+        for e in entries:
+            sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
             try:
-                kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
-                runtime_input_digest = _runtime_input_digest(chal_dir)
-            except (OSError, ValueError, RuntimeError) as exc:
-                print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
-                return 3
-            prompt = args.agent.replace("{dir}", chal_dir)
-            trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
-            started_at = datetime.now(timezone.utc).isoformat()
-            t0 = time.time()
-            timed_out = False
-            try:
-                p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
-                               timeout=args.timeout, trace_path=trace_path)
-                agent_out = p.stdout.decode(errors="replace")
-                agent_rc = p.returncode
-            except subprocess.TimeoutExpired as exc:
-                timed_out = True
-                partial = exc.stdout or b""
-                agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
-                agent_rc = 124
-            except (OSError, RuntimeError) as exc:
-                print("[ratbench:err] %s: agent sandbox unavailable: %s" % (e["id"], exc), file=sys.stderr)
-                return 3
-            wall = int((time.time() - t0) * 1000)
-            finished_at = datetime.now(timezone.utc).isoformat()
+                try:
+                    kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
+                    runtime_input_digest = _runtime_input_digest(chal_dir)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
+                    raise _ModeBAbort(3)
+                prompt = args.agent.replace("{dir}", chal_dir)
+                trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
+                started_at = datetime.now(timezone.utc).isoformat()
+                t0 = time.time()
+                timed_out = False
+                try:
+                    p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
+                                   timeout=args.timeout, trace_path=trace_path)
+                    agent_out = p.stdout.decode(errors="replace")
+                    agent_rc = p.returncode
+                except subprocess.TimeoutExpired as exc:
+                    timed_out = True
+                    partial = exc.stdout or b""
+                    agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
+                    agent_rc = 124
+                except OutputCapExceeded as exc:
+                    # An output flood is a terminal failure for this entry, not a
+                    # success.  Keep a bounded diagnostic and never let the flooded
+                    # text be mined for a flag (R2-5).
+                    print("[ratbench:err] %s: %s (treated as failure)" % (e["id"], exc),
+                          file=sys.stderr)
+                    agent_out = ""
+                    agent_rc = 125
+                except (OSError, RuntimeError) as exc:
+                    print("[ratbench:err] %s: agent sandbox unavailable: %s" % (e["id"], exc), file=sys.stderr)
+                    raise _ModeBAbort(3)
+                wall = int((time.time() - t0) * 1000)
+                finished_at = datetime.now(timezone.utc).isoformat()
 
-            flag_claimed = _flag_claimed(e, agent_out)
-            from ratlib.metrics import (first_primitive_pass_ts, process_trace_metrics,
-                                    route_assessment_metrics, benchmark_envelope_observations)
-            from ratlib.completion import completion_gate
-            from ratlib.state_v2 import Stream
-            primitive_pass_at = first_primitive_pass_ts(chal_dir)
-            typed_pass = primitive_pass_at is not None
-            completion = completion_gate(chal_dir)
-            verified = completion.get("verified") is True
-            if verified:
-                outcome = "solved"
-            elif flag_claimed:
-                outcome = "solve-claimed"
-            else:
-                outcome = "fail"
-            rec = {"schema": "rat.bench-result/v2", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
-                   "id": e["id"], "difficulty": e.get("difficulty"),
-                   "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
-                   "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
-                   "typed_primitive_pass": typed_pass, "verified_solve": verified,
-                   "completion_reason": completion.get("reason"), "wall_ms": wall}
-            lines.append(rec)
-            try:
-                events = Stream(chal_dir).read()
-            except (OSError, ValueError):
-                events = []
-            process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
-            routing_metrics = route_assessment_metrics(chal_dir)
-            v2_lines.append(_mode_b_v2_record(
-                e, run_id=run_id, ablation_id=args.ablation,
-                started_at=started_at, finished_at=finished_at,
-                agent_rc=agent_rc, timed_out=timed_out, flag_claimed=flag_claimed,
-                completion=completion, events=events,
-                primitive_pass_at=primitive_pass_at,
-                artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
-                process_metrics=process_metrics, provenance=run_provenance,
-                runtime_input_digest=runtime_input_digest, routing_metrics=routing_metrics,
-                envelope_observations=benchmark_envelope_observations(os.path.join(chal_dir, ".rat")),
-            ))
-            mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
-            detail = ""
-            if outcome == "solve-claimed":
-                detail = "  (flag claimed, verified completion gate NOT satisfied)"
-            elif typed_pass and not verified:
-                detail = "  (primitive PASS present, deterministic verification missing/stale)"
-            print("  [%s] %-18s rc=%s wall=%dms%s" % (mark, e["id"], agent_rc, wall, detail))
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-    for rec in lines:
-        validate(rec, "rat.bench-result/v2")
-    for rec in v2_lines:
-        validate(rec, "rat.benchmark-result/v3")
-    with open(out_path, "w", encoding="utf-8") as fh:
+                flag_claimed = _flag_claimed(e, agent_out)
+                from ratlib.metrics import (first_primitive_pass_ts, process_trace_metrics,
+                                        route_assessment_metrics, benchmark_envelope_observations)
+                from ratlib.completion import completion_gate
+                from ratlib.state_v2 import Stream
+                primitive_pass_at = first_primitive_pass_ts(chal_dir)
+                typed_pass = primitive_pass_at is not None
+                completion = completion_gate(chal_dir)
+                verified = completion.get("verified") is True
+                if verified:
+                    outcome = "solved"
+                elif flag_claimed:
+                    outcome = "solve-claimed"
+                else:
+                    outcome = "fail"
+                rec = {"schema": "rat.bench-result/v2", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
+                       "id": e["id"], "difficulty": e.get("difficulty"),
+                       "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
+                       "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
+                       "typed_primitive_pass": typed_pass, "verified_solve": verified,
+                       "completion_reason": completion.get("reason"), "wall_ms": wall}
+                lines.append(rec)
+                try:
+                    events = Stream(chal_dir).read()
+                except (OSError, ValueError):
+                    events = []
+                process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
+                routing_metrics = route_assessment_metrics(chal_dir)
+                v2_lines.append(_mode_b_v2_record(
+                    e, run_id=run_id, ablation_id=args.ablation,
+                    started_at=started_at, finished_at=finished_at,
+                    agent_rc=agent_rc, timed_out=timed_out, flag_claimed=flag_claimed,
+                    completion=completion, events=events,
+                    primitive_pass_at=primitive_pass_at,
+                    artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
+                    process_metrics=process_metrics, provenance=run_provenance,
+                    runtime_input_digest=runtime_input_digest, routing_metrics=routing_metrics,
+                    envelope_observations=benchmark_envelope_observations(os.path.join(chal_dir, ".rat")),
+                ))
+                mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
+                detail = ""
+                if outcome == "solve-claimed":
+                    detail = "  (flag claimed, verified completion gate NOT satisfied)"
+                elif typed_pass and not verified:
+                    detail = "  (primitive PASS present, deterministic verification missing/stale)"
+                print("  [%s] %-18s rc=%s wall=%dms%s" % (mark, e["id"], agent_rc, wall, detail))
+            finally:
+                shutil.rmtree(sandbox, ignore_errors=True)
         for rec in lines:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
-    with open(v2_out_path, "w", encoding="utf-8") as fh:
+            validate(rec, "rat.bench-result/v2")
         for rec in v2_lines:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
-    print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
-    print("-- benchmark v3 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
-    return 0
+            validate(rec, "rat.benchmark-result/v3")
+        with out_fh as fh:
+            for rec in lines:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        with v2_out_fh as fh:
+            for rec in v2_lines:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
+        print("-- benchmark v3 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
+        return 0
+    except _ModeBAbort as abort:
+        _release_reservations()
+        return abort.code
+    except BaseException:
+        _release_reservations()
+        raise
 
 
 # ---------------------------------------------------------------------------

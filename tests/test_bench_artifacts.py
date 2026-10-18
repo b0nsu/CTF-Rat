@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(ROOT, "bin"))
 from ratlib.bench_artifacts import (
     ArtifactMaterializationError, git_blob_sha1, materialize_entry,
 )
+import ratlib.bench_artifacts as bench_artifacts
 
 
 class BenchArtifactTests(unittest.TestCase):
@@ -82,6 +83,32 @@ class BenchArtifactTests(unittest.TestCase):
                 materialize_entry(entry, root=root, opener=lambda *_args, **_kwargs: io.BytesIO(payload))
             with open(target, "rb") as fh:
                 self.assertEqual(fh.read(), b"wrong")
+
+    def test_download_is_capped_and_fails_without_installing(self):
+        """R2-5: an oversized body must fail closed before verifying/installing,
+        instead of reading an unbounded response into memory."""
+        payload = b"\x7fELF-big"
+        entry = self._entry(payload)
+
+        class _Endless:
+            """Yields more bytes than the cap on each read; never signals EOF."""
+            def read(self, n=-1):
+                return b"A" * (n if n and n > 0 else 65536)
+            def close(self):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with tempfile.TemporaryDirectory() as root:
+            orig = bench_artifacts._MAX_ARTIFACT_BYTES
+            bench_artifacts._MAX_ARTIFACT_BYTES = 256 * 1024  # small cap for the test
+            self.addCleanup(setattr, bench_artifacts, "_MAX_ARTIFACT_BYTES", orig)
+            with self.assertRaisesRegex(ArtifactMaterializationError, "download cap"):
+                materialize_entry(entry, root=root, opener=lambda *_a, **_k: _Endless())
+            target = os.path.join(root, entry["dir"], entry["binary"])
+            self.assertFalse(os.path.exists(target))
 
     def test_symlinked_fixture_dir_cannot_escape_store_root(self):
         """A fixture dir that is a symlink out of the store root must be refused,

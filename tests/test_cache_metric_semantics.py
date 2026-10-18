@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
 from ratlib.metrics import aggregate
+from ratlib.schema import validate
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -64,6 +65,26 @@ class CacheMetricSemanticsTests(unittest.TestCase):
         self.assertEqual(metrics["cache_requests"], 0)
         self.assertEqual(metrics["cache_unusable_hits"], 0)
         self.assertIsNone(metrics["cache_hit_ratio"])
+
+    def test_no_requests_reports_none_ratio_not_zero(self):
+        # R2-8: with nothing measured, the ratio is null (unknown), never 0 (which
+        # would read as "0% reuse" and be mistaken for a measurement).
+        metrics = aggregate([])
+        self.assertEqual(metrics["cache_requests"], 0)
+        self.assertIsNone(metrics["cache_hit_ratio"])
+
+    def test_cache_stats_schema_does_not_claim_session_hit_miss(self):
+        # R2-8: `rat cache stats` is index-level only; it must not expose
+        # uninstrumented session hit/miss/ratio fields (those live in rat-metrics).
+        doc = {"schema": "rat.cache-stats/v1", "store": "/tmp/x", "total_entries": 0,
+               "by_backend": {}, "oldest_produced_at": None, "newest_produced_at": None}
+        validate(doc, "rat.cache-stats/v1")  # baseline is valid
+        for field in ("cache_hits", "cache_misses", "cache_hit_ratio", "cache_requests"):
+            with self.subTest(field=field):
+                bad = dict(doc)
+                bad[field] = 0
+                with self.assertRaises(Exception):
+                    validate(bad, "rat.cache-stats/v1")
 
 
 if __name__ == "__main__":

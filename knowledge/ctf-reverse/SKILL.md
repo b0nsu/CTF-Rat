@@ -2,8 +2,15 @@
 name: ctf-reverse
 description: Provides reverse engineering techniques for CTF challenges. Use when the main job is to understand how a compiled, obfuscated, packed, or virtualized target works before exploiting or solving it, including binaries, APKs, WASM, firmware, custom VMs, bytecode, game clients, malware-like loaders, and anti-debug or anti-analysis logic. Do not use it when the vulnerability is already understood and the remaining task is exploitation; use pwn instead. Do not use it for pure web workflows, log or disk forensics, or standalone crypto problems unless reversing the implementation is the real blocker.
 license: MIT
-compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
-allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
+# ctf-rat ROE override: this is a VENDORED upstream skill used here only as local
+# concept grounding, never executed as a live skill. Web tools and network tool
+# installation are out of scope (see CLAUDE.md 인가 선언 / 인가 ROE and the body
+# banner below). The upstream declarations are preserved under upstream_* for
+# provenance; the effective values are local-only.
+compatibility: Requires filesystem-based agent with bash and Python 3; tools are pre-provisioned by this repo's SETUP.md (no network install).
+upstream_compatibility: Requires filesystem-based agent (Claude Code or similar) with bash, Python 3, and internet access for tool installation.
+allowed-tools: Bash Read Write Edit Glob Grep
+upstream_allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
 metadata:
   user-invocable: "false"
 ---

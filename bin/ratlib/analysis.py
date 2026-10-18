@@ -248,7 +248,16 @@ def profile(a):
         for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
             if api in import_set: signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
         if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
-        arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+        try:
+            arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+        except OSError as exc:
+            # The default .rat object store may land in a read-only directory (e.g.
+            # running against a binary under /usr/bin). Fail closed with a bounded
+            # diagnostic instead of a raw traceback (R3-7).
+            return emit(envelope("rat-profile",a.binary,a,{"store":r},status="error",
+                                 code=EXIT_DEPENDENCY,
+                                 diagnostics=["cannot write artifact store at %s: %s" % (r, type(exc).__name__)],
+                                 started=started),a)
     # ELF is proven by a recorded protection fact (elf.pie/nx/relro), which is
     # only emitted for an ELF; this survives both miss and hit paths without
     # re-parsing the path-prefixed `file` string.

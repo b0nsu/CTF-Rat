@@ -121,6 +121,51 @@ class BenchSuiteManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(SuiteValidationError, "no entries for corpus: private"):
             project_suite(self.suite, corpus="private")
 
+    def test_flag_regex_entry_requires_a_compilable_pattern(self):
+        # R2-6: a flag-regex entry without a usable ``pattern`` would KeyError at
+        # run time inside _verify_flag_regex; reject it at load time instead.
+        base = copy.deepcopy(next(e for e in self.suite["entries"]
+                                  if e["verify"]["kind"] == "flag-regex"))
+        missing = copy.deepcopy(base)
+        missing["verify"].pop("pattern", None)
+        with self.assertRaisesRegex(SuiteValidationError, "pattern is required for flag-regex"):
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [missing]})
+        broken = copy.deepcopy(base)
+        broken["verify"]["pattern"] = "FLAG{["  # unbalanced -> re.error
+        with self.assertRaisesRegex(SuiteValidationError, "pattern is invalid"):
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [broken]})
+
+    def test_symsolve_restore_entry_requires_find_str_and_expected(self):
+        # R2-6: symsolve-restore reads verify["find_str"]/["expected"] at run time.
+        base = copy.deepcopy(self.suite["entries"][0])
+        base["verify"] = {"kind": "symsolve-restore", "find_str": "FLAG",
+                          "expected": "s3cr3t", "stdin_len": 8}
+        good = {"schema": "rat.bench-suite/v2", "entries": [copy.deepcopy(base)]}
+        self.assertIs(validate_suite(good), good)
+        for field in ("find_str", "expected"):
+            bad = copy.deepcopy(base)
+            bad["verify"].pop(field)
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(SuiteValidationError,
+                                            "%s is required for symsolve-restore" % field):
+                    validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad]})
+        bad_len = copy.deepcopy(base)
+        bad_len["verify"]["stdin_len"] = 0
+        with self.assertRaisesRegex(SuiteValidationError, "stdin_len must be a positive integer"):
+            validate_suite({"schema": "rat.bench-suite/v2", "entries": [bad_len]})
+
+    def test_runtime_files_must_be_a_string_list(self):
+        # R2-6: a bare string would iterate per-character and _relative_path each
+        # char; require an explicit list of strings.
+        doc = copy.deepcopy(self.suite)
+        doc["entries"][0]["runtime_files"] = "libc.so.6"
+        with self.assertRaisesRegex(SuiteValidationError, "runtime_files must be a list of strings"):
+            validate_suite(doc)
+        doc2 = copy.deepcopy(self.suite)
+        doc2["entries"][0]["runtime_files"] = ["ok.bin", 7]
+        with self.assertRaisesRegex(SuiteValidationError, "runtime_files must be a list of strings"):
+            validate_suite(doc2)
+
     def test_load_suite_rejects_malformed_json(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "bad.json")

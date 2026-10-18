@@ -134,6 +134,115 @@ class CorpusGateTests(unittest.TestCase):
 
 
 
+class RunIdSafetyTests(unittest.TestCase):
+    """R2-3: run ids become result filenames; reject traversal and refuse to
+    overwrite an existing result."""
+
+    def test_validate_rejects_traversal_and_separators(self):
+        for bad in ("../../outside", "a/b", "", ".", "..", "/abs", "x" * 65,
+                    "-leading", "with space"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RATBENCH.RunIdError):
+                    RATBENCH._validate_run_id(bad)
+
+    def test_validate_accepts_safe_slug(self):
+        for ok in ("A-123", "release-fix-1", "B.codex.1", "x"):
+            with self.subTest(ok=ok):
+                self.assertEqual(RATBENCH._validate_run_id(ok), ok)
+
+    def test_result_path_stays_inside_results_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                os.path.dirname(RATBENCH._result_path(d, "run1", ".jsonl")),
+                os.path.realpath(d))
+            # A validated id never contains a separator, but prove the boundary
+            # check itself rejects one if reached.
+            with self.assertRaises(RATBENCH.RunIdError):
+                RATBENCH._result_path(d, "../escape", ".jsonl")
+
+    def test_open_exclusive_refuses_overwrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "run1.jsonl")
+            with RATBENCH._open_exclusive(path) as fh:
+                fh.write("first\n")
+            with self.assertRaises(RATBENCH.RunIdError):
+                RATBENCH._open_exclusive(path)
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "first\n")  # original bytes preserved
+
+    def test_cmd_run_refuses_to_overwrite_existing_result(self):
+        with tempfile.TemporaryDirectory() as home:
+            results = os.path.join(home, "bench", "results")
+            os.makedirs(results)
+            existing = os.path.join(results, "dup.jsonl")
+            with open(existing, "w", encoding="utf-8") as fh:
+                fh.write("ORIGINAL\n")
+            args = SimpleNamespace(suite=None, corpus=None, id=None, run_id="dup")
+            with mock.patch.dict(os.environ, {"CTF_HOME": home}), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_check_route") as route, \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_run(args), 2)
+                route.assert_not_called()  # refused before doing any work
+            with open(existing, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "ORIGINAL\n")
+
+    def test_cmd_run_rejects_unsafe_run_id_before_work(self):
+        with tempfile.TemporaryDirectory() as home:
+            args = SimpleNamespace(suite=None, corpus=None, id=None, run_id="../../outside")
+            with mock.patch.dict(os.environ, {"CTF_HOME": home}), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_check_route") as route, \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_run(args), 2)
+                route.assert_not_called()
+
+    def test_cmd_run_failure_releases_reserved_result(self):
+        # A failure after reservation must unlink the empty result so a retry with
+        # the same id is not permanently blocked.
+        with tempfile.TemporaryDirectory() as home:
+            args = SimpleNamespace(suite=None, corpus=None, id=None, run_id="boom")
+            with mock.patch.dict(os.environ, {"CTF_HOME": home}), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_check_route", side_effect=RuntimeError("kaboom")), \
+                 mock.patch("builtins.print"):
+                with self.assertRaises(RuntimeError):
+                    RATBENCH.cmd_run(args)
+            self.assertFalse(os.path.exists(os.path.join(home, "bench", "results", "boom.jsonl")))
+
+
+class OutputCapTests(unittest.TestCase):
+    """R2-5: a child that floods stdout must hit the output cap and be torn down,
+    never read unbounded into memory."""
+
+    @unittest.skipUnless(os.name == "posix", "needs a POSIX shell + process groups")
+    def test_flood_raises_output_cap_exceeded(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            argv = ["/bin/sh", "-c", "yes AAAAAAAA"]  # endless output
+            with self.assertRaises(RATBENCH.OutputCapExceeded) as ctx:
+                RATBENCH._run_process_tree(argv, cwd=cwd, env=os.environ.copy(),
+                                           timeout=30, output_cap=128 * 1024)
+            # The captured output is bounded to the cap, not the whole flood.
+            self.assertLessEqual(len(ctx.exception.output), 128 * 1024)
+
+    @unittest.skipUnless(os.name == "posix", "needs a POSIX shell")
+    def test_small_output_within_cap_succeeds(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            argv = ["/bin/sh", "-c", "printf 'hello\\n'; exit 0"]
+            result = RATBENCH._run_process_tree(argv, cwd=cwd, env=os.environ.copy(),
+                                                timeout=30, output_cap=128 * 1024)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"hello\n")
+
+    @unittest.skipUnless(os.name == "posix", "needs a POSIX shell")
+    def test_timeout_still_enforced_with_capped_reader(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            argv = ["/bin/sh", "-c", "sleep 30"]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                RATBENCH._run_process_tree(argv, cwd=cwd, env=os.environ.copy(),
+                                           timeout=1, output_cap=128 * 1024)
+
+
 class ModeBLocalSmokeTests(unittest.TestCase):
     def test_eval_resolves_quoted_agent_executable(self):
         args = SimpleNamespace(agent="'/tmp/agent cli' --version", suite=None, corpus=None, id=None)
@@ -761,6 +870,62 @@ class SymsolveVerifyHonesty(unittest.TestCase):
         with self._patched(0, self._good_doc()):
             status, detail = RATBENCH._verify_symsolve(self.ENTRY, "/bin/true")
         self.assertEqual(status, "pass")
+
+
+@unittest.skipUnless(RATBENCH._have("gcc"), "needs gcc to distinguish compile-failure from skip")
+class CompileFailureHonesty(unittest.TestCase):
+    """R2-4: a broken C fixture must become a verify-fail, never a silent skip,
+    when the compiler itself is present."""
+
+    def _entry_dir(self, body):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        rel = os.path.join("bench", "artifacts", "compile-fixture")
+        os.makedirs(os.path.join(home, rel), exist_ok=True)
+        with open(os.path.join(home, rel, "src.c"), "w") as fh:
+            fh.write(body)
+        return home, {"id": "compile-fixture", "dir": rel}
+
+    def test_broken_source_raises_compile_error_not_none(self):
+        home, entry = self._entry_dir("int main(void){ this is not C }\n")
+        with mock.patch.dict(os.environ, {"CTF_HOME": home}):
+            with tempfile.TemporaryDirectory() as work:
+                with self.assertRaises(RATBENCH.CompileError):
+                    RATBENCH._compile(entry, work)
+
+    def test_cmd_run_reports_broken_fixture_as_verify_fail(self):
+        # Drive the actual Mode A loop decision: compile failure -> verify-fail,
+        # distinct from "route-ok-verify-skipped".
+        home, entry = self._entry_dir("int main(void){ nonsense ; }\n")
+        with mock.patch.dict(os.environ, {"CTF_HOME": home}):
+            with tempfile.TemporaryDirectory() as work:
+                with self.assertRaises(RATBENCH.CompileError):
+                    RATBENCH._compile(entry, work)
+                # The caller maps CompileError -> verify-fail (see cmd_run).
+                try:
+                    RATBENCH._compile(entry, work)
+                except RATBENCH.CompileError as exc:
+                    status, detail = "verify-fail", "fixture compile failed: %s" % exc
+                self.assertEqual(status, "verify-fail")
+                self.assertIn("compile failed", detail)
+
+    def test_missing_source_still_skips(self):
+        # No src.c at all -> genuine skip (None), not a CompileError.
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        rel = os.path.join("bench", "artifacts", "empty-fixture")
+        os.makedirs(os.path.join(home, rel), exist_ok=True)
+        entry = {"id": "empty-fixture", "dir": rel}
+        with mock.patch.dict(os.environ, {"CTF_HOME": home}):
+            with tempfile.TemporaryDirectory() as work:
+                self.assertIsNone(RATBENCH._compile(entry, work))
+
+    def test_good_source_compiles(self):
+        home, entry = self._entry_dir("int main(void){ return 0; }\n")
+        with mock.patch.dict(os.environ, {"CTF_HOME": home}):
+            with tempfile.TemporaryDirectory() as work:
+                out = RATBENCH._compile(entry, work)
+                self.assertTrue(out and os.path.isfile(out))
 
 
 if __name__ == "__main__":

