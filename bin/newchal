@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 RATLIB_BIN="$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)"
-# newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]
+# newchal <name> <binary> [libc.so.6] [host:port] [--run run.json] [--artifact role=path]...
 set -euo pipefail
 # Portability: `readlink -f` is GNU-specific; fall back to a python resolver on macOS/BSD.
 resolve_path() { readlink -f -- "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 if [ "$#" -lt 2 ]; then
-  echo "usage: newchal <name> <binary> [libc.so.6] [host:port] [--run run.json]" >&2
+  echo "usage: newchal <name> <binary> [libc.so.6] [host:port] [--run run.json] [--artifact role=path]..." >&2
   exit 2
 fi
 CTF="$(resolve_path "$CTF_HOME")"; NAME="$1"; BIN="$2"; shift 2
-RUN_SOURCE=""; POSITIONAL=()
+RUN_SOURCE=""; POSITIONAL=(); EXTRA_SPECS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --run)
       [ "$#" -ge 2 ] || { echo "[newchal:err] --run requires a path" >&2; exit 2; }
       RUN_SOURCE="$2"; shift 2 ;;
+    --artifact)
+      [ "$#" -ge 2 ] || { echo "[newchal:err] --artifact requires role=path" >&2; exit 2; }
+      EXTRA_SPECS+=("$2"); shift 2 ;;
     --) shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
     -*) echo "[newchal:err] unknown option: $1" >&2; exit 2 ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -32,7 +35,9 @@ fi
 ARTIFACT_KIND="$(PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$BIN" <<'PY'
 import sys
 from ratlib.kernel_identity import inspect
-print(inspect(sys.argv[1])["kind"])
+from ratlib.raw_loader import inspect_raw
+kind = inspect(sys.argv[1])["kind"]
+print(inspect_raw(sys.argv[1])["kind"] if kind == "unknown" else kind)
 PY
 )"
 if [ -n "$LIBC" ] && [ ! -f "$LIBC" ]; then
@@ -90,12 +95,36 @@ fi
 BIN_ABS="$(resolve_path "$BIN")"
 LIBC_ABS=""
 if [ -n "$LIBC" ]; then LIBC_ABS="$(resolve_path "$LIBC")"; fi
+# Validate additional inputs before writing to solve/.
+EXTRA_FILES=()
+EXTRA_NAMES=("$(basename "$BIN_ABS")" "$(basename "$BIN_ABS")_patched" "libc.so.6" "run.json" "exploit.py" "state.md" "Dockerfile")
+for spec in "${EXTRA_SPECS[@]}"; do
+  if [[ "$spec" != *=* ]]; then
+    echo "[newchal:err] --artifact requires role=path" >&2; exit 2
+  fi
+  role="${spec%%=*}"; source="${spec#*=}"
+  if [[ ! "$role" =~ ^(image|runner|extra)$ ]] || [ -z "$source" ] || [ ! -f "$source" ] || [ -L "$source" ]; then
+    echo "[newchal:err] invalid --artifact role/path: $role" >&2; exit 2
+  fi
+  source="$(resolve_path "$source")"; filename="$(basename "$source")"
+  if [[ ! "$filename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [ "${#filename}" -gt 128 ]; then
+    echo "[newchal:err] unsafe artifact filename: $filename" >&2; exit 2
+  fi
+  for used in "${EXTRA_NAMES[@]}"; do
+    if [ "$filename" = "$used" ]; then
+      echo "[newchal:err] colliding artifact filename: $filename" >&2; exit 2
+    fi
+  done
+  EXTRA_NAMES+=("$filename")
+  EXTRA_FILES+=("$role=$source")
+done
 "$CTF/bin/ctfguard" check-newchal "$NAME" >/dev/null
 mkdir -p -- "$D"; D="$(resolve_path "$D")"
 case "$D/" in "$SOLVE_ROOT"/*/) ;; *) echo "[newchal:err] destination escaped solve root" >&2; exit 5;; esac
 cd "$D"
 cp -- "$BIN_ABS" ./
 BN="$(basename "$BIN_ABS")"
+for artifact in "${EXTRA_FILES[@]}"; do cp -- "${artifact#*=}" ./; done
 if [ -n "$LIBC_ABS" ]; then cp -- "$LIBC_ABS" ./libc.so.6; fi
 SRC_DIR="$(cd -- "$(dirname -- "$BIN_ABS")" && pwd)"
 DOCKER_SRC=""
@@ -126,12 +155,12 @@ fi
 python3 - "$D" "$BN" "$HOST" "$PORT" "$ARTIFACT_KIND" <<'PY'
 import sys,os
 D,BN,HOST,PORT,KIND=sys.argv[1:6]
-if KIND in {"bzimage", "linux-boot-image", "vmlinux"}:
+if KIND in {"bzimage", "linux-boot-image", "vmlinux", "boot-sector-candidate", "disk-image-candidate"}:
     open(os.path.join(D,"exploit.py"),"w").write(
         '#!/usr/bin/env python3\n'
-        '# Kernel artifact: configure the provided boot/initramfs harness before execution.\n'
-        '# Inspect symbols in extracted vmlinux; record runtime evidence before exploitation.\n'
-        'raise SystemExit("Configure the challenge kernel harness first (see run.json)")\n')
+        '# Non-ELF artifact: configure the provided QEMU/boot harness before execution.\n'
+        '# Record runtime evidence before analysis; see QEMU hints and digests in run.json.\n'
+        'raise SystemExit("Configure the challenge execution harness first (see run.json)")\n')
     raise SystemExit(0)
 exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
 haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
@@ -157,26 +186,31 @@ io.interactive()
 ''' % (exe, ('libc = ELF("./libc.so.6", checksec=False)\\n' if haslibc else ''), remote_branch))
 PY
 sed "s/{{NAME}}/$NAME/; s#{{BIN}}#$BN#; s#{{REMOTE}}#${REMOTE:-'-'}#" "$CTF/solve/_template/state.md" > state.md 2>/dev/null || cp "$CTF/solve/_template/state.md" state.md
-PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" <<'PY'
-import sys
+PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" "${EXTRA_FILES[@]}" <<'PY'
+import os,sys
 from ratlib.run_manifest import materialize_for_solve
-source, destination, name, binary, libc, remote, owner = sys.argv[1:]
+source, destination, name, binary, libc, remote, owner = sys.argv[1:8]
+extra = [(item.split("=", 1)[0], os.path.join(os.path.dirname(destination),
+          os.path.basename(item.split("=", 1)[1]))) for item in sys.argv[8:]]
 try:
     materialize_for_solve(source or None, destination, name=name, binary=binary,
-                          libc=libc or None, remote=remote or None, owner_path=owner)
+                          libc=libc or None, remote=remote or None, owner_path=owner,
+                          extra_inputs=extra)
 except (OSError, ValueError) as exc:
     print("[newchal:err] run manifest: %s" % exc, file=sys.stderr)
     raise SystemExit(2)
 PY
 echo "=== libcgate ==="; "$CTF/bin/libcgate" "." | tee -a state.md || true
-if [[ "$ARTIFACT_KIND" = bzimage || "$ARTIFACT_KIND" = linux-boot-image || "$ARTIFACT_KIND" = vmlinux ]]; then
+if [[ "$ARTIFACT_KIND" = bzimage || "$ARTIFACT_KIND" = linux-boot-image || "$ARTIFACT_KIND" = vmlinux || "$ARTIFACT_KIND" = boot-sector-candidate || "$ARTIFACT_KIND" = disk-image-candidate ]]; then
   PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "./$BN" <<'PY' | tee -a state.md
 import json,sys
 from ratlib.kernel_identity import inspect
 identity=inspect(sys.argv[1])
-print("[newchal] 커널 이미지 (%s): 일반 ELF recon 생략" % identity["kind"])
+from ratlib.raw_loader import inspect_raw
+kind = identity["kind"] if identity["kind"] != "unknown" else inspect_raw(sys.argv[1])["kind"]
+print("[newchal] 비-ELF/커널 이미지 (%s): 일반 ELF recon 생략" % kind)
 print(json.dumps(identity,ensure_ascii=False,sort_keys=True))
-if identity["kind"] != "vmlinux":
+if kind in {"bzimage", "linux-boot-image"}:
     print("[newchal] Linux scripts/extract-vmlinux로 ELF vmlinux를 추출한 뒤 함수 조회. 부팅 환경은 별도 확인 필요.")
 PY
   echo "[+] $D 생성. 다음: cd $D; rat route ./$BN"
