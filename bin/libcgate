@@ -11,6 +11,7 @@ whether the current challenge directory has enough runtime evidence and prints
 the heap/tcache checks that must precede a "remote libc differs" conclusion.
 """
 import argparse
+from ratlib.copy_reloc import copy_relocations
 import hashlib
 import json
 import os
@@ -83,7 +84,7 @@ def find_files(root):
                 dockerfiles.append(p)
             elif LIBC_RE.match(base):
                 libcs.append(p)
-            elif base.startswith("ld-") or base.startswith("ld-linux"):
+            elif base.startswith("ld-") or base.startswith("ld_") or "ld-linux" in base or "ld-musl" in base:
                 loaders.append(p)
     return sorted(dockerfiles), sorted(libcs), sorted(loaders)
 
@@ -145,60 +146,6 @@ def manifest_binary(root):
         return binary, None
     except (OSError, ValueError, TypeError, AttributeError) as exc:
         return None, "cannot validate run.json binary: %s." % type(exc).__name__
-
-
-def copy_relocations(binary):
-    """Return static ELF COPY relocations; an unsupported scan is never 'none'."""
-    header = read_bytes(binary, 20)
-    if header[:4] != b"\x7fELF" or len(header) < 18:
-        return None, "selected artifact is not an ELF executable"
-    endian = "little" if header[5] == 1 else "big" if header[5] == 2 else None
-    if endian is None:
-        return None, "ELF byte order is unknown"
-    e_type = int.from_bytes(header[16:18], endian)
-    machine = int.from_bytes(header[18:20], endian)
-    copy_kinds = {3: "R_386_COPY", 62: "R_X86_64_COPY", 183: "R_AARCH64_COPY"}
-    if machine not in copy_kinds:
-        return None, "ELF machine %d has no supported COPY relocation parser" % machine
-    readelf = shutil.which("readelf")
-    if not readelf:
-        return None, "readelf unavailable; COPY relocation scan not performed"
-    try:
-        # Capture to disk so huge relocation tables cannot fill agent memory.
-        with tempfile.TemporaryFile() as capture:
-            result = subprocess.run([readelf, "-rW", "--", binary],
-                                    stdout=capture, stderr=capture, timeout=10, check=False,
-                                    env={**os.environ, "LC_ALL": "C"})
-            if result.returncode:
-                return None, "readelf failed (exit %d)" % result.returncode
-            if capture.tell() > 2 * 1024 * 1024:
-                return None, "readelf relocation output exceeds 2 MiB bound"
-            capture.seek(0)
-            output = capture.read().decode("utf-8", "replace")
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, "readelf unavailable or timed out (%s)" % type(exc).__name__
-    sections = re.findall(r"^Relocation section '([^']+)' at offset 0x[0-9a-fA-F]+ "
-                          r"contains ([0-9]+) entr(?:y|ies):$", output, re.M)
-    no_relocations = re.search(r"^There are no relocations in this file\.$", output, re.M)
-    if not sections and not no_relocations:
-        return None, "readelf relocation output is unrecognized"
-    expected_rows = sum(int(count) for name, count in sections if not name.startswith(".relr"))
-    parsed_rows = sum(bool(re.match(r"^[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+\S+", line))
-                      for line in output.splitlines())
-    if parsed_rows < expected_rows:
-        return None, "readelf relocation output is incomplete"
-    copies = set()
-    for line in output.splitlines():
-        fields = line.split()
-        if (len(fields) < 5 or not re.fullmatch(r"[0-9a-fA-F]+", fields[0])
-                or fields[2] != copy_kinds[machine]):
-            continue
-        symbol = fields[4].split("@", 1)[0]
-        if symbol:
-            copies.add((int(fields[0], 16), symbol, fields[2]))
-    return [(("PIE+0x%x" if e_type == 3 else "0x%x") % addr, symbol, kind)
-            for addr, symbol, kind in sorted(copies)], None
-
 
 
 def parse_from_image(from_line_text):
