@@ -219,7 +219,8 @@ print(json.dumps({'schema':'rat.decomp-list/v1','status':'ok','total':len(rows),
 PY
   else
     echo "# 함수 목록 (size 내림차순).  개별: decomp <bin> <func>"
-    sort -t$'\t' -k3 -nr "$CACHE/_index.txt" 2>/dev/null | head -60
+    # Consume the full sorted stream: head exits early and SIGPIPEs sort under pipefail.
+    sort -t "$(printf '\t')" -k3 -nr "$CACHE/_index.txt" 2>/dev/null | awk 'NR <= 60 { print }'
   fi
 else
   IFS=$'\t' read -r lookup_status lookup_file lookup_addr lookup_vma < <(python3 "$CTF_HOME/bin/ratlib/decomp_lookup.py" "$BIN" "$CACHE" "$FUNC")
