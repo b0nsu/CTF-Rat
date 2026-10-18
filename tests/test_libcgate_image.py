@@ -173,6 +173,59 @@ class LibcgateImageTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), b"container libc fixture")
             self.assertEqual(external.read_bytes(), b"host secret fixture")
 
+    @staticmethod
+    def _elf_header(e_machine):
+        # Minimal 20-byte ELF header prefix: magic + 64-bit LSB + e_machine at [18:20].
+        h = bytearray(b"\x7fELF")
+        h += bytes([2, 1, 1, 0])          # EI_CLASS=64, EI_DATA=LSB, EI_VERSION, EI_OSABI
+        h += b"\x00" * 8                   # EI_PAD
+        h += (2).to_bytes(2, "little")     # e_type = ET_EXEC
+        h += int(e_machine).to_bytes(2, "little")  # e_machine at offset 18
+        return bytes(h) + b"\x00" * 44
+
+    def test_arch_mismatch_refuses_wrong_libc(self):
+        """An aarch64 target must not get an x86_64 libc even if both paths exist."""
+        extract = LIBCGATE["extract_from_image"]
+        image_id = "sha256:" + "c" * 64
+        cp_paths = []
+
+        def fake_run(argv, **kwargs):
+            if argv[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+            if argv[1] == "create":
+                return subprocess.CompletedProcess(argv, 0, "cid\n", "")
+            if argv[1] == "cp":
+                src, target = argv[-2], Path(argv[-1])
+                cp_paths.append(src)
+                # Image has BOTH arch trees; serve an ELF matching the path's arch token.
+                if "libc.so.6" in src and not target.name.startswith("ld_"):
+                    em = 0xB7 if "aarch64" in src else 0x3E
+                    target.write_bytes(self._elf_header(em))
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "ld-linux" in src:
+                    em = 0xB7 if "aarch64" in src else 0x3E
+                    target.write_bytes(self._elf_header(em))
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "chall"
+            binary.write_bytes(self._elf_header(0xB7))  # aarch64 target
+            atomic_write(str(root / "run.json"),
+                         new_direct("fixture", str(binary), None, None))
+            with patch.object(LIBCGATE["shutil"], "which", return_value="/fake/docker"), \
+                 patch.object(LIBCGATE["subprocess"], "run", side_effect=fake_run):
+                text, rc = extract(str(root), image="challenge:built")
+            self.assertEqual(rc, 0, text)
+            # No x86_64 path should have been attempted for an aarch64 target.
+            self.assertFalse(any("x86_64" in p for p in cp_paths),
+                             "x86_64 path attempted for aarch64 target: %s" % cp_paths)
+            self.assertIn("target binary arch: aarch64", text)
+            self.assertEqual(LIBCGATE["_elf_arch"](root / "libc_docker.so.6"), "aarch64")
+            self.assertEqual(LIBCGATE["_elf_arch"](root / "ld_docker.so"), "aarch64")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,13 +31,28 @@ def git_blob_sha1(data):
     return hashlib.sha1(header + payload).hexdigest()
 
 
+def _contains(parent, child):
+    """True if ``child`` is ``parent`` or lives under it (both already real paths)."""
+    try:
+        return os.path.commonpath((parent, child)) == parent
+    except ValueError:  # different drives / mixed abs-rel
+        return False
+
+
 def _target_path(root, entry):
-    base = os.path.realpath(os.path.join(root, entry["dir"]))
+    store_root = os.path.realpath(root)
+    base = os.path.realpath(os.path.join(store_root, entry["dir"]))
+    # The fixture directory itself must stay within the store root: a symlinked
+    # ``dir`` would otherwise let the target escape even though ``target`` resolves
+    # under its own (escaped) base.
+    if not _contains(store_root, base):
+        raise ArtifactMaterializationError(
+            "fixture dir escapes store root: %s" % entry.get("dir"))
     binary = entry.get("binary")
     if not binary:
         raise ArtifactMaterializationError("%s has no binary target" % entry["id"])
     target = os.path.realpath(os.path.join(base, binary))
-    if os.path.commonpath((base, target)) != base:
+    if not _contains(base, target) or not _contains(store_root, target):
         raise ArtifactMaterializationError("binary target escapes fixture root: %s" % binary)
     return target
 

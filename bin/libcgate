@@ -191,6 +191,55 @@ _LOADER_IN_IMAGE = (
 )
 
 
+# ELF e_machine -> architecture token used in the image library paths below.
+_EM_TO_ARCH = {
+    0x3E: "x86_64",      # EM_X86_64
+    0x03: "i386",        # EM_386
+    0xB7: "aarch64",     # EM_AARCH64
+    0x28: "arm",         # EM_ARM
+    0x08: "mips",        # EM_MIPS
+}
+
+
+def _elf_arch(path):
+    """Return an architecture token (x86_64/i386/aarch64/...) from an ELF header,
+    or None if the file is not an ELF we recognize. Pure stdlib, no readelf."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return None
+    little = head[5] == 1  # EI_DATA: 1=LSB, 2=MSB
+    e_machine = int.from_bytes(head[18:20], "little" if little else "big")
+    return _EM_TO_ARCH.get(e_machine)
+
+
+def _arch_matches_path(arch, image_path):
+    """True if an image library path is compatible with the target ELF arch.
+
+    Paths carry an explicit multiarch token (x86_64/i386/aarch64/...). Ambiguous
+    generic paths (/lib/libc.so.6, /lib64/...) carry no token; treat those as a
+    match only for the native-ambiguous case so a single-arch image still works,
+    but never let a tokened path of the wrong arch through."""
+    if arch is None:
+        return True  # cannot discriminate; preserve previous behavior
+    # Map each arch to the path substrings that identify it. Loader names use a hyphen
+    # (ld-linux-x86-64, ld-linux-aarch64) while libc multiarch dirs use the token form.
+    arch_markers = {
+        "x86_64": ("x86_64", "x86-64"),
+        "i386": ("i386",),
+        "aarch64": ("aarch64",),
+        "arm": ("arm", "armhf"),
+        "mips": ("mips", "mipsel"),
+    }
+    all_markers = {mk for marks in arch_markers.values() for mk in marks}
+    if not any(mk in image_path for mk in all_markers):
+        return True  # generic/untokened path: allow (single-arch image)
+    return any(mk in image_path for mk in arch_markers.get(arch, (arch,)))
+
+
 def _build_id(path):
     """Return the GNU build-id hex of an ELF, or None (readelf-based, bounded)."""
     readelf = shutil.which("readelf")
@@ -205,8 +254,12 @@ def _build_id(path):
     return m.group(1) if m else None
 
 
-def _docker_cp_first(container, candidates, dest):
-    """Try docker cp for each candidate path; return the image path copied, or None."""
+def _docker_cp_first(container, candidates, dest, accept=None):
+    """Try docker cp for each candidate path; return the image path copied, or None.
+
+    ``accept`` is an optional predicate(dest_path) -> bool. When it rejects a copied
+    file (e.g. wrong architecture), that candidate is discarded and the next is tried,
+    so an untokened generic path holding a wrong-arch ELF does not end the search."""
     docker = shutil.which("docker")
     for src_path in candidates:
         try:
@@ -215,7 +268,13 @@ def _docker_cp_first(container, candidates, dest):
         except (OSError, subprocess.TimeoutExpired):
             continue
         if r.returncode == 0 and os.path.isfile(dest) and not os.path.islink(dest):
-            return src_path
+            if accept is None or accept(dest):
+                return src_path
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            continue
         # docker cp of a symlink target: if dest is a symlink or dir, clean up
         if os.path.lexists(dest) and (os.path.islink(dest) or not os.path.isfile(dest)):
             try:
@@ -270,13 +329,36 @@ def extract_from_image(root, image=None):
         lines.append("No host libc fallback; resolve image access and retry.")
         return "\n".join(lines), 2
     container = created.stdout.strip()
+    # Determine the target binary's architecture so we extract a matching libc/loader
+    # pair, not whichever multiarch path happens to come first.
+    target_arch = None
+    for item in manifest.get("inputs", []):
+        if item.get("role") == "binary":
+            bin_path = item.get("path") or item.get("name")
+            if bin_path and not os.path.isabs(bin_path):
+                bin_path = os.path.join(root, bin_path)
+            if bin_path and os.path.isfile(bin_path):
+                target_arch = _elf_arch(bin_path)
+            break
+    if target_arch:
+        lines.append("target binary arch: %s" % target_arch)
+    else:
+        lines.append("WARN: target binary arch undetermined; extracting without arch filter.")
     with tempfile.TemporaryDirectory(prefix=".libcgate-extract-", dir=root) as stage_dir:
         extracted = []
         try:
+            def arch_ok(path):
+                # Reject a copied ELF whose arch disagrees with the target. Untokened
+                # generic paths can still hold a wrong-arch ELF, so verify the bytes.
+                if not target_arch:
+                    return True
+                got = _elf_arch(path)
+                return got is None or got == target_arch
             for role, name, candidates in (("libc", "libc_docker.so.6", _LIBC_IN_IMAGE),
                                            ("loader", "ld_docker.so", _LOADER_IN_IMAGE)):
+                filtered = [c for c in candidates if _arch_matches_path(target_arch, c)]
                 staged = os.path.join(stage_dir, name)
-                src = _docker_cp_first(container, candidates, staged)
+                src = _docker_cp_first(container, filtered, staged, accept=arch_ok)
                 if src:
                     extracted.append((role, staged, os.path.join(root, name), src))
         finally:

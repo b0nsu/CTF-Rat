@@ -83,6 +83,33 @@ class BenchArtifactTests(unittest.TestCase):
             with open(target, "rb") as fh:
                 self.assertEqual(fh.read(), b"wrong")
 
+    def test_symlinked_fixture_dir_cannot_escape_store_root(self):
+        """A fixture dir that is a symlink out of the store root must be refused,
+        and nothing may be written to the external target."""
+        payload = b"\x7fELF-escape-payload"
+        entry = {
+            "id": "escape-01",
+            "dir": "bench/artifacts/escape-01",
+            "binary": "chall.bin",
+            "fetch": {
+                "url": "https://example.invalid/chall.bin",
+                "git_blob_sha1": git_blob_sha1(payload),
+                "license": "Apache-2.0",
+            },
+        }
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            link_path = os.path.join(root, "bench", "artifacts", "escape-01")
+            os.makedirs(os.path.dirname(link_path), exist_ok=True)
+            os.symlink(outside, link_path)  # fixture dir points outside the store root
+
+            def should_not_fetch(*_args, **_kwargs):
+                raise AssertionError("escape attempt must fail before any network access")
+
+            with self.assertRaisesRegex(ArtifactMaterializationError, "escape"):
+                materialize_entry(entry, root=root, opener=should_not_fetch)
+            # No file written into the external directory.
+            self.assertEqual(os.listdir(outside), [])
+
 
 if __name__ == "__main__":
     unittest.main()

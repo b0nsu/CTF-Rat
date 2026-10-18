@@ -179,7 +179,10 @@ def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
         for path in runtime_env_dirs:
             if os.path.isdir(path):
                 isolation += ["--ro-bind", path, path]
-        isolation += ["--proc", "/proc", "--dev-bind", "/dev", "/dev", "--"]
+        # --dev (minimal new devtmpfs: null/zero/full/random/urandom/tty) instead of
+        # --dev-bind /dev /dev, which would expose host block devices (/dev/sda,
+        # /dev/mem, ...) to the sandboxed agent.
+        isolation += ["--proc", "/proc", "--dev", "/dev", "--"]
     else:
         raise RuntimeError("Mode B requires bwrap on Linux")
     try:
