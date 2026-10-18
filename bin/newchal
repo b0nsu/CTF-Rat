@@ -176,6 +176,13 @@ continue
 def conn():
 %s    if args.REMOTE: raise SystemExit("remote target was not configured by newchal")
     if args.GDB:    return gdb.debug([exe.path], gdbscript=GS)   # heap/인터랙티브 디버깅 주력
+    # stdio wiring 주의(#106): pwntools 기본 process()는 자식 stdout/stderr를 PTY에
+    # 붙인다(isatty(1)==1). 그러면 glibc stdout이 line-buffered가 되어 remote(nc=소켓=
+    # non-tty, fully-buffered)와 다른 크기의 stdio 버퍼를 heap에서 malloc한다. 그 버퍼가
+    # 이후 heap 청크 주소를 밀어 ASLR off에서도 로컬↔remote heap 레이아웃이 어긋날 수 있다
+    # (버퍼 크기는 glibc/디바이스마다 다르니 상수로 가정 금지). tcache/heap 주소가 로컬에선
+    # 맞고 remote에선 깨지면(또는 그 반대) 먼저 이 wiring을 의심하라. remote와 레이아웃을
+    # 맞추려면 non-tty로 띄운다: process([exe.path], stdin=PIPE, stdout=PIPE, stderr=PIPE).
     return process([exe.path])
 
 io = conn()
