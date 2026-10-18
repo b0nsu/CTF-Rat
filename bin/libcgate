@@ -125,7 +125,7 @@ def manifest_binary(root):
     """Select the challenge-local, digest-verified binary; do not guess paths."""
     path = os.path.join(root, "run.json")
     if not os.path.isfile(path):
-        return None, None
+        return None, "run.json is missing; COPY relocation scan unavailable without a digest-bound binary."
     try:
         with open(path, encoding="utf-8") as source:
             manifest = json.load(source)
@@ -167,7 +167,8 @@ def copy_relocations(binary):
         # Capture to disk so huge relocation tables cannot fill agent memory.
         with tempfile.TemporaryFile() as capture:
             result = subprocess.run([readelf, "-rW", "--", binary],
-                                    stdout=capture, stderr=capture, timeout=10, check=False)
+                                    stdout=capture, stderr=capture, timeout=10, check=False,
+                                    env={**os.environ, "LC_ALL": "C"})
             if result.returncode:
                 return None, "readelf failed (exit %d)" % result.returncode
             if capture.tell() > 2 * 1024 * 1024:
@@ -176,6 +177,16 @@ def copy_relocations(binary):
             output = capture.read().decode("utf-8", "replace")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, "readelf unavailable or timed out (%s)" % type(exc).__name__
+    sections = re.findall(r"^Relocation section '([^']+)' at offset 0x[0-9a-fA-F]+ "
+                          r"contains ([0-9]+) entr(?:y|ies):$", output, re.M)
+    no_relocations = re.search(r"^There are no relocations in this file\.$", output, re.M)
+    if not sections and not no_relocations:
+        return None, "readelf relocation output is unrecognized"
+    expected_rows = sum(int(count) for name, count in sections if not name.startswith(".relr"))
+    parsed_rows = sum(bool(re.match(r"^[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+\S+", line))
+                      for line in output.splitlines())
+    if parsed_rows < expected_rows:
+        return None, "readelf relocation output is incomplete"
     copies = set()
     for line in output.splitlines():
         fields = line.split()
@@ -245,7 +256,7 @@ def audit(root):
         if binary:
             copies, relocation_warning = copy_relocations(binary)
             if relocation_warning:
-                notes.append("COPY relocation scan unavailable: " + relocation_warning)
+                warnings.append("COPY relocation scan unavailable: " + relocation_warning)
             elif copies:
                 lines.append("COPY relocations (executable-owned globals, not libc's symbol):")
                 for address, symbol, kind in copies[:32]:
