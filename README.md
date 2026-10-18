@@ -110,7 +110,7 @@ flowchart LR
 CLAUDE.md / AGENTS.md      agent entry point (symlink)
 SETUP.md                   environment-agnostic initial setup
 doctrine/                  SOLVING · SOLVABILITY · PRIMITIVE_GATE · REFUSAL · FINALS
-docs/                       calibration (오염 상수 포함 — doctrine 밖)
+docs/                       calibration (로컬 누적 로그, 릴리스는 빈 템플릿 — 오염 상수는 doctrine 밖)
 knowledge/                 vendored pwn/rev knowledge + repo-owned learned/ + writeup pipeline
 reference/                 libc-offsets/ · glibc/(list · SOURCES · glibc-fetch)
 bin/                       all tools (+ghidra_scripts/)
@@ -242,9 +242,9 @@ By default `pkflag` uses `solve/<active-challenge>/FLAG_FORMAT` (from `ctfguard`
 
 ```sh
 ctfguard begin example
-pkflag --set 'DH\{[A-Za-z0-9_]+\}' # set this challenge's format
+pkflag --set 'CTF\{[A-Za-z0-9_]+\}' # set this challenge's format
 pkflag --show                          # show this challenge's format
-pkflag 'DH{example_candidate}'         # format-only check
+pkflag 'CTF{example_candidate}'        # format-only check
 pkflag --global --show                 # explicitly inspect legacy global format
 ```
 
