@@ -67,6 +67,11 @@ libc.
 For exploit development outside the container, copy the exact runtime libc and
 dynamic loader out of the built image:
 
+`libcgate --extract --image ctf-chal:local .` resolves the final built image
+to an immutable Docker image ID before copying and records that ID, file hashes,
+and build IDs in `run.json`. A Dockerfile `FROM` line alone is not runtime
+provenance. The manual equivalent is:
+
 ```bash
 cid="$(docker create ctf-chal:local)"
 docker cp -L "$cid":/lib/x86_64-linux-gnu/libc.so.6 ./libc.so.6

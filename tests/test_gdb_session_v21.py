@@ -38,7 +38,9 @@ for line in sys.stdin:
     elif '-data-list-register-values' in line:
         print(token+'^done,register-values=[{number="0",value="0x1234"},{number="1",value="0x123456789abcdef0"}]', flush=True)
     elif '-data-read-memory-bytes' in line:
-        print(token+'^done,memory=[{begin="0x1000",contents="41424344"}]', flush=True)
+        addr, count = line.split()[-2:]
+        payload = "41424344" if addr == "0x1000" and count == "4" else "00"*int(count)
+        print(token+'^done,memory=[{begin="'+addr+'",contents="'+payload+'"}]', flush=True)
     elif '-break-insert' in line:
         print(token+'^done,bkpt={number="1"}', flush=True)
     elif 'catch exec' in line:
@@ -100,6 +102,22 @@ class GdbSessionProtocol(unittest.TestCase):
         self.assertEqual(gdb_session.request(self.binary, sid, "close")["status"], "closed")
         time.sleep(0.1)
         self.assertFalse(os.path.exists(sock))
+
+    def test_heap_snapshot_is_read_only_candidate_in_session(self):
+        start = gdb_session.start(self.binary, self.scenario, idle_timeout=5)
+        sid = start["session_id"]
+        self.addCleanup(lambda: gdb_session.request(self.binary, sid, "close"))
+        output = gdb_session.request(self.binary, sid, "heap",
+                                     layout="glibc-2.35-x86_64", tcache="0x500000")
+        self.assertEqual(output["status"], "ok", output)
+        self.assertEqual(output["observation"]["result"]["snapshot"]["regions"]["tcache"]["bins"], [])
+        capture = gdb_session.request(self.binary, sid, "capture")
+        artifact = json.loads(get(capture["artifact"]["digest"], root=os.path.join(self.tmp.name, ".rat")))
+        self.assertEqual(artifact["observations"][0]["action"], "heap")
+        self.assertFalse(artifact["direct_evidence"])
+        rejected = gdb_session.request(self.binary, sid, "heap", layout="glibc-2.39-x86_64",
+                                       tcache="0x500000")
+        self.assertEqual(rejected["status"], "error")
 
     def test_missing_gdb_and_invalid_input(self):
         with patch("ratlib.gdb_session.shutil.which", return_value=None):
@@ -285,6 +303,99 @@ class RealGdbSession(unittest.TestCase):
                     self.assertTrue(last["session_ended"])
                     self.assertEqual(last["termination"], "inferior-exited")
                     self.assertIn("done", str(last["observation"]["result"]["output"]))
+                finally:
+                    gdb_session.request(binary, sid, "close")
+
+    def test_heap_snapshot_matches_independent_gdb_ground_truth(self):
+        """The bounded heap snapshot must equal values an independent GDB reads.
+
+        Regression for #105: a binary deterministically fills two tcache bins and
+        stops at a marker; the session heap snapshot is compared against the SAME
+        raw bytes read by a separate GDB run and decoded with the same arithmetic.
+        no-pie + disable-randomization make the heap layout reproducible across the
+        two runs. This is version-agnostic: both sides read the same bytes at the
+        same offsets, so it pins that the session reads and decodes correctly, not
+        a particular glibc's absolute addresses.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "heapfill.c")
+            binary = os.path.join(root, "heapfill")
+            with open(source, "w") as handle:
+                handle.write(
+                    "#include <stdlib.h>\n#include <unistd.h>\n"
+                    "void breakpoint_here(void){ }\n"
+                    "int main(void){\n"
+                    "  void *a[5]; for(int i=0;i<5;i++) a[i]=malloc(0x18);\n"
+                    "  for(int i=0;i<5;i++) free(a[i]);\n"
+                    "  void *b[2]; for(int i=0;i<2;i++) b[i]=malloc(0x38);\n"
+                    "  for(int i=0;i<2;i++) free(b[i]);\n"
+                    "  breakpoint_here();\n"
+                    "  char c; (void)!read(0,&c,1); return 0;\n}\n")
+            subprocess.run(["gcc", "-O0", "-g", "-no-pie", "-fno-stack-protector",
+                            source, "-o", binary], check=True, capture_output=True)
+
+            # Independent GDB ground truth: resolve tcache/&main_arena and dump the
+            # exact byte ranges the session reads.
+            tcache_bin = os.path.join(root, "tcache.bin")
+            arena_bin = os.path.join(root, "arena.bin")
+            gt_script = os.path.join(root, "gt.gdb")
+            with open(gt_script, "w") as handle:
+                handle.write(
+                    "set pagination off\nset disable-randomization on\n"
+                    "break breakpoint_here\nrun\n"
+                    "printf \"TCACHE=%p\\n\", tcache\n"
+                    "printf \"ARENA=%p\\n\", &main_arena\n"
+                    "dump binary memory " + tcache_bin + " tcache ((char*)tcache)+640\n"
+                    "dump binary memory " + arena_bin + " (char*)&main_arena+0x60 "
+                    "(char*)&main_arena+0x60+32\n"
+                    "quit\n")
+            gt = subprocess.run(["gdb", "-q", "-nx", "-batch", "-x", gt_script, binary],
+                                capture_output=True, text=True, timeout=60,
+                                stdin=subprocess.DEVNULL)
+            addrs = dict(re.findall(r"(TCACHE|ARENA)=(0x[0-9a-fA-F]+)", gt.stdout))
+            if "TCACHE" not in addrs or not os.path.exists(tcache_bin):
+                self.skipTest("ground-truth GDB could not resolve glibc tcache symbol")
+            with open(tcache_bin, "rb") as f: raw = f.read()
+            with open(arena_bin, "rb") as f: arena_raw = f.read()
+            u64 = lambda b, i: int.from_bytes(b[i:i+8], "little")
+            counts = [int.from_bytes(raw[2*i:2*i+2], "little") for i in range(64)]
+            entries = [u64(raw, 128 + 8*i) for i in range(64)]
+            gt_bins = sorted((i, counts[i], entries[i])
+                             for i in range(64) if counts[i] or entries[i])
+            gt_arena = {"top": u64(arena_raw, 0), "last_remainder": u64(arena_raw, 8),
+                        "unsorted_fd": u64(arena_raw, 16), "unsorted_bk": u64(arena_raw, 24)}
+            # The fixture freed 5x0x20 and 2x0x40 chunks, so two bins must be set.
+            self.assertEqual([(b[0], b[1]) for b in gt_bins], [(0, 5), (2, 2)], gt_bins)
+
+            # Session snapshot at the same stop, same addresses.
+            scenario = os.path.join(root, "scenario.json")
+            with open(scenario, "w") as handle:
+                json.dump({"schema": "rat.scenario/v1", "argv": []}, handle)
+            run = new_direct("fixture", binary, None, None); run["status"] = "active"
+            with open(os.path.join(root, "run.json"), "w") as handle: json.dump(run, handle)
+            with open(os.path.join(root, "ACTIVE.json"), "w") as handle:
+                json.dump({"chal": "fixture"}, handle)
+            with patch.dict(os.environ, {"CTF_HOME": root}):
+                started = gdb_session.start(binary, scenario, action_timeout=15, idle_timeout=20)
+                sid = started["session_id"]
+                try:
+                    self.assertEqual(
+                        gdb_session.request(binary, sid, "break", target="breakpoint_here")["status"], "ok")
+                    cont = gdb_session.request(binary, sid, "continue")
+                    self.assertIn("breakpoint-hit", cont["observation"]["result"]["stop"])
+                    snap = gdb_session.request(
+                        binary, sid, "heap", layout="glibc-2.35-x86_64",
+                        tcache=addrs["TCACHE"], arena=addrs["ARENA"])
+                    self.assertEqual(snap["status"], "ok", snap)
+                    regions = snap["observation"]["result"]["snapshot"]["regions"]
+                    sess_bins = sorted((b["index"], b["count"], int(b["head"], 16))
+                                       for b in regions["tcache"]["bins"])
+                    self.assertEqual(sess_bins, gt_bins, "tcache bins differ from GDB")
+                    sess_arena = {k: int(regions["arena"][k], 16)
+                                  for k in ("top", "last_remainder", "unsorted_fd", "unsorted_bk")}
+                    self.assertEqual(sess_arena, gt_arena, "arena fields differ from GDB")
+                    # Candidate-grade: never direct evidence.
+                    self.assertFalse(snap["observation"]["result"]["snapshot"]["direct_evidence"])
                 finally:
                     gdb_session.request(binary, sid, "close")
 

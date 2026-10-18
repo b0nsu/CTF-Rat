@@ -208,5 +208,41 @@ class ReconTests(unittest.TestCase):
         self.assertNotIn("tcache", result.stdout)
 
 
+    def test_memcpy_only_rev_checker_never_predicts_rop(self):
+        """Issue #100: no canary + memcpy + tiny VM is not ROP evidence."""
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fixture = root / "checker"
+            fixture.write_bytes(b"ELF")
+            (root / "pwn.py").write_text(
+                "class _Context: log_level = None\ncontext = _Context()\n"
+                "class ELF:\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        self.symbols={'memcpy':1,'memcmp':2,'main':3}\n"
+                "        self.plt={}; self.functions={f'step_{i}': i for i in range(10)}\n"
+                "        self.pie=False; self.canary=False; self.nx=True; self.relro='Partial'\n")
+            file_tool = root / "file"
+            file_tool.write_text("#!/bin/sh\nprintf '%s\\n' 'ELF 64-bit, not stripped'\n")
+            file_tool.chmod(0o755)
+            strings_tool = root / "strings"
+            strings_tool.write_text("#!/bin/sh\nprintf 'Correct!\\nWrong!\\n'\n")
+            strings_tool.chmod(0o755)
+            machine = self.run_recon(root, fixture, "--format", "json")
+            human = self.run_recon(root, fixture)
+        self.assertEqual(machine.returncode, 0, machine.stderr)
+        self.assertEqual(human.returncode, 0, human.stderr)
+        doc = json.loads(machine.stdout)
+        self.assertEqual(doc["signals"]["sinks"], ["memcpy"])
+        self.assertFalse(doc["protections"]["canary"])
+        self.assertEqual(doc["protections"]["functions"], 10)
+        self.assertEqual(doc["triage"]["techniques"], [])
+        self.assertEqual(doc["triage"]["confidence_key"], "low")
+        self.assertTrue(doc["triage"]["prior_only"])
+        self.assertEqual(doc["triage"]["canonical_router"], "rat route")
+        self.assertNotIn("ROP", human.stdout)
+        self.assertIn("추정 기법: 미확인", human.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

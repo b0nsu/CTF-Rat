@@ -15,6 +15,9 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/heap-techniques.
 - No real heap bug (allocator calls present but no UAF/double-free/overflow reachable) → re-route from `rat-profile`/`revq` signals to the actual primitive.
 - Bug is really a stack overflow inside a heap-allocated struct copy → `pwn-stack` primitive mechanics still apply once the vuln is pinned down.
 
+- **Allocator provenance mismatch (conditional):** after unsorted-bin manipulation, if a `malloc` refill returns an unexpected address, do not assume it came from the top chunk. Capture pre/post tcache counts and heads, top, unsorted fd/bk, and actual returned addresses with the same libc/loader and run identity. An unsorted-bin split can invalidate the planned refill target and later make `tcache_get` crash; this is a candidate diagnosis, never a conclusion from imports alone. The optional `rat dyn session heap --layout glibc-2.35-x86_64` snapshot requires operator-supplied addresses and only supports that pinned layout; use ordinary bounded memory reads for other glibc versions.
+- **Remote round-trip amplification (conditional):** for bit-by-bit or menu-driven primitives, count *sequential* request/response dependencies before remote execution. Estimate a latency floor as `sequential_round_trips * measured_RTT`; add server processing separately, and do not confuse `send()` calls with round trips. Reduce unnecessary bit flips and leak reads; batch only when the server protocol actually accepts pipelining. Check that the reduced plan preserves the same primitive and final oracle.
+
 ## ESCALATE
 - glibc version/tcache-safe-linking behavior uncertain → DEEP; confirm via the in-repo `reference/glibc/` version table + local Docker before picking a house-of-* technique, per `knowledge/GROUNDING_INDEX.md` (glibc gate; how2heap optional).
 - Multiple plausible corruption targets (vtable vs GOT vs tcache key) → DEEP, gate on `doctrine/SOLVABILITY.md` before committing.

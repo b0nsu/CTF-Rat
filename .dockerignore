@@ -3,6 +3,7 @@
 .venv-angr
 .claude
 .rat
+bench/results
 docs/HANDOFF-*
 solve/*
 !solve/_template/

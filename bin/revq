@@ -35,6 +35,7 @@ angr 는 lazy-import. 기본 rev 분석은 `.venv-angr` 인터프리터를 자�
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -52,10 +53,11 @@ from ratlib.evasion import (
 )
 from ratlib.runner import run
 from ratlib.kernel_identity import inspect as inspect_kernel, SCHEMA as KERNEL_IDENTITY_SCHEMA
+from ratlib.wasm import is_wasm, inspect as inspect_wasm
 
-SCHEMA = 5
+SCHEMA = 6
 REVQ_POLICY = "sha256:" + hashlib.sha256(
-    b"revq-local-static-analysis-v5-capstone-register-effects-and-direct-calls"
+    b"revq-local-static-analysis-v6-wasm-and-engine-diagnostics"
 ).hexdigest()
 
 # ─────────────────────────── 휴리스틱 사전 ───────────────────────────
@@ -169,7 +171,9 @@ def annotate_counts(rev):
         "functions_visible": len(canonical),
         "functions_truncated": 0,
         "functions_exact": exact,
-        "scope": "discovered non-PLT functions" if rev.get("engine") == "angr" else "defined text symbols only",
+        "scope": ("Wasm defined function bodies (no CFG)" if rev.get("engine") == "wasm-structure"
+                  else "discovered non-PLT functions" if rev.get("engine") == "angr"
+                  else "defined text symbols only"),
         "aliases": {key: names for key, names in aliases.items() if len(names) > 1},
     }
     return rev
@@ -187,21 +191,24 @@ def parse_int(s):
 
 
 # ─────────────────────────── 엔진 A: angr (정확) ───────────────────────────
-def extract_angr(binpath):
+def _engine_analysis_status(diagnostics):
+    if any(item["severity"] in {"error", "critical"} for item in diagnostics):
+        return "partial"
+    return "complete-with-warnings" if diagnostics else "complete"
+
+
+def _extract_angr_impl(binpath, diagnostics, load_spec=None):
     """CFGFast + xrefs 로 revmap 추출. angr 는 여기서만 import (Mac selftest 격리)."""
     try:
         import angr  # noqa: F401
-        import logging
-        logging.getLogger("angr").setLevel(logging.ERROR)
-        logging.getLogger("cle").setLevel(logging.ERROR)
-        logging.getLogger("pyvex").setLevel(logging.ERROR)
     except ImportError:
         die("angr 미설치 — SETUP.md 대로 venv 세팅 후 실행하거나 `--fast`(binutils) 사용.\n"
             "  예: python3 bin/revq %s" % binpath)
 
     import angr
     info("angr CFGFast 분석 중 (최초 1회, 크기에 따라 수초~수분)...")
-    proj = angr.Project(binpath, auto_load_libs=False)
+    from ratlib.raw_loader import project as raw_project
+    proj = raw_project(binpath, load_spec)
     obj = proj.loader.main_object
     cfg = proj.analyses.CFGFast(
         cross_references=True, data_references=True, normalize=True,
@@ -279,11 +286,67 @@ def extract_angr(binpath):
         "functions": functions,
         "strings": strings,
         "imports": imports,
-        "analysis_complete": True,
+        "analysis_complete": _engine_analysis_status(diagnostics) == "complete",
+        "analysis_status": _engine_analysis_status(diagnostics),
+        "analysis_diagnostics": diagnostics,
         "functions_filtered": sum(1 for f in all_functions if f.is_simprocedure or f.is_plt),
         **evasion,
         "platform": platform,
     }
+
+
+def extract_angr(binpath, load_spec=None):
+    """Capture bounded engine diagnostics across extraction and restore logging."""
+    diagnostics = []
+    class Capture(logging.Handler):
+        def emit(self, record):
+            item = {"severity": record.levelname.lower(),
+                    "source": record.name, "message": record.getMessage()[:240]}
+            if len(diagnostics) < 8:
+                diagnostics.append(item)
+            elif item["severity"] in {"error", "critical"} and not any(
+                    previous["severity"] in {"error", "critical"} for previous in diagnostics):
+                diagnostics[-1] = item
+    handler = Capture(level=logging.WARNING)
+    loggers = [logging.getLogger(name) for name in ("angr", "cle", "pyvex")]
+    old = [(logger.level, logger.propagate) for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.WARNING)
+        logger.propagate = False
+        logger.addHandler(handler)
+    try:
+        return (_extract_angr_impl(binpath, diagnostics) if load_spec is None else
+                _extract_angr_impl(binpath, diagnostics, load_spec))
+    finally:
+        for logger, (level, propagate) in zip(loggers, old):
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+            logger.propagate = propagate
+
+
+def extract_wasm(binpath):
+    """Expose only structural facts; Wasm control/data flow needs another engine."""
+    inventory = inspect_wasm(binpath)
+    functions = [{"name": f["name"], "addr": 0, "size": f["size"],
+                  "nblocks": 0, "ninstr": 0, "count_quality": "unavailable",
+                  "calls": [], "strings": [], "ncallers": 0,
+                  "wasm_index": f["index"], "body_sha256": f["body_sha256"]}
+                 for f in inventory["functions"][:256]]
+    return {"schema": SCHEMA, "engine": "wasm-structure", "platform": "wasm",
+            "arch": "wasm32", "pie": False, "stripped": False,
+            "functions": functions, "strings": [],
+            "imports": [item["module"] + "." + item["name"] for item in inventory["imports"]],
+            "analysis_complete": False, "analysis_status": "partial",
+            "analysis_diagnostics": ["Wasm section inventory only; no CFG, xrefs or runtime verification"],
+            "functions_filtered": max(0, len(inventory["functions"]) - 256),
+            "wasm_inventory": {"schema": inventory["schema"], "format": inventory["format"],
+                               "sha256": inventory["sha256"], "coverage": inventory["coverage"],
+                               "sections": inventory["sections"],
+                               "imports_total": len(inventory["imports"]),
+                               "exports_total": len(inventory["exports"]),
+                               "functions_total": len(inventory["functions"])},
+            "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
+            "evasion_signals": [], "evasion": []}
 
 
 def _extract_strings_from_loader(proj):
@@ -665,6 +728,14 @@ def render_summary(rev):
     L.append("IMPORT: " + (", ".join(hot) if hot else "(판별/입력/crypto 관련 없음)"))
     if rev["engine"] == "binutils":
         L.append("[!] binutils 엔진 — xref/interesting 부정확. 정밀분석은 angr(기본, --fast 빼기).")
+    if rev.get("platform") == "wasm":
+        L.append("PLATFORM: WebAssembly core v1 — 섹션/함수 목록만 확인; CFG·xref·성공 검증 아님")
+        L.append("  구조 조회: rat-wasm inspect <bin> [--func INDEX] | 독립 실행: rat-wasm verify <bin> --stdin-file INPUT --expect-stdout LITERAL")
+        L.append("  runtime 없으면: .venv-angr/bin/python -m pip install wasmtime")
+    if rev.get("analysis_diagnostics"):
+        L.extend("[!] 분석 상태 %s: %s" %
+                 (rev.get("analysis_status", "partial"), item.get("message", "") if isinstance(item, dict) else item)
+                 for item in rev["analysis_diagnostics"][:4])
     if rev.get("platform") == "pe":
         L.append("PLATFORM: PE/Windows — 정적=decomp(Ghidra)+revq(angr) | 동적=Qiling/Frida(Wine 불필요)")
         L.append("  ※ recon(pwn/ELF triage) 대상 아님 · .NET/Unity=ilspycmd/il2cppdumper")
@@ -716,8 +787,12 @@ def render_summary(rev):
     L.append("-" * 64)
     top = _sorted_funcs(rev["functions"], "size")[:1]
     tf = (" 최대함수 %s(size %d)" % (top[0]["name"], top[0]["size"])) if top else ""
-    L.append("다음: revq %s --func <후보>  |  decomp %s <후보>%s"
-             % (rev.get("bin", "?"), rev.get("bin", "?"), tf))
+    if rev.get("platform") == "wasm":
+        L.append("다음: rat-wasm inspect %s --func <index>  |  rat-wasm verify %s --stdin-file <input> --expect-stdout <literal>"
+                 % (rev.get("bin", "?"), rev.get("bin", "?")))
+    else:
+        L.append("다음: revq %s --func <후보>  |  decomp %s <후보>%s"
+                 % (rev.get("bin", "?"), rev.get("bin", "?"), tf))
     L.append("=" * 64)
     return "\n".join(L)
 
@@ -873,6 +948,8 @@ def compute_function_card(rev, target):
         unresolved.append({"kind": "compare_length", "detail": "%d comparison lengths remain unresolved" % len(unresolved_lengths)})
     if rev.get("engine") != "angr":
         unresolved.append({"kind": "engine_limited", "detail": "binutils engine: calls/xrefs may be incomplete"})
+    if rev.get("load_spec"):
+        unresolved.append({"kind": "operator_blob_map", "detail": "raw-code mapping is operator-supplied; runtime stage and load address are unverified"})
     if callers_truncated or callees_truncated or strings_truncated:
         unresolved.append({"kind": "truncated", "detail": "callers/callees/strings capped at %d" % _CAP})
     return {
@@ -890,7 +967,8 @@ def compute_function_card(rev, target):
             "detector_version": INTERESTING_DETECTOR_VERSION,
         },
         "unresolved": unresolved,
-        "next": "decomp %s %s" % (rev.get("bin", "?"), name),
+        "next": ("verify the loaded raw-code stage and mapping before runtime analysis"
+                 if rev.get("load_spec") else "decomp %s %s" % (rev.get("bin", "?"), name)),
         "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"), "engine": rev.get("engine")},
     }
 
@@ -922,7 +1000,7 @@ def render_xrefs(rev, target):
 
 
 # ─────────────────────────── 오케스트레이션 ───────────────────────────
-def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
+def _canonical_index(binpath, want_engine, cur_sha, index_root=None, load_spec=None):
     """Best-effort registration in the canonical cache index."""
     try:
         from ratlib.cache import Cache, canonical_key, resolve_index_root
@@ -931,12 +1009,20 @@ def _canonical_index(binpath, want_engine, cur_sha, index_root=None):
             binary_sha256="sha256:" + cur_sha,
             tool_name="revq",
             tool_version=str(SCHEMA),
-            params={"engine": want_engine, "evasion_signal_schema": EVASION_SIGNAL_SCHEMA},
+            params={"engine": want_engine, "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
+                    **({"load_spec": load_spec} if load_spec else {})},
             dep_versions={},
         )
         return Cache(idx_root), ck
     except Exception:
         return None, None
+
+
+def _index_for_load(binpath, engine, digest, index_root, load_spec):
+    """Preserve the existing four-argument canonical index contract."""
+    if load_spec is None:
+        return _canonical_index(binpath, engine, digest, index_root)
+    return _canonical_index(binpath, engine, digest, index_root, load_spec=load_spec)
 
 
 def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
@@ -960,7 +1046,8 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
             },
             "run_id": invocation_id,
             "invocation_id": invocation_id,
-            "status": "ok",
+            "status": ("partial" if rev.get("engine") == "angr" and rev.get("analysis_status") == "partial"
+                       else "ok"),
             "started_at": started_at,
             "finished_at": finished_at,
             "duration_ms": max(0, int((time.monotonic() - t0) * 1000)),
@@ -972,10 +1059,11 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
                 "strings_total": len(rev.get("strings", [])),
                 "imports_total": len(rev.get("imports", [])),
                 "analysis_complete": bool(rev.get("analysis_complete", False)),
+                "analysis_status": rev.get("analysis_status", "partial"),
             },
             "artifacts": [],
             "findings": [],
-            "diagnostics": [],
+            "diagnostics": rev.get("analysis_diagnostics", []),
             "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
             "provenance": {
                 "platform": sys.platform,
@@ -1000,9 +1088,18 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
         pass
 
 
-def load_or_extract(binpath, want_engine, refresh, index_root=None):
+def load_or_extract(binpath, want_engine, refresh, index_root=None, load_spec=None):
+    wasm = is_wasm(binpath)
+    if wasm:
+        if load_spec:
+            raise ValueError("explicit blob mapping cannot override a recognized Wasm module")
+        want_engine = "wasm-structure"
     identity = inspect_kernel(binpath, include_symbols=True)
     kernel = identity["kind"] == "vmlinux"
+    if load_spec and (kernel or identity["kind"] in {"bzimage", "linux-boot-image"}):
+        raise ValueError("explicit blob mapping cannot override a recognized Linux kernel")
+    if load_spec and want_engine == "binutils":
+        raise ValueError("raw blob mapping requires the angr engine (do not use --fast)")
     if identity["kind"] in {"bzimage", "linux-boot-image"}:
         die("Linux 부트 이미지: scripts/extract-vmlinux로 ELF vmlinux를 먼저 추출하세요")
     # Kernel symbol recovery is metadata-only. Do not silently start CFGFast
@@ -1010,17 +1107,20 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
     if kernel:
         want_engine = "binutils"
     cp = cache_path(binpath)
+    if load_spec:
+        cp += ".blob-" + hashlib.sha256(json.dumps(load_spec, sort_keys=True).encode()).hexdigest()[:16]
     cur_sha = sha256(binpath)
     if not refresh and os.path.isfile(cp):
         try:
             with open(cp) as f:
                 rev = json.load(f)
-            if (rev.get("sha256") == cur_sha and rev.get("schema") == SCHEMA
+            if (rev.get("sha256") == cur_sha and rev.get("load_spec") == load_spec
+                    and rev.get("schema") == SCHEMA
                     and _has_current_evasion_contract(rev)
                     and (not kernel or ((rev.get("artifact_identity") or {}).get("kind") == "vmlinux"
                                         and (rev.get("artifact_identity") or {}).get("schema") == KERNEL_IDENTITY_SCHEMA))
                     and (rev.get("engine") == want_engine or rev.get("engine") == "angr")):
-                idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
+                idx, ck = _index_for_load(binpath, rev.get("engine") or want_engine, cur_sha, index_root, load_spec)
                 info("캐시 사용: %s (engine=%s)" % (cp, rev["engine"]))
                 rev["cache_state"] = "hit"
                 if idx and ck:
@@ -1046,12 +1146,16 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None):
                "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
                "evasion_signals": [], "evasion": []}
     else:
-        rev = extract_binutils(binpath) if want_engine == "binutils" else extract_angr(binpath)
+        rev = (extract_wasm(binpath) if wasm else
+               extract_binutils(binpath) if want_engine == "binutils" else
+               extract_angr(binpath, load_spec))
+    if load_spec:
+        rev["load_spec"] = load_spec
     rev["bin"] = binpath
     rev["sha256"] = cur_sha
     rev["generated_at"] = now_iso()
     rev["cache_state"] = "miss"
-    idx, ck = _canonical_index(binpath, rev.get("engine") or want_engine, cur_sha, index_root)
+    idx, ck = _index_for_load(binpath, rev.get("engine") or want_engine, cur_sha, index_root, load_spec)
     annotate_counts(rev)
     try:
         with open(cp, "w") as f:
@@ -1073,6 +1177,9 @@ def build_parser():
     p.add_argument("binary", nargs="?", help="분석할 ELF (또는 'selftest')")
     p.add_argument("--fast", action="store_true", help="binutils 엔진(빠름, xref 없음)")
     p.add_argument("--refresh", action="store_true", help="캐시 무시 재추출")
+    p.add_argument("--arch", help="explicit raw blob architecture: i386/amd64/arm/aarch64")
+    p.add_argument("--base", help="explicit raw blob load base, e.g. 0x10000")
+    p.add_argument("--entry", help="explicit raw blob entry, e.g. 0x10000")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--funcs", action="store_true", help="함수 목록")
     g.add_argument("--strings", action="store_true", help="문자열 + 참조함수")
@@ -1106,8 +1213,15 @@ def main(argv):
 
     started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
+    from ratlib.raw_loader import load_spec as normalize_blob
+    try:
+        blob_spec = normalize_blob(args.binary, arch=args.arch, base=args.base, entry=args.entry)
+    except ValueError as exc:
+        build_parser().error(str(exc))
+    if blob_spec and args.fast:
+        build_parser().error("--fast cannot analyze an explicit raw blob mapping")
     requested_engine = "binutils" if args.fast else "angr"
-    rev = load_or_extract(args.binary, requested_engine, args.refresh)
+    rev = load_or_extract(args.binary, requested_engine, args.refresh, load_spec=blob_spec)
     operation = "summary"
     requested = None
 
@@ -1154,7 +1268,7 @@ def main(argv):
         print(render_summary(rev))
 
     _, cache_key = _canonical_index(args.binary, rev.get("engine") or requested_engine,
-                                    rev.get("sha256") or sha256(args.binary))
+                                    rev.get("sha256") or sha256(args.binary), load_spec=blob_spec)
     parameters = {
         "requested_engine": requested_engine,
         "effective_engine": rev.get("engine") or requested_engine,
@@ -1164,6 +1278,7 @@ def main(argv):
         "limit": args.limit,
         "sort": args.sort,
         "grep": args.grep,
+        "load_spec": blob_spec,
     }
     _persist_invocation(args.binary, rev.get("sha256") or sha256(args.binary),
                         requested_engine, args.refresh, rev, cache_key, None,

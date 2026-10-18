@@ -1,0 +1,5 @@
+{
+  "profile": {"imports": ["gets", "strcmp", "puts", "setvbuf"], "facts": [{"kind": "elf.nx", "value": true}]},
+  "revq": {"imports": ["gets", "strcmp", "puts"], "platform": "elf"},
+  "interesting": []
+}

@@ -410,6 +410,7 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
     duplicate = 0
     cache_hits = cache_misses = cache_unusable_hits = 0
     tool_name_counts = {}
+    result_class_counts = {}
     duration_total = 0
     for doc in docs:
         status = doc.get("status")
@@ -435,6 +436,17 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
             seen_fingerprints[fp] = seen_fingerprints.get(fp, 0) + 1
         name = _tool_name(doc)
         tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
+        summary = doc.get("summary") if isinstance(doc.get("summary"), dict) else {}
+        result_class = summary.get("result_class")
+        if not isinstance(result_class, str) or not result_class:
+            exit_info = doc.get("exit") if isinstance(doc.get("exit"), dict) else {}
+            if exit_info.get("code") not in (None, 0) or status in {"error", "timeout", "cancelled"}:
+                result_class = "call-failed"
+            elif status == "partial":
+                result_class = "partial"
+            else:
+                result_class = "analysis-unverified"
+        result_class_counts[result_class] = result_class_counts.get(result_class, 0) + 1
         duration_total += doc.get("duration_ms", 0) or 0
     cache_requests = cache_hits + cache_misses
     if primitive_pass_at is None and verify_pass_at is not None:
@@ -447,6 +459,7 @@ def aggregate(docs, *, guard_started_at=None, primitive_pass_at=None,
     return {
         "schema": "rat.session-metrics/v1",
         "tool_calls": len(docs),
+        "result_class_counts": result_class_counts,
         "duplicate_tool_calls": duplicate,
         "cache_requests": cache_requests,
         "cache_hits": cache_hits,

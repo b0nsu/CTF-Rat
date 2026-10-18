@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Bound output without a shell pipeline and retain the child's real exit code."""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.artifact import put_bytes
+from ratlib.runner import CapturedStream, RunResult, run
+from ratlib.schema import validate
+
+
+def classify(result, purpose):
+    if result.timed_out:
+        return "timeout"
+    if result.exit_code != 0:
+        return "call-failed"
+    if purpose in {"help", "source"}:
+        return purpose
+    stderr = result.stderr.preview.decode("utf-8", "replace")
+    if "RAT_STATUS=fallback" in stderr:
+        return "fallback"
+    if result.stdout.truncated or result.stderr.truncated:
+        return "output-truncated"
+    try:
+        doc = json.loads(result.stdout.preview)
+        if doc.get("schema") == "rat.decomp-result/v1":
+            if doc.get("status") == "fallback":
+                return "fallback"
+            if doc.get("status") == "partial":
+                return "partial"
+            if (doc.get("status") == "ok" and doc.get("source") == "decompile"
+                    and isinstance(doc.get("content"), str) and doc["content"]):
+                return "valid-analysis-result"
+        if doc.get("schema") in {"rat.tool-result/v1", "rat.query-result/v1"}:
+            validate(doc)
+            summary = doc.get("summary") if isinstance(doc.get("summary"), dict) else {}
+            if summary.get("result_class") == "valid-analysis-result" and doc.get("status") == "ok":
+                return "valid-analysis-result"
+    except (ValueError, UnicodeDecodeError, AttributeError, TypeError):
+        pass
+    return "analysis-unverified"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="rat-capture")
+    parser.add_argument("--limit", type=int, default=8192, help="bytes shown per stream")
+    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--purpose", choices=("analysis", "help", "source"), default="analysis")
+    parser.add_argument("--store", help="artifact store (default ./.rat)")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    ns = parser.parse_args(argv)
+    command = ns.command[1:] if ns.command[:1] == ["--"] else ns.command
+    if not command or not 0 < ns.limit <= 1024 * 1024 or not 0 < ns.timeout <= 600:
+        parser.error("a command, positive --limit and positive --timeout are required")
+    started = datetime.now(timezone.utc).isoformat()
+    started_mono = time.monotonic()
+    child_env = {key: os.environ[key] for key in
+                 ("CTF_HOME", "GHIDRA_HOME", "RAT_ANGR_PYTHON", "PYTHONPATH", "JAVA_HOME",
+                  "JAVA_TOOL_OPTIONS", "XDG_CONFIG_HOME") if key in os.environ}
+    try:
+        result = run(command, timeout_seconds=ns.timeout, preview_bytes=ns.limit,
+                     max_output_bytes=ns.limit, env=child_env, tool_version="rat-capture")
+    except OSError as exc:
+        empty = CapturedStream(b"", 0, False, None)
+        message = ("%s: %s\n" % (type(exc).__name__, exc)).encode()[:ns.limit]
+        result = RunResult(command, 127, 127, False, False,
+                           int((time.monotonic() - started_mono) * 1000), empty,
+                           CapturedStream(message, len(message), False, None),
+                           "inherit", None, False, "rat-capture")
+    result_class = classify(result, ns.purpose)
+    sys.stdout.buffer.write(result.stdout.preview)
+    sys.stderr.buffer.write(result.stderr.preview)
+    marker = {"class": result_class, "child_exit_code": result.exit_code,
+              "stdout_truncated": result.stdout.truncated,
+              "stderr_truncated": result.stderr.truncated}
+    print("\nRAT_CAPTURE=" + json.dumps(marker, separators=(",", ":")), file=sys.stderr)
+    invocation_id = "capture_" + uuid.uuid4().hex
+    status = ("timeout" if result.timed_out else "error" if result.exit_code != 0
+              else "ok" if result_class == "valid-analysis-result" else "partial")
+    with open(__file__, "rb") as fh:
+        build_digest = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+    envelope = {"schema": "rat.tool-result/v1",
+                "tool": {"name": "rat-capture", "version": "1",
+                         "build_digest": build_digest},
+                "run_id": invocation_id, "invocation_id": invocation_id,
+                "status": status, "started_at": started,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": result.duration_ms, "inputs": [],
+                "parameters": {"purpose": ns.purpose, "child": os.path.basename(command[0]),
+                               "command_digest": "sha256:" + hashlib.sha256("\0".join(command).encode()).hexdigest()},
+                "summary": {"result_class": result_class, "stdout_bytes": result.stdout.total_bytes,
+                            "stderr_bytes": result.stderr.total_bytes,
+                            "truncated": result.stdout.truncated or result.stderr.truncated},
+                "artifacts": [], "findings": [], "diagnostics": [],
+                "exit": {"code": result.exit_code, "signal": result.signal,
+                         "timed_out": result.timed_out, "cancelled": result.cancelled},
+                "provenance": {"platform": sys.platform, "dependency_versions": {},
+                               "policy_digest": "sha256:" + hashlib.sha256(b"rat-capture-v1").hexdigest(),
+                               "cache": {"state": "bypass"}}, "cache_state": "bypass"}
+    try:
+        validate(envelope)
+        put_bytes(json.dumps(envelope, sort_keys=True).encode(), kind="tool-result",
+                  media_type="application/json", logical_name=invocation_id + ".json",
+                  root=ns.store or os.path.join(os.getcwd(), ".rat"))
+    except (OSError, ValueError, RuntimeError) as exc:
+        print("rat-capture: telemetry unavailable: %s" % exc, file=sys.stderr)
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -19,7 +19,7 @@ knowledge live together so they stay in sync.
 
 ## Workflow
 
-- Branch off `dev`, not `main`. Feature/fix PRs target `dev`; `main` only receives curated, reviewed, CI-green release PRs.
+- Branch off `dev`, not `main`. `main` only receives reviewed, CI-green PRs.
 - Keep PRs scoped to one change (one tool, one bug, one doc fix). Large
   unrelated diffs are hard to review and hard to revert.
 - If you touch a tool under `bin/` or `solve/_template/rev/`, run its
@@ -30,9 +30,8 @@ knowledge live together so they stay in sync.
 
 ## Pull requests
 
-- Open normal feature/fix PRs against `dev` using the PR template — describe what changed and
-  why, and list which selftests/tests you ran. Release PRs into `main` must come from a curated
-  release branch that excludes dev-only benchmark corpora, ablations, and design-review docs.
+- Open PRs against `main` using the PR template — describe what changed and
+  why, and list which selftests/tests you ran.
 - CI (`regression` + `analysis-deep` on PRs into `main`) must pass.
 - At least one review approval is required before merge (branch protection
   enforces this, including for maintainers).

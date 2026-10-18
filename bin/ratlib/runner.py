@@ -234,7 +234,8 @@ def run(argv: Sequence[str], *, cwd: Optional[str] = None, env: Optional[Mapping
         network: str = "inherit", guard_target: Sequence[str] = (), ctf_home: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
         tool_version: Optional[str] = None,
-        input_bytes: Optional[bytes] = None) -> RunResult:
+        input_bytes: Optional[bytes] = None,
+        stderr_mode: str = "pipe") -> RunResult:
     """Run argv-only child in a new process group with bounded resources.
 
     This helper has no OS network sandbox. ``network='none'`` therefore fails
@@ -244,6 +245,8 @@ def run(argv: Sequence[str], *, cwd: Optional[str] = None, env: Optional[Mapping
         raise ValueError("argv must be a non-empty sequence of non-empty strings")
     if input_bytes is not None and not isinstance(input_bytes, bytes):
         raise ValueError("input_bytes must be bytes or None")
+    if stderr_mode not in ("pipe", "devnull", "stdout"):
+        raise ValueError("stderr_mode must be pipe, devnull or stdout")
     if timeout_seconds <= 0 or grace_seconds < 0 or max_output_bytes <= 0:
         raise ValueError("invalid runner timeout/output limits")
     if network == "none":
@@ -259,19 +262,23 @@ def run(argv: Sequence[str], *, cwd: Optional[str] = None, env: Optional[Mapping
     if env is not None:
         child_env.update(env)
     existing_processes = _user_process_count()
+    stderr_stream = {"pipe": subprocess.PIPE, "devnull": subprocess.DEVNULL,
+                     "stdout": subprocess.STDOUT}[stderr_mode]
     try:
         proc = subprocess.Popen(list(argv), cwd=cwd, env=child_env,
                                 stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=stderr_stream,
                                 shell=False, start_new_session=True,
                                 preexec_fn=_limit_preexec(limits, existing_processes) if os.name == "posix" else None)
     except FileNotFoundError:
         elapsed = int((time.monotonic() - started) * 1000)
         return RunResult(list(argv), EXIT_DEPENDENCY, EXIT_DEPENDENCY, False, False, elapsed,
                          out.close(), err.close(), network, None, False, tool_version)
-    assert proc.stdout is not None and proc.stderr is not None
-    readers = [threading.Thread(target=_reader, args=(proc.stdout, out), daemon=True),
-               threading.Thread(target=_reader, args=(proc.stderr, err), daemon=True)]
+    assert proc.stdout is not None
+    readers = [threading.Thread(target=_reader, args=(proc.stdout, out), daemon=True)]
+    if stderr_mode == "pipe":
+        assert proc.stderr is not None
+        readers.append(threading.Thread(target=_reader, args=(proc.stderr, err), daemon=True))
     for thread in readers: thread.start()
     writer = None
     if input_bytes is not None:

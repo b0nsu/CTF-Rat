@@ -65,11 +65,15 @@ def profile_environment(a):
  return {"binary":fdigest(a.binary),
          "libc":fdigest(a.libc) if getattr(a,"libc",None) and os.path.isfile(a.libc) else None,
          "loader":fdigest(a.loader) if getattr(a,"loader",None) and os.path.isfile(a.loader) else None}
-def execution_environment(profile, sc):
- return canonical_digest({"profile_environment":profile.get("environment",{}),
-                          "argv":[str(x) for x in sc.get("argv",[])],
-                          "cwd":sc.get("cwd"),
-                          "env":{str(k):str(v) for k,v in sc.get("env",{}).items()}})
+def execution_environment(profile, sc, stderr_mode="pipe"):
+ identity={"profile_environment":profile.get("environment",{}),
+           "argv":[str(x) for x in sc.get("argv",[])],
+           "cwd":sc.get("cwd"),
+           "env":{str(k):str(v) for k,v in sc.get("env",{}).items()}}
+ # Keep legacy/default PIPE identity stable while preventing non-default
+ # diagnostic traces from verifying as if they had the default stdio topology.
+ if stderr_mode!="pipe": identity["stdio"]={"stdout":"pipe","stderr":stderr_mode}
+ return canonical_digest(identity)
 def artifact(data, kind, name, r, media="application/json"):
     rec=put_bytes(data if isinstance(data,bytes) else json.dumps(data,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(),kind=kind,media_type=media,logical_name=name,root=r)
     return {k:rec[k] for k in ("kind","digest","media_type","size","logical_name")}
@@ -102,8 +106,8 @@ def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=()
 def emit(doc,a):
     print(json.dumps(doc,sort_keys=True) if a.format=="json" else "%s: %s"%(doc["tool"]["name"],json.dumps(doc["summary"],ensure_ascii=False)))
     return doc["exit"]["code"]
-def command(argv, timeout, stdin=None, cwd=None, env=None):
-    return run(argv,timeout_seconds=timeout,input_bytes=stdin,cwd=cwd,env=env,tool_version=VERSION)
+def command(argv, timeout, stdin=None, cwd=None, env=None, stderr_mode="pipe"):
+    return run(argv,timeout_seconds=timeout,input_bytes=stdin,cwd=cwd,env=env,tool_version=VERSION,stderr_mode=stderr_mode)
 def scenario(path):
     if not path: return {}
     with open(path,encoding="utf-8") as f: s=json.load(f)
@@ -117,11 +121,11 @@ def scenario_stdin(sc):
     value=sc.get("stdin","")
     if not isinstance(value,str): raise ValueError("scenario stdin must be text")
     return value.encode()
-def execute_binary(binary, sc, timeout):
+def execute_binary(binary, sc, timeout, stderr_mode="pipe"):
     stdin=scenario_stdin(sc)
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
-    return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
+    return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env,stderr_mode=stderr_mode)
 def _profile_cache_keys(bdig, environment, dependencies=None):
     from .cache import canonical_key
     deps=dependencies or _profile_dependency_identity()
@@ -324,7 +328,11 @@ def dyn(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
     except ValueError as exc: return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=[str(exc)],started=started),a)
-    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout)
+    mode=getattr(a,"stderr_mode","pipe")
+    if a.break_loc and mode!="pipe":
+        return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,
+                             diagnostics=["nondefault stderr topology cannot be matched by the separate GDB breakpoint run"],started=started),a)
+    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout,stderr_mode=mode)
     out=p.stdout.preview; err=p.stderr.preview; events=[{"event":"process.exit","exit_code":p.exit_code,"signal":p.signal,"timed_out":p.timed_out}]
     registers={}
     # GDB is optional.  A requested breakpoint is either observed structurally
@@ -343,7 +351,7 @@ def dyn(a):
     for marker in sc.get("markers",[]):
         events.append({"event":"marker","marker":marker,"observed":marker.encode() in out+err})
     status="timeout" if p.timed_out else ("ok" if p.exit_code==0 else "partial")
-    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc),"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
+    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc,stderr_mode=mode),"stdio":{"stdin":"pipe","stdout":"pipe","stderr":mode},"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
     return emit(envelope("rat-dyn",a.binary,a,{"exit":p.exit_code,"signal":p.signal,"trace_span":len(events),"hit_counts":{"breakpoint":int(any(e["event"]=="breakpoint" and e.get("hit") for e in events))},"register_observations":len(registers),"memory_observations":0,"last_event":events[-1]["event"],"dropped_events":0,"scenario_step":sc.get("name","run")},arts,status=status,diagnostics=(["wall timeout; last stable event retained"] if p.timed_out else []),code=p.exit_code if not p.timed_out else EXIT_TIMEOUT,started=started),a)
 def _verify_conditions(expected, process, scenario_doc):
     if "exit_code" in expected and process.exit_code != expected["exit_code"]: return False
@@ -515,7 +523,7 @@ def main(which, argv=None):
         p.epilog=_DIGEST_HANDOFF_EPILOG; p.formatter_class=argparse.RawDescriptionHelpFormatter
     if which=="rat-profile": p.add_argument("--libc"); p.add_argument("--loader"); fn=profile
     elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc"); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); p.add_argument("--mode",choices=["call-path","data"],default="call-path"); p.add_argument("--backward",dest="backward_addr"); p.add_argument("--source",default=None); fn=slice_
-    elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); fn=dyn
+    elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); p.add_argument("--stderr-mode",choices=["pipe","devnull","stdout"],default="pipe"); fn=dyn
     elif which=="rat-verify": p.add_argument("--profile",required=True); p.add_argument("--trace",required=True); p.add_argument("--scenario",required=True); p.add_argument("--claim"); p.add_argument("--primitive"); p.add_argument("--exploit-task"); p.add_argument("--oracle"); p.add_argument("--runs",type=int,default=3); fn=verify
     elif which=="rat-fuzz": p.add_argument("--harness"); p.add_argument("--budget",type=float,default=.2); p.add_argument("--corpus"); p.add_argument("--engine",default="builtin"); fn=fuzz
     elif which=="rat-heap": p.add_argument("--scenario"); p.add_argument("--trace"); p.add_argument("--libc"); fn=heap
