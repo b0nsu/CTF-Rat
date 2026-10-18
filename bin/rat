@@ -18,6 +18,7 @@ from ratlib.artifact import get as artifact_get
 from ratlib.angr_runtime import reexec_for_angr
 from ratlib.cache import Cache, resolve_index_root
 from ratlib.cards import project_pwn_capability
+from ratlib.copy_reloc import copy_relocations
 from ratlib.patterns import project_patterns
 from ratlib.graph_projection import project_graph
 from ratlib.compact import truncate_by_item, truncate_lists_sharing_budget
@@ -956,6 +957,21 @@ def cmd_query_pwn(args):
     if profile is None:
         return _emit(*_query_error("pwn", "dependency_missing", "rat-profile produced no usable binary profile", EXIT_DEPENDENCY), args.format)
     card = project_pwn_capability(profile)
+    # COPY-relocated stdio/globals are an attention fact for FSOP/stdout-target plans:
+    # the executable owns a binary-local copy, so libc's own symbol is a no-op target.
+    copies, copy_warning = copy_relocations(binary)
+    if copies:
+        card["facts"]["copy_relocations"] = [
+            {"symbol": sym, "address": addr, "kind": kind} for addr, sym, kind in copies[:32]]
+        stdio = [c for c in card["facts"]["copy_relocations"]
+                 if c["symbol"] in ("stdout", "stdin", "stderr", "environ")]
+        if stdio:
+            card["heuristics"]["limitations"].append(
+                "COPY-relocated " + ", ".join(sorted(c["symbol"] for c in stdio))
+                + ": target the binary-local copy (e.g. " + stdio[0]["symbol"] + " @ "
+                + stdio[0]["address"] + "), not libc's own global, for FSOP/stdout plans")
+    elif copy_warning:
+        card["facts"]["copy_relocations_unavailable"] = copy_warning
     budget = args.budget_bytes
     sink_items = sorted(card["facts"]["sinks"].items())
     kept, truncated, omit = truncate_lists_sharing_budget(sink_items, budget)
