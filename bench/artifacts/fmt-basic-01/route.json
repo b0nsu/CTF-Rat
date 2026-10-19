@@ -1,0 +1,5 @@
+{
+  "profile": {"imports": ["printf", "read", "setvbuf"], "facts": [{"kind": "elf.nx", "value": true}]},
+  "revq": {"imports": ["printf", "read"], "platform": "elf"},
+  "interesting": []
+}

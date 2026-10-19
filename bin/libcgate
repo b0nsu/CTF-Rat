@@ -6,14 +6,18 @@ Usage:
   libcgate [challenge-dir]
   libcgate --selftest
 
-This is intentionally offline. It does not build Docker images; it reports
+This does not build Docker images; it reports
 whether the current challenge directory has enough runtime evidence and prints
 the heap/tcache checks that must precede a "remote libc differs" conclusion.
 """
 import argparse
+from ratlib.copy_reloc import copy_relocations
 import hashlib
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -80,7 +84,7 @@ def find_files(root):
                 dockerfiles.append(p)
             elif LIBC_RE.match(base):
                 libcs.append(p)
-            elif base.startswith("ld-") or base.startswith("ld-linux"):
+            elif base.startswith("ld-") or base.startswith("ld_") or "ld-linux" in base or "ld-musl" in base:
                 loaders.append(p)
     return sorted(dockerfiles), sorted(libcs), sorted(loaders)
 
@@ -118,6 +122,331 @@ def same_file(a, b):
         return False
 
 
+def manifest_binary(root):
+    """Select the challenge-local, digest-verified binary; do not guess paths."""
+    path = os.path.join(root, "run.json")
+    if not os.path.isfile(path):
+        return None, "run.json is missing; COPY relocation scan unavailable without a digest-bound binary."
+    try:
+        with open(path, encoding="utf-8") as source:
+            manifest = json.load(source)
+        name = manifest.get("scaffold", {}).get("binary")
+        if (not isinstance(name, str) or name in (".", "..")
+                or os.path.basename(name) != name):
+            return None, "run.json does not select a safe challenge-local scaffold binary."
+        record = next((item for item in manifest.get("inputs", [])
+                       if item.get("role") == "binary" and item.get("name") == name), None)
+        if not record or not isinstance(record.get("sha256"), str):
+            return None, "run.json has no digest-bound binary input for %s." % name
+        binary = os.path.join(root, name)
+        if os.path.islink(binary) or not os.path.isfile(binary):
+            return None, "selected binary is not an ordinary challenge-local file: %s." % name
+        if record["sha256"].lower().removeprefix("sha256:") != sha256(binary):
+            return None, "run.json binary digest differs from %s; refusing stale COPY facts." % name
+        return binary, None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return None, "cannot validate run.json binary: %s." % type(exc).__name__
+
+
+def parse_from_image(from_line_text):
+    """Extract the image reference from a Dockerfile FROM line, preferring a
+    pinned @sha256 digest. Returns (reference, pinned_bool) or (None, False)."""
+    if not from_line_text:
+        return None, False
+    # drop leading FROM and any "--platform=..." / "AS name"
+    rest = from_line_text.strip()
+    rest = re.sub(r"^FROM\s+", "", rest, flags=re.I)
+    rest = re.sub(r"^--\S+\s+", "", rest)  # --platform=...
+    rest = re.split(r"\s+AS\s+", rest, flags=re.I)[0].strip()
+    token = rest.split()[0] if rest else ""
+    if not token or token.lower() == "scratch":
+        return None, False
+    # A digest pin is repo[:tag]@sha256:...  — keep the whole ref (docker accepts repo@sha256:)
+    m = re.search(r"@sha256:[0-9a-fA-F]{64}", token)
+    if m:
+        # docker create accepts "repo@sha256:..."; strip a tag before @ if both present
+        ref = re.sub(r":[^@/]+@sha256:", "@sha256:", token)
+        return ref, True
+    return token, False
+
+
+_LIBC_IN_IMAGE = (
+    "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6",
+    "/lib/i386-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6",
+    "/lib/libc.so.6",
+    "/usr/lib/libc.so.6",
+)
+_LOADER_IN_IMAGE = (
+    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/i386-linux-gnu/ld-linux.so.2",
+    "/usr/lib/i386-linux-gnu/ld-linux.so.2",
+    "/lib/ld-linux.so.2",
+    "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-aarch64.so.1",
+)
+
+
+# ELF e_machine -> architecture token used in the image library paths below.
+_EM_TO_ARCH = {
+    0x3E: "x86_64",      # EM_X86_64
+    0x03: "i386",        # EM_386
+    0xB7: "aarch64",     # EM_AARCH64
+    0x28: "arm",         # EM_ARM
+    0x08: "mips",        # EM_MIPS
+}
+
+
+def _elf_arch(path):
+    """Return an architecture token (x86_64/i386/aarch64/...) from an ELF header,
+    or None if the file is not an ELF we recognize. Pure stdlib, no readelf."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return None
+    little = head[5] == 1  # EI_DATA: 1=LSB, 2=MSB
+    e_machine = int.from_bytes(head[18:20], "little" if little else "big")
+    return _EM_TO_ARCH.get(e_machine)
+
+
+def _arch_matches_path(arch, image_path):
+    """True if an image library path is compatible with the target ELF arch.
+
+    Paths carry an explicit multiarch token (x86_64/i386/aarch64/...). Ambiguous
+    generic paths (/lib/libc.so.6, /lib64/...) carry no token; treat those as a
+    match only for the native-ambiguous case so a single-arch image still works,
+    but never let a tokened path of the wrong arch through."""
+    if arch is None:
+        return True  # cannot discriminate; preserve previous behavior
+    # Map each arch to the path substrings that identify it. Loader names use a hyphen
+    # (ld-linux-x86-64, ld-linux-aarch64) while libc multiarch dirs use the token form.
+    arch_markers = {
+        "x86_64": ("x86_64", "x86-64"),
+        "i386": ("i386",),
+        "aarch64": ("aarch64",),
+        "arm": ("arm", "armhf"),
+        "mips": ("mips", "mipsel"),
+    }
+    all_markers = {mk for marks in arch_markers.values() for mk in marks}
+    if not any(mk in image_path for mk in all_markers):
+        return True  # generic/untokened path: allow (single-arch image)
+    return any(mk in image_path for mk in arch_markers.get(arch, (arch,)))
+
+
+def _build_id(path):
+    """Return the GNU build-id hex of an ELF, or None (readelf-based, bounded)."""
+    readelf = shutil.which("readelf")
+    if not readelf:
+        return None
+    try:
+        out = subprocess.run([readelf, "-n", "--", path], capture_output=True,
+                             text=True, timeout=10, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"Build ID:\s*([0-9a-f]+)", out.stdout)
+    return m.group(1) if m else None
+
+
+def _docker_cp_first(container, candidates, dest, accept=None):
+    """Try docker cp for each candidate path; return the image path copied, or None.
+
+    ``accept`` is an optional predicate(dest_path) -> bool. When it rejects a copied
+    file (e.g. wrong architecture), that candidate is discarded and the next is tried,
+    so an untokened generic path holding a wrong-arch ELF does not end the search."""
+    docker = shutil.which("docker")
+    for src_path in candidates:
+        try:
+            r = subprocess.run([docker, "cp", "-L", "%s:%s" % (container, src_path), dest],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and os.path.isfile(dest) and not os.path.islink(dest):
+            if accept is None or accept(dest):
+                return src_path
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            continue
+        # docker cp of a symlink target: if dest is a symlink or dir, clean up
+        if os.path.lexists(dest) and (os.path.islink(dest) or not os.path.isfile(dest)):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+    return None
+
+
+def extract_from_image(root, image=None):
+    """Extract libc/loader from an explicitly selected final built image into ``root``
+    and record them as run.json inputs. Loud failure, never a host fallback.
+    Returns (text, exit_code)."""
+    root = os.path.abspath(root)
+    lines = ["== libcgate extract: %s ==" % root]
+    if not image or not isinstance(image, str) or image.startswith("-"):
+        return "\n".join(lines + [
+            "ERROR: --image FINAL_BUILT_IMAGE is required; a Dockerfile FROM is not runtime provenance."]), 2
+    docker = shutil.which("docker")
+    if not docker:
+        lines.append("ERROR: docker not available; cannot extract the challenge libc.")
+        lines.append("Do NOT assume the host libc matches. Install docker or supply libc/ld manually.")
+        return "\n".join(lines), 2
+    try:
+        inspected = subprocess.run([docker, "image", "inspect", "--format", "{{.Id}}", image],
+                                   capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "\n".join(lines + ["ERROR: docker image inspect failed (%s)." %
+                                  type(exc).__name__]), 2
+    image_id = inspected.stdout.strip()
+    if (inspected.returncode != 0 or
+            not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_id)):
+        return "\n".join(lines + ["ERROR: final image identity is unavailable or ambiguous."]), 2
+    image_id = image_id.lower()
+    lines.append("final built image: %s (id=%s)" % (image, image_id))
+    manifest_path = os.path.join(root, "run.json")
+    try:
+        from ratlib.run_manifest import read as _read, atomic_write as _write, _input as _mk_input
+        manifest = _read(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        lines.append("ERROR: valid run.json required before extraction (%s)." % type(exc).__name__)
+        return "\n".join(lines), 2
+    # Verify manifest integrity and resolve the target arch BEFORE creating a
+    # container or touching any runtime file.  A manifest-integrity failure (path
+    # escape, digest or size mismatch) must ABORT with a nonzero exit before any
+    # docker create / docker cp / run.json rewrite, so a stale binary input record
+    # can never coexist with freshly installed libc/loader provenance.  This is
+    # distinct from a healthy binary whose arch is merely undetermined (non-ELF, or
+    # no binary input), which only disables the arch filter (review P1).
+    target_arch = None
+    root_real = os.path.realpath(root)
+    for item in manifest.get("inputs", []):
+        if item.get("role") != "binary":
+            continue
+        bin_rel = item.get("path") or item.get("name")
+        if not bin_rel:
+            lines.append("WARN: run.json binary input has no path/name; no arch filter.")
+            break
+        if os.path.isabs(bin_rel):
+            lines.append("ERROR: run.json binary path is absolute; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        bin_path = os.path.realpath(os.path.join(root, bin_rel))
+        if os.path.commonpath((root_real, bin_path)) != root_real:
+            lines.append("ERROR: run.json binary path escapes challenge root; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        if not os.path.isfile(bin_path):
+            lines.append("ERROR: run.json binary input missing on disk; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        recorded = str(item.get("sha256", "")).lower().removeprefix("sha256:")
+        if not recorded or recorded != sha256(bin_path):
+            lines.append("ERROR: binary digest differs from run.json; refusing extraction on untracked bytes.")
+            return "\n".join(lines), 2
+        recorded_size = item.get("size")
+        if isinstance(recorded_size, int) and recorded_size != os.path.getsize(bin_path):
+            lines.append("ERROR: binary size differs from run.json; refusing extraction on untracked bytes.")
+            return "\n".join(lines), 2
+        target_arch = _elf_arch(bin_path)  # may be None for a non-ELF; arch filter off then
+        break
+    if target_arch:
+        lines.append("target binary arch: %s" % target_arch)
+    else:
+        lines.append("WARN: target binary arch undetermined; extracting without arch filter.")
+    # create a container (pulls if needed) without running it
+    try:
+        created = subprocess.run([docker, "create", "--", image_id], capture_output=True,
+                                 text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        lines.append("ERROR: docker create failed (%s). No host fallback." % type(exc).__name__)
+        return "\n".join(lines), 2
+    if created.returncode != 0:
+        lines.append("ERROR: docker create failed: %s" % created.stderr.strip()[:300])
+        lines.append("No host libc fallback; resolve image access and retry.")
+        return "\n".join(lines), 2
+    container = created.stdout.strip()
+    with tempfile.TemporaryDirectory(prefix=".libcgate-extract-", dir=root) as stage_dir:
+        extracted = []
+        try:
+            def arch_ok(path):
+                # Reject a copied ELF whose arch disagrees with the target. Untokened
+                # generic paths can still hold a wrong-arch ELF, so verify the bytes.
+                if not target_arch:
+                    return True
+                got = _elf_arch(path)
+                return got is None or got == target_arch
+            for role, name, candidates in (("libc", "libc_docker.so.6", _LIBC_IN_IMAGE),
+                                           ("loader", "ld_docker.so", _LOADER_IN_IMAGE)):
+                filtered = [c for c in candidates if _arch_matches_path(target_arch, c)]
+                staged = os.path.join(stage_dir, name)
+                src = _docker_cp_first(container, filtered, staged, accept=arch_ok)
+                if src:
+                    extracted.append((role, staged, os.path.join(root, name), src))
+        finally:
+            try:
+                subprocess.run([docker, "rm", "-f", "--", container],
+                               capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                lines.append("WARN: temporary Docker container cleanup failed.")
+        if not any(role == "libc" for role, _, _, _ in extracted):
+            lines.append("ERROR: could not extract libc.so.6 from the image (tried known paths).")
+            lines.append("No host libc fallback; inspect the image layout and extend the path list.")
+            return "\n".join(lines), 2
+        if not any(role == "loader" for role, _, _, _ in extracted):
+            lines.append("ERROR: could not extract the loader from the image (tried known paths).")
+            return "\n".join(lines), 2
+        inputs = manifest.setdefault("inputs", [])
+        recorded = []
+        for role, staged, dest, src in extracted:
+            name = os.path.basename(dest)
+            ver = libc_version(staged) if role == "libc" else None
+            bid = _build_id(staged)
+            lines.append("extracted %s: %s (from %s)%s%s" % (
+                role, name, src, "  glibc=%s" % ver if ver else "",
+                "  build-id=%s" % bid if bid else ""))
+            inputs[:] = [i for i in inputs if not (i.get("role") == role and i.get("name") == name)]
+            item = _mk_input(role, staged, name=name)
+            item["provenance"] = {
+                "source": "docker-final-image", "requested_image": image,
+                "image_id": image_id, "container_path": src, "build_id": bid,
+            }
+            inputs.append(item)
+            recorded.append(name)
+        backups = {}
+        installed = []
+        try:
+            for role, staged, dest, _src in extracted:
+                if os.path.lexists(dest):
+                    backup = os.path.join(stage_dir, ".previous-" + role)
+                    os.replace(dest, backup)
+                    backups[dest] = backup
+                os.replace(staged, dest)
+                installed.append(dest)
+            _write(manifest_path, manifest)
+        except Exception as exc:
+            rollback_errors = []
+            for dest in reversed(installed):
+                try:
+                    os.unlink(dest)
+                except OSError as rollback_exc:
+                    rollback_errors.append(type(rollback_exc).__name__)
+            for dest, backup in backups.items():
+                try:
+                    os.replace(backup, dest)
+                except OSError as rollback_exc:
+                    rollback_errors.append(type(rollback_exc).__name__)
+            lines.append("ERROR: could not commit extracted runtime (%s); rollback %s." % (
+                type(exc).__name__, "incomplete: " + ", ".join(rollback_errors)
+                if rollback_errors else "complete"))
+            return "\n".join(lines), 2
+        lines.append("recorded as run.json inputs: %s" % ", ".join(recorded))
+    return "\n".join(lines), 0
+
+
 def audit(root):
     root = os.path.abspath(root)
     old = os.getcwd()
@@ -145,7 +474,7 @@ def audit(root):
         else:
             lines.append("  - none")
             if dockerfiles:
-                warnings.append("Dockerfile exists but no extracted libc candidate was found in this directory.")
+                warnings.append("Dockerfile exists but no extracted libc candidate was found; run 'libcgate --extract --image FINAL_BUILT_IMAGE' (no host fallback).")
 
         lines.append("loader candidates:")
         if loaders:
@@ -167,6 +496,22 @@ def audit(root):
                 notes.append("libc.so.6 matches libc_docker.so.6 by sha256.")
             else:
                 warnings.append("libc.so.6 differs from libc_docker.so.6; pick one authoritative runtime libc and record why.")
+
+        binary, selection_warning = manifest_binary(".")
+        if selection_warning:
+            warnings.append(selection_warning)
+        if binary:
+            copies, relocation_warning = copy_relocations(binary)
+            if relocation_warning:
+                warnings.append("COPY relocation scan unavailable: " + relocation_warning)
+            elif copies:
+                lines.append("COPY relocations (executable-owned globals, not libc's symbol):")
+                for address, symbol, kind in copies[:32]:
+                    lines.append("  - %s @ %s [%s]" % (symbol, address, kind))
+                if len(copies) > 32:
+                    lines.append("  - ... %d additional COPY relocations omitted" % (len(copies) - 32))
+            else:
+                lines.append("COPY relocations: none detected in the selected ELF")
 
         lines.append("verdict:")
         for w in warnings:
@@ -192,6 +537,32 @@ def selftest():
         assert "glibc=2.35" in out
         assert "host loader" in out
         assert rc == 1
+
+    # parse_from_image: prefer @sha256 pin, strip --platform/AS, reject scratch
+    ref, pinned = parse_from_image("FROM ubuntu:24.04@sha256:" + "a" * 64)
+    assert pinned and ref == "ubuntu@sha256:" + "a" * 64, ref
+    ref, pinned = parse_from_image("FROM --platform=linux/amd64 x:1@sha256:" + "b" * 64 + " AS base")
+    assert pinned and ref == "x@sha256:" + "b" * 64, ref
+    ref, pinned = parse_from_image("FROM ubuntu:22.04")
+    assert ref == "ubuntu:22.04" and not pinned, ref
+    assert parse_from_image("FROM scratch") == (None, False)
+
+    # Extraction requires an explicit final image; a Dockerfile base is insufficient.
+    with tempfile.TemporaryDirectory() as d:
+        out, rc = extract_from_image(d)
+        assert rc == 2 and "--image" in out, (rc, out)
+    # when docker is absent, extraction fails loudly (exit 2) rather than guessing the host libc
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "Dockerfile"), "w") as f:
+            f.write("FROM ubuntu:22.04@sha256:" + "c" * 64 + "\n")
+        saved = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = ""  # hide docker/readelf/etc from shutil.which
+            out, rc = extract_from_image(d, image="challenge:built")
+        finally:
+            os.environ["PATH"] = saved
+        assert rc == 2 and "docker not available" in out and "host libc" in out, (rc, out)
+
     print("[libcgate] selftest ALL GREEN")
 
 
@@ -199,10 +570,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--extract", action="store_true",
+                    help="extract libc/ld from an explicitly selected final built image")
+    ap.add_argument("--image", help="final built Docker image; required with --extract")
     args = ap.parse_args()
     if args.selftest:
         selftest()
         return 0
+    if args.extract:
+        out, rc = extract_from_image(args.path, image=args.image)
+        print(out)
+        return rc
     out, rc = audit(args.path)
     print(out)
     return rc

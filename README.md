@@ -110,7 +110,7 @@ flowchart LR
 CLAUDE.md / AGENTS.md      agent entry point (symlink)
 SETUP.md                   environment-agnostic initial setup
 doctrine/                  SOLVING · SOLVABILITY · PRIMITIVE_GATE · REFUSAL · FINALS
-docs/                       calibration (오염 상수 포함 — doctrine 밖)
+docs/                       calibration (로컬 누적 로그, 릴리스는 빈 템플릿 — 오염 상수는 doctrine 밖)
 knowledge/                 vendored pwn/rev knowledge + repo-owned learned/ + writeup pipeline
 reference/                 libc-offsets/ · glibc/(list · SOURCES · glibc-fetch)
 bin/                       all tools (+ghidra_scripts/)
@@ -131,6 +131,23 @@ tests/                     e2e_mock.py(ctfpull) · e2e_rev.sh(rev loop)
 no new analysis). Static routing leaves `skill=null`; after an active derived/direct STATE observation confirms the method, `rat route <bin> --skill <name> --skill-evidence <obs_id> --skill-reason <reason>` records the committed Skill in the existing route-assessment note. It emits a recommendation only when one probe clearly dominates the alternatives on deterministic evidence/cost criteria, and `rat query {graph,func,oracle,pwn,pattern,slice}` · `rat dyn|verify` · `rat state compact` ·
 `rat cache stats` expose everything through one entry point. Existing CLIs (revq / recon / etc.)
 still work standalone.
+
+Each routed probe has a stable ID bound to the binary digest and expected evidence.
+`rat query func`, `rat query oracle`, and `rat query pwn` save hash-checked result
+artifacts with active STATE observations. A later `rat route` consumes matching
+results: a complete checker card with comparison sites and both oracle branches
+retires that probe, while partial or invalidated evidence keeps it pending with
+an explicit reason and suspends automatic re-query. After `rat route BIN` →
+`rat query pwn BIN` → `rat route BIN`, a stack candidate advances to a local
+`pwncrash` control measurement; format and heap candidates advance to one
+bounded `decomp BIN CALLER` inspection. A caller named by `revq` is selected
+when available; otherwise the placeholder in `next.target` must be replaced
+with a recovered caller. Independent leads can leave `decision=null`; choose
+one of the listed experiments. Import-only PWN cards never prove a safe or
+vulnerable callsite.
+An active `route.probe.refutation` observation can refute an exact probe; for
+bounded `read`/`fgets` input callsites the current validator has no independent
+exhaustive inventory, so it does not accept a safe-callsite refutation.
 
 `rat query pattern <bin>` returns at most three source-bound hypothesis aids for
 coexisting Router v2 leads. `rat dyn session` optionally keeps one local GDB
@@ -179,6 +196,13 @@ vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
 from a cached function is marked `partial` with a bounded `objdump` diagnostic;
 compare revq's mapped address with the ELF VMA before disassembly.
 
+For WebAssembly core modules, `rat route` and `revq` expose a bounded section
+inventory. Use `rat-wasm inspect BIN --func INDEX` for one function body digest
+and `rat-wasm verify BIN --stdin-file INPUT --expect-stdout LITERAL` for an
+independent Wasmtime execution (optional setup in SETUP §9). This does not
+promote a solve or primitive. Use `rat-capture --limit N -- TOOL ...` instead
+of piping tool output through `head` when the original exit code matters.
+
 For Linux boot images, `newchal` skips generic ELF recon and `rat route` reports
 the kernel identity and the prerequisite to extract ELF `vmlinux` using Linux
 `scripts/extract-vmlinux`. Symbol-bearing kernels use bounded ELF metadata in
@@ -212,6 +236,19 @@ verifier before recording solve evidence.
 <br>
 
 `pwnkit` / `pwnstage` / `primitives` · `pwncalc` / `pwnleak` / `pwnpayload` / `pwnropcheck` / `pwncrash` / `pwnscope` / `pwnclean` / `pkflag`
+
+`pkflag` checks **format only**; `REAL` is not proof of executable-oracle success.
+By default `pkflag` uses `solve/<active-challenge>/FLAG_FORMAT` (from `ctfguard`'s `ACTIVE.json`, or the current `solve/<challenge>` directory). A stale repository-global `FLAG_FORMAT` is **not** used implicitly. With no challenge format, a generic `NAME{...}` heuristic applies.
+
+```sh
+ctfguard begin example
+pkflag --set 'CTF\{[A-Za-z0-9_]+\}' # set this challenge's format
+pkflag --show                          # show this challenge's format
+pkflag 'CTF{example_candidate}'        # format-only check
+pkflag --global --show                 # explicitly inspect legacy global format
+```
+
+Use `--chal example` to select a challenge explicitly. `--global --set` is available only for deliberate legacy-global configuration; `pkselftest` no longer writes the repository setting.
 
 </details>
 

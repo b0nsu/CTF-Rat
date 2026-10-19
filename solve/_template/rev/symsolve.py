@@ -328,12 +328,16 @@ def solve(args):
     if not simgr.found:
         print("[symsolve] FAIL — 해 없음 (%.1fs, active=%d). 힌트: 입력 길이/문자셋/목표 재확인, "
               "또는 EXTENSION 훅 필요." % (dt, len(simgr.active)))
+        _write_result(args, found=False, concrete_verify="no-solution",
+                      solutions={}, detail="no solution found")
         return 1
 
     found = simgr.found[0]
     print("[symsolve] FOUND (%.1fs)" % dt)
+    solutions = {}
     for label, bv, nbytes in symbols:
         val = found.solver.eval(bv, cast_to=bytes)
+        solutions[label] = val.hex()
         print("  %-6s = %r" % (label, val))
         print("  %-6s   hex: %s" % ("", val.hex()))
     stdout = found.posix.dumps(1)
@@ -341,19 +345,24 @@ def solve(args):
         print("  stdout: %r" % stdout[:200])
 
     # concrete-verify: angr 모델 해를 실제 바이너리에 재실행해 대조 (executable oracle).
+    # Honest-mode: a model solution without a passing concrete re-run is NOT a
+    # verified success.  The exit code and result contract reflect that:
+    #   pass -> 0, fail/skipped/disabled -> non-zero (distinct codes).
+    cv_status = "disabled"; cv_detail = "concrete-verify disabled (--no-verify)" if args.no_verify else "no string oracle (--find/--avoid addresses only)"
     if not args.no_verify and (find_strs or avoid_strs):
         ok, detail = concrete_verify(args.binary, symbols, found, find_strs, avoid_strs)
+        cv_detail = detail if isinstance(detail, str) else repr(detail)
         if ok is None:
+            cv_status = "skipped"
             print("  concrete-verify: ⏭  %s" % detail)
         elif ok:
+            cv_status = "pass"
             print("  concrete-verify: ✅ 실제 실행이 목표와 일치 (해 신뢰)")
             engine_digest = engine_build_digest()
             print("  producer: " + json.dumps({
                 "engine": "symsolve", "engine_build_digest": engine_digest,
             }, sort_keys=True, separators=(",", ":")))
             if args.record_state_dir:
-                solutions = {label: found.solver.eval(bv, cast_to=bytes).hex()
-                             for label, bv, _n in symbols}
                 try:
                     observation_id = record_concrete_observation(
                         args.record_state_dir, args.binary, detail, solutions)
@@ -361,9 +370,59 @@ def solve(args):
                 except Exception as exc:
                     print("[symsolve:warn] STATE provenance 기록 실패: %s" % exc, file=sys.stderr)
         else:
+            cv_status = "fail"
             print("  concrete-verify: ⚠️ 불일치 — angr 모델 ≠ 실제(anti-debug/환경/입력모델 의심). "
                   "실제 stdout=%r" % detail)
-    return 0
+    _write_result(args, found=True, concrete_verify=cv_status,
+                  solutions=solutions, detail=cv_detail)
+    # Exit status: only a passing concrete-verify (or an address-only find with
+    # no string oracle, where there is nothing to re-run) counts as success.
+    if cv_status == "pass":
+        return 0
+    if cv_status == "disabled" and not (find_strs or avoid_strs):
+        return 0  # address-reach solve with no string oracle to concrete-verify
+    if cv_status == "fail":
+        return 3  # model solution contradicted by real execution
+    return 4      # verification skipped or disabled; not an established success
+
+
+SYMSOLVE_RESULT_SCHEMA = "rat.symsolve-result/v1"
+def _write_result(args, found, concrete_verify, solutions, detail):
+    """Atomically write the machine-readable concrete-verify contract.
+
+    `concrete_verify` is one of: pass | fail | skipped | disabled | no-solution.
+    Only `pass` (string oracle re-run matched) is a verified success; a consumer
+    must not treat `found` alone, nor a stdout substring, as success.  No-op when
+    `--result` was not requested."""
+    path = getattr(args, "result", None)
+    if not path:
+        return
+    try:
+        bdigest = None
+        if args.binary and os.path.isfile(args.binary):
+            with open(args.binary, "rb") as fh:
+                bdigest = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        bdigest = None
+    doc = {
+        "schema": SYMSOLVE_RESULT_SCHEMA,
+        "binary": os.path.abspath(args.binary) if args.binary else None,
+        "binary_digest": bdigest,
+        "found": bool(found),
+        "concrete_verify": concrete_verify,
+        "verified": concrete_verify == "pass",
+        "solutions": solutions,
+        "find_str": list(args.find_str), "avoid_str": [s for s in args.avoid_str if s],
+        "detail": detail if isinstance(detail, str) else repr(detail),
+        "engine": "symsolve",
+        "engine_build_digest": engine_build_digest(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, sort_keys=True, separators=(",", ":"))
+        fh.flush(); os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
@@ -438,6 +497,8 @@ def build_parser():
     p.add_argument("--no-verify", action="store_true", help="복원 해의 실 바이너리 재실행 검증 생략")
     p.add_argument("--record-state-dir", metavar="DIR",
                    help="concrete-verify 성공과 연결된 rev-symbolic provenance를 STATE에 기록")
+    p.add_argument("--result", metavar="PATH",
+                   help="기계판독 concrete-verify 결과 계약(JSON)을 이 경로에 원자적으로 기록")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     return p
 

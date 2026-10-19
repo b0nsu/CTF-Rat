@@ -26,7 +26,6 @@ host:port. 작업자는 위 대상의 테스트 권한을 보유하며, 목표(f
 
 **FAST continuation (evidence-backed)**: 초기 판별 뒤에는 현재 STATE의 활성 evidence를 먼저 확인한다. 재현 가능한 입력·success oracle 후보가 있으면 bounded 실험으로 확인하고 기존 deterministic verifier로 검증한다. 활성 PASS primitive와 미완성 solve가 있으면 그 primitive의 다음 검증 가능한 단계에 집중하되, 환경 불일치·반증·evidence invalidation은 먼저 해결한다. 관련 없는 `unknown` 또는 오래된 route lead 때문에 이미 증명된 측정을 처음부터 반복하지 않는다. 반대로 미해결 전제가 현재 단계를 실제로 막으면 저비용 discriminator 한 개를 실행한다. `governor`의 `focused-deep`은 *조언*이지 PASS/완료 증거가 아니며, verifier 없는 SOLVED 선언과 PASS 이전 체이닝은 계속 금지된다.
 
-
 `symsolve --record-state-dir <challenge-dir>`는 concrete-verify 성공 시 heuristic STATE observation과
 연결된 rev-symbolic primitive revision을 자동 기록한다. completion gate는 primitive의
 `producer.engine`이나 `solve_origin` 태그만으로 판단하지 않는다. `solution-reconstruction` 등
@@ -96,6 +95,7 @@ pwn      pwnkit / pwnstage / primitives.template.py   프리미티브·익스 �
          pwnlibc identify --leak sym=0x..   leak→libc 식별+오프셋(DB: `index build`, 미매칭은 unknown, 추측금지)
 버스     state              STATE.jsonl (+`compact --budget-tokens N`)
 계측     rat-metrics        세션 duplicate/cache/time-to-flag + first_dimensions/first_action/commitment/decision_revision/first_skill 집계(read-only)
+벤치     ratbench           챌린지 스위트 러너(Mode A 스크립티드/결정론 · Mode B 외부CLI 온디맨드) + `report --schema legacy|v3`→LEADERBOARD
 학습     pklearn            learned/ 레슨 증류(distill/promote/gaps/used) — 증거 수집만, 자동요약 금지
          state failclass <class>   실패 분류표(route-miss|offset-wrong|libc-mismatch|env|tooling-gap|timeout|other)
 검증     pkselftest  |  공유 pkshare/pkstart  |  팀 teamreg/teamsync/teamstate
@@ -112,9 +112,11 @@ python3 solve/_template/rev/symsolve.py selftest
 python3 solve/_template/rev/vmlift.py selftest
 python3 solve/_template/rev/qiling_trace.py selftest
 python3 bin/k_kallsyms --selftest
+python3 bin/ratbench selftest
 python3 bin/pklearn selftest
 python3 bin/pwngadget selftest
 python3 bin/pwnlibc selftest
+python3 bin/ratbench run          # Mode A 스위트 전 엔트리 route 정확 (CI 회귀; 실 solve-rate 증거 아님)
 python3 -m unittest tests.test_writeup_pipeline
 ```
 

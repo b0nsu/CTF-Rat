@@ -12,6 +12,31 @@ class RouteResultSchema(unittest.TestCase):
     def test_reference_schema_excludes_old_fields(self):
         schema=json.loads((ROOT/"schemas/rat.route-result.v2.json").read_text())
         self.assertFalse({"track","subroute","confidence","alternatives","score_semantics"}&set(schema["properties"]))
+    def test_reference_schema_accepts_route_feedback_fields(self):
+        schema=json.loads((ROOT/"schemas/rat.route-result.v2.json").read_text())
+        self.assertIn("feedback", schema["properties"])
+        self.assertIn("probe_status", schema["properties"])
+        initial=route(profile={"imports":["read"]}, binary_digest="sha256:"+"0"*64)
+        action=initial["next"][0]
+        doc=route(profile={"imports":["read"]}, binary_digest="sha256:"+"0"*64,
+                  probe_feedback={action["probe_id"]:{"status":"partial","reason":"bounded probe incomplete"}})
+        try: import jsonschema
+        except ImportError: return
+        jsonschema.validate(doc, schema)
+    def test_reference_schema_status_enums_match_runtime_inspected_state(self):
+        # route_feedback emits an "inspected" status (see route.py / route_feedback.py);
+        # the reference schema's feedback/probe_status enums must include it, or a
+        # valid route result would fail reference validation (does not need jsonschema).
+        schema=json.loads((ROOT/"schemas/rat.route-result.v2.json").read_text())
+        for field in ("feedback","probe_status"):
+            enum=schema["properties"][field]["items"]["properties"]["status"]["enum"]
+            self.assertIn("inspected", enum, field)
+        try: import jsonschema
+        except ImportError: return
+        doc=route()
+        doc["feedback"]=[{"probe_id":"p1","status":"inspected","reason":"decompilation completed; unverified"}]
+        doc["probe_status"]=[{"probe_id":"p1","status":"inspected","reason":"crash probe is not structured evidence"}]
+        jsonschema.validate(doc, schema)
     def test_nested_error_envelope_has_no_v1_fields(self):
         doc=route(); doc["error"]={"code":"input_invalid","message":"regenerate with rat route <bin>"}; validate(doc)
         self.assertFalse({"track","subroute","confidence"}&set(doc))

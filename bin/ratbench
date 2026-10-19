@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+"""ratbench — challenge-suite runner + leaderboard (plans/BENCHMARK_LEARNING_LOOP.md B1/B2).
+
+Mode A (scripted-driver, deterministic, CI-able) is a route-unit + oracle-smoke check, NOT
+a route-to-exploit E2E run: it (1) checks route judgment against each entry's committed
+`route.json` fixture with zero external dependencies, and (2) feeds each fixture's known-good
+"magic input" (`verify.stdin` / `verify.find_str`) straight to a real oracle (a compiled
+binary's stdout regex, or angr symsolve). No model, agent, or exploit-construction step is in
+the loop; a "solved" row proves the route+oracle pairing works when handed the answer, not
+that anything discovered the answer. The oracle stage is reported as `skipped` (not failed)
+when its toolchain (gcc / angr) is missing.
+
+Mode B (model-eval) is intentionally on-demand. Each attempt receives an isolated runtime
+export of CTF-Rat plus only the challenge runtime artifact(s): benchmark source, route fixtures,
+known-good inputs, and ground truth remain outside the agent workspace. A bare flag-shaped
+string in agent stdout is only a claim. `solved` requires the canonical completion gate: an
+active typed primitive PASS/consumed primitive plus a non-stale authenticated rat-verify PASS
+linked to the same completed exploit task. When Linux `strace` is usable, Mode B additionally
+records an observer-owned execve trace so process-level tool/duplicate/heavy-analyzer counts
+do not depend on agent-authored telemetry.
+
+  ratbench run [--id ID] [--suite path] [--corpus synthetic|integration|real|private] [--run-id ID]
+  ratbench eval --agent '<cli {dir}>' [--id ID] [--suite path] [--corpus ...] [--run-id ID]
+                [--model-id ID] [--reasoning-effort LABEL]
+  ratbench report [--schema legacy|v3]
+  ratbench selftest
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import shlex
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib import route as route_mod  # noqa: E402
+from ratlib.bench_suite import (  # noqa: E402
+    CORPORA, SuiteValidationError, load_suite, project_suite, suite_digest,
+)
+from ratlib.run_manifest import environment_identity, toolchain_identity  # noqa: E402
+from ratlib.schema import validate  # noqa: E402
+
+
+def ctf_home():
+    return os.environ.get(
+        "CTF_HOME",
+        os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")),
+    )
+
+
+def _suite_path(override=None):
+    return override or os.path.join(ctf_home(), "bench", "suite.json")
+
+
+# Run ids become result filenames, so they must be a short, path-safe ASCII slug.
+# Without this, ``--run-id ../../outside`` escapes bench/results and ``w`` mode
+# silently overwrites a prior result (R2-3).
+_RUN_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+class RunIdError(ValueError):
+    pass
+
+
+def _validate_run_id(run_id):
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        raise RunIdError(
+            "run-id must be a 1-64 char ASCII slug [A-Za-z0-9._-] starting alphanumeric")
+    # Defence in depth: reject anything that normalizes to a path component.
+    if run_id in (".", "..") or os.sep in run_id or (os.altsep and os.altsep in run_id):
+        raise RunIdError("run-id must not contain path separators")
+    return run_id
+
+
+def _results_dir():
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
+def _result_path(results_dir, run_id, suffix):
+    """Resolve a result path and prove it stays inside results_dir (R2-3)."""
+    root = os.path.realpath(results_dir)
+    path = os.path.realpath(os.path.join(root, run_id + suffix))
+    if os.path.dirname(path) != root:
+        raise RunIdError("result path escapes bench/results: %s" % run_id)
+    return path
+
+
+def _open_exclusive(path):
+    """Open a result file for exclusive creation; refuse to overwrite (R2-3)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as exc:
+        raise RunIdError("result already exists (refusing overwrite): %s"
+                         % os.path.basename(path)) from exc
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def _load_suite(path):
+    return load_suite(path)
+
+
+def _select_entries(args):
+    """Validate once, then project one corpus before any benchmark work begins."""
+    suite = project_suite(_load_suite(_suite_path(args.suite)), corpus=getattr(args, "corpus", None))
+    entries = suite["entries"]
+    if getattr(args, "id", None):
+        entries = [entry for entry in entries if entry["id"] == args.id]
+        if not entries:
+            raise LookupError("no entry %s" % args.id)
+    return entries
+
+
+def _selected_suite_doc(entries):
+    """Canonical identity document for the exact post-filter execution set."""
+    return {"schema": "rat.bench-suite/v2", "entries": list(entries)}
+
+
+def _command_digest(command):
+    return "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def _file_digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def _flag_claimed(entry, agent_out):
+    """Detect a solve claim using challenge-specific syntax when declared.
+
+    This signal is telemetry only; it never satisfies the verified completion
+    gate.  Historical suites without ``verify.claim_pattern`` keep the legacy
+    ``FLAG{...}`` detector for backward compatibility.
+    """
+    verify = entry.get("verify") or {}
+    pattern = verify.get("claim_pattern") or r"FLAG\{.+\}"
+    return bool(re.search(pattern, agent_out))
+
+
+def _benchmark_provenance(args, agent_bin, entries, trace_enabled):
+    """Observer-owned conditions required to compare Mode B runs honestly."""
+    return {
+        "suite_digest": suite_digest(_selected_suite_doc(entries)),
+        "corpora": sorted({entry["corpus"] for entry in entries}),
+        "agent": {
+            "executable": os.path.basename(agent_bin),
+            "command_digest": _command_digest(args.agent),
+            "model_id": getattr(args, "model_id", None),
+            "reasoning_effort": getattr(args, "reasoning_effort", None),
+        },
+        "execution": {
+            "timeout_seconds": args.timeout,
+            "observer_execve_trace": bool(trace_enabled),
+        },
+        "environment": environment_identity(),
+        "toolchain": toolchain_identity(ctf_home()),
+    }
+
+
+def _have(cmd):
+    from shutil import which
+    return which(cmd) is not None
+
+
+def _angr_python():
+    python = os.environ.get("RAT_ANGR_PYTHON")
+    if not python:
+        candidate = os.path.join(ctf_home(), ".venv-angr", "bin", "python")
+        python = candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else sys.executable
+    return python
+
+
+def _have_angr():
+    try:
+        subprocess.run([_angr_python(), "-c", "import angr; from angr.engines import UberEnginePcode; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return True
+    except Exception:
+        return False
+
+
+def _strace_usable():
+    """Whether observer-owned execve tracing can run without changing eval semantics."""
+    if os.name != "posix" or not _have("strace"):
+        return False
+    try:
+        p = subprocess.run(
+            ["strace", "-qq", "-e", "trace=execve", "-o", os.devnull,
+             sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _run_agent(prompt, *, cwd, env, timeout, trace_path=None):
+    source_root = os.path.realpath(ctf_home())
+    runtime_env_dirs = [os.path.join(source_root, name) for name in (".venv", ".venv-angr")]
+    if sys.platform == "darwin":
+        # sandbox-exec with (allow default) exposes the operator's home and
+        # other checkouts, and a process group cannot contain daemonized
+        # descendants. Until macOS has an independently verified containment
+        # backend, fail closed rather than score an unsafe Mode B run.
+        raise RuntimeError("Mode B on macOS requires a verified filesystem and process-tree sandbox")
+    if sys.platform.startswith("linux") and _have("bwrap"):
+        kit_root = os.path.realpath(env["CTF_HOME"])
+        if os.path.commonpath((kit_root, os.path.realpath(cwd))) != kit_root:
+            raise RuntimeError("Mode B cwd must be inside its exported kit")
+        # bwrap's PID-1 reaper makes even setsid/double-fork descendants die
+        # when the timeout kills bwrap. A process group alone cannot do that.
+        isolation = ["bwrap", "--unshare-pid", "--die-with-parent",
+                     "--tmpfs", "/", "--tmpfs", "/tmp"]
+        for path in ("/usr", "/bin", "/lib", "/lib64"):
+            if os.path.exists(path):
+                isolation += ["--ro-bind", path, path]
+        for path in ("/etc/ssl/certs", "/etc/resolv.conf", "/etc/hosts",
+                     "/etc/nsswitch.conf"):
+            if os.path.exists(path):
+                isolation += ["--ro-bind", path, path]
+        isolation += ["--bind", kit_root, kit_root]
+        for path in runtime_env_dirs:
+            if os.path.isdir(path):
+                isolation += ["--ro-bind", path, path]
+        # --dev (minimal new devtmpfs: null/zero/full/random/urandom/tty) instead of
+        # --dev-bind /dev /dev, which would expose host block devices (/dev/sda,
+        # /dev/mem, ...) to the sandboxed agent.
+        isolation += ["--proc", "/proc", "--dev", "/dev", "--"]
+    else:
+        raise RuntimeError("Mode B requires bwrap on Linux")
+    try:
+        probe = subprocess.run([*isolation, "/usr/bin/true"], cwd=cwd, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Mode B filesystem sandbox preflight timed out") from exc
+    if probe.returncode != 0:
+        raise RuntimeError("Mode B filesystem sandbox failed: %s" %
+                           probe.stdout.decode(errors="replace")[:300])
+    if trace_path:
+        # Explicit /bin/sh preserves the previous shell-command contract while
+        # making strace the observer rather than a wrapper inside the agent tree.
+        argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-s", "4096",
+                "-o", trace_path, *isolation, "/bin/sh", "-c", prompt]
+        return _run_process_tree(argv, cwd=cwd, env=env, timeout=timeout)
+    return _run_process_tree([*isolation, "/bin/sh", "-c", prompt],
+                             cwd=cwd, env=env, timeout=timeout)
+
+
+# A misbehaving agent can flood stdout; cap it so a Mode B run cannot exhaust
+# host memory via ``communicate()``.  The cap is generous for real agent traces
+# but far below an OOM, and overflow is treated as a terminal condition for that
+# entry rather than a silently truncated "success" (R2-5).
+_AGENT_OUTPUT_CAP = 16 << 20  # 16 MiB
+
+
+def _killpg(process):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _read_capped(stream, cap, overflow):
+    """Read up to ``cap`` bytes, then set ``overflow`` and stop.  Runs in a reader
+    thread so the caller can still enforce the wall-clock timeout."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        if total + len(chunk) > cap:
+            chunks.append(chunk[: cap - total])
+            overflow.set()
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _run_process_tree(argv, *, cwd, env, timeout, output_cap=_AGENT_OUTPUT_CAP):
+    process = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    overflow = threading.Event()
+    captured = {}
+
+    def _reader():
+        try:
+            captured["data"] = _read_capped(process.stdout, output_cap, overflow)
+        finally:
+            # On overflow, tear down the whole process group from the reader
+            # itself: a child that catches BrokenPipeError and keeps running
+            # would otherwise keep process.wait() blocked for the full timeout,
+            # and the overflow would be misreported as a plain timeout (not the
+            # untrusted-output path).  Killing here makes wait() return promptly.
+            if overflow.is_set():
+                _killpg(process)
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _killpg(process)
+        reader.join(timeout=5)
+        stdout = captured.get("data", b"")
+        # A timeout that coincided with an output flood is still an overflow:
+        # report it as such so the caller follows the untrusted-output path.
+        if overflow.is_set():
+            raise OutputCapExceeded(argv, output_cap, stdout)
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout)
+
+    # Process exited; drain the reader.  If it overflowed, the child may still be
+    # writing into a now-closed pipe -- tear down the whole group to be safe.
+    reader.join(timeout=5)
+    stdout = captured.get("data", b"")
+    if overflow.is_set():
+        _killpg(process)
+        raise OutputCapExceeded(argv, output_cap, stdout)
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, None)
+
+
+class OutputCapExceeded(RuntimeError):
+    """A child process wrote more than the allowed output cap (R2-5)."""
+
+    def __init__(self, argv, cap, output=b""):
+        super().__init__("child output exceeded %d bytes" % cap)
+        self.argv = argv
+        self.cap = cap
+        self.output = output
+
+
+def _run_capped(argv, *, input_bytes=None, timeout, output_cap, env=None):
+    """Run a child collecting at most ``output_cap`` bytes of stdout+stderr while
+    enforcing the wall-clock timeout, tearing down the process group on either
+    overflow or timeout.  Returns (returncode, stdout, overflowed).  Unlike
+    ``subprocess.run(stdout=PIPE)`` this never buffers an unbounded flood into
+    memory before the cap is checked (R0-2/R0-3/R2-5)."""
+    process = subprocess.Popen(argv, stdin=(subprocess.PIPE if input_bytes is not None else None),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=True, env=env)
+    overflow = threading.Event()
+    captured = {}
+
+    def _reader():
+        try:
+            captured["data"] = _read_capped(process.stdout, output_cap, overflow)
+        finally:
+            # Kill on overflow from the reader so a child that ignores the closed
+            # pipe cannot keep wait() blocked until the timeout and mask the
+            # overflow as a plain timeout.
+            if overflow.is_set():
+                _killpg(process)
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    # Feed stdin from a background thread under the SAME deadline: a child that does
+    # not consume its stdin would otherwise block a synchronous write past the pipe
+    # buffer and defeat the timeout entirely (review P1). On timeout, _killpg unblocks
+    # the writer by tearing down the process group.
+    writer = None
+    if input_bytes is not None:
+        def _writer():
+            try:
+                process.stdin.write(input_bytes)
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+        writer = threading.Thread(target=_writer, daemon=True)
+        writer.start()
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _killpg(process)
+        reader.join(timeout=5)
+        if writer is not None:
+            writer.join(timeout=5)
+        # An overflow that coincided with the timeout is still an overflow: return
+        # the overflowed flag instead of raising, so callers treat it uniformly.
+        if overflow.is_set():
+            return process.returncode, captured.get("data", b""), True
+        raise subprocess.TimeoutExpired(argv, timeout, output=captured.get("data", b""))
+    reader.join(timeout=5)
+    if writer is not None:
+        writer.join(timeout=5)
+    if overflow.is_set():
+        _killpg(process)
+    return process.returncode, captured.get("data", b""), overflow.is_set()
+
+
+# ---------------------------------------------------------------------------
+# route stage (always runs — pure python, no deps)
+# ---------------------------------------------------------------------------
+def _check_route(entry):
+    fx_path = os.path.join(ctf_home(), entry["dir"], entry.get("route_fixture", "route.json"))
+    with open(fx_path, encoding="utf-8") as fh:
+        fx = json.load(fh)
+    result = route_mod.route(profile=fx.get("profile"), revq=fx.get("revq"),
+                             interesting=fx.get("interesting"))
+    expected = entry["expected"]
+    checks = []
+    for name, values in (expected.get("dimensions") or {}).items():
+        checks.append(set(values) <= set((result.get("dimensions") or {}).get(name, [])))
+    if "leads" in expected: checks.append(set(expected["leads"]) <= set(result.get("leads", [])))
+    if "action" in expected: checks.append((result.get("decision") or {}).get("action") == expected["action"])
+    if "commitment" in expected: checks.append(result.get("commitment") == expected["commitment"])
+    observed = {"dimensions": result.get("dimensions"), "leads": result.get("leads"),
+                "action": (result.get("decision") or {}).get("action"), "commitment": result.get("commitment")}
+    return all(checks), observed
+
+
+# ---------------------------------------------------------------------------
+# verify stage (runs the real fixture when toolchain is present)
+# ---------------------------------------------------------------------------
+class CompileError(RuntimeError):
+    """gcc is present and the source exists, but the fixture failed to build.
+
+    Distinct from a missing toolchain/source (``_compile`` returns ``None``): a
+    broken C fixture must surface as a ``verify-fail`` in CI, never as a quiet
+    ``skipped`` that hides a corrupt benchmark (R2-4)."""
+
+
+def _compile(entry, workdir):
+    src = os.path.join(ctf_home(), entry["dir"], entry.get("source", "src.c"))
+    # Genuine absence of toolchain/source is a skip, not a failure.
+    if not os.path.isfile(src) or not _have("gcc"):
+        return None
+    out = os.path.join(workdir, entry["id"])
+    # Keep fixture control flow identical across GCC/Clang host compilers. The
+    # optimization levels used for a real target are a separate environment fact.
+    cmd = ["gcc", "-w", "-O0", "-fno-stack-protector", "-no-pie", src, "-o", out]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise CompileError("%s: gcc timed out" % entry["id"]) from exc
+    except subprocess.CalledProcessError as exc:
+        raise CompileError("%s: gcc exit %d" % (entry["id"], exc.returncode)) from exc
+    except OSError as exc:
+        # gcc disappeared/raced between the _have check and exec.
+        raise CompileError("%s: gcc could not run: %s" % (entry["id"], exc)) from exc
+    if not os.path.isfile(out):
+        raise CompileError("%s: gcc produced no output binary" % entry["id"])
+    return out
+
+
+_FLAG_REGEX_OUTPUT_CAP = 1 << 16  # 64 KiB; a flag line is tiny, anything larger is anomalous
+
+
+def _verify_flag_regex(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    stdin = entry["verify"].get("stdin", "").encode()
+    # Read with a bound just above the cap so overflow is detectable, but never
+    # buffer an unbounded flood: _run_capped stops at the limit and kills the
+    # process group (R0-2/R2-5).
+    try:
+        rc, raw, overflowed = _run_capped([binpath], input_bytes=stdin, timeout=30,
+                                          output_cap=_FLAG_REGEX_OUTPUT_CAP + 1)
+    except subprocess.TimeoutExpired:
+        return "verify-fail", "binary timed out"
+    except Exception as exc:
+        return "error", str(exc)
+    # Honest-mode: a non-zero exit is not a success even if the pattern appears,
+    # and a flood of output is anomalous, not a pass.  Bound the stored detail.
+    if overflowed or len(raw) > _FLAG_REGEX_OUTPUT_CAP:
+        return "verify-fail", "output exceeded %d bytes" % _FLAG_REGEX_OUTPUT_CAP
+    if rc != 0:
+        return "verify-fail", "binary exit %d (not a success)" % rc
+    out = raw.decode(errors="replace")
+    if re.search(entry["verify"]["pattern"], out):
+        last = out.strip().splitlines()[-1] if out.strip() else ""
+        return "pass", last[:200]
+    return "fail", "pattern %r not in output" % entry["verify"]["pattern"]
+
+
+_SYMSOLVE_OUTPUT_CAP = 1 << 20  # 1 MiB of child stdout is more than enough for a human trace
+
+
+def _verify_symsolve(entry, binpath):
+    if binpath is None:
+        return "skipped", "no gcc/binary"
+    if not _have_angr():
+        return "skipped", "no angr venv"
+    v = entry["verify"]
+    python = _angr_python()
+    sym = os.path.join(ctf_home(), "bin", "symsolve")
+    with tempfile.TemporaryDirectory() as td:
+        result_path = os.path.join(td, "result.json")
+        cmd = [sym, binpath, "--find-str", v["find_str"],
+               "--avoid-str", v.get("avoid_str", ""), "--stdin", str(v.get("stdin_len", 16)),
+               "--printable", "--result", result_path]
+        try:
+            env = os.environ.copy()
+            env["RAT_ANGR_PYTHON"] = python
+            rc, _out, overflowed = _run_capped(cmd, timeout=180,
+                                               output_cap=_SYMSOLVE_OUTPUT_CAP, env=env)
+        except subprocess.TimeoutExpired:
+            return "fail", "symsolve timed out"
+        except Exception as exc:
+            return "error", str(exc)
+        if overflowed:
+            return "verify-fail", "symsolve output exceeded %d bytes" % _SYMSOLVE_OUTPUT_CAP
+        # Honest-mode: never trust stdout substrings.  Require (1) clean exit,
+        # (2) a well-formed result contract, (3) concrete_verify == pass,
+        # (4) the recovered solution to actually contain the expected answer.
+        if rc != 0:
+            return "verify-fail", "symsolve exit %d (not a verified success)" % rc
+        try:
+            with open(result_path, encoding="utf-8") as fh:
+                res = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return "verify-fail", "missing/malformed symsolve result: %s" % exc
+        # The result must be a JSON object; a list/null/string top-level would
+        # otherwise raise AttributeError on .get() (R0-3).
+        if not isinstance(res, dict):
+            return "verify-fail", "symsolve result is not a JSON object (%s)" % type(res).__name__
+        if res.get("schema") != "rat.symsolve-result/v1":
+            return "verify-fail", "unexpected symsolve result schema %r" % res.get("schema")
+        if res.get("concrete_verify") != "pass" or not res.get("verified"):
+            return "verify-fail", "concrete_verify=%r (expected pass)" % res.get("concrete_verify")
+        # `solutions` must be an object mapping names to hex values; any other
+        # shape is a malformed contract, not a verified success (R0-3).
+        solutions = res.get("solutions")
+        if solutions is not None and not isinstance(solutions, dict):
+            return "verify-fail", "symsolve solutions is not an object (%s)" % type(solutions).__name__
+        # The expected plaintext must appear in a recovered symbol value.
+        expected = v["expected"]
+        recovered = []
+        for hexval in (solutions or {}).values():
+            try:
+                recovered.append(bytes.fromhex(hexval))
+            except (ValueError, TypeError):
+                continue
+        if not any(expected.encode() in r for r in recovered):
+            return "verify-fail", "expected %r not in recovered solution" % expected
+        return "pass", expected
+
+
+def _verify(entry, binpath):
+    kind = entry["verify"]["kind"]
+    if kind == "flag-regex":
+        return _verify_flag_regex(entry, binpath)
+    if kind == "symsolve-restore":
+        return _verify_symsolve(entry, binpath)
+    if kind == "rat-verify-pass":
+        return "skipped", "rat-verify report presence check (not produced in Mode A)"
+    return "skipped", "unknown verify kind %s" % kind
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+def cmd_run(args):
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
+    run_id = args.run_id or ("A-%d" % int(time.time()))
+    try:
+        _validate_run_id(run_id)
+        results_dir = _results_dir()
+        out_path = _result_path(results_dir, run_id, ".jsonl")
+        # Reserve the result name up front with exclusive creation so a re-run of
+        # the same id fails before doing any work instead of overwriting (R2-3).
+        out_fh = _open_exclusive(out_path)
+    except RunIdError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        return _run_mode_a(args, entries, run_id, out_path, out_fh)
+    except BaseException:
+        # The result name was reserved with O_EXCL; drop the empty/partial file so
+        # a retry with the same id is not permanently blocked by a failed run.
+        try:
+            out_fh.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        raise
+
+
+def _run_mode_a(args, entries, run_id, out_path, out_fh):
+    import tempfile
+    with tempfile.TemporaryDirectory() as workdir:
+        return _run_mode_a_body(args, entries, run_id, out_path, out_fh, workdir)
+
+
+def _run_mode_a_body(args, entries, run_id, out_path, out_fh, workdir):
+    n_fail = 0
+    lines = []
+    print("== ratbench Mode A: %s (%d entries) ==" % (run_id, len(entries)))
+    for e in entries:
+        t0 = time.time()
+        route_ok, observed = _check_route(e)
+        try:
+            binpath = _compile(e, workdir)
+        except CompileError as exc:
+            # gcc present + source present but the fixture does not build: this is
+            # a broken benchmark, not an environment skip (R2-4).
+            binpath, vstatus, vdetail = None, "verify-fail", "fixture compile failed: %s" % exc
+        else:
+            vstatus, vdetail = _verify(e, binpath)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        if not route_ok:
+            outcome = "route-miss"
+        elif vstatus == "pass":
+            outcome = "solved"
+        elif vstatus == "skipped":
+            outcome = "route-ok-verify-skipped"
+        else:
+            outcome = "verify-fail"
+        if outcome in ("route-miss", "verify-fail"):
+            n_fail += 1
+        rec = {
+            "schema": "rat.bench-result/v2", "mode": "A", "run_id": run_id,
+            "id": e["id"], "difficulty": e.get("difficulty"),
+            "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
+            "expected": e["expected"], "observed": observed,
+            "route_ok": route_ok, "verify": {"kind": e["verify"]["kind"], "status": vstatus, "detail": vdetail},
+            "outcome": outcome, "wall_ms": elapsed_ms,
+        }
+        lines.append(rec)
+        mark = {"solved": "OK  ", "route-ok-verify-skipped": "~   ",
+                "route-miss": "MISS", "verify-fail": "FAIL"}[outcome]
+        print("  [%s] %-18s route=%s%s verify=%s (%s)" % (
+            mark, e["id"], observed.get("action"),
+            "" if route_ok else "!=expected-conditions",
+            vstatus, vdetail if vstatus != "pass" else "ok"))
+    for rec in lines:
+        validate(rec, "rat.bench-result/v2")
+    with out_fh as fh:
+        for rec in lines:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    print("-- results: %s" % os.path.relpath(out_path, ctf_home()))
+    if n_fail:
+        print("-- %d entr%s FAILED (route-miss/verify-fail)" % (n_fail, "y" if n_fail == 1 else "ies"))
+        return 1
+    n_skipped = sum(1 for rec in lines if rec["verify"]["status"] == "skipped")
+    if n_skipped:
+        print("-- all entries route-correct, %d/%d verifier%s skipped (see per-entry reason; no solve claim)" %
+              (n_skipped, len(lines), "" if n_skipped == 1 else "s"))
+    else:
+        print("-- all entries route-correct and verified")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# eval workspace — runtime only; benchmark truth never enters the agent tree
+# ---------------------------------------------------------------------------
+_RUNTIME_DIRS = ("bin", "doctrine", "knowledge", "reference", "schemas", "skills", "kernel")
+_RUNTIME_FILES = ("CLAUDE.md", "AGENTS.md", "FLAG_FORMAT")
+
+
+def _reject_external_symlinks(src):
+    """Allow aliases inside one exported tree, never links to benchmark data."""
+    if os.path.islink(src):
+        raise ValueError("Mode B runtime export has a symlinked root: %s" % src)
+    root = os.path.realpath(src)
+    for directory, subdirs, files in os.walk(src, followlinks=False):
+        for name in subdirs + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path) and os.path.commonpath((root, os.path.realpath(path))) != root:
+                raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % path)
+
+
+def _tracked_relpaths(src_root):
+    """Set of Git-tracked paths (relative to src_root), or None if this is not a
+    usable git checkout.  Used to keep ignored/untracked local files (e.g.
+    `knowledge/learned/{pwn,rev}/*.md`) out of the Mode B agent export (R1-1)."""
+    if not os.path.isdir(os.path.join(src_root, ".git")) and not os.path.exists(os.path.join(src_root, ".git")):
+        return None
+    try:
+        p = subprocess.run(["git", "-C", src_root, "ls-files", "-z"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    return {os.path.normpath(x) for x in p.stdout.decode("utf-8", "replace").split("\0") if x}
+
+
+def _copy_tracked_dir(src, dst_root, name, tracked, src_root):
+    """Copy only Git-tracked files under `name` into dst_root/name.  Fails closed
+    on symlink escape.  Untracked/ignored files are silently excluded."""
+    import shutil
+    rel_prefix = os.path.relpath(src, src_root)
+    root_real = os.path.realpath(src_root)
+    copied = 0
+    for directory, subdirs, files in os.walk(src, followlinks=False):
+        for fname in files:
+            path = os.path.join(directory, fname)
+            rel = os.path.normpath(os.path.relpath(path, src_root))
+            if rel not in tracked:
+                continue  # untracked or gitignored -> never exported
+            if os.path.islink(path):
+                real = os.path.realpath(path)
+                # shutil.copy2 follows the link, so a tracked symlink to an
+                # untracked/gitignored file would leak that file's content.
+                # Require the resolved target to stay inside the checkout AND be a
+                # tracked path too; otherwise skip the link entirely (R1-1).
+                if os.path.commonpath((root_real, real)) != root_real:
+                    raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % path)
+                target_rel = os.path.normpath(os.path.relpath(real, root_real))
+                if target_rel not in tracked:
+                    continue  # tracked link -> untracked target: never exported
+            target = os.path.join(dst_root, os.path.relpath(path, src_root))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(path, target)
+            copied += 1
+    return copied
+
+
+def _copy_runtime_export(dst_root):
+    import shutil
+    src_root = ctf_home()
+    os.makedirs(dst_root, exist_ok=True)
+    tracked = _tracked_relpaths(src_root)
+    for name in _RUNTIME_FILES:
+        src = os.path.join(src_root, name)
+        if os.path.isfile(src):
+            if os.path.islink(src):
+                target = os.path.realpath(src)
+                if target not in {os.path.realpath(os.path.join(src_root, item)) for item in _RUNTIME_FILES}:
+                    raise ValueError("Mode B runtime export symlink escapes allowlist: %s" % src)
+            if tracked is not None and os.path.normpath(name) not in tracked:
+                continue  # local-only top-level file: do not export
+            shutil.copy2(src, os.path.join(dst_root, name))
+    # Non-git fallback consults the repo's own .gitignore so arbitrary local-only
+    # files (e.g. knowledge/private/*) are excluded, not just a hardcoded denylist (R1-1).
+    ignore_cb = _local_only_ignore if tracked is not None else _gitignore_aware_ignore(src_root)
+    for name in _RUNTIME_DIRS:
+        src = os.path.join(src_root, name)
+        if os.path.isdir(src):
+            _reject_external_symlinks(src)
+            if tracked is not None:
+                _copy_tracked_dir(src, dst_root, name, tracked, src_root)
+            else:
+                # Not a git checkout (fresh unpack): full copy minus ignored paths.
+                shutil.copytree(src, os.path.join(dst_root, name), symlinks=False,
+                                ignore=ignore_cb)
+    template = os.path.join(src_root, "solve", "_template")
+    if os.path.isdir(template):
+        _reject_external_symlinks(template)
+        os.makedirs(os.path.join(dst_root, "solve"), exist_ok=True)
+        if tracked is not None:
+            _copy_tracked_dir(template, dst_root, os.path.join("solve", "_template"), tracked, src_root)
+        else:
+            shutil.copytree(template, os.path.join(dst_root, "solve", "_template"),
+                            symlinks=False, ignore=ignore_cb)
+
+
+def _load_gitignore_patterns(src_root):
+    """Parse the repo .gitignore into (patterns, root).  Negations (!) are ignored
+    conservatively: in the non-git fallback we prefer to drop a file that MIGHT be
+    local-only over leaking it, so a re-included path still falls to the floor
+    denylist only (never silently re-admitted)."""
+    patterns = []
+    path = os.path.join(src_root, ".gitignore")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("!"):
+                    continue
+                patterns.append(line)
+    except OSError:
+        pass
+    return patterns
+
+
+def _gitignore_matches(rel, patterns, is_dir):
+    """Best-effort gitignore match for a path relative to the repo root."""
+    import fnmatch
+    rel = rel.replace(os.sep, "/")
+    candidates = [rel] + ([rel + "/"] if is_dir else [])
+    base = rel.rsplit("/", 1)[-1]
+    for pat in patterns:
+        p = pat
+        anchored = p.startswith("/")
+        if anchored:
+            p = p[1:]
+        dir_only = p.endswith("/")
+        if dir_only:
+            p = p[:-1]
+        if dir_only and not is_dir:
+            continue
+        # Patterns with no slash match a basename at any depth.
+        if "/" not in p:
+            if fnmatch.fnmatch(base, p):
+                return True
+            continue
+        # Patterns with a slash match against the path (anchored or any depth).
+        for cand in (rel, rel.rstrip("/")):
+            if fnmatch.fnmatch(cand, p) or (not anchored and fnmatch.fnmatch(cand, "*/" + p)):
+                return True
+    return False
+
+
+def _gitignore_aware_ignore(src_root):
+    """Build a copytree ignore callback that drops .gitignored paths (R1-1), always
+    including the hardcoded local-only floor."""
+    patterns = _load_gitignore_patterns(src_root)
+    root_real = os.path.realpath(src_root)
+
+    def _ignore(directory, names):
+        drop = set(_local_only_ignore(directory, names))
+        for n in names:
+            full = os.path.join(directory, n)
+            rel = os.path.relpath(os.path.realpath(full), root_real)
+            if rel.startswith(os.pardir):
+                continue
+            if _gitignore_matches(rel, patterns, os.path.isdir(full)):
+                drop.add(n)
+        return drop
+
+    return _ignore
+
+
+def _local_only_ignore(directory, names):
+    """copytree ignore callback for the non-git fallback: drop private state and
+    distilled local lessons that must never reach the agent workspace."""
+    drop = set()
+    for n in names:
+        if n == ".rat" or n.endswith(".env"):
+            drop.add(n)
+    # Distilled lesson files live under knowledge/learned/{pwn,rev}; they are
+    # gitignored and must not be exported even without a git index.
+    base = os.path.basename(os.path.normpath(directory))
+    parent = os.path.basename(os.path.dirname(os.path.normpath(directory)))
+    if parent == "learned" and base in ("pwn", "rev"):
+        drop.update(n for n in names if n.endswith(".md"))
+    return drop
+
+
+def _flag_named_path(path):
+    return any(part.lower() in {"flag", "flag.txt", "flag.json", "flag.bin"}
+               or part.lower().endswith(".flag") for part in path.split(os.sep))
+
+
+def _runtime_fixture_relpath(relpath):
+    if not isinstance(relpath, str) or not relpath or os.path.isabs(relpath):
+        raise ValueError("runtime fixture path must be relative")
+    normalized = os.path.normpath(relpath)
+    if normalized in ("", ".", os.pardir) or normalized.startswith(os.pardir + os.sep):
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if ".rat" in normalized.split(os.sep):
+        raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+    if _flag_named_path(normalized):
+        raise ValueError("flag file cannot be exported to Mode B: %s" % relpath)
+    return normalized
+
+
+def _fixture_file(entry, relpath):
+    normalized = _runtime_fixture_relpath(relpath)
+    base = os.path.realpath(os.path.join(ctf_home(), entry["dir"]))
+    candidate = os.path.realpath(os.path.join(base, normalized))
+    if os.path.commonpath((base, candidate)) != base:
+        raise ValueError("runtime fixture path escapes fixture root: %s" % relpath)
+    if _flag_named_path(os.path.relpath(candidate, base)):
+        raise ValueError("flag file cannot be exported to Mode B: %s" % relpath)
+    if not os.path.isfile(candidate):
+        raise ValueError("runtime fixture file missing: %s" % relpath)
+    return candidate
+
+
+def _prepare_eval_workspace(entry, sandbox):
+    """Create a CTF-Rat runtime export plus answer-free challenge directory."""
+    import shutil
+    source_root = os.path.realpath(ctf_home())
+    fixture_root = os.path.realpath(os.path.join(source_root, entry["dir"]))
+    if os.path.commonpath((source_root, fixture_root)) != source_root:
+        raise ValueError("runtime fixture directory escapes CTF_HOME: %s" % entry["dir"])
+    kit_root = os.path.join(sandbox, "ctf-rat")
+    _copy_runtime_export(kit_root)
+    chal_dir = os.path.join(kit_root, "solve", entry["id"])
+    os.makedirs(chal_dir, exist_ok=True)
+
+    chal_real = os.path.realpath(chal_dir)
+    forbidden = {
+        _runtime_fixture_relpath(entry.get("source", "src.c")),
+        _runtime_fixture_relpath(entry.get("route_fixture", "route.json")),
+    }
+    forbidden_targets = {
+        os.path.realpath(os.path.join(fixture_root, relpath))
+        for relpath in forbidden
+    }
+
+    # Compute every destination (binary + runtime files) up front so a collision
+    # -- the binary and a runtime file landing on the same path, or one nested
+    # inside another -- is rejected before any copy runs (R1-2).  `claimed` maps a
+    # normalized destination realpath to its origin label for diagnostics.
+    claimed = {}
+    def _claim(dst_real, label):
+        for other in claimed:
+            if dst_real == other:
+                raise ValueError("Mode B destination collision: %s and %s target %s"
+                                 % (label, claimed[other], dst_real))
+            # parent/child nesting is also a collision (a file cannot be both a
+            # directory and a regular file).
+            a, b = sorted((dst_real, other))
+            if b.startswith(a + os.sep):
+                raise ValueError("Mode B destination nests: %s (%s) under %s (%s)"
+                                 % (b, label, a, claimed[a if a == other else other]))
+        claimed[dst_real] = label
+
+    binary_rel = entry.get("binary")
+    binary_src = None
+    if binary_rel:
+        binary_src = _fixture_file(entry, binary_rel)
+        truth = {os.path.realpath(os.path.join(fixture_root, entry.get("source", "src.c"))),
+                 os.path.realpath(os.path.join(fixture_root, entry.get("route_fixture", "route.json")))}
+        if binary_src in truth:
+            raise ValueError("ground-truth file cannot be used as Mode B binary")
+        target = os.path.join(chal_dir, os.path.basename(binary_rel))
+    else:
+        target = os.path.join(chal_dir, "chall")
+    _claim(os.path.realpath(target), "binary")
+
+    runtime_plan = []  # (src, dst) computed and validated before any copy
+    for relpath in entry.get("runtime_files", []) or []:
+        normalized = _runtime_fixture_relpath(relpath)
+        if normalized in forbidden:
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        src = _fixture_file(entry, normalized)
+        if ".rat" in os.path.relpath(src, fixture_root).split(os.sep):
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        if src in forbidden_targets:
+            raise ValueError("ground-truth/state file cannot be exported to Mode B: %s" % relpath)
+        dst = os.path.realpath(os.path.join(chal_dir, normalized))
+        if os.path.commonpath((chal_real, dst)) != chal_real:
+            raise ValueError("runtime fixture path escapes challenge workspace: %s" % relpath)
+        _claim(dst, "runtime_file %s" % relpath)
+        runtime_plan.append((src, dst))
+
+    # Now materialize: binary first, then runtime files onto non-colliding paths.
+    if binary_rel:
+        shutil.copy2(binary_src, target)
+    else:
+        built = _compile(entry, chal_dir)
+        if built is None:
+            raise RuntimeError("cannot materialize runtime binary (gcc/source unavailable)")
+        os.replace(built, target)
+    binary_digest_before = _file_digest(target)
+
+    for src, dst in runtime_plan:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    # The binary must be byte-identical after runtime files were staged: a
+    # collision would have changed it (defence in depth beyond the pre-checks).
+    if _file_digest(target) != binary_digest_before:
+        raise RuntimeError("Mode B binary was modified after runtime-file staging")
+
+    # Explicit invariant: the agent export never contains the benchmark tree.
+    if os.path.exists(os.path.join(kit_root, "bench")):
+        raise RuntimeError("Mode B runtime export leaked benchmark data")
+    return kit_root, chal_dir, target
+
+
+def _agent_environment(kit_root):
+    env = {"CTF_HOME": kit_root, "HOME": kit_root,
+           "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp"}
+    for key in ("LANG", "LC_ALL", "TERM"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    pwn_venv = os.path.join(ctf_home(), ".venv", "bin")
+    path_parts = [os.path.join(kit_root, "bin")]
+    if os.path.isdir(pwn_venv):
+        path_parts.append(pwn_venv)
+    path_parts.extend(("/usr/local/bin", "/usr/bin", "/bin"))
+    env["PATH"] = os.pathsep.join(path_parts)
+    env.pop("PWD", None)
+    for key in ("RAT_INDEX_ROOT", "STATE_PATH", "CTF_TEAM", "PYTHONPATH"):
+        env.pop(key, None)
+    # Keep the challenge export answer-free while pointing the symsolve shim at
+    # the operator-provisioned host engine. No Docker/image fallback is involved.
+    if _have_angr():
+        env["RAT_ANGR_PYTHON"] = _angr_python()
+    return env
+
+
+def _epoch(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _elapsed_ms(started_epoch, finished_epoch):
+    if not isinstance(started_epoch, (int, float)) or not isinstance(finished_epoch, (int, float)):
+        return None
+    if finished_epoch < started_epoch:
+        return None
+    return int(round((finished_epoch - started_epoch) * 1000))
+
+
+def _first_event_ms(events, started_epoch, predicate):
+    candidates = []
+    for event in events:
+        if not predicate(event):
+            continue
+        event_epoch = _epoch(event.get("at"))
+        latency = _elapsed_ms(started_epoch, event_epoch)
+        if latency is not None:
+            candidates.append(latency)
+    return min(candidates) if candidates else None
+
+
+def _artifact_count(store_root):
+    meta = os.path.join(store_root, "metadata", "sha256")
+    if not os.path.isdir(meta):
+        return 0
+    count = 0
+    for prefix in os.listdir(meta):
+        directory = os.path.join(meta, prefix)
+        if os.path.isdir(directory):
+            count += sum(1 for name in os.listdir(directory) if name.endswith(".json"))
+    return count
+
+
+def _runtime_input_digest(chal_dir):
+    """Digest the exact answer-free challenge tree before the agent mutates it."""
+    digest = hashlib.sha256()
+    for root, dirs, files in os.walk(chal_dir):
+        dirs[:] = sorted(name for name in dirs if name != ".rat")
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            relpath = os.path.relpath(path, chal_dir).replace(os.sep, "/")
+            digest.update(relpath.encode("utf-8")); digest.update(b"\0")
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(64 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def _mode_b_v2_record(entry, *, run_id, ablation_id, started_at, finished_at,
+                      agent_rc, flag_claimed, completion, events,
+                      primitive_pass_at, artifact_count, process_metrics=None,
+                      provenance=None, runtime_input_digest=None, routing_metrics=None,
+                      envelope_observations=None, timed_out=False):
+    """Build one honest Mode B `rat.benchmark-result/v3` record.
+
+    Unknown instrumentation is encoded as null, never fabricated as zero. Process
+    metrics are populated only when an observer-owned execve trace was actually
+    available for the attempt. Routing telemetry is an optional projection of
+    route-assessment STATE notes; historical rows without it remain valid.
+    Provenance is optional only to keep old fixtures/result rows readable; the
+    live Mode B producer always supplies it.
+    """
+    started_epoch = _epoch(started_at)
+    verified = completion.get("verified") is True
+    verification_id = completion.get("verification_id")
+    process_metrics = process_metrics or {}
+    time_to_first_query_ms = _first_event_ms(
+        events, started_epoch,
+        lambda e: e.get("type") == "governor.checked"
+        and str(e.get("payload", {}).get("action", "")).startswith("query:"),
+    )
+    time_to_first_hypothesis_ms = _first_event_ms(
+        events, started_epoch, lambda e: e.get("type") == "hypothesis.recorded"
+    )
+    time_to_verified_solve_ms = None
+    if verified and verification_id:
+        time_to_verified_solve_ms = _first_event_ms(
+            events, started_epoch,
+            lambda e: e.get("type") == "verification.recorded"
+            and e.get("payload", {}).get("verification_id") == verification_id,
+        )
+    time_to_first_valid_primitive_ms = _elapsed_ms(started_epoch, primitive_pass_at)
+    if verified:
+        outcome = "verified"
+    elif flag_claimed:
+        outcome = "solve-claimed"
+    elif timed_out:
+        outcome = "censored"
+    else:
+        outcome = "failed"
+    # Observed outcome category, not an exploit/model root-cause diagnosis.
+    if completion.get("reason") == "unsanctioned-symbolic-engine":
+        failure_class = "tooling-gap:symsolve-bypass"
+    elif verified:
+        failure_class = None
+    elif timed_out:
+        failure_class = "agent-timeout"
+    elif flag_claimed:
+        failure_class = "claim-without-completion"
+    elif agent_rc != 0:
+        failure_class = "agent-nonzero-exit"
+    else:
+        failure_class = "no-verified-completion"
+    metrics = {
+        "correctness": {"verified_solve": verified,
+                        "false_solved": bool(flag_claimed and not verified),
+                        "oracle_pass": True if verified else None},
+        "latency": {"time_to_first_query_ms": time_to_first_query_ms,
+                    "time_to_first_hypothesis_ms": time_to_first_hypothesis_ms,
+                    "time_to_first_valid_primitive_ms": time_to_first_valid_primitive_ms,
+                    "time_to_verified_solve_ms": time_to_verified_solve_ms},
+        "context": {"input_tokens": None, "output_tokens": None,
+                    "peak_context_tokens": None, "tool_output_bytes": None},
+        "tools": {"tool_calls": process_metrics.get("tool_calls"),
+                  "duplicate_tool_calls": process_metrics.get("duplicate_tool_calls"),
+                  "ghidra_runs": process_metrics.get("ghidra_runs"),
+                  "cfgfast_runs": None,
+                  "symbolic_runs": process_metrics.get("symbolic_runs"),
+                  "subagent_count": None},
+        "cache": {"cache_requests": None, "cache_hits": None,
+                  "cache_hit_ratio": None, "bytes_reused": None, "cold_warm": "cold"},
+        "reasoning": {"hypotheses_created": sum(1 for e in events if e.get("type") == "hypothesis.recorded"),
+                      "hypotheses_refuted": None, "pivot_count": None,
+                      "deep_escalations": None},
+        "artifacts": {"functions_decompiled": None, "raw_output_size": None,
+                      "compressed_output_size": None, "artifact_count": artifact_count},
+    }
+    doc = {
+        "schema": "rat.benchmark-result/v3",
+        "benchmark_run_id": run_id,
+        "ablation_id": ablation_id,
+        "challenge_id": entry["id"],
+        "attempt": 1,
+        "status": "timeout" if timed_out else "completed",
+        "eligible": True,
+        "outcome": outcome,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "metrics": metrics,
+        "oracle": {"kind": "completion-gate", "reason": completion.get("reason"),
+                   "verification_id": verification_id, "failure_class": failure_class},
+        "ground_truth": {"difficulty": entry.get("difficulty"), "expected": entry.get("expected"),
+                         "verify_kind": (entry.get("verify") or {}).get("kind"),
+                         "corpus": entry.get("corpus"),
+                         "capabilities": entry.get("capabilities", []),
+                         "redistributable": entry.get("redistributable"),
+                         "runtime_input_digest": runtime_input_digest},
+    }
+    if provenance is not None:
+        doc["provenance"] = provenance
+    if routing_metrics is not None:
+        doc["routing"] = dict(routing_metrics)
+    if envelope_observations is not None:
+        doc["observations"] = {"tool_result_envelopes": dict(envelope_observations)}
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# eval (Mode B — external model CLI, on-demand, human-run, NOT CI)
+# ---------------------------------------------------------------------------
+def cmd_eval(args):
+    """Run an external agent against an answer-free CTF-Rat runtime export."""
+    import shutil
+    import tempfile
+    if not args.agent:
+        print("[ratbench:err] eval requires --agent \"<cli command template>\" (use {dir} placeholder)", file=sys.stderr); return 2
+    try:
+        # Only the command word is needed for the executable preflight.  The
+        # rest is a shell program and may contain nested quoting in $(...).
+        words = shlex.shlex(args.agent, posix=True)
+        words.whitespace_split = True
+        agent_bin = words.get_token()
+        if not agent_bin:
+            raise ValueError("empty agent command")
+    except (ValueError, IndexError):
+        print("[ratbench:err] eval requires a valid agent command", file=sys.stderr)
+        return 2
+    if not _have(agent_bin):
+        print("[ratbench:err] agent CLI not found: %s (Mode B is on-demand; install it first)" % agent_bin, file=sys.stderr)
+        return 3
+    try:
+        entries = _select_entries(args)
+    except SuiteValidationError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 3
+    except LookupError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 4
+    run_id = args.run_id or ("B-%s-%d" % (os.path.basename(agent_bin), int(time.time())))
+    try:
+        _validate_run_id(run_id)
+        results_dir = _results_dir()
+        out_path = _result_path(results_dir, run_id, ".jsonl")
+        v2_out_path = _result_path(results_dir, run_id, ".benchmark-v3.jsonl")
+        # Reserve both result names up front with exclusive creation so a re-run of
+        # the same id fails before any agent runs and both files stay consistent
+        # (R2-3).  If the second reservation fails, release the first.
+        out_fh = _open_exclusive(out_path)
+        try:
+            v2_out_fh = _open_exclusive(v2_out_path)
+        except RunIdError:
+            out_fh.close()
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+    except RunIdError as exc:
+        print("[ratbench:err] %s" % exc, file=sys.stderr)
+        return 2
+    def _release_reservations():
+        for fh, path in ((out_fh, out_path), (v2_out_fh, v2_out_path)):
+            try:
+                fh.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    class _ModeBAbort(Exception):
+        def __init__(self, code):
+            self.code = code
+
+    lines = []
+    v2_lines = []
+    trace_enabled = _strace_usable()
+    run_provenance = _benchmark_provenance(args, agent_bin, entries, trace_enabled)
+    print("== ratbench Mode B: %s via %s (%d entries) ==" % (run_id, agent_bin, len(entries)))
+    if trace_enabled:
+        print("-- process telemetry: observer execve trace enabled")
+    else:
+        print("-- process telemetry: unavailable (process metrics remain null)")
+    try:
+        for e in entries:
+            sandbox = tempfile.mkdtemp(prefix="ratbench-B-")
+            try:
+                try:
+                    kit_root, chal_dir, _binary = _prepare_eval_workspace(e, sandbox)
+                    runtime_input_digest = _runtime_input_digest(chal_dir)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print("[ratbench:err] %s: %s" % (e["id"], exc), file=sys.stderr)
+                    raise _ModeBAbort(3)
+                prompt = args.agent.replace("{dir}", chal_dir)
+                trace_path = os.path.join(sandbox, "execve.log") if trace_enabled else None
+                started_at = datetime.now(timezone.utc).isoformat()
+                t0 = time.time()
+                timed_out = False
+                output_overflow = False
+                try:
+                    p = _run_agent(prompt, cwd=chal_dir, env=_agent_environment(kit_root),
+                                   timeout=args.timeout, trace_path=trace_path)
+                    agent_out = p.stdout.decode(errors="replace")
+                    agent_rc = p.returncode
+                except subprocess.TimeoutExpired as exc:
+                    timed_out = True
+                    partial = exc.stdout or b""
+                    agent_out = partial if isinstance(partial, str) else partial.decode(errors="replace")
+                    agent_rc = 124
+                except OutputCapExceeded as exc:
+                    # An output flood is a terminal failure for this entry, not a
+                    # success.  Keep a bounded diagnostic and never let the flooded
+                    # text be mined for a flag (R2-5).
+                    print("[ratbench:err] %s: %s (treated as failure)" % (e["id"], exc),
+                          file=sys.stderr)
+                    agent_out = ""
+                    agent_rc = 125
+                    output_overflow = True
+                except (OSError, RuntimeError) as exc:
+                    print("[ratbench:err] %s: agent sandbox unavailable: %s" % (e["id"], exc), file=sys.stderr)
+                    raise _ModeBAbort(3)
+                wall = int((time.time() - t0) * 1000)
+                finished_at = datetime.now(timezone.utc).isoformat()
+
+                flag_claimed = _flag_claimed(e, agent_out)
+                from ratlib.metrics import (first_primitive_pass_ts, process_trace_metrics,
+                                        route_assessment_metrics, benchmark_envelope_observations)
+                from ratlib.completion import completion_gate
+                from ratlib.state_v2 import Stream
+                primitive_pass_at = first_primitive_pass_ts(chal_dir)
+                typed_pass = primitive_pass_at is not None
+                completion = completion_gate(chal_dir)
+                # An output flood makes the whole run untrusted: never promote it to
+                # solved/verified even if a completion record already sat in the
+                # workspace before the flood (R2-5).
+                verified = completion.get("verified") is True and not output_overflow
+                if output_overflow:
+                    outcome = "fail"
+                    flag_claimed = False
+                    completion = {**completion, "verified": False,
+                                  "reason": "output cap exceeded; run untrusted"}
+                elif verified:
+                    outcome = "solved"
+                elif flag_claimed:
+                    outcome = "solve-claimed"
+                else:
+                    outcome = "fail"
+                rec = {"schema": "rat.bench-result/v2", "mode": "B", "run_id": run_id, "agent": os.path.basename(agent_bin),
+                       "id": e["id"], "difficulty": e.get("difficulty"),
+                       "corpus": e.get("corpus"), "capabilities": e.get("capabilities", []),
+                       "outcome": outcome, "agent_rc": agent_rc, "flag_claimed": flag_claimed,
+                       "typed_primitive_pass": typed_pass, "verified_solve": verified,
+                       "completion_reason": completion.get("reason"), "wall_ms": wall}
+                lines.append(rec)
+                try:
+                    events = Stream(chal_dir).read()
+                except (OSError, ValueError):
+                    events = []
+                process_metrics = process_trace_metrics(trace_path, kit_root, chal_dir) if trace_path else None
+                routing_metrics = route_assessment_metrics(chal_dir)
+                v2_lines.append(_mode_b_v2_record(
+                    e, run_id=run_id, ablation_id=args.ablation,
+                    started_at=started_at, finished_at=finished_at,
+                    agent_rc=agent_rc, timed_out=timed_out, flag_claimed=flag_claimed,
+                    completion=completion, events=events,
+                    primitive_pass_at=primitive_pass_at,
+                    artifact_count=_artifact_count(os.path.join(chal_dir, ".rat")),
+                    process_metrics=process_metrics, provenance=run_provenance,
+                    runtime_input_digest=runtime_input_digest, routing_metrics=routing_metrics,
+                    envelope_observations=benchmark_envelope_observations(os.path.join(chal_dir, ".rat")),
+                ))
+                mark = {"solved": "OK  ", "solve-claimed": "CLAIM", "fail": "FAIL"}[outcome]
+                detail = ""
+                if outcome == "solve-claimed":
+                    detail = "  (flag claimed, verified completion gate NOT satisfied)"
+                elif typed_pass and not verified:
+                    detail = "  (primitive PASS present, deterministic verification missing/stale)"
+                print("  [%s] %-18s rc=%s wall=%dms%s" % (mark, e["id"], agent_rc, wall, detail))
+            finally:
+                shutil.rmtree(sandbox, ignore_errors=True)
+        for rec in lines:
+            validate(rec, "rat.bench-result/v2")
+        for rec in v2_lines:
+            validate(rec, "rat.benchmark-result/v3")
+        with out_fh as fh:
+            for rec in lines:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        with v2_out_fh as fh:
+            for rec in v2_lines:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        print("-- results (git-ignored): %s" % os.path.relpath(out_path, ctf_home()))
+        print("-- benchmark v3 (git-ignored): %s" % os.path.relpath(v2_out_path, ctf_home()))
+        return 0
+    except _ModeBAbort as abort:
+        _release_reservations()
+        return abort.code
+    except BaseException:
+        _release_reservations()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+def _read_legacy_results(results_dir):
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".jsonl") or fn.endswith(".benchmark-v3.jsonl"):
+            continue
+        with open(os.path.join(results_dir, fn), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return rows
+
+
+def _read_v3_results(results_dir):
+    """Read canonical v3 benchmark rows fail-closed.
+
+    Measurement output is an evidence artifact: malformed JSON or a schema-invalid
+    row must stop the report instead of being silently dropped and biasing rates.
+    """
+    rows = []
+    if not os.path.isdir(results_dir):
+        return rows
+    for fn in sorted(os.listdir(results_dir)):
+        if not fn.endswith(".benchmark-v3.jsonl"):
+            continue
+        path = os.path.join(results_dir, fn)
+        with open(path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("%s:%d invalid JSON: %s" % (fn, lineno, exc)) from exc
+                try:
+                    validate(row, "rat.benchmark-result/v3")
+                except Exception as exc:
+                    raise ValueError("%s:%d invalid benchmark-v3 row: %s" % (fn, lineno, exc)) from exc
+                rows.append(row)
+    return rows
+
+
+def _assert_v2_run_provenance(rows):
+    """One comparison run cannot silently combine measurement conditions."""
+    groups = {}
+    for row in rows:
+        key = row["benchmark_run_id"]
+        serialized = json.dumps(row.get("provenance"), sort_keys=True, separators=(",", ":"))
+        groups.setdefault(key, set()).add(serialized)
+    mixed = [key for key, values in groups.items() if len(values) > 1]
+    if mixed:
+        run_id = sorted(mixed)[0]
+        raise ValueError("mixed provenance for benchmark comparison run %s" % run_id)
+
+
+def cmd_report(args):
+    results_dir = os.path.join(ctf_home(), "bench", "results")
+    schema = getattr(args, "schema", "legacy")
+    if schema == "v3":
+        try:
+            rows = _read_v3_results(results_dir)
+            _assert_v2_run_provenance(rows)
+        except (OSError, ValueError) as exc:
+            print("[ratbench:err] %s" % exc, file=sys.stderr)
+            return 3
+        lb = _render_v2_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.v3.md")
+    else:
+        rows = _read_legacy_results(results_dir)
+        lb = _render_leaderboard(rows)
+        out_path = os.path.join(ctf_home(), "bench", "LEADERBOARD.md")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(lb)
+    print(lb)
+    print("-- wrote %s" % os.path.relpath(out_path, ctf_home()))
+    return 0
+
+
+def _render_leaderboard(rows):
+    L = ["# ratbench leaderboard", "",
+         "> Generated by `ratbench report` from `bench/results/*.jsonl`. A/B comparisons are only",
+         "> valid across the SAME suite. Mode A = scripted driver; Mode B = external model eval.", ""]
+    if not rows:
+        L.append("_(no results yet — run `ratbench run`)_")
+        return "\n".join(L) + "\n"
+    runs = {}
+    for r in rows:
+        runs.setdefault(r.get("run_id", "?"), []).append(r)
+    L.append("## Runs")
+    L.append("")
+    L.append("| Run | Mode | Entries | Route OK | Solved | Claimed | Verify-skipped | Failed | Route acc |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    for rid, rs in sorted(runs.items()):
+        n = len(rs)
+        route_ok = sum(1 for x in rs if x.get("route_ok"))
+        solved = sum(1 for x in rs if x.get("outcome") == "solved")
+        claimed = sum(1 for x in rs if x.get("outcome") == "solve-claimed")
+        skipped = sum(1 for x in rs if x.get("outcome") == "route-ok-verify-skipped")
+        failed = sum(1 for x in rs if x.get("outcome") in ("route-miss", "verify-fail", "fail"))
+        acc = "%.0f%%" % (100.0 * route_ok / n) if n else "n/a"
+        mode = rs[0].get("mode", "?")
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %d | %s |" % (rid, mode, n, route_ok, solved, claimed, skipped, failed, acc))
+    latest = {}
+    for r in rows:
+        latest[r.get("id")] = r
+    L.append("")
+    L.append("## By difficulty (latest per entry)")
+    L.append("")
+    L.append("| Difficulty | Entries | Route OK | Solved |")
+    L.append("|---|---|---|---|")
+    by_diff = {}
+    for r in latest.values():
+        by_diff.setdefault(r.get("difficulty"), []).append(r)
+    for d in sorted(by_diff, key=lambda x: (x is None, x)):
+        rs = by_diff[d]
+        L.append("| %s | %d | %d | %d |" % (
+            d, len(rs), sum(1 for x in rs if x.get("route_ok")),
+            sum(1 for x in rs if x.get("outcome") == "solved")))
+    return "\n".join(L) + "\n"
+
+
+def _nested_metric(row, group, name):
+    return ((row.get("metrics") or {}).get(group) or {}).get(name)
+
+
+def _metric_median(rows, group, name, *, suffix=""):
+    values = [_nested_metric(row, group, name) for row in rows]
+    values = [value for value in values
+              if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    total = len(rows)
+    if not values:
+        return "n/a (0/%d)" % total
+    value = statistics.median(values)
+    rendered = ("%.1f" % value).rstrip("0").rstrip(".")
+    return "%s%s (%d/%d)" % (rendered, suffix, len(values), total)
+
+
+def _render_v2_leaderboard(rows):
+    L = ["# ratbench benchmark-v3 leaderboard", "",
+         "> Generated by `ratbench report --schema v3` from `bench/results/*.benchmark-v3.jsonl`.",
+         "> Only `eligible=true` attempts enter solve-rate and metric medians. Metric cells include",
+         "> measured coverage `(non-null/eligible)` so unavailable telemetry is never treated as zero.", ""]
+    if not rows:
+        L.append("_(no benchmark-v3 results yet — run `ratbench eval ...`)_")
+        return "\n".join(L) + "\n"
+    runs = {}
+    for row in rows:
+        runs.setdefault((row["benchmark_run_id"], row["ablation_id"]), []).append(row)
+    L += ["## Runs", "",
+          "| Run | Ablation | Eligible | Verified | False solved | Failed | Censored | Verified rate | Median TTVS | Median tools | Median duplicate | Median cache hit |",
+          "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|"]
+    for (run_id, ablation_id), rs in sorted(runs.items()):
+        eligible = [row for row in rs if row.get("eligible") is True]
+        n = len(eligible)
+        verified = sum(1 for row in eligible if row.get("outcome") == "verified")
+        false_solved = sum(1 for row in eligible if _nested_metric(row, "correctness", "false_solved") is True)
+        failed = sum(1 for row in eligible if row.get("outcome") == "failed")
+        censored = sum(1 for row in eligible if row.get("outcome") == "censored")
+        rate = ("%.1f%%" % (100.0 * verified / n)) if n else "n/a"
+        L.append("| %s | %s | %d | %d | %d | %d | %d | %s | %s | %s | %s | %s |" % (
+            run_id, ablation_id, n, verified, false_solved, failed, censored, rate,
+            _metric_median(eligible, "latency", "time_to_verified_solve_ms", suffix="ms"),
+            _metric_median(eligible, "tools", "tool_calls"),
+            _metric_median(eligible, "tools", "duplicate_tool_calls"),
+            _metric_median(eligible, "cache", "cache_hit_ratio"),
+        ))
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def _selftest():
+    fails = []
+
+    def chk(cond, label):
+        print(("  OK " if cond else "  XX ") + label)
+        if not cond:
+            fails.append(label)
+
+    suite = _load_suite(_suite_path())
+    ids = {e["id"] for e in suite["entries"]}
+    chk({"stack-basic-01", "fmt-basic-01", "checker-basic-01"} <= ids, "suite: synthetic entries present")
+    for e in suite["entries"]:
+        ok, got = _check_route(e)
+        chk(ok, "route: %s -> %s" % (e["id"], got))
+    bad = dict(suite["entries"][0]); bad["expected"] = {"leads":["impossible"]}
+    ok, _got = _check_route(bad)
+    chk(not ok, "route: misassignment detected (negative test)")
+    chk("bench" not in _RUNTIME_DIRS and "tests" not in _RUNTIME_DIRS and "fixtures" not in _RUNTIME_DIRS,
+        "eval: runtime export allowlist excludes benchmark/test fixture trees")
+    lb = _render_leaderboard([
+        {"run_id": "T", "mode": "A", "id": "x", "difficulty": 1, "route_ok": True, "outcome": "solved"},
+        {"run_id": "T", "mode": "A", "id": "y", "difficulty": 1, "route_ok": False, "outcome": "route-miss"},
+    ])
+    chk("Route acc" in lb and "50%" in lb, "report: leaderboard renders route accuracy")
+    if fails:
+        print("ratbench selftest: FAIL (%d)" % len(fails)); return 1
+    print("ratbench selftest: OK"); return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ratbench", description="challenge-suite runner + leaderboard")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("run", help="Mode A scripted driver over the suite")
+    r.add_argument("--id"); r.add_argument("--suite"); r.add_argument("--run-id")
+    r.add_argument("--corpus", choices=sorted(CORPORA))
+    ev = sub.add_parser("eval", help="Mode B external agent CLI eval (on-demand, not CI)")
+    ev.add_argument("--agent", help="CLI command template; {dir} = sandbox challenge dir")
+    ev.add_argument("--id"); ev.add_argument("--suite"); ev.add_argument("--run-id")
+    ev.add_argument("--corpus", choices=sorted(CORPORA))
+    ev.add_argument("--model-id", help="optional declarative model label recorded in provenance")
+    ev.add_argument("--reasoning-effort", help="optional declarative reasoning-effort label recorded in provenance")
+    ev.add_argument("--ablation", choices=("A0", "A1", "A2", "A3", "A4", "A5"), default="A0")
+    ev.add_argument("--timeout", type=int, default=600)
+    rep = sub.add_parser("report", help="render a legacy or benchmark-v3 leaderboard from results")
+    rep.add_argument("--suite")
+    rep.add_argument("--schema", choices=("legacy", "v3"), default="legacy")
+    sub.add_parser("selftest", help="pure-logic regression")
+    args = ap.parse_args(argv)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "eval":
+        return cmd_eval(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    if args.cmd == "selftest":
+        return _selftest()
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

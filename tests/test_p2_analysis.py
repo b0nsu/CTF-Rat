@@ -124,4 +124,84 @@ class P2Analysis(unittest.TestCase):
   _,first=self.tool("rat-profile"); self.assertEqual(first["cache_state"],"miss")
   _,second=self.tool("rat-profile"); self.assertEqual(second["cache_state"],"hit")
   _,third=self.tool("rat-profile","--no-cache"); self.assertEqual(third["cache_state"],"miss")
+ @unittest.skipIf(os.geteuid()==0,"root bypasses directory write permissions")
+ def test_profile_readonly_store_fails_closed_without_traceback(self):
+  # R3-7: an unwritable default/override store must produce a bounded error
+  # envelope + non-zero exit, not a raw PermissionError traceback.
+  rod=tempfile.TemporaryDirectory(); ro=pathlib.Path(rod.name)
+  store=ro/".rat"
+  ro.chmod(0o555)
+  self.addCleanup(rod.cleanup)
+  self.addCleanup(lambda: ro.chmod(0o755))  # restore before cleanup can remove it
+  p=subprocess.run([str(BIN/"rat-profile"),str(self.exe),"--store",str(store),"--format","json"],
+                   text=True,capture_output=True)
+  self.assertNotEqual(p.returncode,0)
+  self.assertNotIn("Traceback",p.stderr)
+  doc=json.loads(p.stdout); validate(doc,"rat.tool-result/v1")
+  self.assertEqual(doc["status"],"error")
+  self.assertTrue(any("artifact store" in d.get("message","") for d in doc["diagnostics"]))
+@unittest.skipUnless(shutil.which("gcc"), "gcc required for ELF protection regression")
+class ProfileElfProtections(unittest.TestCase):
+ """R0-1: ELF identification must not depend on `file`'s path prefix, PIE must
+ come from the ELF header Type (not a 'DYN' substring of DYNAMIC), imports must
+ be only normalized UND dynamic symbols, and miss/hit must agree."""
+ SRC='#include <string.h>\n#include <stdio.h>\nint main(int c,char**v){char b[64];if(c>1)strcpy(b,v[1]);puts(b);gets(b);return 0;}\n'
+ def setUp(self):
+  self.d=tempfile.TemporaryDirectory(); self.work=pathlib.Path(self.d.name)
+  self.src=self.work/"r.c"; self.src.write_text(self.SRC)
+  self.store=self.work/"store"
+ def tearDown(self): self.d.cleanup()
+ def _compile(self,name,*flags):
+  exe=self.work/name
+  subprocess.run(["gcc","-O0",*flags,str(self.src),"-o",str(exe)],check=True)
+  return exe
+ def _profile(self,exe,*args):
+  p=subprocess.run([str(BIN/"rat-profile"),str(exe),"--store",str(self.store),"--format","json",*args],text=True,capture_output=True)
+  self.assertEqual(p.returncode,0,p.stderr)
+  doc=json.loads(p.stdout); validate(doc,"rat.tool-result/v1")
+  get=__import__("ratlib.artifact",fromlist=["get"]).get
+  prof=json.loads(get(doc["artifacts"][0]["digest"],root=str(self.store)))
+  return doc,prof
+ def test_non_pie_elf_profiled_with_pie_false(self):
+  exe=self._compile("nopie","-no-pie","-fno-pie")
+  doc,prof=self._profile(exe,"--no-cache")
+  facts={f["kind"]:f["value"] for f in prof["facts"]}
+  self.assertIn("elf-header",doc["summary"]["coverage"])
+  self.assertEqual(facts.get("elf.pie"),False)  # ET_EXEC with DYNAMIC seg is not PIE
+  self.assertEqual(facts.get("elf.nx"),True)
+  self.assertIn("gets",prof["imports"]); self.assertIn("strcpy",prof["imports"])
+  # imports are clean UND symbols, free of readelf noise and version suffixes
+  self.assertNotIn("ELF64",prof["imports"])
+  self.assertFalse(any("@" in i for i in prof["imports"]))
+  self.assertFalse(any(i.endswith(".c") for i in prof["imports"]))
+  self.assertEqual(sorted({s["target"] for s in prof["signals"]}),["gets","strcpy"])
+ def test_pie_elf_profiled_with_pie_true(self):
+  exe=self._compile("pie","-fPIE","-pie")
+  _,prof=self._profile(exe,"--no-cache")
+  facts={f["kind"]:f["value"] for f in prof["facts"]}
+  self.assertEqual(facts.get("elf.pie"),True)
+ def test_shared_object_not_claimed_as_pie(self):
+  # R0-1 (re-open #4): a shared library is ET_DYN with no INTERP; it must not be
+  # asserted as PIE, while NX/RELRO still report. PIE is omitted (unknown), not false.
+  libsrc=self.work/"lib.c"; libsrc.write_text("int add(int a,int b){return a+b;}\n")
+  so=self.work/"libfoo.so"
+  subprocess.run(["gcc","-shared","-fPIC",str(libsrc),"-o",str(so)],check=True)
+  p=subprocess.run([str(BIN/"rat-profile"),str(so),"--store",str(self.store),"--format","json","--no-cache"],
+                   text=True,capture_output=True)
+  self.assertEqual(p.returncode,0,p.stderr)
+  doc=json.loads(p.stdout); validate(doc,"rat.tool-result/v1")
+  get=__import__("ratlib.artifact",fromlist=["get"]).get
+  prof=json.loads(get(doc["artifacts"][0]["digest"],root=str(self.store)))
+  facts={f["kind"]:f["value"] for f in prof["facts"]}
+  self.assertNotIn("elf.pie",facts)  # ambiguous DYN-without-INTERP -> omitted
+  self.assertEqual(facts.get("elf.nx"),True)
+  self.assertIn("elf.relro",facts)
+ def test_miss_and_hit_agree(self):
+  exe=self._compile("c","-no-pie","-fno-pie")
+  d1,p1=self._profile(exe); self.assertEqual(d1["cache_state"],"miss")
+  d2,p2=self._profile(exe); self.assertEqual(d2["cache_state"],"hit")
+  self.assertEqual(d1["summary"]["coverage"],d2["summary"]["coverage"])
+  self.assertEqual(sorted(p1["imports"]),sorted(p2["imports"]))
+  self.assertEqual([f for f in p1["facts"]],[f for f in p2["facts"]])
+
 if __name__=="__main__": unittest.main()

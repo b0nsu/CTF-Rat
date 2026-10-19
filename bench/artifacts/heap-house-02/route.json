@@ -1,0 +1,5 @@
+{
+  "profile": {"imports": ["calloc", "malloc", "free", "fgets", "memcpy", "puts"], "facts": [{"kind": "elf.nx", "value": true}]},
+  "revq": {"imports": ["calloc", "malloc", "free", "fgets", "memcpy", "puts"], "platform": "elf"},
+  "interesting": []
+}

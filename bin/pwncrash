@@ -208,6 +208,17 @@ def main(argv=None) -> int:
         "diagnostics": diagnostics,
         "verdict": "crash-reproduced" if not errors else "inconclusive",
     }
+    try:
+        from ratlib.route_feedback import record_followup_result
+        record_followup_result(os.path.dirname(binary), report["binary"]["sha256"],
+                               "pwncrash", {
+                                   "query": "pwncrash", "selector": "",
+                                   "binary_digest": report["binary"]["sha256"],
+                                   "status": "ok" if report["verdict"] == "crash-reproduced" else "partial",
+                                   "report": report,
+                               })
+    except (OSError, ValueError, RuntimeError) as exc:
+        diagnostics.append("route feedback unavailable: %s" % type(exc).__name__)
     if args.format == "json":
         print(json.dumps(report, sort_keys=True, indent=2))
     else:

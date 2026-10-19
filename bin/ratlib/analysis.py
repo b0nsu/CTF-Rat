@@ -65,11 +65,15 @@ def profile_environment(a):
  return {"binary":fdigest(a.binary),
          "libc":fdigest(a.libc) if getattr(a,"libc",None) and os.path.isfile(a.libc) else None,
          "loader":fdigest(a.loader) if getattr(a,"loader",None) and os.path.isfile(a.loader) else None}
-def execution_environment(profile, sc):
- return canonical_digest({"profile_environment":profile.get("environment",{}),
-                          "argv":[str(x) for x in sc.get("argv",[])],
-                          "cwd":sc.get("cwd"),
-                          "env":{str(k):str(v) for k,v in sc.get("env",{}).items()}})
+def execution_environment(profile, sc, stderr_mode="pipe"):
+ identity={"profile_environment":profile.get("environment",{}),
+           "argv":[str(x) for x in sc.get("argv",[])],
+           "cwd":sc.get("cwd"),
+           "env":{str(k):str(v) for k,v in sc.get("env",{}).items()}}
+ # Keep legacy/default PIPE identity stable while preventing non-default
+ # diagnostic traces from verifying as if they had the default stdio topology.
+ if stderr_mode!="pipe": identity["stdio"]={"stdout":"pipe","stderr":stderr_mode}
+ return canonical_digest(identity)
 def artifact(data, kind, name, r, media="application/json"):
     rec=put_bytes(data if isinstance(data,bytes) else json.dumps(data,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(),kind=kind,media_type=media,logical_name=name,root=r)
     return {k:rec[k] for k in ("kind","digest","media_type","size","logical_name")}
@@ -102,8 +106,8 @@ def envelope(name, binary, a, summary, artifacts=(), status="ok", diagnostics=()
 def emit(doc,a):
     print(json.dumps(doc,sort_keys=True) if a.format=="json" else "%s: %s"%(doc["tool"]["name"],json.dumps(doc["summary"],ensure_ascii=False)))
     return doc["exit"]["code"]
-def command(argv, timeout, stdin=None, cwd=None, env=None):
-    return run(argv,timeout_seconds=timeout,input_bytes=stdin,cwd=cwd,env=env,tool_version=VERSION)
+def command(argv, timeout, stdin=None, cwd=None, env=None, stderr_mode="pipe"):
+    return run(argv,timeout_seconds=timeout,input_bytes=stdin,cwd=cwd,env=env,tool_version=VERSION,stderr_mode=stderr_mode)
 def scenario(path):
     if not path: return {}
     with open(path,encoding="utf-8") as f: s=json.load(f)
@@ -117,11 +121,11 @@ def scenario_stdin(sc):
     value=sc.get("stdin","")
     if not isinstance(value,str): raise ValueError("scenario stdin must be text")
     return value.encode()
-def execute_binary(binary, sc, timeout):
+def execute_binary(binary, sc, timeout, stderr_mode="pipe"):
     stdin=scenario_stdin(sc)
     argv=[binary]+[str(x) for x in sc.get("argv",[])]
     env={str(k):str(v) for k,v in sc.get("env",{}).items()}
-    return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env)
+    return command(argv,timeout,stdin=stdin,cwd=sc.get("cwd"),env=env,stderr_mode=stderr_mode)
 def _profile_cache_keys(bdig, environment, dependencies=None):
     from .cache import canonical_key
     deps=dependencies or _profile_dependency_identity()
@@ -144,6 +148,75 @@ def _profile_cache_lookup(r, bdig, environment, dependencies=None):
         return idx,keys,profile_doc,(profile_art,strings_art),pe.get("source_invocation")
     except Exception:
         return None,None,None,None,None
+def normalize_import(name):
+    """Canonical import name: drop ELF version suffixes (`gets@GLIBC_2.2.5`,
+    `gets@@GLIBC_2.2.5`) so a single spelling feeds both the dangerous-import
+    signal and downstream sink matching (rat `_pwn_summary`)."""
+    if not name: return name
+    return name.split("@",1)[0]
+def _elf_header_type(readelf_h):
+    """Return 'exec' | 'dyn' | None from `readelf -h` ELF header `Type:` line.
+    We read the real header field rather than substring-matching the whole
+    dump, where 'DYN' also appears inside 'DYNAMIC' for non-PIE binaries."""
+    for line in readelf_h.splitlines():
+        s=line.strip()
+        if s.startswith("Type:"):
+            val=s.split(":",1)[1].strip().upper()
+            if val.startswith("EXEC"): return "exec"
+            if val.startswith("DYN"): return "dyn"
+            if val.startswith("REL"): return "rel"
+            if val.startswith("CORE"): return "core"
+            return None
+    return None
+def _elf_protections(readelf_h, readelf_l):
+    """PIE/NX/RELRO facts from the ELF header type and program headers.
+    PIE is true only for an executable ET_DYN (interp present); a non-PIE
+    ET_EXEC with a DYNAMIC segment is not PIE.  Returns the facts list."""
+    etype=_elf_header_type(readelf_h)
+    facts=[]
+    has_interp=any("INTERP" in ln for ln in readelf_l.splitlines())
+    # PIE: ET_EXEC -> False.  ET_DYN is PIE only when it is an *executable* DYN,
+    # evidenced by an INTERP program header; a shared object (.so) is ET_DYN with
+    # no INTERP and must not be asserted as PIE (R0-1).  An ET_DYN without INTERP
+    # is ambiguous (shared object vs static-PIE executable), so omit PIE rather
+    # than claim a direct fact.  Unknown header -> omit.
+    if etype=="exec":
+        facts.append({"kind":"elf.pie","value":False,"quality":"direct"})
+    elif etype=="dyn" and has_interp:
+        facts.append({"kind":"elf.pie","value":True,"quality":"direct"})
+    # NX: a GNU_STACK program header whose flags lack 'E' (executable).
+    stack_lines=[ln for ln in readelf_l.splitlines() if "GNU_STACK" in ln]
+    if stack_lines:
+        flags=_phdr_flags(stack_lines[0])
+        facts.append({"kind":"elf.nx","value":"E" not in flags,"quality":"direct"})
+    else:
+        # No GNU_STACK header: toolchain default is a non-exec stack on modern
+        # ld, but we cannot prove it from headers -> report unknown by omission.
+        pass
+    # RELRO: GNU_RELRO program header present (full vs partial not distinguished
+    # here; BIND_NOW would require .dynamic FLAGS parsing).
+    facts.append({"kind":"elf.relro","value":any("GNU_RELRO" in ln for ln in readelf_l.splitlines()),"quality":"direct"})
+    return facts
+def _phdr_flags(line):
+    """Extract the flag column (e.g. 'RW', 'RWE', 'R E') from a `readelf -lW`
+    program-header line.  Flags are single letters among R/W/E after the sizes."""
+    m=re.search(r"0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+([RWE ]{1,3})\s+0x",line)
+    if m: return m.group(1).replace(" ","")
+    # Fallback: last run of R/W/E letters before the alignment column.
+    m=re.search(r"\b([RWE]{1,3})\b\s+0x[0-9a-fA-F]+\s*$",line.strip())
+    return m.group(1) if m else ""
+def _elf_undefined_imports(readelf_s):
+    """Collect only UND dynamic symbols (external imports) from `readelf -sW`,
+    normalized to drop version suffixes and deduplicated, order-stable."""
+    out=[]; seen=set()
+    for line in readelf_s.splitlines():
+        # Symbol-table rows: "<num>: <value> <size> <type> <bind> <vis> UND <name>"
+        m=re.match(r"\s*\d+:\s+[0-9a-fA-F]+\s+\d+\s+\S+\s+\S+\s+\S+\s+UND\s+(\S+)",line)
+        if not m: continue
+        name=normalize_import(m.group(1))
+        if not name or name in seen: continue
+        seen.add(name); out.append(name)
+    return out
 def profile(a):
     if not os.path.isfile(a.binary): return emit(envelope("rat-profile",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=["binary missing"]),a)
     r=root(a,a.binary); started=iso(); bdig=fdigest(a.binary); environment=profile_environment(a); dependencies=_profile_dependency_identity()
@@ -163,18 +236,36 @@ def profile(a):
     else:
         cache_state="miss"; facts=[]; signals=[]; routes=[]
         fileout=command(["file","--",a.binary],a.timeout).stdout.preview.decode(errors="replace").strip()
-        readelf=command(["readelf","-hW","-lW","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
-        is_elf=fileout.startswith("ELF ")
+        # `file` prepends "<path>: " to the description; the path is the operator's,
+        # not evidence, so detect ELF from the description after the first ": ".
+        file_desc=fileout.split(": ",1)[1] if ": " in fileout else fileout
+        readelf_h=command(["readelf","-hW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        readelf_l=command(["readelf","-lW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        readelf_s=command(["readelf","-sW",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        is_elf=file_desc.startswith("ELF ") or _elf_header_type(readelf_h) in ("exec","dyn","rel","core")
         facts.append({"kind":"format","value":fileout,"quality":"direct"})
         if is_elf:
-            facts.extend([{"kind":"elf.pie","value":"DYN" in readelf,"quality":"direct"},{"kind":"elf.nx","value":"GNU_STACK" in readelf and "RWE" not in readelf,"quality":"direct"},{"kind":"elf.relro","value":"GNU_RELRO" in readelf,"quality":"direct"}])
-        imports=re.findall(r"\b(?:UND\s+)?([_A-Za-z][\w@.]*)$",readelf,re.M)
+            facts.extend(_elf_protections(readelf_h,readelf_l))
+        imports=_elf_undefined_imports(readelf_s) if is_elf else []
         strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
+        import_set=set(imports)
         for api in ("gets","strcpy","strcat","sprintf","memcpy","read","scanf"):
-            if re.search(r"\b"+re.escape(api)+r"(?:@|\b)",readelf): signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
+            if api in import_set: signals.append({"detector":"dangerous-import/v1","target":api,"score":0.6,"false_positive_note":"import alone is not a vulnerability"})
         if signals: routes.append({"tool":"rat-slice","target":signals[0]["target"],"reason":"inspect direct call/data-flow before claim"})
-        arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
-    is_elf=next((f["value"] for f in facts if f["kind"]=="format"),"").startswith("ELF ")
+        try:
+            arts=[artifact({"binary_digest":bdig,"environment":environment,"facts":facts,"signals":signals,"routes":routes,"imports":imports},"profile","profile.json",r),artifact({"strings":strings.splitlines()[:1000]},"string-index","string-index.json",r)]
+        except OSError as exc:
+            # The default .rat object store may land in a read-only directory (e.g.
+            # running against a binary under /usr/bin). Fail closed with a bounded
+            # diagnostic instead of a raw traceback (R3-7).
+            return emit(envelope("rat-profile",a.binary,a,{"store":r},status="error",
+                                 code=EXIT_DEPENDENCY,
+                                 diagnostics=["cannot write artifact store at %s: %s" % (r, type(exc).__name__)],
+                                 started=started),a)
+    # ELF is proven by a recorded protection fact (elf.pie/nx/relro), which is
+    # only emitted for an ELF; this survives both miss and hit paths without
+    # re-parsing the path-prefixed `file` string.
+    is_elf=any(f["kind"].startswith("elf.") for f in facts)
     coverage="elf-header+program-header+dynamic-symbols" if is_elf else "format-only; ELF protection facts skipped"
     doc=envelope("rat-profile",a.binary,a,{"format":next((f["value"] for f in facts if f["kind"]=="format"),""),"fact_count":len(facts),"signal_count":len(signals),"route_count":len(routes),"coverage":coverage,"skipped_analyzers":[] if is_elf else ["elf-protections"]},arts,started=started)
     doc["tool_name"]="rat-profile"; doc["params_digest"]=keys["profile"] if keys else "unindexed"; doc["cache_state"]=cache_state
@@ -324,7 +415,11 @@ def dyn(a):
     r=root(a,a.binary); started=iso()
     try: profile=require_profile(a,r)
     except ValueError as exc: return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,diagnostics=[str(exc)],started=started),a)
-    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout)
+    mode=getattr(a,"stderr_mode","pipe")
+    if a.break_loc and mode!="pipe":
+        return emit(envelope("rat-dyn",a.binary,a,{},status="error",code=EXIT_INPUT,
+                             diagnostics=["nondefault stderr topology cannot be matched by the separate GDB breakpoint run"],started=started),a)
+    sc=scenario(a.scenario); p=execute_binary(a.binary,sc,a.timeout,stderr_mode=mode)
     out=p.stdout.preview; err=p.stderr.preview; events=[{"event":"process.exit","exit_code":p.exit_code,"signal":p.signal,"timed_out":p.timed_out}]
     registers={}
     # GDB is optional.  A requested breakpoint is either observed structurally
@@ -343,7 +438,7 @@ def dyn(a):
     for marker in sc.get("markers",[]):
         events.append({"event":"marker","marker":marker,"observed":marker.encode() in out+err})
     status="timeout" if p.timed_out else ("ok" if p.exit_code==0 else "partial")
-    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc),"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
+    arts=[artifact({"binary_digest":fdigest(a.binary),"profile_digest":a.profile,"environment_digest":execution_environment(profile,sc,stderr_mode=mode),"stdio":{"stdin":"pipe","stdout":"pipe","stderr":mode},"scope":"local-only","events":events},"execution-trace","trace.json",r),artifact(out,"io-transcript","stdout.bin",r,"application/octet-stream"),artifact(err,"io-transcript","stderr.bin",r,"application/octet-stream")]
     return emit(envelope("rat-dyn",a.binary,a,{"exit":p.exit_code,"signal":p.signal,"trace_span":len(events),"hit_counts":{"breakpoint":int(any(e["event"]=="breakpoint" and e.get("hit") for e in events))},"register_observations":len(registers),"memory_observations":0,"last_event":events[-1]["event"],"dropped_events":0,"scenario_step":sc.get("name","run")},arts,status=status,diagnostics=(["wall timeout; last stable event retained"] if p.timed_out else []),code=p.exit_code if not p.timed_out else EXIT_TIMEOUT,started=started),a)
 def _verify_conditions(expected, process, scenario_doc):
     if "exit_code" in expected and process.exit_code != expected["exit_code"]: return False
@@ -515,7 +610,7 @@ def main(which, argv=None):
         p.epilog=_DIGEST_HANDOFF_EPILOG; p.formatter_class=argparse.RawDescriptionHelpFormatter
     if which=="rat-profile": p.add_argument("--libc"); p.add_argument("--loader"); fn=profile
     elif which=="rat-slice": p.add_argument("--profile",required=True); p.add_argument("--from",dest="from_loc"); p.add_argument("--to",dest="to_loc"); p.add_argument("--direction",default="forward"); p.add_argument("--depth",type=int,default=4); p.add_argument("--mode",choices=["call-path","data"],default="call-path"); p.add_argument("--backward",dest="backward_addr"); p.add_argument("--source",default=None); fn=slice_
-    elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); fn=dyn
+    elif which=="rat-dyn": p.add_argument("--profile",required=True); p.add_argument("--scenario",required=True); p.add_argument("--break",dest="break_loc"); p.add_argument("--watch"); p.add_argument("--stderr-mode",choices=["pipe","devnull","stdout"],default="pipe"); fn=dyn
     elif which=="rat-verify": p.add_argument("--profile",required=True); p.add_argument("--trace",required=True); p.add_argument("--scenario",required=True); p.add_argument("--claim"); p.add_argument("--primitive"); p.add_argument("--exploit-task"); p.add_argument("--oracle"); p.add_argument("--runs",type=int,default=3); fn=verify
     elif which=="rat-fuzz": p.add_argument("--harness"); p.add_argument("--budget",type=float,default=.2); p.add_argument("--corpus"); p.add_argument("--engine",default="builtin"); fn=fuzz
     elif which=="rat-heap": p.add_argument("--scenario"); p.add_argument("--trace"); p.add_argument("--libc"); fn=heap

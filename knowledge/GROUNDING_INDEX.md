@@ -11,6 +11,7 @@
 4. **오프셋/gadget/상수는 여기서 recall 금지** — 전부 바이너리·gdb 실측 후 evidence-backed typed STATE v2 observation으로 기록한다. 문서 값은 개념 예시일 뿐.
 5. glibc 게이팅은 **레포 내 `reference/glibc/`(버전 표, list) 우선** — 1차 grounding. how2heap은 미vendoring 외부 옵션이므로 clone 돼 있을 때만 폭 보강, ctf-skills는 개념 보강.
 6. 이 라우터는 외부 상호작용·결과 획득을 위한 실행 지침을 자동으로 불러오지 않는다. 고위험 실행·격리 경계·kernel 자료는 기본 경로에서 제외한다.
+   - **"기본 라우팅 제외"의 의미**: 이 표가 triage class만으로 해당 지식 md를 **자동 grounding**으로 끌어오지 않는다는 뜻이다. Router v2가 반환하는 kernel/seccomp lead나, 유효한 실행/구조 증거를 STATE observation으로 기록한 뒤 `rat route <bin> --skill pwn-kernel --skill-evidence <obs_id>`로 수행하는 **증거 기반 Skill commit**을 금지하는 것이 **아니다**. 자동 지식 grounding(이 표)과 증거 기반 Skill commit(CLAUDE.md FAST hot-path 4)은 별개 경로다 — 전자는 class만으로 보류, 후자는 cited active+direct observation이 있을 때만 진행.
 
 ## 소스 3축
 | 소스 | 경로 | 강점 |
@@ -45,10 +46,10 @@
 |---|---|---|
 | 시작점 / 전반 라우팅 | `ctf-reverse/SKILL.md`(ToC) | `patterns.md` |
 | crackme / keygen / serial 검증 로직 | `ctf-reverse/patterns-ctf.md` | `patterns-ctf-2.md`, `patterns-ctf-3.md` |
-| anti-debug / packing / 난독화 (revq **EVASION** 뜨면) | `ctf-reverse/anti-analysis-ctf.md` | `anti-analysis.md` |
+| anti-debug / packing / 난독화 (revq **EVASION** 뜨면) | `ctf-reverse/anti-analysis-ctf.md` | `anti-analysis.md`; MBA 난독화면 `mba-simplification.md` |
 | 언어별(Go/Rust/C++/.NET/Nim…) | `ctf-reverse/languages.md` | `languages-compiled.md`, `languages-platforms.md` |
-| custom VM / bytecode (→ `vmlift`) | `ctf-reverse/patterns-runtime.md` | — |
-| 툴 선택(Ghidra/IDA/angr/frida/qemu) | `ctf-reverse/tools.md` | `tools-dynamic.md`, `tools-emulation.md`, `tools-advanced{,-2}.md` |
+| custom VM / bytecode (→ `vmlift`) | `ctf-reverse/patterns-runtime.md` | `unicorn-emulation.md`(핸들러 에뮬 시) |
+| 툴 선택(Ghidra/IDA/angr/frida/qemu) | `ctf-reverse/tools.md` | `tools-dynamic.md`, `tools-emulation.md`, `tools-advanced{,-2}.md`, `radare2-r2pipe.md`, `tools-mcp.md` |
 | 플랫폼(모바일/임베디드/HW) | `ctf-reverse/platforms.md` | `platforms-hardware.md` |
 | 실전 팁 | `ctf-reverse/field-notes.md` | — |
 
@@ -83,4 +84,6 @@
 
 ## vendored 출처 / 미vendoring
 - 출처: **github.com/ljagiello/ctf-skills (MIT)**. 매핑: pwn=`ctf-skills/`(업스트림 ctf-pwn) · rev=`ctf-reverse/` · writeup=`ctf-writeup/`.
+- 마지막 동기화: 업스트림 `3bb6bad` (2026-10-16). 각 `SKILL.md` 상단의 **ctf-rat 배너**(로컬 전용)만 재삽입하고 콘텐츠는 원문 보존한다. 재동기화 시 동일 절차(콘텐츠 md 교체 → SKILL.md 배너 재삽입).
+- 이번 동기화 신규: pwn `tools-mcp.md`; rev `mba-simplification.md`·`radare2-r2pipe.md`·`tools-mcp.md`·`unicorn-emulation.md`.
 - 업스트림엔 `ctf-web`·`ctf-crypto`·`ctf-forensics`·`ctf-osint`·`ctf-malware`·`ctf-misc`·`ctf-ai-ml` 도 있으나 **pwn/rev 스코프상 미vendoring** (필요 시 동일 방식으로 추가).

@@ -35,7 +35,9 @@ trap 'exit 130' HUP INT TERM
 # a fabricated fake verifier no longer counts as direct (that was the whole point).
 state init st >/dev/null 2>&1
 DIRECT_OK=0
-if "$ANGR_PY" -c 'import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None' >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+if [ -x "$CTF_HOME/.venv-angr/bin/python" ] &&
+   "$CTF_HOME/.venv-angr/bin/python" -c 'import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None' >/dev/null 2>&1 &&
+   command -v cc >/dev/null 2>&1; then
   cat > fx.c <<'CEOF'
 #include <stdio.h>
 int main(void){ puts("HELLO_MARKER"); return 0; }
@@ -82,11 +84,17 @@ else
 fi
 printf '{"t":"offset","k":"legacy","v":"0xdead","src":"selftest"}\n' > STATE.jsonl
 $VENV -c "import pwnstage;assert 'legacy' not in pwnstage.offsets()" 2>/dev/null && ok "legacy offset isolation" || no "legacy offset isolation"
-# T3 pkflag real vs fake
-pkflag --set 'DH\{[0-9a-f]{4,}\}' >/dev/null 2>&1
-pkflag 'DH{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no
-pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
-[ "$R1" = ok ] && [ "$R2" = ok ] && ok "pkflag real/fake" || no "pkflag real/fake"
+# T3 pkflag scoped format / placeholder; never mutate repository FLAG_FORMAT.
+mkdir -p "$T/solve/pkflag-selftest" "$T/solve/pkflag-other"
+printf '{"chal":"pkflag-selftest"}\n' > "$T/ACTIVE.json"
+CTF_HOME="$T" pkflag --set 'CTF\{[0-9a-f]{4,}\}' >/dev/null 2>&1
+CTF_HOME="$T" pkflag 'CTF{deadbeef}' >/dev/null 2>&1 && R1=ok || R1=no
+CTF_HOME="$T" pkflag 'flag{fake_flag}' >/dev/null 2>&1 && R2=bad || R2=ok
+[ "$R1" = ok ] && [ "$R2" = ok ] && ok "pkflag real/fake (isolated)" || no "pkflag real/fake (isolated)"
+printf '{"chal":"pkflag-other"}\n' > "$T/ACTIVE.json"
+CTF_HOME="$T" pkflag 'CTF{challenge_scope_ok}' >/dev/null 2>&1 && R3=ok || R3=no
+[ "$R3" = ok ] && [ ! -f "$T/solve/pkflag-other/FLAG_FORMAT" ] && ok "pkflag challenge scope" || no "pkflag challenge scope"
+rm -f "$T/ACTIVE.json"
 # T4 pwnkit snapscript + pwnclean --kv filter
 $VENV -c "import pwnkit;print(pwnkit.snapscript([('a','0x1')]).strip())" 2>/dev/null | grep -q 'SNAP a=' && ok "pwnkit.snapscript" || no "pwnkit.snapscript"
 printf '\033[31mpwndbg: x\033[0m\nSNAP r=0x401234\nnoise\n' | pwnclean --kv 2>/dev/null | grep -q 'SNAP r=0x401234' && ok "pwnclean --kv filter" || no "pwnclean --kv filter"
@@ -114,15 +122,21 @@ printf 'print("local fixture")\n' > solve_local.py
 pkshare --handoff >/dev/null 2>&1 && [ -f HANDOFF.md ] && writeupcheck HANDOFF.md --strict >/dev/null 2>&1 && ok "pkshare HANDOFF.md" || no "pkshare HANDOFF.md"
 # T7 libcgate provenance audit
 libcgate --selftest >/dev/null 2>&1 && ok "libcgate selftest" || no "libcgate selftest"
-# T8 decomp cache lookup: revq sub_40xxxx alias -> Ghidra FUN_0010xxxx
-touch ./m
-mkdir -p ./m.decomp
-printf '00101234\tFUN_00101234\t1\n' > ./m.decomp/_index.txt
-printf 'decompiled alias ok\n' > ./m.decomp/FUN_00101234.c
-if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+# T8 decomp cache lookup: a measured PIE image base maps revq to Ghidra.
+if ! command -v cc >/dev/null 2>&1; then
+  skip "decomp revq/Ghidra addr alias (cc dependency 없음)"
+elif ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
   skip "decomp revq/Ghidra addr alias (timeout dependency 없음)"
 else
-  "$CTF_HOME/bin/decomp" ./m sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
+  printf 'int main(){return 0;}\n' > ./pie.c
+  cc -fPIE -pie ./pie.c -o ./pie 2>/dev/null || no "decomp PIE fixture build"
+  if [ -x ./pie ]; then
+    mkdir -p ./pie.decomp
+    printf '00101234\tFUN_00101234\t1\n' > ./pie.decomp/_index.txt
+    printf 'decompiled alias ok\n' > ./pie.decomp/FUN_00101234.c
+    printf '{"image_base":"100000","discovered":1,"exported":1,"failed":[]}\n' > ./pie.decomp/.rat-decomp-status.json
+    "$CTF_HOME/bin/decomp" ./pie sub_401234 2>/dev/null | grep -q 'decompiled alias ok' && ok "decomp revq/Ghidra addr alias" || no "decomp revq/Ghidra addr alias"
+  fi
 fi
 if ! command -v cc >/dev/null 2>&1; then
   skip "decomp disassembly fallback (cc dependency 없음)"
@@ -134,9 +148,9 @@ else
   printf 'int main(){return 0;}\n' > ./m2.c
   mkdir -p ./m2.decomp
   printf '' > ./m2.decomp/_index.txt
-  cc ./m2.c -o ./m2 2>/dev/null || { no "decomp fallback fixture build"; }
+  cc -no-pie ./m2.c -o ./m2 2>/dev/null || { no "decomp fallback fixture build"; }
   if [ -x ./m2 ]; then
-    "$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
+    GHIDRA_HOME="$T/no-ghidra" "$CTF_HOME/bin/decomp" ./m2 0x401234 2>/dev/null | grep -q 'file format' && ok "decomp missing addr disasm fallback" || no "decomp missing addr disasm fallback"
   fi
 fi
 # T9 bounded Qiling transport + optional dependency status

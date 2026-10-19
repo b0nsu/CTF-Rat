@@ -3,12 +3,22 @@
 .venv-angr
 .claude
 .rat
+**/.rat/
+bench/results
 docs/HANDOFF-*
+# 로컬 전용 계획/인수인계 문서 (flag 형태 값 포함 가능 — 이미지에 넣지 않음)
+docs/plans/
+# pklearn 로컬 레슨 (오염 상수 포함 가능 — 구조 파일만 추적)
+knowledge/learned/pwn/*.md
+knowledge/learned/rev/*.md
 solve/*
 !solve/_template/
 !solve/_template/**
 reference/glibc/libs/
 kernel/dumps/
 kernel/logs/
+# 로컬 시크릿
+.ctfd.env
+*.env
 __pycache__
 *.pyc

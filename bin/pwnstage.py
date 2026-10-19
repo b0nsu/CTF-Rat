@@ -38,16 +38,17 @@ from pwn import *
 import pwnstage
 
 def leak_heap(io):
-    "returns heap_base (per-run). TODO: 검증된 로직 이식."
-    raise NotImplementedError
+    "TEMPLATE STUB — implement from this binary's verified leak before any solve call."
+    # Unimplemented on purpose: fail loudly instead of returning a fabricated value (R3-5).
+    raise NotImplementedError("leak_heap is a template stub; implement from verified evidence")
 
 def leak_libc(io, heap_base):
-    "returns libc_base (per-run)."
-    raise NotImplementedError
+    "TEMPLATE STUB — returns libc_base (per-run) once implemented from verified evidence."
+    raise NotImplementedError("leak_libc is a template stub; implement from verified evidence")
 
 def arb_write(io, addr, data):
-    "arbitrary write primitive."
-    raise NotImplementedError
+    "TEMPLATE STUB — arbitrary write primitive; implement from verified evidence."
+    raise NotImplementedError("arb_write is a template stub; implement from verified evidence")
 '''
 if __name__ == "__main__":
     import sys, shutil

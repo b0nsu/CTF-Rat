@@ -10,6 +10,7 @@ rat dyn session break ./chall gdb_<session-id> main
 rat dyn session continue ./chall gdb_<session-id>
 rat dyn session registers ./chall gdb_<session-id>
 rat dyn session memory ./chall gdb_<session-id> 0x404000 32
+rat dyn session heap ./chall gdb_<session-id> --layout glibc-2.35-x86_64 --tcache 0x<TCACHE_ADDRESS> --arena 0x<MAIN_ARENA_ADDRESS> --chunk 0x<CHUNK_HEADER_ADDRESS>
 rat dyn session mappings ./chall gdb_<session-id>
 rat dyn session capture ./chall gdb_<session-id>
 rat dyn session close ./chall gdb_<session-id>
@@ -23,6 +24,31 @@ session result file that keeps the digest reachable for artifact GC. The
 artifact includes binary, environment and scenario digests, process identity,
 sequence and tool version. It is a candidate, never direct evidence for STATE
 PASS or SOLVED. A changed run, binary, or inferior identity ends the session.
+
+### Bounded heap snapshot (#104 / #105)
+
+`rat dyn session heap` is an optional *read-only, stopped-inferior* action.
+Pass one or more of `--tcache`, `--arena`, `--chunk` as numeric addresses
+obtained from the same local run. It never attaches to an arbitrary PID.
+The only decoded layout is `glibc-2.35-x86_64`; other libc versions are
+rejected, not guessed. Confirm the exact build and corresponding layouts
+before interpreting the result (a libc version string alone is not proof of
+matching allocator state).
+
+The action reads at most 640 bytes from a tcache structure, 32 from
+`main_arena+0x60`, and 32 from a chunk header, in requests of at most
+256 bytes each. Maximum total is 1024 bytes per action. Only non-empty
+tcache bins are shown; full raw dumps are not injected into the model context.
+A short/inaccessible read yields `partial` and an unresolved region, not
+invented zero values. `candidate_decoded_fd` assumes the supplied chunk is
+freed and safe-linked, and must not be treated as established pointer control.
+The selected snapshots are included in the existing GDB candidate artifact
+on `capture`; no direct STATE evidence or primitive PASS is created.
+
+**Interaction limitation:** this session still does not expose an interactive
+stdin action. If the target requires input between allocator operations,
+the existing session cannot automatically reach every desired heap state.
+Do not claim an end-to-end exploit observer from a static snapshot alone.
 
 `rat.gdb-session-candidate/v1` is the first version of this artifact contract.
 Schema versions are scoped to document types: STATE events remain
@@ -62,3 +88,40 @@ This passed on native ARM64 Linux GDB 15.1: the tests compare a plain run with
 the debugger scenario, hit two breakpoints in one inferior, read registers and
 memory, capture candidate evidence, and observe process exit. They also issue
 `rat dyn session` commands from separate CLI processes against one live session.
+
+## Child stdio wiring and heap layout (issue #106)
+
+How a target's stdio is wired changes its early **heap layout**, which can make
+a heap/tcache exploit look flaky or non-reproducible even with ASLR disabled.
+The symptom in #106 was a SIGSEGV in `tcache_get` that reproduced under
+pwntools' default `process([exe])` but vanished with `stderr=DEVNULL`.
+
+The real variable is **not stderr** — glibc's `stderr` is unbuffered, so writing
+to it allocates nothing and cannot move the heap. The variable is whether
+**stdout is a TTY**:
+
+- pwntools default `process()` attaches the child to a **PTY**, so `isatty(1)==1`
+  and glibc makes stdout **line-buffered**.
+- A pipe, file, or `/dev/null` makes stdout **fully-buffered**.
+
+glibc allocates the stdout buffer **from the heap on first output**, and the
+buffer size differs between those modes (it is derived partly from the device's
+`st_blksize`, so it is **not a portable constant**). That buffer preempts heap
+space, shifting every subsequent chunk address. A `nc` remote is a socket
+(non-tty, fully-buffered), so a local PTY run and the remote get **different**
+heap layouts; an exploit tuned against one can crash against the other.
+
+Guidance:
+
+- The kit's own execution paths are already explicit and non-tty:
+  `runner.spawn_owned` (used by GDB/MI) and `runner.run` (used by `pwncrash`,
+  `pwnkit`, …) wire stdin/stdout/stderr to `PIPE`/`DEVNULL`, never a PTY.
+- The `newchal`-generated `exploit.py` carries an inline note on this. To match
+  the remote's layout when debugging a heap/tcache issue locally, launch the
+  target non-tty: `process([exe.path], stdin=PIPE, stdout=PIPE, stderr=PIPE)`.
+- If tcache/heap addresses are right locally but wrong on the remote (or vice
+  versa), suspect stdio wiring **before** assuming a heap bug.
+
+Regression: `tests/test_stdio_wiring_heap_layout.py` pins the mechanism — stdout
+tty-ness shifts subsequent chunk spacing, and stderr wiring does not move the
+heap. It asserts the *existence* of the shift, never a specific buffer size.

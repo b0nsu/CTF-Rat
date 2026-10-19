@@ -69,7 +69,7 @@ public class DecompExport extends GhidraScript {
             }
         } finally {
             try (FileWriter fh = new FileWriter(new File(outdir, ".rat-decomp-status.json"))) {
-                fh.write("{\"discovered\":" + discovered + ",\"exported\":" + idx.size() + ",\"failed\":[");
+                fh.write("{\"image_base\":\"" + currentProgram.getImageBase().toString() + "\",\"discovered\":" + discovered + ",\"exported\":" + idx.size() + ",\"failed\":[");
                 for (int i = 0; i < failed.size(); i++) { if (i > 0) fh.write(","); fh.write("\"" + failed.get(i).replace("\"", "\\\"") + "\""); }
                 fh.write("]}\n");
             }

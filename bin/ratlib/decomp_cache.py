@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 
 SCHEMA = "rat.decomp-cache/v2"
-PAYLOAD_SCHEMA = "rat.decomp-payload/v1"
+PAYLOAD_SCHEMA = "rat.decomp-payload/v2"
 _INVOCATION_POLICY = "sha256:" + hashlib.sha256(b"decomp-local-ghidra-v2-payload-integrity").hexdigest()
 
 
@@ -29,8 +29,8 @@ def payload_manifest(cache: str):
     """Return a deterministic manifest of the observed exported payload.
 
     Completeness stays owned by DecompExport's discovered/exported/failure
-    status contract. This seal only protects the files that make up a complete
-    cache at metadata-write time: `_index.txt` plus every regular `.c` export.
+    status contract. The seal covers the index, exported C files, and the
+    Ghidra status record that carries the observed image base when present.
     """
     index = os.path.join(cache, "_index.txt")
     if not os.path.isfile(index) or os.path.islink(index):
@@ -40,6 +40,8 @@ def payload_manifest(cache: str):
             name for name in os.listdir(cache)
             if name.endswith(".c") and os.path.isfile(os.path.join(cache, name))
         )
+        if os.path.lexists(os.path.join(cache, ".rat-decomp-status.json")):
+            names.append(".rat-decomp-status.json")
     except OSError:
         return None
 
@@ -120,7 +122,8 @@ def validate(cache: str, binary: str, ghidra_home: str, script_dir: str) -> tupl
     if not meta:
         return False, "legacy"
     prov = provenance(binary, ghidra_home, script_dir)
-    if meta.get("schema") != SCHEMA or meta.get("key") != cache_key(prov):
+    if (meta.get("schema") != SCHEMA or meta.get("payload_schema") != PAYLOAD_SCHEMA
+            or meta.get("key") != cache_key(prov)):
         return False, "stale"
     if meta.get("status") != "complete" or not os.path.isfile(os.path.join(cache, "_index.txt")):
         return False, "partial"
@@ -185,13 +188,16 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
 
 def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str,
                       cache_state: str, status: str, operation: str, requested: str,
-                      started_at: str, started_ns: int) -> bool:
-    """Persist one successful decomp CLI invocation using the canonical tool-result stream."""
+                      started_at: str, started_ns: int, exit_code: int = 0,
+                      result_class: str = "analysis") -> bool:
+    """Persist actual invocation outcome, including failures and fallbacks."""
     try:
         if cache_state not in {"hit", "miss", "bypass"}:
             raise ValueError("invalid cache state")
-        if status not in {"ok", "partial"}:
-            raise ValueError("invalid successful result status")
+        if status not in {"ok", "partial", "error"}:
+            raise ValueError("invalid result status")
+        if status == "ok" and exit_code != 0:
+            raise ValueError("successful result cannot have a failing exit")
         if operation not in {"list", "function"}:
             raise ValueError("invalid operation")
         prov = provenance(binary, ghidra_home, script_dir)
@@ -217,11 +223,12 @@ def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str
                 "cache_status": meta.get("status"),
                 "functions_total": meta.get("functions_total"),
                 "functions_exported": meta.get("functions_exported"),
+                "result_class": result_class,
             },
             "artifacts": [],
             "findings": [],
             "diagnostics": [],
-            "exit": {"code": 0, "signal": None, "timed_out": False, "cancelled": False},
+            "exit": {"code": exit_code, "signal": None, "timed_out": exit_code == 124, "cancelled": False},
             "provenance": {
                 "platform": sys.platform,
                 "dependency_versions": dependency_versions,
@@ -259,11 +266,13 @@ def main(argv=None) -> int:
     sp = sub.add_parser("invocation")
     sp.add_argument("cache"); sp.add_argument("binary"); sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
     sp.add_argument("cache_state", choices=("hit", "miss", "bypass"))
-    sp.add_argument("status", choices=("ok", "partial"))
+    sp.add_argument("status", choices=("ok", "partial", "error"))
     sp.add_argument("operation", choices=("list", "function"))
     sp.add_argument("requested")
     sp.add_argument("started_at")
     sp.add_argument("started_ns", type=int)
+    sp.add_argument("--exit-code", type=int, default=0)
+    sp.add_argument("--result-class", default="analysis")
     a = p.parse_args(argv)
     if a.cmd == "key":
         print(cache_key(provenance(a.binary, a.ghidra_home, a.script_dir))); return 0
@@ -273,7 +282,7 @@ def main(argv=None) -> int:
     if a.cmd == "invocation":
         record_invocation(a.cache, a.binary, a.ghidra_home, a.script_dir,
                           a.cache_state, a.status, a.operation, a.requested,
-                          a.started_at, a.started_ns)
+                          a.started_at, a.started_ns, a.exit_code, a.result_class)
         return 0
     write_meta(a.cache, a.binary, a.ghidra_home, a.script_dir, a.status, a.diagnostic); return 0
 
