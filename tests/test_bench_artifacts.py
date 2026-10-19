@@ -110,6 +110,26 @@ class BenchArtifactTests(unittest.TestCase):
             target = os.path.join(root, entry["dir"], entry["binary"])
             self.assertFalse(os.path.exists(target))
 
+    def test_oversized_existing_file_is_rejected_before_read(self):
+        """Codex P2: an already-materialized target larger than the cap must fail
+        closed on size, not be read whole into memory before the digest check."""
+        payload = b"\x7fELF-small"
+        entry = self._entry(payload)
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, entry["dir"], entry["binary"])
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            orig = bench_artifacts._MAX_ARTIFACT_BYTES
+            bench_artifacts._MAX_ARTIFACT_BYTES = 1024  # small cap for the test
+            self.addCleanup(setattr, bench_artifacts, "_MAX_ARTIFACT_BYTES", orig)
+            with open(target, "wb") as fh:
+                fh.write(b"B" * 4096)  # pre-existing file over the cap
+
+            def should_not_fetch(*_a, **_k):
+                raise AssertionError("must fail on size before any fetch")
+
+            with self.assertRaisesRegex(ArtifactMaterializationError, "exceeds"):
+                materialize_entry(entry, root=root, opener=should_not_fetch)
+
     def test_symlinked_fixture_dir_cannot_escape_store_root(self):
         """A fixture dir that is a symlink out of the store root must be refused,
         and nothing may be written to the external target."""

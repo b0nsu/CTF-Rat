@@ -330,16 +330,40 @@ def extract_from_image(root, image=None):
         return "\n".join(lines), 2
     container = created.stdout.strip()
     # Determine the target binary's architecture so we extract a matching libc/loader
-    # pair, not whichever multiarch path happens to come first.
+    # pair, not whichever multiarch path happens to come first.  The arch must be
+    # read from the binary bytes the manifest actually pinned: verify the current
+    # file's path (no escape), sha256 and size against the recorded input before
+    # trusting its arch, or extraction could install libc/loader for untracked
+    # replaced bytes while keeping a stale binary record (Codex P2).
     target_arch = None
+    root_real = os.path.realpath(root)
     for item in manifest.get("inputs", []):
-        if item.get("role") == "binary":
-            bin_path = item.get("path") or item.get("name")
-            if bin_path and not os.path.isabs(bin_path):
-                bin_path = os.path.join(root, bin_path)
-            if bin_path and os.path.isfile(bin_path):
-                target_arch = _elf_arch(bin_path)
+        if item.get("role") != "binary":
+            continue
+        bin_rel = item.get("path") or item.get("name")
+        if not bin_rel:
+            lines.append("WARN: run.json binary input has no path/name; skipping arch filter.")
             break
+        if os.path.isabs(bin_rel):
+            lines.append("WARN: run.json binary path is absolute; refusing. No arch filter.")
+            break
+        bin_path = os.path.realpath(os.path.join(root, bin_rel))
+        if os.path.commonpath((root_real, bin_path)) != root_real:
+            lines.append("WARN: run.json binary path escapes challenge root; refusing. No arch filter.")
+            break
+        if not os.path.isfile(bin_path):
+            lines.append("WARN: run.json binary input missing on disk; no arch filter.")
+            break
+        recorded = str(item.get("sha256", "")).lower().removeprefix("sha256:")
+        if not recorded or recorded != sha256(bin_path):
+            lines.append("WARN: binary digest differs from run.json; refusing arch from untracked bytes. No arch filter.")
+            break
+        recorded_size = item.get("size")
+        if isinstance(recorded_size, int) and recorded_size != os.path.getsize(bin_path):
+            lines.append("WARN: binary size differs from run.json; refusing arch from untracked bytes. No arch filter.")
+            break
+        target_arch = _elf_arch(bin_path)
+        break
     if target_arch:
         lines.append("target binary arch: %s" % target_arch)
     else:

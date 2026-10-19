@@ -110,6 +110,14 @@ def materialize_entry(entry, *, root, opener=None, timeout=60):
     target = _target_path(root, entry)
 
     if os.path.isfile(target):
+        # Apply the same byte cap to an already-materialized file: an unexpectedly
+        # large pre-existing target must be rejected before its digest check, not
+        # read whole into memory (R2-5; parity with the download path).
+        size = os.path.getsize(target)
+        if size > _MAX_ARTIFACT_BYTES:
+            raise ArtifactMaterializationError(
+                "%s existing artifact exceeds %d-byte cap (%d)"
+                % (entry["id"], _MAX_ARTIFACT_BYTES, size))
         with open(target, "rb") as fh:
             payload = fh.read()
         _verify_payload(entry, payload)

@@ -306,6 +306,13 @@ def _run_process_tree(argv, *, cwd, env, timeout, output_cap=_AGENT_OUTPUT_CAP):
         try:
             captured["data"] = _read_capped(process.stdout, output_cap, overflow)
         finally:
+            # On overflow, tear down the whole process group from the reader
+            # itself: a child that catches BrokenPipeError and keeps running
+            # would otherwise keep process.wait() blocked for the full timeout,
+            # and the overflow would be misreported as a plain timeout (not the
+            # untrusted-output path).  Killing here makes wait() return promptly.
+            if overflow.is_set():
+                _killpg(process)
             try:
                 process.stdout.close()
             except OSError:
@@ -319,6 +326,10 @@ def _run_process_tree(argv, *, cwd, env, timeout, output_cap=_AGENT_OUTPUT_CAP):
         _killpg(process)
         reader.join(timeout=5)
         stdout = captured.get("data", b"")
+        # A timeout that coincided with an output flood is still an overflow:
+        # report it as such so the caller follows the untrusted-output path.
+        if overflow.is_set():
+            raise OutputCapExceeded(argv, output_cap, stdout)
         raise subprocess.TimeoutExpired(argv, timeout, output=stdout)
 
     # Process exited; drain the reader.  If it overflowed, the child may still be
@@ -367,6 +378,11 @@ def _run_capped(argv, *, input_bytes=None, timeout, output_cap, env=None):
         try:
             captured["data"] = _read_capped(process.stdout, output_cap, overflow)
         finally:
+            # Kill on overflow from the reader so a child that ignores the closed
+            # pipe cannot keep wait() blocked until the timeout and mask the
+            # overflow as a plain timeout.
+            if overflow.is_set():
+                _killpg(process)
             try:
                 process.stdout.close()
             except OSError:
@@ -379,6 +395,10 @@ def _run_capped(argv, *, input_bytes=None, timeout, output_cap, env=None):
     except subprocess.TimeoutExpired:
         _killpg(process)
         reader.join(timeout=5)
+        # An overflow that coincided with the timeout is still an overflow: return
+        # the overflowed flag instead of raising, so callers treat it uniformly.
+        if overflow.is_set():
+            return process.returncode, captured.get("data", b""), True
         raise subprocess.TimeoutExpired(argv, timeout, output=captured.get("data", b""))
     reader.join(timeout=5)
     if overflow.is_set():

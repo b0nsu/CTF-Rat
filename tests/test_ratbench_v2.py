@@ -242,6 +242,41 @@ class OutputCapTests(unittest.TestCase):
                 RATBENCH._run_process_tree(argv, cwd=cwd, env=os.environ.copy(),
                                            timeout=1, output_cap=128 * 1024)
 
+    # Child that floods past the cap, then ignores the closed pipe and keeps
+    # running (catches BrokenPipeError and sleeps). The overflow must be detected
+    # and the group killed immediately, not masked as a plain timeout.
+    _FLOOD_THEN_SURVIVE = (
+        "import sys,time\n"
+        "try:\n"
+        " sys.stdout.buffer.write(b'A'*200000); sys.stdout.buffer.flush()\n"
+        "except BrokenPipeError: pass\n"
+        "for _ in range(100):\n"
+        " try: time.sleep(0.3)\n"
+        " except BrokenPipeError: pass\n")
+
+    @unittest.skipUnless(os.name == "posix", "needs POSIX process groups")
+    def test_overflow_with_surviving_child_is_not_masked_as_timeout(self):
+        # Codex P1: _run_process_tree must raise OutputCapExceeded promptly, not
+        # wait for the whole timeout, when the over-cap child survives the broken pipe.
+        with tempfile.TemporaryDirectory() as cwd:
+            argv = [sys.executable, "-c", self._FLOOD_THEN_SURVIVE]
+            t0 = time.time()
+            with self.assertRaises(RATBENCH.OutputCapExceeded):
+                RATBENCH._run_process_tree(argv, cwd=cwd, env={"PATH": "/usr/bin:/bin"},
+                                           timeout=20, output_cap=128 * 1024)
+            self.assertLess(time.time() - t0, 10)  # well under the 20s timeout
+
+    @unittest.skipUnless(os.name == "posix", "needs POSIX process groups")
+    def test_run_capped_overflow_with_surviving_child_returns_overflow_flag(self):
+        with tempfile.TemporaryDirectory():
+            argv = [sys.executable, "-c", self._FLOOD_THEN_SURVIVE]
+            t0 = time.time()
+            rc, out, overflowed = RATBENCH._run_capped(
+                argv, timeout=20, output_cap=128 * 1024)
+            self.assertTrue(overflowed)
+            self.assertLessEqual(len(out), 128 * 1024)
+            self.assertLess(time.time() - t0, 10)
+
 
 class ModeBLocalSmokeTests(unittest.TestCase):
     def test_eval_resolves_quoted_agent_executable(self):

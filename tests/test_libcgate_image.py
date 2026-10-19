@@ -66,6 +66,61 @@ class LibcgateImageTests(unittest.TestCase):
             self.assertEqual(recorded["libc"]["sha256"],
                              "sha256:" + LIBCGATE["sha256"](root / "libc_docker.so.6"))
 
+    def _extract_with_fake_docker(self, root, image):
+        extract = LIBCGATE["extract_from_image"]
+        image_id = "sha256:" + "c" * 64
+
+        def fake_run(argv, **kwargs):
+            if argv[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+            if argv[1] == "create":
+                return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+            if argv[1] == "cp":
+                target = Path(argv[-1])
+                if "libc.so.6" in argv[-2] and not target.name.startswith("ld_"):
+                    target.write_bytes(b"GNU C Library stable release version 2.35\0")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "ld-linux" in argv[-2]:
+                    target.write_bytes(b"loader")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(LIBCGATE["shutil"], "which", return_value="/fake/docker"), \
+                patch.object(LIBCGATE["subprocess"], "run", side_effect=fake_run):
+            return extract(str(root), image=image)
+
+    def test_arch_refused_when_binary_digest_differs_from_manifest(self):
+        # Codex P2: if the on-disk binary no longer matches the sha256/size the
+        # manifest pinned, the arch must not be read from those untracked bytes.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "chall"
+            binary.write_bytes(b"\x7fELF" + b"\x02\x01\x01" + b"\0" * 57)  # plausible ELF
+            atomic_write(str(root / "run.json"),
+                         new_direct("fixture", str(binary), None, None))
+            (root / "Dockerfile").write_text("FROM final:stage\n")
+            # Tamper with the binary AFTER the manifest pinned its digest.
+            binary.write_bytes(b"\x7fELF" + b"\x02\x01\x01" + b"\xff" * 57)
+            text, rc = self._extract_with_fake_docker(root, "challenge:built")
+            self.assertIn("digest differs from run.json", text)
+            self.assertIn("extracting without arch filter", text)
+
+    def test_arch_read_when_binary_matches_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "chall"
+            # x86-64 ELF header (EI_CLASS=2, e_machine=0x3e at offset 18).
+            header = bytearray(64)
+            header[0:4] = b"\x7fELF"; header[4] = 2; header[5] = 1; header[18] = 0x3e
+            binary.write_bytes(bytes(header))
+            atomic_write(str(root / "run.json"),
+                         new_direct("fixture", str(binary), None, None))
+            (root / "Dockerfile").write_text("FROM final:stage\n")
+            text, rc = self._extract_with_fake_docker(root, "challenge:built")
+            self.assertIn("target binary arch:", text)
+            self.assertNotIn("digest differs", text)
+
     def test_missing_or_ambiguous_identity_fails_closed(self):
         extract = LIBCGATE["extract_from_image"]
         with tempfile.TemporaryDirectory() as temporary:
