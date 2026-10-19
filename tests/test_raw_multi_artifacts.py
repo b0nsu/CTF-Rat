@@ -180,6 +180,53 @@ class RawAndMultiArtifactTests(unittest.TestCase):
                 materialize_for_solve(None, str(manifest), **(args | {
                     "extra_inputs": [("image", str(disk)), ("image", str(disk))]}))
 
+    def test_retained_provenance_is_reverified_against_solve_dir(self):
+        """A retained non-binary/libc input is dropped when its file is absent and
+        aborts when its bytes drifted, so solve/run.json never carries stale
+        provenance (review P2)."""
+        from ratlib.run_manifest import new_direct, atomic_write, _input
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "chall"
+            binary.write_bytes(b"\x7fELF" + bytes(60))
+            solve = root / "solve"
+            solve.mkdir()
+            dest = solve / "run.json"
+            # (a) absent retained loader -> dropped
+            src = new_direct("chall", str(binary), None, None)
+            src["inputs"].append({"role": "loader", "name": "missing-ld.so",
+                                  "sha256": "sha256:" + "0" * 64, "size": 12345})
+            src_path = root / "src.json"
+            atomic_write(str(src_path), src)
+            doc = materialize_for_solve(str(src_path), str(dest), name="chall",
+                                        binary=str(binary), libc=None, remote=None,
+                                        owner_path=str(dest))
+            self.assertFalse([i for i in doc["inputs"] if i.get("role") == "loader"],
+                             "absent retained loader must not be recorded")
+            # (b) present + matching retained loader -> kept
+            loader = solve / "ld.so"
+            loader.write_bytes(b"\x7fELF" + b"L" * 100)
+            src2 = new_direct("chall", str(binary), None, None)
+            src2["inputs"].append(_input("loader", str(loader)))
+            atomic_write(str(src_path), src2)
+            dest.unlink()
+            doc = materialize_for_solve(str(src_path), str(dest), name="chall",
+                                        binary=str(binary), libc=None, remote=None,
+                                        owner_path=str(dest))
+            self.assertEqual([i["name"] for i in doc["inputs"] if i.get("role") == "loader"],
+                             ["ld.so"])
+            # (c) present but drifted digest -> abort
+            src3 = new_direct("chall", str(binary), None, None)
+            src3["inputs"].append({"role": "loader", "name": "ld.so",
+                                   "sha256": "sha256:" + "a" * 64,
+                                   "size": loader.stat().st_size})
+            atomic_write(str(src_path), src3)
+            dest.unlink()
+            with self.assertRaises(ValueError):
+                materialize_for_solve(str(src_path), str(dest), name="chall",
+                                      binary=str(binary), libc=None, remote=None,
+                                      owner_path=str(dest))
+
     def test_newchal_boot_multi_image_scaffolding_and_duplicate_guard(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

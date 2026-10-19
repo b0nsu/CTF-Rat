@@ -373,12 +373,17 @@ def extract_from_image(root, image=None):
         extracted = []
         try:
             def arch_ok(path):
-                # Reject a copied ELF whose arch disagrees with the target. Untokened
-                # generic paths can still hold a wrong-arch ELF, so verify the bytes.
+                # When the target arch is known, a libc/loader we record as runtime
+                # provenance must itself be a recognizable ELF of that arch. Fail
+                # CLOSED on anything we cannot identify as such: a non-ELF or corrupt
+                # extraction (plain text, truncated, unknown e_machine) returns None
+                # from _elf_arch and must be rejected, never silently recorded as a
+                # genuine libc. Untokened generic paths can also hold a wrong-arch
+                # ELF, so the bytes are always verified. With no target
+                # arch (non-ELF target, or no binary input) the filter stays off.
                 if not target_arch:
                     return True
-                got = _elf_arch(path)
-                return got is None or got == target_arch
+                return _elf_arch(path) == target_arch
             for role, name, candidates in (("libc", "libc_docker.so.6", _LIBC_IN_IMAGE),
                                            ("loader", "ld_docker.so", _LOADER_IN_IMAGE)):
                 filtered = [c for c in candidates if _arch_matches_path(target_arch, c)]

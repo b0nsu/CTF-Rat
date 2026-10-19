@@ -110,6 +110,40 @@ class BenchArtifactTests(unittest.TestCase):
             target = os.path.join(root, entry["dir"], entry["binary"])
             self.assertFalse(os.path.exists(target))
 
+    def test_slow_drip_download_fails_on_total_deadline(self):
+        """#7: a source that drips bytes under the socket timeout and the byte cap
+        must still fail closed once the total wall-clock budget is exceeded."""
+        entry = self._entry(b"\x7fELFsmall")
+
+        class _Drip:
+            def read(self, n=-1):
+                return b"X"  # one byte per read, forever, well under the cap
+            def close(self):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        # Simulate wall-clock advancing 100s per monotonic() read so the deadline
+        # trips without the test actually sleeping.
+        base = bench_artifacts.time.monotonic()
+        counter = {"t": base}
+
+        def fake_monotonic():
+            counter["t"] += 100.0
+            return counter["t"]
+
+        with tempfile.TemporaryDirectory() as root:
+            orig = bench_artifacts.time.monotonic
+            bench_artifacts.time.monotonic = fake_monotonic
+            self.addCleanup(setattr, bench_artifacts.time, "monotonic", orig)
+            with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                materialize_entry(entry, root=root, opener=lambda *_a, **_k: _Drip(),
+                                  timeout=60, total_timeout=300)
+            target = os.path.join(root, entry["dir"], entry["binary"])
+            self.assertFalse(os.path.exists(target))
+
     def test_oversized_existing_file_is_rejected_before_read(self):
         """Codex P2: an already-materialized target larger than the cap must fail
         closed on size, not be read whole into memory before the digest check."""

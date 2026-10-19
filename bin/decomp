@@ -187,7 +187,15 @@ if [ ! -f "$CACHE/_index.txt" ]; then
   analysis_rc=$?
   set -e
   if [ "$analysis_rc" -ne 0 ]; then
-       cat "$CACHE/.ghidra.log" >&2
+       # 실패 로그는 디스크(.ghidra.log)에 전량 보존하되, stderr로는 끝부분만
+       # 상한까지 내보낸다. 폭주·루프성 분석이 만든 수백 MB 로그를 그대로 덤프하면
+       # 호출부 출력 경계를 깨므로 마지막 LOG_TAIL_BYTES 바이트만 표시한다.
+       LOG_TAIL_BYTES="${DECOMP_LOG_TAIL_BYTES:-$((256 * 1024))}"
+       log_size=$(wc -c < "$CACHE/.ghidra.log" 2>/dev/null || echo 0)
+       if [ "$log_size" -gt "$LOG_TAIL_BYTES" ]; then
+         echo "[...] .ghidra.log truncated to last ${LOG_TAIL_BYTES} bytes of ${log_size} (full log: $CACHE/.ghidra.log)" >&2
+       fi
+       tail -c "$LOG_TAIL_BYTES" "$CACHE/.ghidra.log" >&2
        python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" partial --diagnostic "ghidra exit=$analysis_rc"
        rm -rf "$proj"
        if [ "$analysis_rc" -eq 124 ]; then echo "RAT_STATUS=timeout RAT_EXIT=124" >&2; exit 124; fi

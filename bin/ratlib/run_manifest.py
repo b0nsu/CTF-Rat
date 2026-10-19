@@ -276,9 +276,34 @@ def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
             raise ValueError("duplicate or missing additional artifact: %s" % key[1])
         extra_keys.add(key)
         extra_names.add(key[1])
-    inputs = [item for item in payload["inputs"]
-              if item.get("role") not in ("binary", "libc")
-              and item.get("name") not in extra_names]
+    # Retained provenance inputs (loader/image/runner/extra carried from the
+    # source or prior solve manifest) are re-verified against the solve directory
+    # before being recorded, so a stale or drifted record can never coexist with
+    # the freshly stamped binary/libc provenance (parity with the libcgate
+    # extraction guard). A retained input whose file is absent is
+    # dropped (nothing to vouch for); one whose bytes drifted from the recorded
+    # digest/size ABORTS, because a changed file under an unchanged provenance
+    # record is a tampering signal, not a benign miss. binary/libc are excluded
+    # here because they are recomputed fresh just below.
+    solve_dir = os.path.dirname(os.path.abspath(destination))
+    carried = []
+    for item in payload["inputs"]:
+        if item.get("role") in ("binary", "libc") or item.get("name") in extra_names:
+            continue
+        name = item.get("name")
+        candidate = os.path.join(solve_dir, name) if name else None
+        if not candidate or not os.path.isfile(candidate):
+            continue  # stale: the artifact it vouches for is not present
+        recorded_digest = str(item.get("sha256", "")).lower()
+        if recorded_digest and recorded_digest != sha256_file(candidate):
+            raise ValueError("retained input %r digest differs on disk; refusing "
+                             "to carry stale provenance" % name)
+        recorded_size = item.get("size")
+        if isinstance(recorded_size, int) and recorded_size != os.path.getsize(candidate):
+            raise ValueError("retained input %r size differs on disk; refusing "
+                             "to carry stale provenance" % name)
+        carried.append(item)
+    inputs = carried
     inputs.append(_input("binary", binary))
     if libc:
         inputs.append(_input("libc", libc, "libc.so.6"))

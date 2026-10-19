@@ -1,0 +1,64 @@
+"""concrete_verify must bound its child's output and lifetime (review #4).
+
+The concrete-verify re-run feeds solver-recovered input into the real binary.
+An adversarial or buggy target could flood stdout or fork a long-lived
+descendant. The bounded runner caps captured output and kills the whole process
+group on timeout so a forked grandchild cannot outlive the verification.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_symsolve():
+    path = str(ROOT / "solve" / "_template" / "rev" / "symsolve.py")
+    loader = importlib.machinery.SourceFileLoader("symsolve_concrete_bound_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(os.name == "posix", "process-group kill is POSIX-only")
+class ConcreteVerifyBound(unittest.TestCase):
+    def setUp(self):
+        self.symsolve = load_symsolve()
+
+    def test_output_is_capped(self):
+        cap = self.symsolve._CONCRETE_VERIFY_OUTPUT_CAP
+        with tempfile.TemporaryDirectory() as d:
+            flood = os.path.join(d, "flood.sh")
+            Path(flood).write_text("#!/bin/sh\nyes AAAA | head -c %d\n" % (cap * 4))
+            os.chmod(flood, 0o755)
+            out, truncated = self.symsolve._run_bounded([flood], b"", timeout=15)
+            self.assertLessEqual(len(out), cap)
+            self.assertTrue(truncated)
+
+    def test_forked_descendant_is_killed_on_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "alive.marker")
+            script = os.path.join(d, "fork.sh")
+            # Background grandchild would write the marker after 3s; the parent
+            # then blocks. A 1s timeout must kill the whole group so the marker
+            # is never created.
+            Path(script).write_text(
+                "#!/bin/sh\n( sleep 3; echo alive > %s ) &\nsleep 30\n" % marker)
+            os.chmod(script, 0o755)
+            start = time.time()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.symsolve._run_bounded([script], b"", timeout=1)
+            self.assertLess(time.time() - start, 5)
+            time.sleep(4)
+            self.assertFalse(os.path.exists(marker),
+                             "forked descendant survived the timeout kill")
+
+
+if __name__ == "__main__":
+    unittest.main()

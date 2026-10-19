@@ -13,6 +13,7 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 import urllib.request
 
 from ratlib.bench_suite import SuiteValidationError, load_suite, project_suite
@@ -28,11 +29,21 @@ class ArtifactMaterializationError(RuntimeError):
 _MAX_ARTIFACT_BYTES = 64 << 20  # 64 MiB
 
 
-def _read_capped(response, cap):
-    """Stream the body up to ``cap`` bytes; fail closed if the source exceeds it."""
+def _read_capped(response, cap, deadline=None):
+    """Stream the body up to ``cap`` bytes; fail closed if the source exceeds it.
+
+    ``deadline`` (a ``time.monotonic`` value) bounds the TOTAL wall-clock of the
+    download. The socket ``timeout`` passed to ``urlopen`` only bounds a single
+    stalled read, so a source that keeps dripping just under that timeout could
+    otherwise extend the download indefinitely while never tripping the byte cap.
+    Checking the deadline between reads fails closed on that.
+    """
     chunks = []
     total = 0
     while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise ArtifactMaterializationError(
+                "artifact download exceeded total time budget")
         chunk = response.read(65536)
         if not chunk:
             break
@@ -97,12 +108,16 @@ def _mark_executable(path):
     os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def materialize_entry(entry, *, root, opener=None, timeout=60):
+def materialize_entry(entry, *, root, opener=None, timeout=60, total_timeout=None):
     """Fetch one pinned binary, or validate an already-materialized copy.
 
     Returns ``"present"`` when an existing file already matches the pin and
     ``"downloaded"`` when a new file is installed.  A mismatched existing file
     fails closed rather than being silently replaced.
+
+    ``timeout`` bounds a single socket operation; ``total_timeout`` bounds the
+    whole download's wall-clock (default ``max(timeout * 10, 600)`` seconds) so a
+    slow-drip source cannot extend the fetch indefinitely.
     """
     fetch = entry.get("fetch")
     if not isinstance(fetch, dict):
@@ -129,10 +144,13 @@ def materialize_entry(entry, *, root, opener=None, timeout=60):
         fetch["url"],
         headers={"User-Agent": "CTF-Rat-ratbench/1"},
     )
+    if total_timeout is None:
+        total_timeout = max(timeout * 10, 600)
+    deadline = time.monotonic() + total_timeout
     try:
         response = opener(request, timeout=timeout)
         with response:
-            payload = _read_capped(response, _MAX_ARTIFACT_BYTES)
+            payload = _read_capped(response, _MAX_ARTIFACT_BYTES, deadline=deadline)
     except ArtifactMaterializationError:
         raise
     except Exception as exc:

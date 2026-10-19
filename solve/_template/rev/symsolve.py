@@ -425,6 +425,49 @@ def _write_result(args, found, concrete_verify, solutions, detail):
     os.replace(tmp, path)
 
 
+_CONCRETE_VERIFY_OUTPUT_CAP = 1 << 20  # 1 MiB; a solve oracle's output is tiny
+
+
+def _run_bounded(run_args, stdin_val, timeout):
+    """복원 입력을 실제 바이너리에 넣어 실행하되 출력·수명을 bound한다.
+
+    - 새 세션(process group)으로 띄워 timeout 시 fork된 자식 손자까지 killpg로 정리.
+    - stdout/stderr는 cap까지만 읽어 적대적 바이너리의 출력 폭주로부터 메모리 보호.
+    반환: (combined_output_bytes[:cap+], truncated). 실행 불가/타임아웃은 예외로 전파.
+    """
+    posix = os.name == "posix"
+    proc = subprocess.Popen(
+        run_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=posix,  # 자체 process group → 손자까지 한 번에 종료
+    )
+
+    def _terminate():
+        if posix:
+            try:
+                os.killpg(os.getpgid(proc.pid), __import__("signal").SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+        else:
+            proc.kill()
+
+    try:
+        # communicate는 전체 출력을 메모리에 담으므로, cap+1 만큼만 안전하게 읽기
+        # 위해 통신 후 잘라낸다. timeout은 communicate가 강제하고, 초과 시 그룹 전체를
+        # kill 한 뒤 잔여 파이프를 비워 좀비/파이프 블록을 막는다.
+        out, _ = proc.communicate(input=stdin_val, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate()
+        try:
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
+        raise
+    out = out or b""
+    truncated = len(out) > _CONCRETE_VERIFY_OUTPUT_CAP
+    return out[:_CONCRETE_VERIFY_OUTPUT_CAP], truncated
+
+
 def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
     """복원 입력을 실제 바이너리에 넣어 재실행 → 목표 문자열 실제 출력 확인.
     h4c.team 실패원인 ⑤(정적/모델 과신) 대응. 반환: (True|False|None, 상세).
@@ -446,10 +489,9 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
         else:
             return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)"
     try:
-        p = subprocess.run(run_args, input=stdin_val, capture_output=True, timeout=10)
+        out, _truncated = _run_bounded(run_args, stdin_val, timeout=10)
     except Exception as e:
         return None, "재실행 스킵(%s)" % type(e).__name__
-    out = (p.stdout or b"") + (p.stderr or b"")
     ok = all(t in out for t in find_strs) and not any(t in out for t in avoid_strs)
     return ok, out[:200]
 

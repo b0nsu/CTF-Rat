@@ -683,6 +683,15 @@ class Stream:
   else:
    raise ValueError("unsupported state event type %s" % typ)
  def append(self, typ, payload, *, actor="local", task_id="local", caused_by=None):
+  # DESIGN NOTE: each append re-reads and re-validates the whole
+  # history under the stream lock to enforce seq monotonicity and to recover an
+  # interrupted final record before writing. That is an intentional O(n)
+  # integrity cost, not an oversight: the stream is an append-only evidence log
+  # whose correctness depends on validating every prior record. Unbounded growth
+  # is managed operationally by `state compact --budget-tokens N` (a distilled
+  # view), not by trimming or skipping validation here, which would weaken the
+  # integrity guarantee. If append latency ever becomes a real bottleneck, the
+  # fix is an incremental/cached validation cursor, not a size cap on history.
   os.makedirs(os.path.dirname(self.path),mode=0o700,exist_ok=True)
   with open(self.path,"a+",encoding="utf-8") as f:
    fcntl.flock(f,fcntl.LOCK_EX); f.seek(0); events=[]; sid=None; last_valid_offset=0

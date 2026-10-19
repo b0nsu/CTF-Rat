@@ -298,6 +298,47 @@ class LibcgateImageTests(unittest.TestCase):
             self.assertEqual(LIBCGATE["_elf_arch"](root / "libc_docker.so.6"), "aarch64")
             self.assertEqual(LIBCGATE["_elf_arch"](root / "ld_docker.so"), "aarch64")
 
+    def test_non_elf_extraction_fails_closed_when_arch_known(self):
+        """With a known target arch, a non-ELF (or corrupt) extraction must abort,
+        never be recorded as a genuine libc/loader provenance input (review P2)."""
+        extract = LIBCGATE["extract_from_image"]
+        image_id = "sha256:" + "e" * 64
+
+        def fake_run(argv, **kwargs):
+            if argv[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+            if argv[1] == "create":
+                return subprocess.CompletedProcess(argv, 0, "cid\n", "")
+            if argv[1] == "cp":
+                src, target = argv[-2], Path(argv[-1])
+                # Image serves PLAIN TEXT where a libc/loader ELF is expected.
+                if "libc.so.6" in src and not target.name.startswith("ld_"):
+                    target.write_bytes(b"GNU C Library stable release version 2.35\0")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if "ld-linux" in src:
+                    target.write_bytes(b"not an elf loader")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "chall"
+            binary.write_bytes(self._elf_header(0x3E))  # x86_64 target -> arch known
+            atomic_write(str(root / "run.json"),
+                         new_direct("fixture", str(binary), None, None))
+            with patch.object(LIBCGATE["shutil"], "which", return_value="/fake/docker"), \
+                 patch.object(LIBCGATE["subprocess"], "run", side_effect=fake_run):
+                text, rc = extract(str(root), image="challenge:built")
+            self.assertEqual(rc, 2, text)
+            self.assertIn("could not extract libc.so.6", text)
+            # A non-ELF extraction is never left behind nor recorded as provenance.
+            self.assertFalse((root / "libc_docker.so.6").exists())
+            self.assertFalse((root / "ld_docker.so").exists())
+            recorded = [i for i in read(str(root / "run.json"))["inputs"]
+                        if i.get("role") in {"libc", "loader"}]
+            self.assertEqual(recorded, [])
+
 
 if __name__ == "__main__":
     unittest.main()

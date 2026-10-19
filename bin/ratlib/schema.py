@@ -218,7 +218,8 @@ def benchmark_result_v2(d):
     if "routing" in d: _benchmark_routing(d["routing"])
     if "observations" in d: _benchmark_observations(d["observations"])
     groups = {
-        "correctness": {"verified_solve","false_solved","oracle_pass"},
+        # correctness is handled below so legacy `oracle_pass` rows and the new
+        # split (`completion_verified`/`challenge_oracle_pass`) are both accepted.
         "latency": {"time_to_first_query_ms","time_to_first_hypothesis_ms","time_to_first_valid_primitive_ms","time_to_verified_solve_ms"},
         "context": {"input_tokens","output_tokens","peak_context_tokens","tool_output_bytes"},
         "tools": {"tool_calls","duplicate_tool_calls","ghidra_runs","cfgfast_runs","symbolic_runs","subagent_count"},
@@ -227,10 +228,19 @@ def benchmark_result_v2(d):
         "artifacts": {"functions_decompiled","raw_output_size","compressed_output_size","artifact_count"},
     }
     metrics = d["metrics"]
-    if not isinstance(metrics,Mapping) or set(metrics) != set(groups): raise ValidationError("benchmark metrics missing required groups")
+    required_groups = set(groups) | {"correctness"}
+    if not isinstance(metrics,Mapping) or set(metrics) != required_groups: raise ValidationError("benchmark metrics missing required groups")
     for name, fields in groups.items():
         group = metrics[name]
         if not isinstance(group,Mapping) or set(group) != fields: raise ValidationError("invalid metrics.%s fields" % name)
+    # correctness: the internal completion gate and an external challenge oracle
+    # are distinct measurements. Accept the new split shape and the legacy single
+    # `oracle_pass` shape so stored evidence rows stay readable.
+    corr = metrics["correctness"]
+    legacy = {"verified_solve","false_solved","oracle_pass"}
+    split = {"verified_solve","false_solved","completion_verified","challenge_oracle_pass"}
+    if not isinstance(corr,Mapping) or set(corr) not in (legacy, split):
+        raise ValidationError("invalid metrics.correctness fields")
     if metrics["cache"]["cold_warm"] not in {"cold","warm"}: raise ValidationError("invalid metrics.cache.cold_warm")
     ratio = metrics["cache"]["cache_hit_ratio"]
     if ratio is not None and not (isinstance(ratio,(int,float)) and 0 <= ratio <= 1): raise ValidationError("invalid metrics.cache.cache_hit_ratio")
