@@ -45,7 +45,7 @@ kind = inspect(sys.argv[1])["kind"]
 if kind == "unknown":
     # A valid WebAssembly core module is neither an ELF nor a raw/boot image; use
     # the same validity check as ratlib.wasm.inspect so the scaffold does not apply
-    # pwntools ELF() to a Wasm target (R2-7). Fall back to raw-loader otherwise.
+    # pwntools ELF() to a Wasm target. Fall back to raw-loader otherwise.
     from ratlib import wasm
     if wasm.is_wasm(sys.argv[1]):
         try:
@@ -121,7 +121,7 @@ if [ -n "$LIBC" ]; then LIBC_ABS="$(resolve_path "$LIBC")"; fi
 # Reserved destination basenames the scaffold itself writes/produces. The main
 # artifact must not claim one of these, or scaffolding would silently overwrite
 # the operator's binary (or vice versa). libc.so.6 is reserved because --libc is
-# copied to that fixed name. (R1-3)
+# copied to that fixed name.
 RESERVED_NAMES=("run.json" "exploit.py" "state.md" "Dockerfile" "libc.so.6")
 for reserved in "${RESERVED_NAMES[@]}"; do
   if [ "$BN" = "$reserved" ]; then
@@ -206,7 +206,7 @@ if KIND in {"bzimage", "linux-boot-image", "vmlinux", "boot-sector-candidate", "
     raise SystemExit(0)
 if KIND == "wasm-core-v1":
     # A WebAssembly core module is not an ELF; pwntools ELF() cannot load it.
-    # Scaffold a bounded inventory + runtime harness stub instead (R2-7).
+    # Scaffold a bounded inventory + runtime harness stub instead.
     open(os.path.join(D,"exploit.py"),"w").write(
         '#!/usr/bin/env python3\n'
         '# WebAssembly core module: NOT an ELF. Do not use pwntools ELF() here.\n'
@@ -234,13 +234,11 @@ continue
 def conn():
 %s    if args.REMOTE: raise SystemExit("remote target was not configured by newchal")
     if args.GDB:    return gdb.debug([exe.path], gdbscript=GS)   # heap/인터랙티브 디버깅 주력
-    # stdio wiring 주의(#106): pwntools 기본 process()는 자식 stdout/stderr를 PTY에
-    # 붙인다(isatty(1)==1). 그러면 glibc stdout이 line-buffered가 되어 remote(nc=소켓=
-    # non-tty, fully-buffered)와 다른 크기의 stdio 버퍼를 heap에서 malloc한다. 그 버퍼가
-    # 이후 heap 청크 주소를 밀어 ASLR off에서도 로컬↔remote heap 레이아웃이 어긋날 수 있다
-    # (버퍼 크기는 glibc/디바이스마다 다르니 상수로 가정 금지). tcache/heap 주소가 로컬에선
-    # 맞고 remote에선 깨지면(또는 그 반대) 먼저 이 wiring을 의심하라. remote와 레이아웃을
-    # 맞추려면 non-tty로 띄운다: process([exe.path], stdin=PIPE, stdout=PIPE, stderr=PIPE).
+    # stdout wiring 주의: stdout이 PTY(TTY)면 glibc가 line-buffered로 바뀌며
+    # remote(nc=소켓=non-tty, fully-buffered)와 다른 크기의 stdio 버퍼를 heap에서
+    # malloc해 heap 레이아웃이 로컬↔remote 간 어긋날 수 있다(버퍼 크기는
+    # glibc/디바이스마다 다르니 상수로 가정 금지). remote와 레이아웃을 맞추려면
+    # non-tty로 띄운다: process([exe.path], stdin=PIPE, stdout=PIPE, stderr=PIPE).
     return process([exe.path])
 
 io = conn()
@@ -286,7 +284,7 @@ if kind in {"bzimage", "linux-boot-image"}:
 PY
   echo "[+] $D 생성. 다음: cd $D; rat route ./$BN"
 elif [[ "$ARTIFACT_KIND" = wasm-core-v1 ]]; then
-  # WebAssembly: bounded inventory instead of ELF recon/route (R2-7).
+  # WebAssembly: bounded inventory instead of ELF recon/route.
   PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "./$BN" <<'PY' | tee -a state.md
 import json,sys
 from ratlib import wasm
