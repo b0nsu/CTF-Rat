@@ -73,6 +73,32 @@ class RouteFeedbackTests(unittest.TestCase):
         return route(revq=self.rev, interesting=self.interesting, binary_digest=self.digest,
                      probe_feedback=feedback)
 
+    def test_duplicate_decomp_followup_is_recorded_once(self):
+        # R-review #4: decomp serves cached results on every lookup and calls
+        # record_followup_result each time; an identical result must not append a
+        # new observation on repeated cache hits.
+        doc = {"query": "decomp", "selector": "main", "binary_digest": self.digest,
+               "status": "ok", "content_sha256": "sha256:" + "a" * 64,
+               "content": "int main(){}", "content_truncated": False}
+        d1 = record_followup_result(self.tmp.name, self.digest, "decomp", dict(doc))
+        d2 = record_followup_result(self.tmp.name, self.digest, "decomp", dict(doc))
+        self.assertEqual(d1, d2)  # same content-addressed artifact
+        obs = [e for e in Stream(self.tmp.name).read()
+               if e.get("type") == "observation.recorded"
+               and (e.get("payload", {}).get("value") or {}).get("query") == "decomp"]
+        self.assertEqual(len(obs), 1)  # not duplicated on the second (cache-hit) call
+
+    def test_changed_decomp_result_is_recorded_as_new_observation(self):
+        base = {"query": "decomp", "selector": "main", "binary_digest": self.digest,
+                "status": "ok", "content": "v1", "content_truncated": False}
+        record_followup_result(self.tmp.name, self.digest, "decomp", dict(base))
+        changed = dict(base, content="v2 different")
+        record_followup_result(self.tmp.name, self.digest, "decomp", changed)
+        obs = [e for e in Stream(self.tmp.name).read()
+               if e.get("type") == "observation.recorded"
+               and (e.get("payload", {}).get("value") or {}).get("query") == "decomp"]
+        self.assertEqual(len(obs), 2)  # different content -> distinct observation
+
     def test_cross_binary_result_cannot_be_relabelled_or_persisted(self):
         original = _card(self.digest)
         imported = json.loads(json.dumps(original))

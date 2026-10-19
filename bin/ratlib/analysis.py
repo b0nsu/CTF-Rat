@@ -169,9 +169,9 @@ def _elf_header_type(readelf_h):
             return None
     return None
 def _elf_protections(readelf_h, readelf_l):
-    """PIE/NX/RELRO from the ELF header type and program headers.
+    """PIE/NX/RELRO facts from the ELF header type and program headers.
     PIE is true only for an executable ET_DYN (interp present); a non-PIE
-    ET_EXEC with a DYNAMIC segment is not PIE.  Returns (facts, pie_known)."""
+    ET_EXEC with a DYNAMIC segment is not PIE.  Returns the facts list."""
     etype=_elf_header_type(readelf_h)
     facts=[]
     has_interp=any("INTERP" in ln for ln in readelf_l.splitlines())
@@ -196,7 +196,7 @@ def _elf_protections(readelf_h, readelf_l):
     # RELRO: GNU_RELRO program header present (full vs partial not distinguished
     # here; BIND_NOW would require .dynamic FLAGS parsing).
     facts.append({"kind":"elf.relro","value":any("GNU_RELRO" in ln for ln in readelf_l.splitlines()),"quality":"direct"})
-    return facts, etype=="exec" or (etype=="dyn" and has_interp)
+    return facts
 def _phdr_flags(line):
     """Extract the flag column (e.g. 'RW', 'RWE', 'R E') from a `readelf -lW`
     program-header line.  Flags are single letters among R/W/E after the sizes."""
@@ -245,8 +245,7 @@ def profile(a):
         is_elf=file_desc.startswith("ELF ") or _elf_header_type(readelf_h) in ("exec","dyn","rel","core")
         facts.append({"kind":"format","value":fileout,"quality":"direct"})
         if is_elf:
-            prot_facts,_=_elf_protections(readelf_h,readelf_l)
-            facts.extend(prot_facts)
+            facts.extend(_elf_protections(readelf_h,readelf_l))
         imports=_elf_undefined_imports(readelf_s) if is_elf else []
         strings=command(["strings","-n","4","--",a.binary],a.timeout).stdout.preview.decode(errors="replace")
         import_set=set(imports)

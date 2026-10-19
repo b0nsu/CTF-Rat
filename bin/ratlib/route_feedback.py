@@ -68,6 +68,23 @@ def record_followup_result(state_dir, binary_digest, query, doc):
                          media_type="application/json", logical_name=query + "-result.json",
                          provenance={"binary_digest": binary_digest, "query": query})
     digest = artifact["digest"]
+    # Idempotence: decomp serves cached results on every lookup, so emit_file calls
+    # this on a cache hit too.  If an identical active follow-up observation already
+    # exists for this (binary, query, selector, content-addressed artifact), do not
+    # append a duplicate observation/note -- the content is byte-identical (R-review #4).
+    try:
+        observations = stream.view().get("observations", {})
+    except (OSError, ValueError):
+        observations = {}
+    for obs in observations.values():
+        value = obs.get("value") or {}
+        if (obs.get("kind") == "route.probe.followup-result"
+                and (obs.get("validity") or {}).get("state") == "active"
+                and obs.get("subject", {}).get("binary_digest") == binary_digest
+                and value.get("query") == query
+                and value.get("selector") == selector
+                and value.get("artifact_digest") == digest):
+            return digest  # already recorded; avoid STATE noise on repeated cache hits
     observation_id = "route-followup-" + uuid.uuid4().hex
     stream.append("observation.recorded", {
         "observation_id": observation_id, "kind": "route.probe.followup-result",

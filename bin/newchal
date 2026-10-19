@@ -140,7 +140,7 @@ fi
 # Validate additional inputs before writing to solve/.
 EXTRA_FILES=()
 EXTRA_NAMES=("$(basename "$BIN_ABS")" "$(basename "$BIN_ABS")_patched" "libc.so.6" "run.json" "exploit.py" "state.md" "Dockerfile")
-for spec in "${EXTRA_SPECS[@]}"; do
+for spec in ${EXTRA_SPECS[@]+"${EXTRA_SPECS[@]}"}; do
   if [[ "$spec" != *=* ]]; then
     echo "[newchal:err] --artifact requires role=path" >&2; exit 2
   fi
@@ -166,7 +166,7 @@ case "$D/" in "$SOLVE_ROOT"/*/) ;; *) echo "[newchal:err] destination escaped so
 cd "$D"
 cp -- "$BIN_ABS" ./
 BN="$(basename "$BIN_ABS")"
-for artifact in "${EXTRA_FILES[@]}"; do cp -- "${artifact#*=}" ./; done
+for artifact in ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}; do cp -- "${artifact#*=}" ./; done
 if [ -n "$LIBC_ABS" ]; then cp -- "$LIBC_ABS" ./libc.so.6; fi
 SRC_DIR="$(cd -- "$(dirname -- "$BIN_ABS")" && pwd)"
 DOCKER_SRC=""
@@ -257,7 +257,7 @@ source, name, binary, remote = sys.argv[1:]
 print(Path(source).read_text(encoding="utf-8").replace("{{NAME}}", name)
       .replace("{{BIN}}", binary).replace("{{REMOTE}}", remote or "-"), end="")
 PY
-PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" "${EXTRA_FILES[@]}" <<'PY'
+PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"} <<'PY'
 import os,sys
 from ratlib.run_manifest import materialize_for_solve
 source, destination, name, binary, libc, remote, owner = sys.argv[1:8]
