@@ -10,7 +10,25 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv-angr" / "bin" / "python"
 
 
-@unittest.skipUnless(PYTHON.is_file(), "bundled Wasmtime environment unavailable")
+def _wasmtime_available():
+    """True only when .venv-angr's python can actually import wasmtime.
+
+    The interpreter file existing is not enough: a .venv-angr without the optional
+    SETUP §9 `wasmtime` package would otherwise FAIL (not skip) at wat2wasm, which
+    misreports a missing optional dependency as a real test failure."""
+    if not PYTHON.is_file():
+        return False
+    try:
+        probe = subprocess.run(
+            [str(PYTHON), "-c", "import wasmtime"],
+            capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+@unittest.skipUnless(_wasmtime_available(),
+                     "optional Wasmtime package not installed in .venv-angr (SETUP §9)")
 class WasmExitTests(unittest.TestCase):
     def test_exit_zero_nonzero_and_trap(self):
         with tempfile.TemporaryDirectory() as temporary:
