@@ -317,6 +317,46 @@ def extract_from_image(root, image=None):
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         lines.append("ERROR: valid run.json required before extraction (%s)." % type(exc).__name__)
         return "\n".join(lines), 2
+    # Verify manifest integrity and resolve the target arch BEFORE creating a
+    # container or touching any runtime file.  A manifest-integrity failure (path
+    # escape, digest or size mismatch) must ABORT with a nonzero exit before any
+    # docker create / docker cp / run.json rewrite, so a stale binary input record
+    # can never coexist with freshly installed libc/loader provenance.  This is
+    # distinct from a healthy binary whose arch is merely undetermined (non-ELF, or
+    # no binary input), which only disables the arch filter (review P1).
+    target_arch = None
+    root_real = os.path.realpath(root)
+    for item in manifest.get("inputs", []):
+        if item.get("role") != "binary":
+            continue
+        bin_rel = item.get("path") or item.get("name")
+        if not bin_rel:
+            lines.append("WARN: run.json binary input has no path/name; no arch filter.")
+            break
+        if os.path.isabs(bin_rel):
+            lines.append("ERROR: run.json binary path is absolute; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        bin_path = os.path.realpath(os.path.join(root, bin_rel))
+        if os.path.commonpath((root_real, bin_path)) != root_real:
+            lines.append("ERROR: run.json binary path escapes challenge root; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        if not os.path.isfile(bin_path):
+            lines.append("ERROR: run.json binary input missing on disk; refusing (manifest integrity).")
+            return "\n".join(lines), 2
+        recorded = str(item.get("sha256", "")).lower().removeprefix("sha256:")
+        if not recorded or recorded != sha256(bin_path):
+            lines.append("ERROR: binary digest differs from run.json; refusing extraction on untracked bytes.")
+            return "\n".join(lines), 2
+        recorded_size = item.get("size")
+        if isinstance(recorded_size, int) and recorded_size != os.path.getsize(bin_path):
+            lines.append("ERROR: binary size differs from run.json; refusing extraction on untracked bytes.")
+            return "\n".join(lines), 2
+        target_arch = _elf_arch(bin_path)  # may be None for a non-ELF; arch filter off then
+        break
+    if target_arch:
+        lines.append("target binary arch: %s" % target_arch)
+    else:
+        lines.append("WARN: target binary arch undetermined; extracting without arch filter.")
     # create a container (pulls if needed) without running it
     try:
         created = subprocess.run([docker, "create", "--", image_id], capture_output=True,
@@ -329,45 +369,6 @@ def extract_from_image(root, image=None):
         lines.append("No host libc fallback; resolve image access and retry.")
         return "\n".join(lines), 2
     container = created.stdout.strip()
-    # Determine the target binary's architecture so we extract a matching libc/loader
-    # pair, not whichever multiarch path happens to come first.  The arch must be
-    # read from the binary bytes the manifest actually pinned: verify the current
-    # file's path (no escape), sha256 and size against the recorded input before
-    # trusting its arch, or extraction could install libc/loader for untracked
-    # replaced bytes while keeping a stale binary record (Codex P2).
-    target_arch = None
-    root_real = os.path.realpath(root)
-    for item in manifest.get("inputs", []):
-        if item.get("role") != "binary":
-            continue
-        bin_rel = item.get("path") or item.get("name")
-        if not bin_rel:
-            lines.append("WARN: run.json binary input has no path/name; skipping arch filter.")
-            break
-        if os.path.isabs(bin_rel):
-            lines.append("WARN: run.json binary path is absolute; refusing. No arch filter.")
-            break
-        bin_path = os.path.realpath(os.path.join(root, bin_rel))
-        if os.path.commonpath((root_real, bin_path)) != root_real:
-            lines.append("WARN: run.json binary path escapes challenge root; refusing. No arch filter.")
-            break
-        if not os.path.isfile(bin_path):
-            lines.append("WARN: run.json binary input missing on disk; no arch filter.")
-            break
-        recorded = str(item.get("sha256", "")).lower().removeprefix("sha256:")
-        if not recorded or recorded != sha256(bin_path):
-            lines.append("WARN: binary digest differs from run.json; refusing arch from untracked bytes. No arch filter.")
-            break
-        recorded_size = item.get("size")
-        if isinstance(recorded_size, int) and recorded_size != os.path.getsize(bin_path):
-            lines.append("WARN: binary size differs from run.json; refusing arch from untracked bytes. No arch filter.")
-            break
-        target_arch = _elf_arch(bin_path)
-        break
-    if target_arch:
-        lines.append("target binary arch: %s" % target_arch)
-    else:
-        lines.append("WARN: target binary arch undetermined; extracting without arch filter.")
     with tempfile.TemporaryDirectory(prefix=".libcgate-extract-", dir=root) as stage_dir:
         extracted = []
         try:

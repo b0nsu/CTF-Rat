@@ -90,9 +90,10 @@ class LibcgateImageTests(unittest.TestCase):
                 patch.object(LIBCGATE["subprocess"], "run", side_effect=fake_run):
             return extract(str(root), image=image)
 
-    def test_arch_refused_when_binary_digest_differs_from_manifest(self):
-        # Codex P2: if the on-disk binary no longer matches the sha256/size the
-        # manifest pinned, the arch must not be read from those untracked bytes.
+    def test_digest_mismatch_aborts_extraction_and_leaves_manifest_unchanged(self):
+        # Review P1: a manifest-integrity failure (on-disk binary no longer matches
+        # the pinned sha256/size) must ABORT with rc != 0 before any docker cp or
+        # run.json rewrite -- never install a runtime over a stale binary record.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binary = root / "chall"
@@ -100,11 +101,27 @@ class LibcgateImageTests(unittest.TestCase):
             atomic_write(str(root / "run.json"),
                          new_direct("fixture", str(binary), None, None))
             (root / "Dockerfile").write_text("FROM final:stage\n")
+            manifest_before = (root / "run.json").read_bytes()
             # Tamper with the binary AFTER the manifest pinned its digest.
             binary.write_bytes(b"\x7fELF" + b"\x02\x01\x01" + b"\xff" * 57)
-            text, rc = self._extract_with_fake_docker(root, "challenge:built")
+
+            image_id = "sha256:" + "c" * 64
+
+            def fake_run(argv, **kwargs):
+                if argv[1:3] == ["image", "inspect"]:
+                    return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+                # Integrity must abort before create/cp: any such call is a failure.
+                raise AssertionError("extraction must abort before docker create/cp (%r)" % argv[1])
+
+            with patch.object(LIBCGATE["shutil"], "which", return_value="/fake/docker"), \
+                    patch.object(LIBCGATE["subprocess"], "run", side_effect=fake_run):
+                text, rc = LIBCGATE["extract_from_image"](str(root), image="challenge:built")
+            self.assertNotEqual(rc, 0)
             self.assertIn("digest differs from run.json", text)
-            self.assertIn("extracting without arch filter", text)
+            # No libc/loader installed and the manifest is byte-identical.
+            self.assertFalse((root / "libc_docker.so.6").exists())
+            self.assertFalse((root / "ld_docker.so").exists())
+            self.assertEqual((root / "run.json").read_bytes(), manifest_before)
 
     def test_arch_read_when_binary_matches_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

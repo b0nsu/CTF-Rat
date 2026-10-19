@@ -361,16 +361,6 @@ def _run_capped(argv, *, input_bytes=None, timeout, output_cap, env=None):
     process = subprocess.Popen(argv, stdin=(subprocess.PIPE if input_bytes is not None else None),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                start_new_session=True, env=env)
-    if input_bytes is not None:
-        try:
-            process.stdin.write(input_bytes)
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
     overflow = threading.Event()
     captured = {}
 
@@ -390,17 +380,40 @@ def _run_capped(argv, *, input_bytes=None, timeout, output_cap, env=None):
 
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
+    # Feed stdin from a background thread under the SAME deadline: a child that does
+    # not consume its stdin would otherwise block a synchronous write past the pipe
+    # buffer and defeat the timeout entirely (review P1). On timeout, _killpg unblocks
+    # the writer by tearing down the process group.
+    writer = None
+    if input_bytes is not None:
+        def _writer():
+            try:
+                process.stdin.write(input_bytes)
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+        writer = threading.Thread(target=_writer, daemon=True)
+        writer.start()
+
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _killpg(process)
         reader.join(timeout=5)
+        if writer is not None:
+            writer.join(timeout=5)
         # An overflow that coincided with the timeout is still an overflow: return
         # the overflowed flag instead of raising, so callers treat it uniformly.
         if overflow.is_set():
             return process.returncode, captured.get("data", b""), True
         raise subprocess.TimeoutExpired(argv, timeout, output=captured.get("data", b""))
     reader.join(timeout=5)
+    if writer is not None:
+        writer.join(timeout=5)
     if overflow.is_set():
         _killpg(process)
     return process.returncode, captured.get("data", b""), overflow.is_set()

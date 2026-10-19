@@ -277,6 +277,18 @@ class OutputCapTests(unittest.TestCase):
             self.assertLessEqual(len(out), 128 * 1024)
             self.assertLess(time.time() - t0, 10)
 
+    @unittest.skipUnless(os.name == "posix", "needs POSIX process groups")
+    def test_run_capped_timeout_enforced_when_child_never_reads_stdin(self):
+        # Review P1: a child that does not consume its stdin must not let a large
+        # synchronous stdin write block past the pipe buffer and defeat the timeout.
+        with tempfile.TemporaryDirectory():
+            argv = [sys.executable, "-c", "import time; time.sleep(60)"]
+            t0 = time.time()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                RATBENCH._run_capped(argv, input_bytes=b"A" * (4 * 1024 * 1024),
+                                     timeout=2, output_cap=128 * 1024)
+            self.assertLess(time.time() - t0, 10)  # not blocked for the child's 60s
+
 
 class ModeBLocalSmokeTests(unittest.TestCase):
     def test_eval_resolves_quoted_agent_executable(self):
