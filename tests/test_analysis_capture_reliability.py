@@ -19,7 +19,7 @@ from tests.test_telemetry import envelope
 
 
 def load_revq():
-    loader = importlib.machinery.SourceFileLoader("_issue112_revq", str(BIN / "revq"))
+    loader = importlib.machinery.SourceFileLoader("_revq_under_test", str(BIN / "revq"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
