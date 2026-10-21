@@ -32,6 +32,7 @@ import importlib.metadata
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -425,6 +426,83 @@ def _write_result(args, found, concrete_verify, solutions, detail):
     os.replace(tmp, path)
 
 
+_CONCRETE_VERIFY_OUTPUT_CAP = 1 << 20  # 1 MiB; a solve oracle's output is tiny
+
+
+def _run_bounded(run_args, stdin_val, timeout):
+    """복원 입력을 실제 바이너리에 넣어 실행하되 출력·수명을 bound한다.
+
+    - 새 세션(process group)으로 띄워 timeout 시 fork된 자식 손자까지 killpg로 정리.
+    - stdout/stderr와 stdin을 nonblocking으로 처리하며 cap+1 바이트만 보관.
+    반환: (combined_output_bytes[:cap], truncated). 실행 불가/타임아웃은 예외로 전파.
+    """
+    posix = os.name == "posix"
+    proc = subprocess.Popen(
+        run_args, stdin=subprocess.PIPE if stdin_val else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=posix,  # 자체 process group → 손자까지 한 번에 종료
+    )
+
+    def _terminate():
+        if posix:
+            try:
+                os.killpg(os.getpgid(proc.pid), __import__("signal").SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                if proc.poll() is None:
+                    proc.kill()
+        else:
+            if proc.poll() is None:
+                proc.kill()
+
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    pending = memoryview(stdin_val) if stdin_val else None
+    try:
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(proc.stdout.fileno(), False)
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            if pending:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(run_args, timeout)
+                for key, _events in selector.select(remaining):
+                    if key.fileobj is proc.stdin:
+                        try:
+                            written = os.write(proc.stdin.fileno(), pending)
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            written = len(pending)
+                        pending = pending[written:]
+                        if not pending:
+                            selector.unregister(proc.stdin)
+                            proc.stdin.close()
+                    else:
+                        chunk = os.read(proc.stdout.fileno(), min(65536, _CONCRETE_VERIFY_OUTPUT_CAP + 1 - len(output)))
+                        if not chunk:
+                            selector.unregister(proc.stdout)
+                            continue
+                        output.extend(chunk)
+                        if len(output) > _CONCRETE_VERIFY_OUTPUT_CAP:
+                            _terminate()
+                            proc.wait(timeout=5)
+                            return bytes(output[:_CONCRETE_VERIFY_OUTPUT_CAP]), True
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        return bytes(output), False
+    except BaseException:
+        _terminate()
+        proc.wait(timeout=5)
+        raise
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.stdout.close()
+
+
 def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
     """복원 입력을 실제 바이너리에 넣어 재실행 → 목표 문자열 실제 출력 확인.
     h4c.team 실패원인 ⑤(정적/모델 과신) 대응. 반환: (True|False|None, 상세).
@@ -446,10 +524,11 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
         else:
             return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)"
     try:
-        p = subprocess.run(run_args, input=stdin_val, capture_output=True, timeout=10)
+        out, truncated = _run_bounded(run_args, stdin_val, timeout=10)
     except Exception as e:
         return None, "재실행 스킵(%s)" % type(e).__name__
-    out = (p.stdout or b"") + (p.stderr or b"")
+    if truncated:
+        return None, "concrete output cap exceeded; execution was not fully observed"
     ok = all(t in out for t in find_strs) and not any(t in out for t in avoid_strs)
     return ok, out[:200]
 

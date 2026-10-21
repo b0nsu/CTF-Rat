@@ -49,3 +49,16 @@ Use the issue templates (bug report / feature request).
   one.
 - Keep tool output machine-parseable where the tool already supports
   `--format json`; don't grep/sed human-readable text output.
+- Don't put issue/PR numbers, internal review markers (e.g. `R2-8`), or a
+  specific challenge's analysis history in generated files or CLI help text —
+  those reach end users. A comment that needs the *why* states the reusable
+  condition or invariant directly instead of pointing at a ticket number.
+- In source/tests/docs, an issue number is fine only as a single-line
+  reference in a test docstring or a workaround comment — don't narrate the
+  issue's history around it.
+- Don't state an issue's status ("still open", "unresolved") in code or docs;
+  it goes stale as soon as the issue closes. The issue tracker is the source
+  of truth for status.
+- Don't bake an issue number into a filename or function name (e.g.
+  `test_issue_112_*`); name things after what they test, not the ticket that
+  prompted them.

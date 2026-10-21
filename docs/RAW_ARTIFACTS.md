@@ -57,7 +57,7 @@ newchal bumpy drive0 \
 Every supplied regular file is copied by basename after validation. Files
 that collide with each other or with generated solve files are rejected.
 
-The existing `solve/bumpy/run.json` retains `rat.run/v1` and records a
+The generated `solve/bumpy/run.json` retains `rat.run/v1` and records a
 SHA-256 digest and size for each input. A runner is inspected **statically**;
 the kit never executes it during ingestion. Up to four candidate
 `qemu-system-*` command lines are recorded with a source digest and an
@@ -65,5 +65,5 @@ unresolved-shell marker. They remain *hints*, not a verified execution
 environment. `rat brief drive0` can display bounded, manifest-bound QEMU
 hints if the manifest's primary binary digest matches the analyzed file.
 
-Disk filesystem traversal, sector carving, guest ISA recovery and #102
+Disk filesystem traversal, sector carving, guest ISA recovery and
 dispatcher/VM semantics recovery remain separate, measured follow-up work.

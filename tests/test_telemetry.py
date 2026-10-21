@@ -47,7 +47,8 @@ class BenchmarkResultV2Schema(unittest.TestCase):
             "challenge_id": "c1", "attempt": 1, "status": "completed", "eligible": True, "outcome": "verified",
             "started_at": "2026-08-23T00:00:00Z", "finished_at": "2026-08-23T00:01:00Z", "oracle": {}, "ground_truth": {},
             "metrics": {
-                "correctness": {"verified_solve": True, "false_solved": False, "oracle_pass": True},
+                "correctness": {"verified_solve": True, "false_solved": False,
+                                 "completion_verified": True, "challenge_oracle_pass": None},
                 "latency": {"time_to_first_query_ms": 1, "time_to_first_hypothesis_ms": 2, "time_to_first_valid_primitive_ms": 3, "time_to_verified_solve_ms": 4},
                 "context": {"input_tokens": 1, "output_tokens": 2, "peak_context_tokens": 3, "tool_output_bytes": 4},
                 "tools": {"tool_calls": 1, "duplicate_tool_calls": 0, "ghidra_runs": 0, "cfgfast_runs": 0, "symbolic_runs": 0, "subagent_count": 0},
@@ -94,6 +95,37 @@ class BenchmarkResultV2Schema(unittest.TestCase):
     def test_bad_cache_hit_ratio_rejected(self):
         doc = self._valid(); doc["metrics"]["cache"]["cache_hit_ratio"] = 1.5
         with self.assertRaises(ValidationError): validate(doc)
+
+    def test_split_correctness_keeps_internal_and_external_independent(self):
+        # Internal completion gate and external challenge oracle are distinct
+        # measurements (review P2): a completion-verified run with no independent
+        # oracle run must report challenge_oracle_pass=null, not True.
+        doc = self._valid()
+        doc["metrics"]["correctness"] = {"verified_solve": True, "false_solved": False,
+                                          "completion_verified": True,
+                                          "challenge_oracle_pass": None}
+        validate(doc)
+
+    def test_legacy_oracle_pass_correctness_still_validates(self):
+        # Stored evidence rows predating the split must remain readable by report.
+        doc = self._valid()
+        doc["metrics"]["correctness"] = {"verified_solve": True, "false_solved": False,
+                                          "oracle_pass": True}
+        validate(doc)
+
+    def test_correctness_requires_a_known_shape(self):
+        doc = self._valid()
+        doc["metrics"]["correctness"] = {"verified_solve": True, "false_solved": False}
+        with self.assertRaises(ValidationError): validate(doc)
+
+    def test_split_correctness_rejects_wrong_types_and_alias_mismatch(self):
+        for field, value in (("verified_solve", 1), ("false_solved", "false"),
+                             ("completion_verified", False),
+                             ("challenge_oracle_pass", "success")):
+            with self.subTest(field=field):
+                doc = self._valid()
+                doc["metrics"]["correctness"][field] = value
+                with self.assertRaises(ValidationError): validate(doc)
 
 class OperationFingerprint(unittest.TestCase):
     def test_identical_inputs_produce_identical_fingerprint(self):

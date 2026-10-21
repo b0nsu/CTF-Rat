@@ -1,18 +1,22 @@
-"""Regression for issue #106: child stdio wiring shifts the heap layout.
+"""How a child's stdio wiring shifts its early heap layout.
 
-The reported symptom was a SIGSEGV in ``tcache_get`` that reproduced only when
-the target's stdout/stderr were inherited (pwntools' default ``process()``,
-which attaches a PTY) and vanished with ``stderr=DEVNULL``. The mechanism is not
-a heap bug: when stdout is a TTY, glibc makes it line-buffered and allocates a
-differently sized stdio buffer from the heap than when stdout is a pipe/file
-(fully-buffered). That buffer preempts heap space, so *subsequent* chunk
-addresses move -- even with ASLR disabled. ``stderr`` itself is unbuffered and
-does not move the heap, so it was never the real variable.
+These tests pin one independently measurable mechanism: when stdout is a TTY,
+glibc makes it line-buffered and allocates a differently sized stdio buffer from
+the heap than when stdout is a pipe/file (fully-buffered). That buffer preempts
+heap space, so *subsequent* chunk addresses move -- even with ASLR disabled. The
+stderr probe checks the complementary fact: changing the non-tty stderr sink
+does not move the heap, because glibc's stderr is unbuffered.
 
-These tests pin the mechanism deterministically without asserting any exact
-buffer size (buffer sizing depends on glibc/device ``st_blksize`` and is not a
-portable constant -- we only require that the difference exists and that stderr
-does not move the heap).
+This matters for heap/tcache exploits that look flaky across a local PTY run and
+a non-tty remote (an ``nc`` socket is fully-buffered): a layout that depends on
+stdout's tty-ness will diverge. A target that imports no stdio at all (only
+``read``/``write`` syscalls) allocates no stdout buffer and is immune -- so this
+mechanism only applies to stdio-using targets, and is not a universal
+explanation for every wiring-dependent crash.
+
+No exact buffer size is asserted (buffer sizing depends on glibc/device
+``st_blksize`` and is not a portable constant). We only require that the stdout
+shift exists and that non-tty stderr wiring does not move the heap.
 """
 import os
 import pty
@@ -151,7 +155,7 @@ class StdioWiringHeapLayout(unittest.TestCase):
             self.assertNotEqual(
                 gap_pipe, gap_tty,
                 "stdout tty-ness did not change the heap chunk spacing; the "
-                "#106 mechanism (stdio buffer preempting heap) is not reproduced")
+                "stdio-buffer heap shift was not observed")
 
     def test_stderr_wiring_does_not_move_the_heap(self):
         with tempfile.TemporaryDirectory() as d:
@@ -180,7 +184,7 @@ class StdioWiringHeapLayout(unittest.TestCase):
             self.assertEqual(
                 pipe_run["P"], file_run["P"],
                 "stderr sink changed the heap layout; stderr is unbuffered and "
-                "must not move the heap (see #106)")
+                "must not move the heap")
 
 
 if __name__ == "__main__":

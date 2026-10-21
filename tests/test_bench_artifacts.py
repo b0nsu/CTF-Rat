@@ -1,19 +1,29 @@
 import io
+import http.client
+import http.server
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "bin"))
 
 from ratlib.bench_artifacts import (
-    ArtifactMaterializationError, git_blob_sha1, materialize_entry,
+    ArtifactMaterializationError, _read_capped, git_blob_sha1, materialize_entry,
 )
 import ratlib.bench_artifacts as bench_artifacts
 
 
 class BenchArtifactTests(unittest.TestCase):
+    def test_http_without_interruptible_socket_fails_closed(self):
+        response = object.__new__(http.client.HTTPResponse)
+        response.fp = io.BytesIO(b"payload")
+        with self.assertRaisesRegex(ArtifactMaterializationError, "cannot enforce"):
+            _read_capped(response, 1024, deadline=time.monotonic() + 1)
+
     def _entry(self, payload):
         return {
             "id": "real-example-01",
@@ -109,6 +119,147 @@ class BenchArtifactTests(unittest.TestCase):
                 materialize_entry(entry, root=root, opener=lambda *_a, **_k: _Endless())
             target = os.path.join(root, entry["dir"], entry["binary"])
             self.assertFalse(os.path.exists(target))
+
+    def test_slow_drip_download_fails_on_total_deadline(self):
+        """#7: a source that drips bytes under the socket timeout and the byte cap
+        must still fail closed once the total wall-clock budget is exceeded."""
+        entry = self._entry(b"\x7fELFsmall")
+
+        class _Drip:
+            def read(self, n=-1):
+                return b"X"  # one byte per read, forever, well under the cap
+            def close(self):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        # Simulate wall-clock advancing 100s per monotonic() read so the deadline
+        # trips without the test actually sleeping.
+        base = bench_artifacts.time.monotonic()
+        counter = {"t": base}
+
+        def fake_monotonic():
+            counter["t"] += 100.0
+            return counter["t"]
+
+        with tempfile.TemporaryDirectory() as root:
+            orig = bench_artifacts.time.monotonic
+            bench_artifacts.time.monotonic = fake_monotonic
+            self.addCleanup(setattr, bench_artifacts.time, "monotonic", orig)
+            with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                materialize_entry(entry, root=root, opener=lambda *_a, **_k: _Drip(),
+                                  timeout=60, total_timeout=300)
+            target = os.path.join(root, entry["dir"], entry["binary"])
+            self.assertFalse(os.path.exists(target))
+
+    def test_live_chunked_drip_stops_within_total_deadline(self):
+        entry = self._entry(b"expected")
+
+        class DripHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    for _ in range(100):
+                        self.wfile.write(b"1\r\nX\r\n")
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DripHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                start = time.monotonic()
+                with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                    materialize_entry(entry, root=root, timeout=1, total_timeout=0.2)
+                self.assertLess(time.monotonic() - start, 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_live_http_download_installs_pinned_payload(self):
+        payload = b"\x7fELF-live-worker"
+        entry = self._entry(payload)
+        received_user_agents = []
+
+        class PayloadHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received_user_agents.append(self.headers.get("User-Agent"))
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PayloadHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                self.assertEqual(materialize_entry(entry, root=root, timeout=2,
+                                                   total_timeout=2), "downloaded")
+                target = os.path.join(root, entry["dir"], entry["binary"])
+                with open(target, "rb") as source:
+                    self.assertEqual(source.read(), payload)
+                self.assertEqual(received_user_agents, ["CTF-Rat-ratbench/1"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_slow_http_headers_stop_within_total_deadline(self):
+        entry = self._entry(b"expected")
+        headers_started = threading.Event()
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                    self.wfile.flush()
+                    headers_started.set()
+                    for _ in range(75):
+                        self.wfile.write(b"a")
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                    self.wfile.write(b"\r\nContent-Length: 8\r\n\r\n")
+                    self.wfile.write(b"expected")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHeaders)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                start = time.monotonic()
+                with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                    materialize_entry(entry, root=root, timeout=2, total_timeout=0.5)
+                self.assertTrue(headers_started.is_set(), "the fetch must reach HTTP headers")
+                self.assertLess(time.monotonic() - start, 1.2)
+                target = os.path.join(root, entry["dir"], entry["binary"])
+                self.assertFalse(os.path.exists(target))
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_oversized_existing_file_is_rejected_before_read(self):
         """Codex P2: an already-materialized target larger than the cap must fail
