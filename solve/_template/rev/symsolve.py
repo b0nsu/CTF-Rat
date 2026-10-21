@@ -524,9 +524,11 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
         else:
             return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)"
     try:
-        out, _truncated = _run_bounded(run_args, stdin_val, timeout=10)
+        out, truncated = _run_bounded(run_args, stdin_val, timeout=10)
     except Exception as e:
         return None, "재실행 스킵(%s)" % type(e).__name__
+    if truncated:
+        return None, "concrete output cap exceeded; execution was not fully observed"
     ok = all(t in out for t in find_strs) and not any(t in out for t in avoid_strs)
     return ok, out[:200]
 

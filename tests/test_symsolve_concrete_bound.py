@@ -53,6 +53,21 @@ class ConcreteVerifyBound(unittest.TestCase):
             self.assertEqual(len(out), self.symsolve._CONCRETE_VERIFY_OUTPUT_CAP)
             self.assertLess(time.monotonic() - start, 3)
 
+    def test_truncated_success_prefix_never_verifies(self):
+        cap = self.symsolve._CONCRETE_VERIFY_OUTPUT_CAP
+        with tempfile.TemporaryDirectory() as d:
+            script = os.path.join(d, "prefix.py")
+            Path(script).write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdout.buffer.write(b'GOOD' + b'A' * %d + b'BAD')\n"
+                "sys.stdout.buffer.flush()\n" % cap)
+            os.chmod(script, 0o755)
+            ok, detail = self.symsolve.concrete_verify(
+                script, [], None, [b"GOOD"], [b"BAD"])
+            self.assertIsNone(ok, "a truncated prefix must not become a PASS")
+            self.assertIn("cap", detail)
+
     def test_transient_nonblocking_stdin_backpressure_is_retried(self):
         real_write = os.write
         attempts = 0

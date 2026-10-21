@@ -188,6 +188,79 @@ class BenchArtifactTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_live_http_download_installs_pinned_payload(self):
+        payload = b"\x7fELF-live-worker"
+        entry = self._entry(payload)
+        received_user_agents = []
+
+        class PayloadHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received_user_agents.append(self.headers.get("User-Agent"))
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PayloadHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                self.assertEqual(materialize_entry(entry, root=root, timeout=2,
+                                                   total_timeout=2), "downloaded")
+                target = os.path.join(root, entry["dir"], entry["binary"])
+                with open(target, "rb") as source:
+                    self.assertEqual(source.read(), payload)
+                self.assertEqual(received_user_agents, ["CTF-Rat-ratbench/1"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_slow_http_headers_stop_within_total_deadline(self):
+        entry = self._entry(b"expected")
+        headers_started = threading.Event()
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                    self.wfile.flush()
+                    headers_started.set()
+                    for _ in range(75):
+                        self.wfile.write(b"a")
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                    self.wfile.write(b"\r\nContent-Length: 8\r\n\r\n")
+                    self.wfile.write(b"expected")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHeaders)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                start = time.monotonic()
+                with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                    materialize_entry(entry, root=root, timeout=2, total_timeout=0.5)
+                self.assertTrue(headers_started.is_set(), "the fetch must reach HTTP headers")
+                self.assertLess(time.monotonic() - start, 1.2)
+                target = os.path.join(root, entry["dir"], entry["binary"])
+                self.assertFalse(os.path.exists(target))
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_oversized_existing_file_is_rejected_before_read(self):
         """Codex P2: an already-materialized target larger than the cap must fail
         closed on size, not be read whole into memory before the digest check."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import multiprocessing
 import os
 import socket
 import stat
@@ -89,6 +90,59 @@ def _read_capped(response, cap, deadline=None):
         if timer is not None:
             timer.cancel()
     return b"".join(chunks)
+
+
+def _download_worker(url, headers, timeout, deadline, cap, payload_path, error_path):
+    """Fetch in a disposable process so connect, TLS and headers have a hard deadline."""
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ArtifactMaterializationError("artifact download exceeded total time budget")
+        with urllib.request.urlopen(request, timeout=min(timeout, remaining)) as response:
+            payload = _read_capped(response, cap, deadline=deadline)
+        with open(payload_path, "wb") as output:
+            output.write(payload)
+    except Exception as exc:
+        with open(error_path, "w", encoding="utf-8") as output:
+            output.write("%s: %s" % (type(exc).__name__, str(exc)[:512]))
+        raise SystemExit(1)
+
+
+def _download_with_deadline(request, timeout, deadline, cap):
+    """Terminate the whole fetch if any network phase exceeds ``deadline``."""
+    with tempfile.TemporaryDirectory(prefix="ratbench-fetch-") as scratch:
+        payload_path = os.path.join(scratch, "payload")
+        error_path = os.path.join(scratch, "error")
+        process = multiprocessing.get_context("spawn").Process(
+            target=_download_worker,
+            args=(request.full_url, request.headers, timeout, deadline, cap,
+                  payload_path, error_path),
+        )
+        process.start()
+        try:
+            process.join(max(0, deadline - time.monotonic()))
+            if process.is_alive() or time.monotonic() >= deadline:
+                raise ArtifactMaterializationError(
+                    "artifact download exceeded total time budget")
+            if process.exitcode != 0:
+                try:
+                    with open(error_path, "r", encoding="utf-8") as source:
+                        detail = source.read(600)
+                except OSError:
+                    detail = "worker exited %s" % process.exitcode
+                raise ArtifactMaterializationError("artifact download failed: %s" % detail)
+            with open(payload_path, "rb") as source:
+                payload = source.read(cap + 1)
+            if len(payload) > cap:
+                raise ArtifactMaterializationError(
+                    "artifact exceeds %d-byte download cap" % cap)
+            return payload
+        finally:
+            if process.is_alive():
+                process.kill()
+            process.join()
+            process.close()
 
 
 def git_blob_sha1(data):
@@ -175,7 +229,6 @@ def materialize_entry(entry, *, root, opener=None, timeout=60, total_timeout=Non
         _mark_executable(target)
         return "present"
 
-    opener = opener or urllib.request.urlopen
     request = urllib.request.Request(
         fetch["url"],
         headers={"User-Agent": "CTF-Rat-ratbench/1"},
@@ -184,9 +237,14 @@ def materialize_entry(entry, *, root, opener=None, timeout=60, total_timeout=Non
         total_timeout = max(timeout * 10, 600)
     deadline = time.monotonic() + total_timeout
     try:
-        response = opener(request, timeout=min(timeout, total_timeout))
-        with response:
-            payload = _read_capped(response, _MAX_ARTIFACT_BYTES, deadline=deadline)
+        if opener is None or opener is urllib.request.urlopen:
+            payload = _download_with_deadline(request, timeout, deadline,
+                                              _MAX_ARTIFACT_BYTES)
+        else:
+            response = opener(request, timeout=min(timeout, total_timeout))
+            with response:
+                payload = _read_capped(response, _MAX_ARTIFACT_BYTES,
+                                       deadline=deadline)
     except ArtifactMaterializationError:
         raise
     except Exception as exc:
