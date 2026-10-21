@@ -241,6 +241,16 @@ def benchmark_result_v2(d):
     split = {"verified_solve","false_solved","completion_verified","challenge_oracle_pass"}
     if not isinstance(corr,Mapping) or set(corr) not in (legacy, split):
         raise ValidationError("invalid metrics.correctness fields")
+    if type(corr["verified_solve"]) is not bool or type(corr["false_solved"]) is not bool:
+        raise ValidationError("invalid metrics.correctness boolean")
+    oracle_key = "oracle_pass" if set(corr) == legacy else "challenge_oracle_pass"
+    if corr[oracle_key] is not None and type(corr[oracle_key]) is not bool:
+        raise ValidationError("invalid metrics.correctness oracle value")
+    if set(corr) == split:
+        if type(corr["completion_verified"]) is not bool:
+            raise ValidationError("invalid metrics.correctness completion_verified")
+        if corr["verified_solve"] != corr["completion_verified"]:
+            raise ValidationError("verified_solve differs from completion_verified")
     if metrics["cache"]["cold_warm"] not in {"cold","warm"}: raise ValidationError("invalid metrics.cache.cold_warm")
     ratio = metrics["cache"]["cache_hit_ratio"]
     if ratio is not None and not (isinstance(ratio,(int,float)) and 0 <= ratio <= 1): raise ValidationError("invalid metrics.cache.cache_hit_ratio")

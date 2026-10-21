@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import os
+import socket
 import stat
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -36,22 +39,55 @@ def _read_capped(response, cap, deadline=None):
     download. The socket ``timeout`` passed to ``urlopen`` only bounds a single
     stalled read, so a source that keeps dripping just under that timeout could
     otherwise extend the download indefinitely while never tripping the byte cap.
-    Checking the deadline between reads fails closed on that.
+    ``read1`` returns available bytes without waiting for a full 64 KiB buffer.
+    A timer also shuts down the HTTP socket at the deadline, including while
+    parsing chunk framing inside a blocking read.
     """
     chunks = []
     total = 0
-    while True:
-        if deadline is not None and time.monotonic() > deadline:
-            raise ArtifactMaterializationError(
-                "artifact download exceeded total time budget")
-        chunk = response.read(65536)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > cap:
-            raise ArtifactMaterializationError(
-                "artifact exceeds %d-byte download cap" % cap)
-        chunks.append(chunk)
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if deadline is not None and isinstance(response, http.client.HTTPResponse) and sock is None:
+        raise ArtifactMaterializationError(
+            "artifact download cannot enforce total time budget on this HTTP transport")
+    expired = threading.Event()
+    timer = None
+    if deadline is not None and sock is not None:
+        def interrupt_read():
+            expired.set()
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        timer = threading.Timer(max(0, deadline - time.monotonic()), interrupt_read)
+        timer.daemon = True
+        timer.start()
+    read = getattr(response, "read1", response.read)
+    try:
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ArtifactMaterializationError(
+                    "artifact download exceeded total time budget")
+            try:
+                chunk = read(65536)
+            except Exception as exc:
+                if expired.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                    raise ArtifactMaterializationError(
+                        "artifact download exceeded total time budget") from exc
+                raise
+            if expired.is_set() or (deadline is not None and time.monotonic() >= deadline):
+                raise ArtifactMaterializationError(
+                    "artifact download exceeded total time budget")
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise ArtifactMaterializationError(
+                    "artifact exceeds %d-byte download cap" % cap)
+            chunks.append(chunk)
+    finally:
+        if timer is not None:
+            timer.cancel()
     return b"".join(chunks)
 
 
@@ -148,7 +184,7 @@ def materialize_entry(entry, *, root, opener=None, timeout=60, total_timeout=Non
         total_timeout = max(timeout * 10, 600)
     deadline = time.monotonic() + total_timeout
     try:
-        response = opener(request, timeout=timeout)
+        response = opener(request, timeout=min(timeout, total_timeout))
         with response:
             payload = _read_capped(response, _MAX_ARTIFACT_BYTES, deadline=deadline)
     except ArtifactMaterializationError:

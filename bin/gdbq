@@ -5,8 +5,7 @@
 # 아니다). gdb 실패(크래시·배치 오류·undefined command → rc!=0)를 성공으로 보고하면
 # 신뢰 검증기 증거 게이트가 오염되므로, 표시용 필터(sed|grep)가 모든 줄을 걸러
 # 내더라도 성공한 gdb 세션은 0으로 남는다. 출력과 실행 시간에는 상한을 둔다.
-# gdb는 임시 파일로 받아 rc를 직접 포착하고(파이프 안에 묻지 않는다),
-# 그 뒤 순수 표시용으로만 필터한다.
+# gdb 출력은 실행 중 cap+1 바이트만 임시 파일에 기록하고 PIPESTATUS로 rc를 포착한다.
 export PWNDBG_NO_AUTOUPDATE=1
 BIN="$1"; shift
 args=(-q -batch -ex "set context-sections ''")
@@ -14,21 +13,29 @@ for c in "$@"; do args+=(-ex "$c"); done
 
 GDBQ_TIMEOUT="${GDBQ_TIMEOUT:-60}"   # 벽시계 상한(초); 호출부가 재정의 가능
 GDBQ_MAX_BYTES="${GDBQ_MAX_BYTES:-$((64 * 1024 * 1024))}"  # 필터 전 원시 출력 상한
+if [[ ! "$GDBQ_MAX_BYTES" =~ ^[0-9]+$ ]] || (( GDBQ_MAX_BYTES < 1 || GDBQ_MAX_BYTES > 1073741824 )); then
+  echo "gdbq: invalid GDBQ_MAX_BYTES" >&2
+  exit 2
+fi
 
 raw_file="$(mktemp "${TMPDIR:-/tmp}/gdbq.XXXXXX")"
 trap 'rm -f "$raw_file"' EXIT
 
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=TERM --kill-after=2 "${GDBQ_TIMEOUT}s" \
-    gdb "${args[@]}" "$BIN" >"$raw_file" 2>&1
+    gdb "${args[@]}" "$BIN" 2>&1 | head -c "$((GDBQ_MAX_BYTES + 1))" >"$raw_file"
 else
-  gdb "${args[@]}" "$BIN" >"$raw_file" 2>&1
+  gdb "${args[@]}" "$BIN" 2>&1 | head -c "$((GDBQ_MAX_BYTES + 1))" >"$raw_file"
 fi
-gdb_rc=$?
+gdb_rc=${PIPESTATUS[0]}
+
+if (( $(wc -c <"$raw_file") > GDBQ_MAX_BYTES )); then
+  echo "gdbq: raw output exceeded ${GDBQ_MAX_BYTES}-byte cap" >&2
+  exit 122
+fi
 
 # 원시 출력을 바이트 상한까지만 읽어 표시용 필터에 통과(폭주 방지).
-head -c "$GDBQ_MAX_BYTES" "$raw_file" \
-  | sed -r 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+sed -r 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$raw_file" \
   | grep -vaE 'pwndbg:|Loaded .* pwndbg|Reading symbols from|no debugging symbols found|Thread debugging using|Using host libthread_db|PWNDBG_NO_AUTOUPDATE|automatic updating'
 
 # timeout(124)·gdb 비정상 종료(undefined command 등 rc!=0)를 그대로 전파;

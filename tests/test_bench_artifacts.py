@@ -1,19 +1,29 @@
 import io
+import http.client
+import http.server
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "bin"))
 
 from ratlib.bench_artifacts import (
-    ArtifactMaterializationError, git_blob_sha1, materialize_entry,
+    ArtifactMaterializationError, _read_capped, git_blob_sha1, materialize_entry,
 )
 import ratlib.bench_artifacts as bench_artifacts
 
 
 class BenchArtifactTests(unittest.TestCase):
+    def test_http_without_interruptible_socket_fails_closed(self):
+        response = object.__new__(http.client.HTTPResponse)
+        response.fp = io.BytesIO(b"payload")
+        with self.assertRaisesRegex(ArtifactMaterializationError, "cannot enforce"):
+            _read_capped(response, 1024, deadline=time.monotonic() + 1)
+
     def _entry(self, payload):
         return {
             "id": "real-example-01",
@@ -143,6 +153,40 @@ class BenchArtifactTests(unittest.TestCase):
                                   timeout=60, total_timeout=300)
             target = os.path.join(root, entry["dir"], entry["binary"])
             self.assertFalse(os.path.exists(target))
+
+    def test_live_chunked_drip_stops_within_total_deadline(self):
+        entry = self._entry(b"expected")
+
+        class DripHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    for _ in range(100):
+                        self.wfile.write(b"1\r\nX\r\n")
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DripHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        entry["fetch"]["url"] = "http://127.0.0.1:%d/chall.bin" % server.server_port
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                start = time.monotonic()
+                with self.assertRaisesRegex(ArtifactMaterializationError, "total time budget"):
+                    materialize_entry(entry, root=root, timeout=1, total_timeout=0.2)
+                self.assertLess(time.monotonic() - start, 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_oversized_existing_file_is_rejected_before_read(self):
         """Codex P2: an already-materialized target larger than the cap must fail

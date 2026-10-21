@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,6 +41,34 @@ class ConcreteVerifyBound(unittest.TestCase):
             out, truncated = self.symsolve._run_bounded([flood], b"", timeout=15)
             self.assertLessEqual(len(out), cap)
             self.assertTrue(truncated)
+
+    def test_endless_output_stops_at_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            flood = os.path.join(d, "flood.sh")
+            Path(flood).write_text("#!/bin/sh\nexec yes AAAA\n")
+            os.chmod(flood, 0o755)
+            start = time.monotonic()
+            out, truncated = self.symsolve._run_bounded([flood], None, timeout=5)
+            self.assertTrue(truncated)
+            self.assertEqual(len(out), self.symsolve._CONCRETE_VERIFY_OUTPUT_CAP)
+            self.assertLess(time.monotonic() - start, 3)
+
+    def test_transient_nonblocking_stdin_backpressure_is_retried(self):
+        real_write = os.write
+        attempts = 0
+
+        def write_after_eagain(fd, data):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise BlockingIOError(11, "temporarily unavailable")
+            return real_write(fd, data)
+
+        with mock.patch.object(self.symsolve.os, "write", side_effect=write_after_eagain):
+            out, truncated = self.symsolve._run_bounded(["/bin/cat"], b"hello", timeout=5)
+        self.assertEqual(out, b"hello")
+        self.assertFalse(truncated)
+        self.assertGreaterEqual(attempts, 2)
 
     def test_forked_descendant_is_killed_on_timeout(self):
         with tempfile.TemporaryDirectory() as d:

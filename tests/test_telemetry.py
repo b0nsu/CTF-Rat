@@ -118,6 +118,15 @@ class BenchmarkResultV2Schema(unittest.TestCase):
         doc["metrics"]["correctness"] = {"verified_solve": True, "false_solved": False}
         with self.assertRaises(ValidationError): validate(doc)
 
+    def test_split_correctness_rejects_wrong_types_and_alias_mismatch(self):
+        for field, value in (("verified_solve", 1), ("false_solved", "false"),
+                             ("completion_verified", False),
+                             ("challenge_oracle_pass", "success")):
+            with self.subTest(field=field):
+                doc = self._valid()
+                doc["metrics"]["correctness"][field] = value
+                with self.assertRaises(ValidationError): validate(doc)
+
 class OperationFingerprint(unittest.TestCase):
     def test_identical_inputs_produce_identical_fingerprint(self):
         self.assertEqual(operation_fingerprint(envelope()), operation_fingerprint(envelope()))

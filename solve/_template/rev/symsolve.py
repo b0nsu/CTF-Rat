@@ -32,6 +32,7 @@ import importlib.metadata
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -432,12 +433,13 @@ def _run_bounded(run_args, stdin_val, timeout):
     """복원 입력을 실제 바이너리에 넣어 실행하되 출력·수명을 bound한다.
 
     - 새 세션(process group)으로 띄워 timeout 시 fork된 자식 손자까지 killpg로 정리.
-    - stdout/stderr는 cap까지만 읽어 적대적 바이너리의 출력 폭주로부터 메모리 보호.
-    반환: (combined_output_bytes[:cap+], truncated). 실행 불가/타임아웃은 예외로 전파.
+    - stdout/stderr와 stdin을 nonblocking으로 처리하며 cap+1 바이트만 보관.
+    반환: (combined_output_bytes[:cap], truncated). 실행 불가/타임아웃은 예외로 전파.
     """
     posix = os.name == "posix"
     proc = subprocess.Popen(
-        run_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        run_args, stdin=subprocess.PIPE if stdin_val else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=posix,  # 자체 process group → 손자까지 한 번에 종료
     )
@@ -447,25 +449,58 @@ def _run_bounded(run_args, stdin_val, timeout):
             try:
                 os.killpg(os.getpgid(proc.pid), __import__("signal").SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
+                if proc.poll() is None:
+                    proc.kill()
         else:
-            proc.kill()
+            if proc.poll() is None:
+                proc.kill()
 
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    pending = memoryview(stdin_val) if stdin_val else None
     try:
-        # communicate는 전체 출력을 메모리에 담으므로, cap+1 만큼만 안전하게 읽기
-        # 위해 통신 후 잘라낸다. timeout은 communicate가 강제하고, 초과 시 그룹 전체를
-        # kill 한 뒤 잔여 파이프를 비워 좀비/파이프 블록을 막는다.
-        out, _ = proc.communicate(input=stdin_val, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(proc.stdout.fileno(), False)
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            if pending:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(run_args, timeout)
+                for key, _events in selector.select(remaining):
+                    if key.fileobj is proc.stdin:
+                        try:
+                            written = os.write(proc.stdin.fileno(), pending)
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            written = len(pending)
+                        pending = pending[written:]
+                        if not pending:
+                            selector.unregister(proc.stdin)
+                            proc.stdin.close()
+                    else:
+                        chunk = os.read(proc.stdout.fileno(), min(65536, _CONCRETE_VERIFY_OUTPUT_CAP + 1 - len(output)))
+                        if not chunk:
+                            selector.unregister(proc.stdout)
+                            continue
+                        output.extend(chunk)
+                        if len(output) > _CONCRETE_VERIFY_OUTPUT_CAP:
+                            _terminate()
+                            proc.wait(timeout=5)
+                            return bytes(output[:_CONCRETE_VERIFY_OUTPUT_CAP]), True
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        return bytes(output), False
+    except BaseException:
         _terminate()
-        try:
-            proc.communicate(timeout=5)
-        except (subprocess.TimeoutExpired, ValueError, OSError):
-            pass
+        proc.wait(timeout=5)
         raise
-    out = out or b""
-    truncated = len(out) > _CONCRETE_VERIFY_OUTPUT_CAP
-    return out[:_CONCRETE_VERIFY_OUTPUT_CAP], truncated
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.stdout.close()
 
 
 def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):

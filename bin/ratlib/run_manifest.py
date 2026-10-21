@@ -285,23 +285,28 @@ def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
     # digest/size ABORTS, because a changed file under an unchanged provenance
     # record is a tampering signal, not a benign miss. binary/libc are excluded
     # here because they are recomputed fresh just below.
-    solve_dir = os.path.dirname(os.path.abspath(destination))
+    solve_dir = os.path.realpath(os.path.dirname(os.path.abspath(destination)))
     carried = []
     for item in payload["inputs"]:
         if item.get("role") in ("binary", "libc") or item.get("name") in extra_names:
             continue
-        name = item.get("name")
-        candidate = os.path.join(solve_dir, name) if name else None
-        if not candidate or not os.path.isfile(candidate):
+        input_name = item.get("name")
+        if (not isinstance(input_name, str) or input_name in ("", ".", "..")
+                or os.path.basename(input_name) != input_name):
+            raise ValueError("retained input has unsafe name: %r" % input_name)
+        candidate = os.path.join(solve_dir, input_name)
+        if os.path.islink(candidate) or os.path.realpath(candidate) != os.path.abspath(candidate):
+            raise ValueError("retained input escapes solve directory: %r" % input_name)
+        if not os.path.isfile(candidate):
             continue  # stale: the artifact it vouches for is not present
         recorded_digest = str(item.get("sha256", "")).lower()
         if recorded_digest and recorded_digest != sha256_file(candidate):
             raise ValueError("retained input %r digest differs on disk; refusing "
-                             "to carry stale provenance" % name)
+                             "to carry stale provenance" % input_name)
         recorded_size = item.get("size")
         if isinstance(recorded_size, int) and recorded_size != os.path.getsize(candidate):
             raise ValueError("retained input %r size differs on disk; refusing "
-                             "to carry stale provenance" % name)
+                             "to carry stale provenance" % input_name)
         carried.append(item)
     inputs = carried
     inputs.append(_input("binary", binary))

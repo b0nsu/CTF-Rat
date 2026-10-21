@@ -215,6 +215,8 @@ class RawAndMultiArtifactTests(unittest.TestCase):
                                         owner_path=str(dest))
             self.assertEqual([i["name"] for i in doc["inputs"] if i.get("role") == "loader"],
                              ["ld.so"])
+            self.assertEqual(doc["scaffold"]["name"], "chall")
+            self.assertEqual(doc["target_policy"]["guard_challenge"], "chall")
             # (c) present but drifted digest -> abort
             src3 = new_direct("chall", str(binary), None, None)
             src3["inputs"].append({"role": "loader", "name": "ld.so",
@@ -226,6 +228,32 @@ class RawAndMultiArtifactTests(unittest.TestCase):
                 materialize_for_solve(str(src_path), str(dest), name="chall",
                                       binary=str(binary), libc=None, remote=None,
                                       owner_path=str(dest))
+
+    def test_retained_provenance_rejects_path_escape(self):
+        from ratlib.run_manifest import new_direct, atomic_write, _input
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "chall"
+            binary.write_bytes(b"binary")
+            solve = root / "solve"
+            solve.mkdir()
+            outside = root / "outside"
+            outside.write_bytes(b"outside")
+            src_path, dest = root / "src.json", solve / "run.json"
+            for unsafe_name in ("../outside", str(outside), "link"):
+                if unsafe_name == "link":
+                    (solve / "link").symlink_to(outside)
+                src = new_direct("chall", str(binary), None, None)
+                item = _input("loader", str(outside))
+                item["name"] = unsafe_name
+                src["inputs"].append(item)
+                atomic_write(str(src_path), src)
+                with self.subTest(unsafe_name=unsafe_name):
+                    with self.assertRaisesRegex(ValueError, "unsafe name|escapes solve"):
+                        materialize_for_solve(str(src_path), str(dest), name="chall",
+                                              binary=str(binary), libc=None, remote=None,
+                                              owner_path=str(dest))
+                    self.assertFalse(dest.exists())
 
     def test_newchal_boot_multi_image_scaffolding_and_duplicate_guard(self):
         with tempfile.TemporaryDirectory() as root:

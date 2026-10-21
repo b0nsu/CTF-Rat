@@ -9,6 +9,7 @@ filter must still exit 0.
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -40,11 +41,26 @@ class GdbqExitStatus(unittest.TestCase):
     def test_valid_session_preserves_requested_output(self):
         r = self._run("/bin/true", "print 1+1")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("$1 = 0x2", r.stdout)
+        self.assertRegex(r.stdout, r"\$1 = (?:2|0x2)\b")
 
     def test_timeout_is_propagated(self):
         r = self._run("/bin/true", "shell sleep 10", env={"GDBQ_TIMEOUT": "1"})
         self.assertEqual(r.returncode, 124, r.stdout + r.stderr)
+
+
+class GdbqOutputCap(unittest.TestCase):
+    def test_cap_is_enforced_while_gdb_writes(self):
+        with tempfile.TemporaryDirectory() as root:
+            fake_gdb = Path(root) / "gdb"
+            fake_gdb.write_text("#!/bin/sh\nhead -c 200000 /dev/zero\n")
+            fake_gdb.chmod(0o755)
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
+                       TMPDIR=root, GDBQ_MAX_BYTES="1024")
+            result = subprocess.run(["bash", str(GDBQ), "/bin/true"], env=env,
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 122, result.stderr)
+            self.assertIn(b"exceeded", result.stderr)
+            self.assertEqual(list(Path(root).glob("gdbq.*")), [])
 
 
 if __name__ == "__main__":
