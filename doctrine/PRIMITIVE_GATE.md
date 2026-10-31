@@ -21,7 +21,7 @@ generic gate(`>=3` distinct active+direct SELF)는 모든 PASS의 바닥 조건�
 
 | primitive class | contract | required proof slots |
 |---|---|---|
-| `control-flow` | `control-flow/v2` | control state: `pwn.reg*` 또는 `pwn.control-flow.state*` · attacker marker: `pwn.marker*` 또는 `pwn.memory-control*` · control target: 검증된 입력 변경 → 제어 대상 → 제어 이전 관계 (현재 producer 미지원) |
+| `control-flow` | `control-flow/v2` | control state: `pwn-control-state` · attacker marker: `pwn-memory-control` · control target: `pwn-control-transfer`가 같은 GDB 세션의 두 입력에서 간접 분기 target 변경과 single-step 뒤 PC 일치를 확인 |
 | `solution-reconstruction` | `solution-reconstruction/v2` | recovered input: `rev.solution.input*` 또는 `rev.symsolve.input*` · success oracle: `rev.solution.oracle*` 또는 `rev.oracle*` · concrete replay: `rev.solution.replay*` 또는 `rev.symsolve.concrete-verify*` |
 
 신규 PASS는 계약 필드가 없으면 현재 버전을 채우고 null·빈 문자열·잘못된 버전은 거부한다.
@@ -66,9 +66,24 @@ Heap/tcache primitive 는 추가로 아래를 증명해야 한다.
 
 `pwn-control-state`는 register snapshot, `pwn-memory-control`은 marker 일치만 기록한다.
 `pwn-control-target`은 일반 word 일치만 확인하므로 `pwn.memory-word`로 기록하고
-`control_relation_proven:false`를 반환한다. 이 세 관찰을 조합해도 `control-flow/v2` PASS는 거부한다.
-현재 verifier는 입력이 제어 대상을 변경하고 그 대상이 제어 이전에 사용되는 동일 scenario 관계를
-증명하지 못한다. `pwn.offset`이나 kind prefix도 control-target 슬롯을 대신할 수 없다.
+`control_relation_proven:false`를 반환한다. 이 관찰은 `control-flow/v2`의 control-target 슬롯을 채우지 못한다.
+`pwn-control-transfer`는 같은 breakpoint에서 서로 다른 stdin 파일로 두 번 실행한다. 각 실행에서
+간접 `call`/`jmp` 명령, 명령 직전의 target register와 PC, 한 명령 `si` 이후 PC를 측정한다.
+두 target이 다르고 각 target이 직후 PC와 같아야 `pwn.control-target` 관찰을 기록한다.
+세 proof slot의 첫 입력 digest와 breakpoint가 일치해야 PASS가 된다. 이 관계는 입력이
+두 관찰된 target 중 어느 쪽으로 제어를 옮기는지 증명하며 임의 주소 선택까지 뜻하지 않는다.
+`pwn.offset`이나 kind prefix는 이 슬롯을 대신할 수 없다.
+
+```sh
+bin/rat-adapt --root .rat --input ./chal --direct-subject ./chal \
+  --proof pwn-control-transfer --proof-input first.bin \
+  --proof-control-input second.bin --proof-break 0x401234 \
+  --proof-target-register '$rax' gdbq
+```
+
+`pwn-control-state`와 `pwn-memory-control`도 `first.bin` 및 같은 breakpoint로 별도 실행해
+독립적인 direct evidence 봉투 세 개를 만든다. 사용 가능한 register는 x86-64 일반
+목적 `r*` register이며, 제어 이전 명령이 그 register를 직접 사용하는 경우에 한한다.
 
 모든 GDB proof run은 inferior stdout/stderr와 debugger 응답을 별도 immutable artifact로 저장한다.
 PWN parser는 adapter가 삽입한 단일 measurement 구간만 읽고, memory 응답에 출력된 실제 주소가
@@ -149,7 +164,19 @@ proof mode가 없는 기존 `rat-adapt ... gdbq --batch ...` 경로와 수동 `s
 `rev.symsolve.concrete-verify` observation의 engine provenance를 확인하고, 근거가 없으면 기본
 deny한다. 그 observation의 `engine_identity.harness_sha256`은 trusted verifier manifest와
 대조하고 합성 `engine_build_digest`와의 일치를 확인한다. 이전 형식처럼 `engine_identity`가
-없는 기록은 새 concrete-verify 또는 수동 attestation이 필요하다. 뒤에 추가된 PWN route note만으로 앞선 rev 후보를 지우지 않으며, active+direct
+없는 기록은 새 concrete-verify 또는 수동 attestation이 필요하다. 종료 상태도 기록되어야 한다:
+`target_returncode == expected_exit_code`이며 두 값은 정상 종료 코드 0–255여야 한다.
+기본 예상 코드는 0이다. 비영 정상 종료가 성공인 문제는 `symsolve --expect-exit-code N`으로
+명시하고 result JSON과 STATE observation에 같은 값을 남긴다. 시그널 종료는 PASS가 아니다.
+
+2026-10-23 이전 trusted manifest의 symsolve.py digest 5개
+(`9640470c`, `7a93a07c`, `036c9783`, `f560aa08`, `c61b2269`로 시작)는 대상 종료코드를
+검사하지 않아 신뢰 목록에서 제외했다. 이 digest로 생성한 기존 rev-symbolic STATE는
+자동 이관되지 않으며 completion gate가 `unsanctioned-symbolic-engine`으로 거부한다.
+원본 바이너리와 입력을 현재 symsolve로 다시 concrete-verify하여 새 observation을 기록하거나,
+실행자가 관련 원본 로그를 직접 확인한 뒤 유효한 수동 attestation을 작성해야 한다.
+기존 JSONL을 삭제하거나 과거 PASS를 소급해서 성공으로 간주하지 않는다.
+뒤에 추가된 PWN route note만으로 앞선 rev 후보를 지우지 않으며, active+direct
 `pwn.*` SELF observation은 잠정적 rev route보다 우선한다. Router v2의 rev lead와 PWN lead가
 한 note에 함께 있으면 그 note만으로 rev 분류하지 않는다.
 rev route note가 없거나 혼합 lead뿐이고 primitive class가 allowlist 밖이면 이 분류로는 잡히지 않는다.

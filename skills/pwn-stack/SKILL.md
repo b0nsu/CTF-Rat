@@ -6,7 +6,7 @@ hot-path only — full technique catalog: `knowledge/ctf-skills/overflow-basics.
 - `recon`/`rat route` flags an overflow-prone import and `elf.nx == false` (shellcode-on-stack still viable). Strong/unbounded sinks: `gets`, `strcpy`, `strcat`, `sprintf`, `scanf` family. Weaker/bounded-capable sinks routed here as a heuristic: `read`, `memcpy`, `fgets`, `fread` — with these, confirm the read length is actually unbounded (source or `pwncrash`) before treating the overflow as real.
 
 ## FIRST ACTION
-- `pwncalc` for offsets/alignment, `pwnropcheck` to confirm the stack region is actually executable and mapped as expected before assembling anything.
+- Use `pwncalc` for measured offsets/alignment. Confirm runtime stack permissions from the local process's memory mappings (for example, a bounded GDB `info proc mappings` read). `pwnropcheck` checks chain entries against supplied ELF PT_LOAD segments; it cannot establish runtime stack permissions.
 - Confirm the overflow's controlled length with a cyclic pattern locally (`pwncrash`) — do not assume the source-read length.
 
 ## PIVOT

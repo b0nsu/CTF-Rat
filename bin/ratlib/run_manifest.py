@@ -251,7 +251,11 @@ def new_direct(name: str, binary: str, libc: Optional[str], remote: Optional[str
 
 def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
                           binary: str, libc: Optional[str], remote: Optional[str],
-                          owner_path: str, extra_inputs=()) -> dict[str, Any]:
+                          owner_path: str, extra_inputs=(),
+                          original_binary: Optional[str] = None,
+                          original_libc: Optional[str] = None,
+                          transformation: Optional[Mapping[str, Any]] = None,
+                          execution_binary: Optional[str] = None) -> dict[str, Any]:
     """Preserve one run identity while making solve/run.json the authoritative copy."""
     incoming = read(source) if source else None
     existing = read(destination) if os.path.isfile(destination) else None
@@ -320,6 +324,41 @@ def materialize_for_solve(source: Optional[str], destination: str, *, name: str,
         if qemu:
             payload.setdefault("environment", {})["qemu_launch_hints"] = qemu
     payload["inputs"] = inputs
+    if original_binary is not None:
+        if not isinstance(transformation, Mapping) or transformation.get("status") not in {
+                "not-run", "success", "failed"} or transformation.get("tool") != "pwninit":
+            raise ValueError("invalid artifact transformation status")
+        if (transformation["status"] == "not-run" and transformation.get("exit_code") is not None
+                or transformation["status"] != "not-run" and type(transformation.get("exit_code")) is not int):
+            raise ValueError("invalid pwninit exit status")
+        def local_copy(path):
+            absolute = os.path.abspath(path)
+            relative = os.path.relpath(absolute, solve_dir)
+            if (relative.startswith(".." + os.sep) or relative == ".."
+                    or os.path.islink(absolute) or os.path.realpath(absolute) != absolute
+                    or not os.path.isfile(absolute)):
+                raise ValueError("artifact provenance path must be a local regular file")
+            return {"path": relative, "sha256": sha256_file(absolute),
+                    "size": os.path.getsize(absolute)}
+        if bool(libc) != bool(original_libc):
+            raise ValueError("original libc and working libc must both be present")
+        provenance = {
+            "binary": {"original": local_copy(original_binary),
+                       "working": local_copy(binary)},
+            "libc": ({"original": local_copy(original_libc),
+                      "working": local_copy(libc)} if libc else None),
+            "transformation": dict(transformation),
+            "execution": {"binary": local_copy(execution_binary or binary),
+                          "libc": local_copy(libc) if libc else None},
+        }
+        previous = payload.get("artifact_provenance")
+        if isinstance(previous, Mapping):
+            for role in ("binary", "libc"):
+                old = previous.get(role)
+                new = provenance.get(role)
+                if old and new and old.get("original", {}).get("sha256") != new["original"]["sha256"]:
+                    raise ValueError("preserved original %s digest changed" % role)
+        payload["artifact_provenance"] = provenance
     payload["updated_at"] = now_iso()
     payload["manifest_owner"] = {"kind": "solve", "path": owner_path}
     payload["scaffold"] = {"name": name, "binary": os.path.basename(binary),

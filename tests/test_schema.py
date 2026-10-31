@@ -21,7 +21,7 @@ class RouteResultSchema(unittest.TestCase):
         doc=route(profile={"imports":["read"]}, binary_digest="sha256:"+"0"*64,
                   probe_feedback={action["probe_id"]:{"status":"partial","reason":"bounded probe incomplete"}})
         try: import jsonschema
-        except ImportError: return
+        except ImportError: self.skipTest("jsonschema is not installed")
         jsonschema.validate(doc, schema)
     def test_reference_schema_status_enums_match_runtime_inspected_state(self):
         # route_feedback emits an "inspected" status (see route.py / route_feedback.py);
@@ -32,7 +32,7 @@ class RouteResultSchema(unittest.TestCase):
             enum=schema["properties"][field]["items"]["properties"]["status"]["enum"]
             self.assertIn("inspected", enum, field)
         try: import jsonschema
-        except ImportError: return
+        except ImportError: self.skipTest("jsonschema is not installed")
         doc=route()
         doc["feedback"]=[{"probe_id":"p1","status":"inspected","reason":"decompilation completed; unverified"}]
         doc["probe_status"]=[{"probe_id":"p1","status":"inspected","reason":"crash probe is not structured evidence"}]

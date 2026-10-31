@@ -262,8 +262,10 @@ def route_assessment_metrics(state_dir):
     `rat route` and `rat brief` store these as ordinary ``note.recorded`` events
     with ``kind=route-assessment``.  Reusing the existing stream keeps routing
     telemetry observer-readable without adding a second database or a new STATE
-    event family. Repeating the same assessment increases assessment_count but
-    not revision_count; the latter counts adjacent fingerprint transitions.
+    event family. Repeating an assessment increases assessment_count. The
+    decision_revision_count counts adjacent changes to the recommended decision,
+    including a change to or from null; changes in skill, commitment, dimensions,
+    or the whole-note fingerprint alone are not decision revisions.
     """
     try:
         events = Stream(state_dir).read()

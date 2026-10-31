@@ -152,7 +152,8 @@ class CompletionGateTests(unittest.TestCase):
             "kind": "rev.symsolve.concrete-verify", "quality": {"level": "heuristic"},
             "validity": {"state": "active"},
             "subject": {"kind": "binary", "sha256": self.primitive["input_digest"]},
-            "value": {"verdict": "pass", "engine": "symsolve", "engine_build_digest": digest},
+            "value": {"verdict": "pass", "engine": "symsolve", "engine_build_digest": digest,
+                      "target_returncode": 0, "expected_exit_code": 0},
             "producer": {"tool": "symsolve", "engine": "symsolve", "engine_build_digest": digest,
                          "engine_identity": identity},
             "evidence": [self.record["report_digest"]],
@@ -182,10 +183,40 @@ class CompletionGateTests(unittest.TestCase):
         self.assertFalse(result["verified"])
         self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
 
+    def test_pre_exit_check_symsolve_builds_require_reverification(self):
+        retired = (
+            "9640470cae3f61740226b531d8e4bf1cb7e62808b254fc92505d16f93f29c106",
+            "7a93a07cd72e2c6cc03cfe4b6a7baca2c96b563f23e50f21ad9eb9563fe65989",
+            "036c97838ec72fb8bc30bdfae7c4cc3feb8df97345d71c88dc2f89c70ff99133",
+            "f560aa08e744937c17eb055d38acff3811dce69f58e371683ca6648789085cc0",
+            "c61b2269f32ea1a442eaab55d6319a65a86d46efbccc86d1ecfa72f3e5ed9876",
+        )
+        for digest in retired:
+            with self.subTest(digest=digest):
+                observation = self._sanctioned_observation()
+                identity = observation["producer"]["engine_identity"]
+                identity["harness_sha256"] = "sha256:" + digest
+                encoded = {**identity, "harness_sha256": digest}
+                build = "sha256:" + hashlib.sha256(json.dumps(
+                    encoded, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                observation["producer"]["engine_build_digest"] = build
+                observation["value"]["engine_build_digest"] = build
+                result = self._run_symbolic_gate(
+                    self._symbolic_fixture(observation=observation))
+                self.assertFalse(result["verified"])
+                self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
+
     def test_mismatched_symsolve_engine_identity_is_denied(self):
         observation = self._sanctioned_observation()
         observation["producer"]["engine_build_digest"] = "sha256:" + "e" * 64
         observation["value"]["engine_build_digest"] = "sha256:" + "e" * 64
+        result = self._run_symbolic_gate(self._symbolic_fixture(observation=observation))
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")
+
+    def test_symsolve_observation_without_exit_evidence_is_denied(self):
+        observation = self._sanctioned_observation()
+        del observation["value"]["target_returncode"]
         result = self._run_symbolic_gate(self._symbolic_fixture(observation=observation))
         self.assertFalse(result["verified"])
         self.assertEqual(result["reason"], "unsanctioned-symbolic-engine")

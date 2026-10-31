@@ -164,10 +164,24 @@ done
 mkdir -p -- "$D"; D="$(resolve_path "$D")"
 case "$D/" in "$SOLVE_ROOT"/*/) ;; *) echo "[newchal:err] destination escaped solve root" >&2; exit 5;; esac
 cd "$D"
-cp -- "$BIN_ABS" ./
 BN="$(basename "$BIN_ABS")"
+[ ! -L original ] || { echo "[newchal:err] original directory must not be a symlink" >&2; exit 5; }
+mkdir -p -- original
+[ ! -L "original/$BN" ] || { echo "[newchal:err] original binary must not be a symlink" >&2; exit 5; }
+if [ -e "original/$BN" ] && ! cmp -s -- "$BIN_ABS" "original/$BN"; then
+  echo "[newchal:err] preserved original binary differs from supplied artifact" >&2; exit 5
+fi
+if [ ! -e "original/$BN" ]; then cp -- "$BIN_ABS" "original/$BN"; fi
+cp -- "original/$BN" "./$BN"
 for artifact in ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"}; do cp -- "${artifact#*=}" ./; done
-if [ -n "$LIBC_ABS" ]; then cp -- "$LIBC_ABS" ./libc.so.6; fi
+if [ -n "$LIBC_ABS" ]; then
+  [ ! -L original/libc.so.6 ] || { echo "[newchal:err] original libc must not be a symlink" >&2; exit 5; }
+  if [ -e original/libc.so.6 ] && ! cmp -s -- "$LIBC_ABS" original/libc.so.6; then
+    echo "[newchal:err] preserved original libc differs from supplied artifact" >&2; exit 5
+  fi
+  if [ ! -e original/libc.so.6 ]; then cp -- "$LIBC_ABS" original/libc.so.6; fi
+  cp -- original/libc.so.6 ./libc.so.6
+fi
 SRC_DIR="$(cd -- "$(dirname -- "$BIN_ABS")" && pwd)"
 DOCKER_SRC=""
 for cand in "$SRC_DIR/Dockerfile" "$SRC_DIR/../Dockerfile"; do
@@ -177,6 +191,7 @@ if [ -n "$DOCKER_SRC" ] && [ ! -f ./Dockerfile ]; then
   cp "$DOCKER_SRC" ./Dockerfile 2>/dev/null || true
 fi
 # pwninit: 매칭 ld fetch + patchelf. --no-template(중복 방지), timeout, 라이브 출력
+pwninit_status="not-run"; pwninit_rc=""
 if [ -n "$LIBC" ] && [[ "$ARTIFACT_KIND" != bzimage && "$ARTIFACT_KIND" != linux-boot-image && "$ARTIFACT_KIND" != vmlinux && "$ARTIFACT_KIND" != wasm-core-v1 ]] && command -v pwninit >/dev/null; then
   echo "[*] pwninit (ld fetch + patchelf, libc6-dbg 다운로드로 ~10-40s 소요될 수 있음)..."
   # `timeout` is GNU coreutils; macOS ships it as `gtimeout`. If neither exists,
@@ -191,12 +206,15 @@ if [ -n "$LIBC" ] && [[ "$ARTIFACT_KIND" != bzimage && "$ARTIFACT_KIND" != linux
   pwninit_rc=${PIPESTATUS[0]}
   set -e
   if [ "$pwninit_rc" -ne 0 ]; then
+    pwninit_status="failed"
     echo "[!] pwninit timeout/실패 (exit=$pwninit_rc) → reference/glibc/ 에서 libc 버전 수동 매칭 후 patchelf 필요 (reference/glibc/SOURCES 참조)"
+  else
+    pwninit_status="success"
   fi
 fi
-python3 - "$D" "$BN" "$HOST" "$PORT" "$ARTIFACT_KIND" <<'PY'
+python3 - "$D" "$BN" "$HOST" "$PORT" "$ARTIFACT_KIND" "$pwninit_status" <<'PY'
 import sys,os
-D,BN,HOST,PORT,KIND=sys.argv[1:6]
+D,BN,HOST,PORT,KIND,TRANSFORM_STATUS=sys.argv[1:7]
 if KIND in {"bzimage", "linux-boot-image", "vmlinux", "boot-sector-candidate", "disk-image-candidate"}:
     open(os.path.join(D,"exploit.py"),"w").write(
         '#!/usr/bin/env python3\n'
@@ -220,7 +238,7 @@ if KIND == "wasm-core-v1":
         '# TODO: invoke exports via the provided runtime; see run.json for host wiring.\n'
         'raise SystemExit("Configure the Wasm runtime harness first (see run.json)")\n' % BN)
     raise SystemExit(0)
-exe = "%s_patched" % BN if os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
+exe = "%s_patched" % BN if TRANSFORM_STATUS == "success" and os.path.exists(os.path.join(D,"%s_patched"%BN)) else BN
 haslibc = os.path.exists(os.path.join(D,"libc.so.6"))
 remote_branch = ('    if args.REMOTE: return remote(%r, %s)\n' % (HOST, PORT)) if HOST else ''
 open(os.path.join(D,"exploit.py"),"w").write('''#!/usr/bin/env python3
@@ -255,16 +273,23 @@ source, name, binary, remote = sys.argv[1:]
 print(Path(source).read_text(encoding="utf-8").replace("{{NAME}}", name)
       .replace("{{BIN}}", binary).replace("{{REMOTE}}", remote or "-"), end="")
 PY
-PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"} <<'PY'
+EXEC_BIN="$D/$BN"
+if [ "$pwninit_status" = success ] && [ -f "$D/${BN}_patched" ]; then EXEC_BIN="$D/${BN}_patched"; fi
+PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$RUN_ABS" "$D/run.json" "$NAME" "$D/$BN" "${LIBC_ABS:+$D/libc.so.6}" "$REMOTE" "solve/$NAME/run.json" "$D/original/$BN" "${LIBC_ABS:+$D/original/libc.so.6}" "$pwninit_status" "$pwninit_rc" "$EXEC_BIN" ${EXTRA_FILES[@]+"${EXTRA_FILES[@]}"} <<'PY'
 import os,sys
 from ratlib.run_manifest import materialize_for_solve
 source, destination, name, binary, libc, remote, owner = sys.argv[1:8]
+original_binary, original_libc, transform_status, transform_rc, execution_binary = sys.argv[8:13]
 extra = [(item.split("=", 1)[0], os.path.join(os.path.dirname(destination),
-          os.path.basename(item.split("=", 1)[1]))) for item in sys.argv[8:]]
+          os.path.basename(item.split("=", 1)[1]))) for item in sys.argv[13:]]
 try:
     materialize_for_solve(source or None, destination, name=name, binary=binary,
                           libc=libc or None, remote=remote or None, owner_path=owner,
-                          extra_inputs=extra)
+                          extra_inputs=extra, original_binary=original_binary,
+                          original_libc=original_libc or None,
+                          transformation={"tool": "pwninit", "status": transform_status,
+                                          "exit_code": int(transform_rc) if transform_rc else None},
+                          execution_binary=execution_binary)
 except (OSError, ValueError) as exc:
     print("[newchal:err] run manifest: %s" % exc, file=sys.stderr)
     raise SystemExit(2)
@@ -297,19 +322,24 @@ else
   # The first user-facing classification must come from the canonical
   # evidence-first router, not the independent legacy recon tier heuristic.
   echo "=== rat route (provisional evidence) ==="
-  ROUTE_RESULT="$(mktemp)"
-  trap 'rm -f -- "$ROUTE_RESULT"' EXIT
-  if "$CTF/bin/rat" route "./$BN" --format json 2>&1 | tee -a state.md "$ROUTE_RESULT"; then
-    if python3 - "$ROUTE_RESULT" <<'PY'
+  ROUTE_RESULT="$D/route.json"
+  ROUTE_DIAGNOSTICS="$D/route.stderr.log"
+  if "$CTF/bin/rat" route "./$BN" --format json >"$ROUTE_RESULT" 2>"$ROUTE_DIAGNOSTICS"; then
+    cat -- "$ROUTE_RESULT" | tee -a state.md
+    if [ -s "$ROUTE_DIAGNOSTICS" ]; then tee -a state.md < "$ROUTE_DIAGNOSTICS" >&2; fi
+    if PYTHONPATH="$RATLIB_BIN${PYTHONPATH:+:$PYTHONPATH}" python3 - "$ROUTE_RESULT" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
         route = json.load(fh)
+    from ratlib.schema import validate
+    validate(route, "rat.route-result/v2")
+    valid = isinstance(route.get("diagnostics", []), list)
     degraded = any(item.get("code") == "analysis_failed"
                    for item in route.get("diagnostics", []))
 except (OSError, ValueError, AttributeError, TypeError):
-    degraded = True
-raise SystemExit(1 if degraded else 0)
+    valid = False; degraded = True
+raise SystemExit(1 if not valid or degraded else 0)
 PY
     then
       echo; echo "[+] $D 생성. 다음: cd $D; 위 ROUTE의 next 후보 확인"
@@ -318,6 +348,8 @@ PY
       echo "[+] $D 생성. 다음: cd $D; rat route ./$BN 재시도"
     fi
   else
+    if [ -s "$ROUTE_RESULT" ]; then cat -- "$ROUTE_RESULT" | tee -a state.md; fi
+    if [ -s "$ROUTE_DIAGNOSTICS" ]; then tee -a state.md < "$ROUTE_DIAGNOSTICS" >&2; fi
     # Keep the scaffold usable, but do not silently fall back to recon or
     # mistake a failed route query for a verified challenge classification.
     echo "[newchal] ROUTE UNKNOWN: rat route 실패; 초기 유형/기법 미확인 (legacy recon 대체 판정 없음)" | tee -a state.md

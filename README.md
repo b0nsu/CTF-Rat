@@ -100,7 +100,7 @@ flowchart LR
 > [!NOTE]
 > **DEEP-only doctrine** — [SOLVING](doctrine/SOLVING.md) (FAST evidence handoff + bounded convergence loop) · [SOLVABILITY](doctrine/SOLVABILITY.md) · [PRIMITIVE_GATE](doctrine/PRIMITIVE_GATE.md) · [FINALS](doctrine/FINALS.md)
 >
-> Benchmark corpus, ablations, and design-review docs live on the `dev` branch. `main` ships only the operational tools needed to actually solve and verify challenges.
+> `main` includes the benchmark runner, committed suite, and evaluation documentation under `bench/`. Private held-out artifacts and local result files are excluded from the repository. Branch names do not certify a release; use the exact commit and test results when comparing versions.
 
 <div align="right"><a href="#readme-top">↑ back to top</a></div>
 
@@ -183,8 +183,8 @@ revq <bin>                     # summary + INTERESTING (check-routine candidates
 revq <bin> --func <name>       # single-function neighborhood card (saves context before decompiling)
 decomp <bin> <func>             # Bash executable: Ghidra headless decompile cache
 mod2solve system.json           # solve matrix @ x = target modulo 2**bits; verify against original inputs
-symsolve.py <bin> --find-str Correct --stdin 16 --printable   # recover input, re-run the real binary to verify
-vmlift.py --disasm|--run|--solve [blob]                       # custom VM lifter
+symsolve <bin> --find-str Correct --stdin 16 --printable      # recover input, re-run the real binary to verify
+vmlift --disasm|--run|--solve [blob]                          # toy-VM scaffold; adapt to target semantics first
 ```
 
 > [!TIP]

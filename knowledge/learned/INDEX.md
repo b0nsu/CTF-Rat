@@ -14,10 +14,16 @@ kept separate from the vendored `ctf-skills` and `ctf-reverse` corpora.
 Create one focused file per pattern under `pwn/` or `rev/`, using `TEMPLATE.md`. Index only lessons
 that have an evidence path and explicit applicability and failure conditions.
 
+## Pwn
+
+| Pattern | Status | Source | Evidence |
+|---|---|---|---|
+| _(none yet)_ | | | |
+
 ## Rev
 
 | Pattern | Status | Source | Evidence |
 |---|---|---|---|
 | _(none yet)_ | | | |
 
-> 인덱스에는 파일이 실제 존재하고 evidence 경로가 repo-relative인 lesson만 등재한다. 외부 머신 경로(`/work/...`)나 미존재 파일 링크는 등재 금지.
+> 인덱스에는 파일이 실제 존재하고 evidence 경로가 repo-relative인 lesson만 등재한다. 외부 머신 경로(`/work/...`)나 미존재 파일 링크는 등재 금지. `candidate` 행은 자동 로딩 대상이 아니며, 독립 artifact 재현 또는 명시적 반증 검토 후 `validated`로 승격해야 `rat query pattern`이 사용한다.

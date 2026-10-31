@@ -100,8 +100,13 @@ def engine_build_digest(identity=None):
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def record_concrete_observation(state_dir, binary, output, solutions):
+def record_concrete_observation(state_dir, binary, output, solutions,
+                                target_returncode, expected_exit_code=0):
     """Record a heuristic solve observation and link it to a rev-symbolic primitive."""
+    if (type(target_returncode) is not int or type(expected_exit_code) is not int
+            or not 0 <= expected_exit_code <= 255
+            or target_returncode != expected_exit_code):
+        raise ValueError("concrete observation requires the expected normal exit")
     repo = os.path.abspath(os.environ.get(
         "CTF_HOME", os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..")))
     bin_dir = os.path.join(repo, "bin")
@@ -122,6 +127,8 @@ def record_concrete_observation(state_dir, binary, output, solutions):
         "output_sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
         "output_hex": output_bytes.hex(),
         "solutions": solutions,
+        "target_returncode": target_returncode,
+        "expected_exit_code": expected_exit_code,
         "engine": "symsolve",
         "engine_build_digest": engine_digest,
     }
@@ -141,7 +148,9 @@ def record_concrete_observation(state_dir, binary, output, solutions):
         "subject": {"kind": "binary", "sha256": binary_digest},
         "kind": "rev.symsolve.concrete-verify",
         "value": {"verdict": "pass", "engine": "symsolve",
-                  "engine_build_digest": engine_digest},
+                  "engine_build_digest": engine_digest,
+                  "target_returncode": target_returncode,
+                  "expected_exit_code": expected_exit_code},
         "evidence": [evidence["digest"]],
         "quality": {"level": "heuristic"},
         "validity": {"state": "active"},
@@ -350,8 +359,11 @@ def solve(args):
     # verified success.  The exit code and result contract reflect that:
     #   pass -> 0, fail/skipped/disabled -> non-zero (distinct codes).
     cv_status = "disabled"; cv_detail = "concrete-verify disabled (--no-verify)" if args.no_verify else "no string oracle (--find/--avoid addresses only)"
+    target_returncode = None
     if not args.no_verify and (find_strs or avoid_strs):
-        ok, detail = concrete_verify(args.binary, symbols, found, find_strs, avoid_strs)
+        ok, detail, target_returncode = concrete_verify(
+            args.binary, symbols, found, find_strs, avoid_strs,
+            expected_exit_code=args.expect_exit_code)
         cv_detail = detail if isinstance(detail, str) else repr(detail)
         if ok is None:
             cv_status = "skipped"
@@ -366,7 +378,8 @@ def solve(args):
             if args.record_state_dir:
                 try:
                     observation_id = record_concrete_observation(
-                        args.record_state_dir, args.binary, detail, solutions)
+                        args.record_state_dir, args.binary, detail, solutions,
+                        target_returncode, args.expect_exit_code)
                     print("  STATE observation: %s" % observation_id)
                 except Exception as exc:
                     print("[symsolve:warn] STATE provenance 기록 실패: %s" % exc, file=sys.stderr)
@@ -375,7 +388,8 @@ def solve(args):
             print("  concrete-verify: ⚠️ 불일치 — angr 모델 ≠ 실제(anti-debug/환경/입력모델 의심). "
                   "실제 stdout=%r" % detail)
     _write_result(args, found=True, concrete_verify=cv_status,
-                  solutions=solutions, detail=cv_detail)
+                  solutions=solutions, detail=cv_detail,
+                  target_returncode=target_returncode)
     # Exit status: only a passing concrete-verify (or an address-only find with
     # no string oracle, where there is nothing to re-run) counts as success.
     if cv_status == "pass":
@@ -388,7 +402,8 @@ def solve(args):
 
 
 SYMSOLVE_RESULT_SCHEMA = "rat.symsolve-result/v1"
-def _write_result(args, found, concrete_verify, solutions, detail):
+def _write_result(args, found, concrete_verify, solutions, detail,
+                  target_returncode=None):
     """Atomically write the machine-readable concrete-verify contract.
 
     `concrete_verify` is one of: pass | fail | skipped | disabled | no-solution.
@@ -412,6 +427,8 @@ def _write_result(args, found, concrete_verify, solutions, detail):
         "found": bool(found),
         "concrete_verify": concrete_verify,
         "verified": concrete_verify == "pass",
+        "target_returncode": target_returncode,
+        "expected_exit_code": args.expect_exit_code,
         "solutions": solutions,
         "find_str": list(args.find_str), "avoid_str": [s for s in args.avoid_str if s],
         "detail": detail if isinstance(detail, str) else repr(detail),
@@ -434,7 +451,8 @@ def _run_bounded(run_args, stdin_val, timeout):
 
     - 새 세션(process group)으로 띄워 timeout 시 fork된 자식 손자까지 killpg로 정리.
     - stdout/stderr와 stdin을 nonblocking으로 처리하며 cap+1 바이트만 보관.
-    반환: (combined_output_bytes[:cap], truncated). 실행 불가/타임아웃은 예외로 전파.
+    반환: (combined_output_bytes[:cap], truncated, returncode).
+    출력 초과 시 returncode는 강제 종료된 대상의 코드다.
     """
     posix = os.name == "posix"
     proc = subprocess.Popen(
@@ -490,9 +508,9 @@ def _run_bounded(run_args, stdin_val, timeout):
                         if len(output) > _CONCRETE_VERIFY_OUTPUT_CAP:
                             _terminate()
                             proc.wait(timeout=5)
-                            return bytes(output[:_CONCRETE_VERIFY_OUTPUT_CAP]), True
+                            return bytes(output[:_CONCRETE_VERIFY_OUTPUT_CAP]), True, proc.returncode
         proc.wait(timeout=max(0, deadline - time.monotonic()))
-        return bytes(output), False
+        return bytes(output), False, proc.returncode
     except BaseException:
         _terminate()
         proc.wait(timeout=5)
@@ -503,9 +521,10 @@ def _run_bounded(run_args, stdin_val, timeout):
         proc.stdout.close()
 
 
-def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
+def concrete_verify(binpath, symbols, found, find_strs, avoid_strs,
+                    expected_exit_code=0):
     """복원 입력을 실제 바이너리에 넣어 재실행 → 목표 문자열 실제 출력 확인.
-    h4c.team 실패원인 ⑤(정적/모델 과신) 대응. 반환: (True|False|None, 상세).
+    h4c.team 실패원인 ⑤(정적/모델 과신) 대응. 반환: (True|False|None, 상세, returncode).
     None = 이 호스트에서 실행 불가(교차 아키텍처 등)로 스킵."""
     stdin_val = argv1 = None
     for label, bv, _n in symbols:
@@ -522,15 +541,18 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs):
         if shutil.which("wine"):
             run_args = ["wine"] + run_args
         else:
-            return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)"
+            return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)", None
     try:
-        out, truncated = _run_bounded(run_args, stdin_val, timeout=10)
+        out, truncated, returncode = _run_bounded(run_args, stdin_val, timeout=10)
     except Exception as e:
-        return None, "재실행 스킵(%s)" % type(e).__name__
+        return None, "재실행 스킵(%s)" % type(e).__name__, None
     if truncated:
-        return None, "concrete output cap exceeded; execution was not fully observed"
+        return None, "concrete output cap exceeded; execution was not fully observed", returncode
+    if returncode != expected_exit_code or returncode < 0:
+        return False, "target exit %s (expected %s); stdout=%r" % (
+            returncode, expected_exit_code, out[:200]), returncode
     ok = all(t in out for t in find_strs) and not any(t in out for t in avoid_strs)
-    return ok, out[:200]
+    return ok, out[:200], returncode
 
 
 # ─────────────────────────── selftest (순수 파서, angr 무관) ───────────────────────────
@@ -574,6 +596,8 @@ def build_parser():
     p.add_argument("--base", type=lambda s: int(s, 0), metavar="ADDR", help="로드 베이스 재지정")
     p.add_argument("--timeout", type=float, default=120.0, metavar="SEC", help="탐색 상한(기본 120s)")
     p.add_argument("--no-verify", action="store_true", help="복원 해의 실 바이너리 재실행 검증 생략")
+    p.add_argument("--expect-exit-code", type=int, default=0, metavar="N",
+                   help="concrete-verify 성공 종료코드(기본 0; 시그널 종료는 항상 실패)")
     p.add_argument("--record-state-dir", metavar="DIR",
                    help="concrete-verify 성공과 연결된 rev-symbolic provenance를 STATE에 기록")
     p.add_argument("--result", metavar="PATH",
@@ -591,6 +615,8 @@ def main(argv):
     if not args.binary:
         build_parser().print_help()
         return 2
+    if args.expect_exit_code < 0 or args.expect_exit_code > 255:
+        build_parser().error("--expect-exit-code must be between 0 and 255")
     if not native_angr_ready():
         sys.stderr.write(_native_engine_error() + "\n")
         return 2

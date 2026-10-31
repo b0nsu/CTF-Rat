@@ -23,5 +23,5 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-ctf.md
 
 ## VERIFY
 - typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`, ≥3 active+direct SELF observations) plus concrete-verify are both required before declaring SOLVED; a solver result alone is a hypothesis.
-- `symsolve.py --find-str <success> --avoid-str <fail>` with concrete-verify (real binary re-execution), or a hand-derived literal re-run through the real binary.
+- `symsolve <bin> --find-str <success> --avoid-str <fail>` with the measured input model and concrete-verify (real binary re-execution), or a hand-derived literal re-run through the real binary.
 - `SOLVED`/PASS requires the recovered input to actually produce the success path when fed to the unmodified binary.

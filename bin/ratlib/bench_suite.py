@@ -22,6 +22,7 @@ CORPORA = {"synthetic", "integration", "real", "private"}
 VERIFY_KINDS = {"flag-regex", "symsolve-restore", "rat-verify-pass"}
 _CAPABILITY = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _GIT_BLOB_SHA1 = re.compile(r"[0-9a-fA-F]{40}\Z")
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class SuiteValidationError(ValueError):
@@ -169,6 +170,14 @@ def validate_suite(doc):
                 re.compile(claim_pattern)
             except re.error as exc:
                 raise SuiteValidationError("%s.verify.claim_pattern is invalid: %s" % (entry_id, exc)) from exc
+        response_digest = verify.get("expected_response_sha256")
+        if response_digest is not None:
+            if not isinstance(response_digest, str) or not _SHA256.fullmatch(response_digest):
+                raise SuiteValidationError(
+                    "%s.verify.expected_response_sha256 must be sha256:<64 lowercase hex>" % entry_id)
+            if not claim_pattern:
+                raise SuiteValidationError(
+                    "%s.verify.claim_pattern is required for expected-response oracle" % entry_id)
         if not isinstance(entry.get("env", {}), Mapping):
             raise SuiteValidationError("%s.env must be an object" % entry_id)
     return doc

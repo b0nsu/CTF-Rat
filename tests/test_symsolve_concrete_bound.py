@@ -38,9 +38,10 @@ class ConcreteVerifyBound(unittest.TestCase):
             flood = os.path.join(d, "flood.sh")
             Path(flood).write_text("#!/bin/sh\nyes AAAA | head -c %d\n" % (cap * 4))
             os.chmod(flood, 0o755)
-            out, truncated = self.symsolve._run_bounded([flood], b"", timeout=15)
+            out, truncated, returncode = self.symsolve._run_bounded([flood], b"", timeout=15)
             self.assertLessEqual(len(out), cap)
             self.assertTrue(truncated)
+            self.assertNotEqual(returncode, 0)
 
     def test_endless_output_stops_at_cap(self):
         with tempfile.TemporaryDirectory() as d:
@@ -48,9 +49,10 @@ class ConcreteVerifyBound(unittest.TestCase):
             Path(flood).write_text("#!/bin/sh\nexec yes AAAA\n")
             os.chmod(flood, 0o755)
             start = time.monotonic()
-            out, truncated = self.symsolve._run_bounded([flood], None, timeout=5)
+            out, truncated, returncode = self.symsolve._run_bounded([flood], None, timeout=5)
             self.assertTrue(truncated)
             self.assertEqual(len(out), self.symsolve._CONCRETE_VERIFY_OUTPUT_CAP)
+            self.assertNotEqual(returncode, 0)
             self.assertLess(time.monotonic() - start, 3)
 
     def test_truncated_success_prefix_never_verifies(self):
@@ -63,7 +65,7 @@ class ConcreteVerifyBound(unittest.TestCase):
                 "sys.stdout.buffer.write(b'GOOD' + b'A' * %d + b'BAD')\n"
                 "sys.stdout.buffer.flush()\n" % cap)
             os.chmod(script, 0o755)
-            ok, detail = self.symsolve.concrete_verify(
+            ok, detail, returncode = self.symsolve.concrete_verify(
                 script, [], None, [b"GOOD"], [b"BAD"])
             self.assertIsNone(ok, "a truncated prefix must not become a PASS")
             self.assertIn("cap", detail)
@@ -80,10 +82,32 @@ class ConcreteVerifyBound(unittest.TestCase):
             return real_write(fd, data)
 
         with mock.patch.object(self.symsolve.os, "write", side_effect=write_after_eagain):
-            out, truncated = self.symsolve._run_bounded(["/bin/cat"], b"hello", timeout=5)
+            out, truncated, returncode = self.symsolve._run_bounded(["/bin/cat"], b"hello", timeout=5)
         self.assertEqual(out, b"hello")
         self.assertFalse(truncated)
+        self.assertEqual(returncode, 0)
         self.assertGreaterEqual(attempts, 2)
+
+    def test_exit_status_is_part_of_concrete_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, ending, expected, verdict in (
+                ("zero", "exit 0", 0, True),
+                ("seven", "exit 7", 0, False),
+                ("explicit_seven", "exit 7", 7, True),
+                ("signal", "kill -TERM $$", 0, False),
+                ("signal_with_expected_seven", "kill -TERM $$", 7, False),
+            ):
+                with self.subTest(name=name):
+                    script = os.path.join(d, name + ".sh")
+                    Path(script).write_text('#!/bin/sh\nprintf "GOOD\\n"\n' + ending + '\n')
+                    os.chmod(script, 0o755)
+                    ok, detail, returncode = self.symsolve.concrete_verify(
+                        script, [], None, [b"GOOD"], [], expected_exit_code=expected)
+                    self.assertEqual(ok, verdict)
+                    self.assertEqual(returncode, 0 if name == "zero" else
+                                     (7 if "seven" in name and not name.startswith("signal") else -15))
+                    if not verdict:
+                        self.assertIn("target exit", detail)
 
     def test_forked_descendant_is_killed_on_timeout(self):
         with tempfile.TemporaryDirectory() as d:

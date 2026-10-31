@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Record a remote-flag solve transcript as attestable STATE evidence.
+
+A custom PWN exploit (hand-written ROP/driver) that pops a shell on the
+user-designated single remote and reads the flag has no symbolic verifier to
+mint a `direct` observation, and its control path does not fit the
+`control-flow/v2` two-input indirect-branch proof slot.  Its legitimate
+completion path is operator attestation (`rat.writeup-attestation/v1`) over a
+concrete evidence artifact -- but nothing previously wrote that artifact.
+
+`pwnflag record` closes exactly that gap: it stores the raw remote transcript
+(the bytes the operator saw, including the `cat flag` output) as a
+content-addressed artifact and mints a `pwn.flag` observation referencing it.
+
+This does NOT weaken any existing gate:
+
+* Observation quality is derived from the evidence envelope's own bytes
+  (`state_v2._evidence_quality`), never from a caller assertion.  A plain
+  transcript artifact is therefore recorded as `heuristic`, exactly as a
+  non-machine-verified remote capture should be.  This tool cannot and does not
+  manufacture `direct` evidence or a typed primitive PASS.
+* The recorded observation only gives the operator a concrete, hash-bound
+  evidence digest to cite in an `operator_attestation`.  The completion gate
+  still requires that attestation (see `ratlib.completion`); recording alone is
+  not a solve.
+
+Format is checked (reusing pkflag) but format `REAL` is not an oracle: the
+transcript is the evidence, and the operator attests to what it shows.
+"""
+import argparse
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from ratlib.artifact import put_bytes
+from ratlib.state_v2 import Stream, rat_dir
+
+
+def ctf_home():
+    return Path(os.environ.get("CTF_HOME") or Path(__file__).resolve().parent.parent).resolve()
+
+
+def _load_pkflag():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pkflag")
+    spec = importlib.util.spec_from_loader("pkflag", importlib.machinery.SourceFileLoader("pkflag", path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _format_verdict(home, flag, chal):
+    """Return (verdict_text, scope) using pkflag's challenge-local format."""
+    import importlib.machinery  # noqa: F401 - used indirectly by _load_pkflag
+    pk = _load_pkflag()
+    try:
+        path, scope = pk.format_path(home, chal, False)
+        fmt = pk.configured_pattern(path)
+        if fmt:
+            matched = pk.compile_pattern(fmt).fullmatch(flag) is not None
+        else:
+            matched = pk.GENERIC_FORMAT.fullmatch(flag) is not None
+        fake = pk.placeholder(flag)
+        verdict = "REAL" if matched and not fake else ("FAKE(placeholder)" if fake else "NO_MATCH")
+        return verdict, scope
+    except pk.FlagConfigError as exc:
+        raise SystemExit("[pwnflag:err] %s" % exc)
+
+
+def _challenge_dir(home, chal):
+    solve = (home / "solve").resolve()
+    location = (home / "solve" / chal).resolve()
+    if not location.is_dir() or not location.is_relative_to(solve):
+        raise SystemExit("[pwnflag:err] challenge directory not found under solve/: %s" % chal)
+    return str(location)
+
+
+def cmd_record(args):
+    home = ctf_home()
+    pk = _load_pkflag()
+    try:
+        chal = pk.challenge_slug(args.chal)
+    except pk.FlagConfigError as exc:
+        return "[pwnflag:err] %s" % exc, 2
+    chal_dir = _challenge_dir(home, chal)
+
+    flag = args.flag.strip()
+    if not flag:
+        return "[pwnflag:err] --flag must be non-empty", 2
+    verdict, scope = _format_verdict(home, flag, chal)
+    if verdict != "REAL":
+        # A placeholder or format-mismatched candidate is never recorded as a
+        # solve transcript; the operator must supply the genuine remote flag.
+        return "[pwnflag:err] flag format verdict is %s (scope %s); refusing to record" % (verdict, scope), 1
+
+    if args.transcript == "-":
+        transcript = sys.stdin.buffer.read()
+    else:
+        with open(args.transcript, "rb") as fh:
+            transcript = fh.read()
+    if not transcript.strip():
+        return "[pwnflag:err] transcript is empty", 2
+    if flag.encode() not in transcript:
+        # The evidence must actually contain the claimed flag, or it does not
+        # support the claim it is being recorded for.
+        return "[pwnflag:err] transcript does not contain the claimed flag", 1
+
+    root = rat_dir(chal_dir)
+    artifact = put_bytes(
+        transcript, kind="remote-flag-transcript", media_type="application/octet-stream",
+        logical_name="remote-flag-transcript.log", root=root,
+        provenance={"challenge": chal, "remote": args.remote, "tool": "pwnflag"})
+    digest = artifact["digest"]
+
+    stream = Stream(chal_dir)
+    observation_id = "pwn-flag-" + digest[7:23]
+    stream.append("observation.recorded", {
+        "observation_id": observation_id, "kind": "pwn.flag",
+        "subject": {"challenge": chal, "remote": args.remote},
+        "value": {"flag": flag, "transcript_digest": digest,
+                  "format_scope": scope, "format_verdict": verdict},
+        # Quality is re-derived from the evidence bytes by the Stream; a plain
+        # transcript stays heuristic.  Stated here only for schema completeness.
+        "quality": {"level": "heuristic"}, "validity": {"state": "active"},
+        "evidence": [digest],
+    })
+    stream.append("note.recorded", {
+        "note_id": "pwn-flag-" + digest[7:23], "kind": "remote-flag-recorded",
+        "challenge": chal, "remote": args.remote, "transcript_digest": digest,
+        "observation_id": observation_id,
+    })
+
+    print("[pwnflag] recorded remote flag transcript for %s" % chal)
+    print("  remote            : %s" % args.remote)
+    print("  transcript_digest : %s" % digest)
+    print("  observation_id    : %s (kind=pwn.flag, quality=heuristic)" % observation_id)
+    print("  next              : cite %s in an operator attestation (rat.writeup-attestation/v1)" % digest)
+    print("  note              : recording is not a solve; the completion gate still requires the attestation")
+    return None, 0
+
+
+def main(argv=None):
+    import importlib.machinery  # noqa: F401
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    rec = sub.add_parser("record", help="record a remote-flag solve transcript as attestable evidence")
+    rec.add_argument("--chal", required=True, help="challenge slug under solve/")
+    rec.add_argument("--flag", required=True, help="the flag the remote returned")
+    rec.add_argument("--remote", required=True, help="the user-designated remote host:port the flag came from")
+    rec.add_argument("--transcript", required=True,
+                     help="path to the raw remote transcript, or - for stdin")
+    args = parser.parse_args(argv)
+    if args.command == "record":
+        message, code = cmd_record(args)
+        if message:
+            print(message, file=sys.stderr)
+        return code
+    parser.error("unknown command")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

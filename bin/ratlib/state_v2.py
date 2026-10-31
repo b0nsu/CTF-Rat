@@ -11,6 +11,7 @@ EVENT_SCHEMA="rat.state-event/v2"; TRANSITIONS={
  "confirmed":{"verified","refuted","invalidated"}, "verified":{"consumed","refuted","invalidated"},
  "consumed":{"invalidated"}, "refuted":set(), "invalidated":set(), "stale":{"supported","refuted"}}
 PRIMITIVE_TRANSITIONS={
+ ("candidate","candidate"),
  ("candidate","pass"), ("candidate","fail"), ("candidate","blocked"),
  ("pass","pass"), ("pass","stale"), ("pass","consumed"),
  ("blocked","candidate"), ("stale","candidate"),
@@ -53,9 +54,18 @@ def _proof_kind_matches(kind, patterns):
    return True
  return False
 def _semantic_slot_supported(class_name, slot, observation, root):
- # No supported verifier currently proves the input->control-target->transfer
- # relation. Word/offset labels cannot assert that relation at the STATE gate.
- if class_name=="control-flow": return slot!="control-target"
+ if class_name=="control-flow":
+  if slot!="control-target": return True
+  if observation.get("extensions",{}).get("proof_mode")!="pwn-control-transfer": return False
+  if not isinstance(observation.get("value"),dict): return False
+  from .contracts import parse_proof_value
+  try:
+   for digest in observation.get("evidence",[]):
+    doc=json.loads(get(digest,root=root))
+    doc["extensions"]={**(doc.get("extensions") or {}),"envelope_digest":digest}
+    if parse_proof_value("pwn-control-transfer",doc,root)!=observation["value"]: return False
+   return bool(observation.get("evidence"))
+  except (ValueError,TypeError,KeyError,OSError): return False
  if class_name!="solution-reconstruction": return True
  if not isinstance(observation.get("value"),dict): return False
  mode={"recovered-input":"rev-solution-input","success-oracle":"rev-success-oracle",
@@ -98,6 +108,42 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids, *, root=
  if missing:
   raise ValueError("PASS primitive class %s missing proof slots: %s" %
                    (payload.get("class"),", ".join(missing)))
+ if payload.get("class")=="control-flow":
+  scenarios={json.dumps(observations[oid].get("extensions",{}).get("scenario"),sort_keys=True)
+             for ids in matches_by_slot.values() for oid in ids}
+  if len(scenarios)!=1 or "null" in scenarios:
+   raise ValueError("control-flow proof slots require the same input and breakpoint scenario")
+  scenario=json.loads(next(iter(scenarios)))
+  if not scenario.get("input_digest") or not scenario.get("break"):
+   raise ValueError("control-flow proof scenario lacks input digest or breakpoint")
+  from .contracts import parse_proof_value
+  modes={"control-state":"pwn-control-state",
+         "attacker-marker":"pwn-memory-control",
+         "control-target":"pwn-control-transfer"}
+  for slot,ids in matches_by_slot.items():
+   for oid in ids:
+    observation=observations[oid]
+    if observation.get("extensions",{}).get("proof_mode")!=modes[slot]:
+     raise ValueError("control-flow proof slot lacks a supported semantic producer")
+    for digest in observation.get("evidence",[]):
+     try:
+      doc=json.loads(get(digest,root=root))
+      doc["extensions"]={**(doc.get("extensions") or {}),"envelope_digest":digest}
+      declared=(doc.get("parameters") or {}).get("proof") or {}
+      if (declared.get("mode")!=modes[slot] or
+          declared.get("input_digest")!=scenario["input_digest"] or
+          declared.get("break")!=scenario["break"] or
+          scenario["input_digest"] not in
+          {item.get("digest") for item in doc.get("inputs",[]) if isinstance(item,dict)}):
+       raise ValueError("control-flow proof scenario differs from immutable invocation")
+      value=parse_proof_value(modes[slot],doc,root,
+                              proof_address=declared.get("address"),
+                              proof_marker=declared.get("marker"),
+                              proof_target=declared.get("target"))
+      if value!=observation.get("value"):
+       raise ValueError("control-flow proof value differs from immutable capture")
+     except (TypeError,KeyError,OSError) as exc:
+      raise ValueError("control-flow proof has missing immutable capture") from exc
  # Require a real one-to-one slot -> observation assignment.  A simple union
  # size check is insufficient once future contracts contain overlapping kind
  # patterns (Hall's condition can fail even when the union is large enough).
@@ -731,9 +777,18 @@ class Stream:
   except (OSError,ValueError): pass
  def delta(self, after=None, until=None):
   events=self.read()
+  for label,value in (("after",after),("until",until)):
+   if value is None: continue
+   if (not isinstance(value,dict) or
+       not isinstance(value.get("stream_id"),str) or not value["stream_id"] or
+       not isinstance(value.get("seq"),int) or isinstance(value["seq"],bool) or value["seq"]<0):
+    raise ValueError("%s cursor requires stream_id and nonnegative integer seq" % label)
+   if events and events[0]["stream_id"]!=value["stream_id"]:
+    raise ValueError("cursor stream mismatch")
+  if after and until and after["seq"]>until["seq"]:
+   raise ValueError("after cursor exceeds until cursor")
   if after:
    sid,seq=after["stream_id"],after["seq"]
-   if events and events[0]["stream_id"]!=sid: raise ValueError("cursor stream mismatch")
    events=[e for e in events if e["seq"]>seq]
   if until:
    events=[e for e in events if e["seq"]<=until["seq"]]

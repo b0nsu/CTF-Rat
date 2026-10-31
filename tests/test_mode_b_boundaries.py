@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 import shlex
-import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -105,13 +104,16 @@ class ObservationBoundaries(unittest.TestCase):
 
     def test_actual_process_exit_and_timeout_save_results_with_mixed_artifacts(self):
         require_mode_b_sandbox()
+        sandbox_python = Path("/usr/bin/python3")
+        if not sandbox_python.is_file():
+            self.skipTest("sandbox-visible /usr/bin/python3 required")
         for code, timeout, expected in (("raise SystemExit(124)", 5, ("completed", "failed", "agent-nonzero-exit")),
                                         ("import time; time.sleep(5)", 0.1, ("timeout", "censored", "agent-timeout"))):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as runtime:
                 chal = Path(runtime) / "chal"
                 chal.mkdir()
                 mixed_store(chal / ".rat")
-                args = SimpleNamespace(agent=shlex.join([sys.executable, "-c", code]),
+                args = SimpleNamespace(agent=shlex.join([str(sandbox_python), "-c", code]),
                                        run_id="boundary", ablation="A0", timeout=timeout,
                                        model_id="test", reasoning_effort="none")
                 with mock.patch.object(RATBENCH, "ctf_home", return_value=scratch), \

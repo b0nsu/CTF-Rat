@@ -1,7 +1,10 @@
 import importlib.machinery
 import importlib.util
 import json
+import hashlib
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -291,6 +294,243 @@ class OutputCapTests(unittest.TestCase):
 
 
 class ModeBLocalSmokeTests(unittest.TestCase):
+    def test_operator_oracle_is_independent_of_internal_completion(self):
+        answer = "FLAG{private-answer}"
+        entry = {**ENTRY, "verify": {"kind": "rat-verify-pass",
+                  "claim_pattern": r"FLAG\{[^}]+\}",
+                  "expected_response_sha256": "sha256:" + hashlib.sha256(answer.encode()).hexdigest()}}
+        output = ("response: " + answer + "\n").encode()
+        passed, detail = RATBENCH._challenge_response_oracle(entry, output.decode(), output,
+                                                              run_complete=True)
+        self.assertTrue(passed)
+        self.assertEqual(detail["reason"], "match")
+        record = RATBENCH._mode_b_v2_record(
+            entry, run_id="B-oracle", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00", agent_rc=0,
+            flag_claimed=True, completion={"verified": False, "reason": "no-active-verification"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            challenge_oracle_pass=passed, challenge_oracle_detail=detail)
+        RATBENCH.validate(record, "rat.benchmark-result/v3")
+        self.assertFalse(record["metrics"]["correctness"]["completion_verified"])
+        self.assertTrue(record["metrics"]["correctness"]["challenge_oracle_pass"])
+        for text, complete, reason in (("FLAG{wrong}", True, "mismatch"),
+                                       (answer + " FLAG{other}", True, "no-unique-response"),
+                                       (answer, False, "agent-run-incomplete")):
+            with self.subTest(text=text, complete=complete):
+                got, evidence = RATBENCH._challenge_response_oracle(
+                    entry, text, text.encode(), run_complete=complete)
+                self.assertFalse(got)
+                self.assertEqual(evidence["reason"], reason)
+
+    def test_eval_retains_bounded_raw_agent_log_with_digest(self):
+        with tempfile.TemporaryDirectory() as root:
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            args = SimpleNamespace(
+                agent="python3 -c 'print(1)' {dir}", suite=None, corpus="private",
+                id=None, run_id="B-raw-log", ablation="A0", timeout=5,
+                model_id="fixture", reasoning_effort="none", attempts=2,
+            )
+            output = b"FLAG{claim-without-proof}\n"
+            entry = {**ENTRY, "verify": {"kind": "rat-verify-pass",
+                     "claim_pattern": r"FLAG\{[^}]+\}",
+                     "expected_response_sha256": "sha256:" + hashlib.sha256(output.strip()).hexdigest()}}
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=root), \
+                 mock.patch.object(RATBENCH, "_have", return_value=True), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[entry]), \
+                 mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=_provenance()), \
+                 mock.patch.object(RATBENCH, "_strace_usable", return_value=False), \
+                 mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(root, chal, "binary")), \
+                 mock.patch.object(RATBENCH, "_runtime_input_digest", return_value="sha256:" + "1" * 64), \
+                 mock.patch.object(RATBENCH, "_agent_environment", return_value={}), \
+                 mock.patch.object(RATBENCH, "_run_agent", return_value=subprocess.CompletedProcess([], 0, output)), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_eval(args), 0)
+            logs = os.path.join(root, "bench", "results", "B-raw-log.logs")
+            with open(os.path.join(logs, "manifest.jsonl"), encoding="utf-8") as fh:
+                manifests = [json.loads(line) for line in fh]
+            self.assertEqual([item["attempt"] for item in manifests], [1, 2])
+            for manifest in manifests:
+                with open(os.path.join(logs, manifest["path"]), "rb") as fh:
+                    self.assertEqual(fh.read(), output)
+                self.assertEqual(manifest["sha256"], "sha256:" + hashlib.sha256(output).hexdigest())
+                self.assertEqual(manifest["captured_bytes"], len(output))
+                self.assertFalse(manifest["truncated"])
+            with open(os.path.join(root, "bench", "results", "B-raw-log.benchmark-v3.jsonl"), encoding="utf-8") as fh:
+                rows = [json.loads(line) for line in fh]
+            self.assertEqual([row["attempt"] for row in rows], [1, 2])
+            for row, manifest in zip(rows, manifests):
+                self.assertFalse(row["metrics"]["correctness"]["completion_verified"])
+                self.assertTrue(row["metrics"]["correctness"]["challenge_oracle_pass"])
+                self.assertEqual(row["oracle"]["challenge"]["capture_sha256"], manifest["sha256"])
+
+    def test_eval_preserves_attempt_evidence_before_sandbox_cleanup(self):
+        # Mode B must copy each attempt's raw STATE/tool-result evidence out of
+        # the sandbox before deleting it, and index it in the manifest so the
+        # chain manifest -> original -> v3 row is re-derivable with recomputable
+        # digests after the sandbox is gone.
+        with tempfile.TemporaryDirectory() as root:
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            output = b"no flag here\n"
+            state_bytes = b'{"type":"note.recorded","payload":{"kind":"route-assessment"}}\n'
+
+            def _agent(*a, **k):
+                # The agent writes a .rat store with a STATE JSONL and one
+                # content-addressed artifact; both must survive sandbox cleanup.
+                events = os.path.join(chal, ".rat", "events")
+                objects = os.path.join(chal, ".rat", "objects")
+                os.makedirs(events, exist_ok=True)
+                os.makedirs(objects, exist_ok=True)
+                with open(os.path.join(events, "STATE.v2.jsonl"), "wb") as fh:
+                    fh.write(state_bytes)
+                with open(os.path.join(objects, "artifact.bin"), "wb") as fh:
+                    fh.write(b"tool-result-envelope-bytes")
+                return subprocess.CompletedProcess([], 0, output)
+
+            args = SimpleNamespace(
+                agent="agent {dir}", suite=None, corpus="private",
+                id=None, run_id="B-evidence", ablation="A0", timeout=5,
+                model_id="fixture", reasoning_effort="none", attempts=1,
+            )
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=root), \
+                 mock.patch.object(RATBENCH, "_have", return_value=True), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=_provenance()), \
+                 mock.patch.object(RATBENCH, "_strace_usable", return_value=False), \
+                 mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(root, chal, "binary")), \
+                 mock.patch.object(RATBENCH, "_runtime_input_digest", return_value="sha256:" + "1" * 64), \
+                 mock.patch.object(RATBENCH, "_agent_environment", return_value={}), \
+                 mock.patch.object(RATBENCH, "_run_agent", side_effect=_agent), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_eval(args), 0)
+            logs = os.path.join(root, "bench", "results", "B-evidence.logs")
+            with open(os.path.join(logs, "manifest.jsonl"), encoding="utf-8") as fh:
+                manifests = [json.loads(line) for line in fh]
+            self.assertEqual(len(manifests), 1)
+            evidence = manifests[0]["evidence"]
+            self.assertTrue(evidence["state_present"])
+            self.assertFalse(evidence["trace_present"])
+            self.assertTrue(evidence["files"])
+            # The sandbox is gone; every preserved file still exists under the
+            # recorded relative path and its recorded digest recomputes.
+            evidence_root = os.path.join(logs, evidence["evidence_dir"])
+            state_rel = "rat-store/events/STATE.v2.jsonl"
+            paths = {item["path"] for item in evidence["files"]}
+            self.assertIn(state_rel, paths)
+            for item in evidence["files"]:
+                with open(os.path.join(evidence_root, item["path"]), "rb") as fh:
+                    data = fh.read()
+                self.assertEqual(item["sha256"], "sha256:" + hashlib.sha256(data).hexdigest())
+                self.assertEqual(item["bytes"], len(data))
+            with open(os.path.join(evidence_root, state_rel), "rb") as fh:
+                self.assertEqual(fh.read(), state_bytes)
+
+    def test_evidence_copy_rejects_agent_links_before_host_reads(self):
+        with tempfile.TemporaryDirectory() as root:
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            with tempfile.TemporaryDirectory() as outside_chal:
+                with self.assertRaisesRegex(OSError, "escapes the runtime export"):
+                    RATBENCH._assert_safe_agent_store(outside_chal, root)
+                linked_chal = os.path.join(root, "linked-challenge")
+                os.symlink(outside_chal, linked_chal)
+                with self.assertRaisesRegex(OSError, "contains a link"):
+                    RATBENCH._assert_safe_agent_store(linked_chal, root)
+            outside = os.path.join(root, "synthetic-outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("synthetic outside data")
+            rat = os.path.join(chal, ".rat")
+            os.mkdir(rat)
+            for name, target in (("file-link", outside), ("directory-link", root)):
+                link = os.path.join(rat, name)
+                os.symlink(target, link)
+                dest = os.path.join(root, "saved-" + name)
+                with self.assertRaisesRegex(OSError, "link or special file"):
+                    RATBENCH._preserve_attempt_evidence(dest, chal, None)
+                self.assertFalse(os.path.lexists(dest))
+                os.unlink(link)
+            if hasattr(os, "mkfifo"):
+                fifo = os.path.join(rat, "special-file")
+                os.mkfifo(fifo)
+                with self.assertRaisesRegex(OSError, "link or special file"):
+                    RATBENCH._assert_safe_agent_store(chal)
+                os.unlink(fifo)
+            os.rmdir(rat)
+            os.symlink(root, rat)
+            with self.assertRaisesRegex(OSError, "link or special file"):
+                RATBENCH._preserve_attempt_evidence(os.path.join(root, "saved-root"), chal, None)
+            self.assertFalse(os.path.lexists(os.path.join(root, "saved-root")))
+            os.unlink(rat)
+            os.mkdir(rat)
+            trace = os.path.join(root, "trace-link")
+            os.symlink(outside, trace)
+            with self.assertRaisesRegex(OSError, "link or special file"):
+                RATBENCH._preserve_attempt_evidence(os.path.join(root, "saved-trace"), chal, trace)
+            self.assertFalse(os.path.lexists(os.path.join(root, "saved-trace")))
+
+    def test_eval_aborts_without_results_for_unsafe_agent_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            outside = os.path.join(root, "synthetic-outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("synthetic outside data")
+
+            def fake_agent(_prompt, **_kwargs):
+                rat = os.path.join(chal, ".rat")
+                os.mkdir(rat)
+                os.symlink(outside, os.path.join(rat, "linked.txt"))
+                return subprocess.CompletedProcess([], 0, b"no claim")
+
+            args = SimpleNamespace(
+                agent="fixture-agent {dir}", suite=None, corpus="private", id=None,
+                run_id="B-unsafe-evidence", ablation="A0", timeout=5,
+                model_id="fixture", reasoning_effort="none", attempts=1,
+            )
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=root), \
+                 mock.patch.object(RATBENCH, "_have", return_value=True), \
+                 mock.patch.object(RATBENCH, "_have_angr", return_value=False), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=_provenance()), \
+                 mock.patch.object(RATBENCH, "_strace_usable", return_value=False), \
+                 mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(root, chal, "binary")), \
+                 mock.patch.object(RATBENCH, "_runtime_input_digest", return_value="sha256:" + "1" * 64), \
+                 mock.patch.object(RATBENCH, "_run_agent", side_effect=fake_agent), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_eval(args), 3)
+            results = os.path.join(root, "bench", "results")
+            self.assertFalse(os.path.exists(os.path.join(results, "B-unsafe-evidence.jsonl")))
+            self.assertFalse(os.path.exists(os.path.join(results, "B-unsafe-evidence.benchmark-v3.jsonl")))
+            self.assertFalse(os.path.exists(os.path.join(results, "B-unsafe-evidence.logs")))
+
+    def test_eval_aborts_when_evidence_copy_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            args = SimpleNamespace(
+                agent="fixture-agent {dir}", suite=None, corpus="private", id=None,
+                run_id="B-copy-failure", ablation="A0", timeout=5,
+                model_id="fixture", reasoning_effort="none", attempts=1,
+            )
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=root), \
+                 mock.patch.object(RATBENCH, "_have", return_value=True), \
+                 mock.patch.object(RATBENCH, "_have_angr", return_value=False), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=_provenance()), \
+                 mock.patch.object(RATBENCH, "_strace_usable", return_value=False), \
+                 mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(root, chal, "binary")), \
+                 mock.patch.object(RATBENCH, "_runtime_input_digest", return_value="sha256:" + "1" * 64), \
+                 mock.patch.object(RATBENCH, "_run_agent", return_value=subprocess.CompletedProcess([], 0, b"no claim")), \
+                 mock.patch.object(RATBENCH, "_preserve_attempt_evidence", side_effect=OSError("synthetic copy failure")), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_eval(args), 3)
+            results = os.path.join(root, "bench", "results")
+            self.assertFalse(os.path.exists(os.path.join(results, "B-copy-failure.jsonl")))
+            self.assertFalse(os.path.exists(os.path.join(results, "B-copy-failure.benchmark-v3.jsonl")))
+            self.assertFalse(os.path.exists(os.path.join(results, "B-copy-failure.logs")))
+
     def test_eval_resolves_quoted_agent_executable(self):
         args = SimpleNamespace(agent="'/tmp/agent cli' --version", suite=None, corpus=None, id=None)
         with mock.patch.object(RATBENCH, "_have", return_value=True) as have, \
@@ -369,6 +609,114 @@ class ModeBLocalSmokeTests(unittest.TestCase):
         self.assertNotIn("SSH_AUTH_SOCK", env)
         self.assertNotIn("/private/bin", env["PATH"])
 
+    def test_eval_opencode_data_is_fresh_and_authenticated_per_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = os.path.join(root, "synthetic-home")
+            source_dir = os.path.join(home, ".local", "share", "opencode")
+            os.makedirs(source_dir)
+            with open(os.path.join(source_dir, "auth.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"fixture": "synthetic-only"}')
+            scratch = os.path.join(root, "scratch")
+            chal = os.path.join(root, "challenge")
+            os.mkdir(chal)
+            seen = []
+
+            def fake_agent(_prompt, **kwargs):
+                data_dir = kwargs["env"]["XDG_DATA_HOME"]
+                with open(os.path.join(data_dir, "opencode", "auth.json"),
+                          encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), '{"fixture": "synthetic-only"}')
+                self.assertIn(data_dir + ":rw", kwargs["expose"])
+                self.assertFalse(os.path.exists(os.path.join(data_dir, "prior-session")))
+                with open(os.path.join(data_dir, "prior-session"), "w") as fh:
+                    fh.write("synthetic prior answer")
+                seen.append(data_dir)
+                return subprocess.CompletedProcess([], 0, b"no claim")
+
+            args = SimpleNamespace(
+                agent="fixture-agent {dir}", suite=None, corpus="private", id=None,
+                run_id="B-synthetic-data", ablation="A0", timeout=5,
+                model_id="fixture", reasoning_effort="none", attempts=2,
+                agent_home=home, agent_data_dir=scratch, agent_bin_dir=[], agent_expose=[],
+            )
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=root), \
+                 mock.patch.object(RATBENCH, "_have", return_value=True), \
+                 mock.patch.object(RATBENCH, "_have_angr", return_value=False), \
+                 mock.patch.object(RATBENCH, "_select_entries", return_value=[ENTRY]), \
+                 mock.patch.object(RATBENCH, "_benchmark_provenance", return_value=_provenance()), \
+                 mock.patch.object(RATBENCH, "_strace_usable", return_value=False), \
+                 mock.patch.object(RATBENCH, "_prepare_eval_workspace", return_value=(root, chal, "binary")), \
+                 mock.patch.object(RATBENCH, "_runtime_input_digest", return_value="sha256:" + "1" * 64), \
+                 mock.patch.object(RATBENCH, "_run_agent", side_effect=fake_agent), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(RATBENCH.cmd_eval(args), 0)
+            self.assertEqual(len(set(seen)), 2)
+            self.assertEqual(os.listdir(scratch), [])
+
+    def test_scratch_auth_is_visible_inside_real_mode_b_sandbox(self):
+        require_mode_b_sandbox()
+        sandbox_python = "/usr/bin/python3"
+        if not os.path.isfile(sandbox_python):
+            self.skipTest("sandbox-visible /usr/bin/python3 required")
+        with tempfile.TemporaryDirectory() as kit, \
+             tempfile.TemporaryDirectory() as home, \
+             tempfile.TemporaryDirectory() as data:
+            app_data = os.path.join(data, "opencode")
+            os.mkdir(app_data)
+            with open(os.path.join(app_data, "auth.json"), "w", encoding="utf-8") as fh:
+                fh.write("synthetic-auth")
+            script = (
+                "import os, pathlib; "
+                "data = pathlib.Path(os.environ['XDG_DATA_HOME']); "
+                "print((data / 'opencode' / 'auth.json').read_text()); "
+                "(data / 'session').write_text('synthetic-session'); "
+                "assert not pathlib.Path(os.environ['HOME']).exists()"
+            )
+            env = RATBENCH._agent_environment(kit, agent_home=home,
+                                               agent_data_dir=data)
+            with mock.patch.object(RATBENCH, "ctf_home", return_value=kit):
+                run = RATBENCH._run_agent(
+                    shlex.join([sandbox_python, "-c", script]), cwd=kit,
+                    env=env, timeout=5, expose=[data + ":rw"])
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertIn(b"synthetic-auth", run.stdout)
+            with open(os.path.join(data, "session"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "synthetic-session")
+
+    def test_agent_environment_isolates_home_by_default(self):
+        # Without --agent-home the agent's HOME is the answer-free kit root and
+        # no XDG config/data lookup points back at the operator's home.
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(RATBENCH, "_have_angr", return_value=False):
+            env = RATBENCH._agent_environment(root)
+        self.assertEqual(env["HOME"], root)
+        self.assertNotIn("XDG_CONFIG_HOME", env)
+        self.assertNotIn("XDG_DATA_HOME", env)
+
+    def test_agent_environment_points_at_real_home_when_exposed(self):
+        # With an operator-authorized agent home, HOME/XDG point at the real
+        # paths that --agent-expose bound, and the exposed bin dir is on PATH.
+        with tempfile.TemporaryDirectory() as root, \
+             tempfile.TemporaryDirectory() as home, \
+             mock.patch.object(RATBENCH, "_have_angr", return_value=False):
+            bindir = os.path.join(home, ".opencode", "bin")
+            os.makedirs(bindir)
+            env = RATBENCH._agent_environment(
+                root, agent_home=home, agent_bin_dirs=[bindir])
+            real_home = os.path.realpath(home)
+            self.assertEqual(env["HOME"], real_home)
+            self.assertEqual(env["XDG_CONFIG_HOME"], os.path.join(real_home, ".config"))
+            self.assertEqual(env["XDG_DATA_HOME"], os.path.join(real_home, ".local", "share"))
+            self.assertIn(os.path.realpath(bindir), env["PATH"].split(os.pathsep))
+
+    def test_run_agent_rejects_missing_expose_path(self):
+        require_mode_b_sandbox()
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(RuntimeError, "agent-expose path does not exist"):
+                RATBENCH._run_agent("true", cwd=root,
+                                    env=RATBENCH._agent_environment(root), timeout=5,
+                                    expose=[os.path.join(root, "does-not-exist")])
+
     def test_timeout_kills_grandchild_before_delayed_write(self):
         with tempfile.TemporaryDirectory() as root:
             marker = os.path.join(root, "late")
@@ -390,8 +738,8 @@ class ModeBLocalSmokeTests(unittest.TestCase):
             time.sleep(1.2)
             self.assertFalse(os.path.exists(marker))
 
-    @unittest.skipUnless(os.name == "posix" and os.path.isfile(sys.executable),
-                         "local python interpreter required")
+    @unittest.skipUnless(os.name == "posix" and os.path.isfile("/usr/bin/python3"),
+                         "sandbox-visible /usr/bin/python3 required")
     def test_real_mode_b_exec_without_completion_remains_unverified(self):
         # Execute the actual Mode B workspace/export + external process path.
         # This is a negative-gate smoke, NOT a model-solving benchmark.
@@ -401,8 +749,9 @@ class ModeBLocalSmokeTests(unittest.TestCase):
             result_dir = os.path.join(ROOT, "bench", "results")
             legacy = os.path.join(result_dir, run_id + ".jsonl")
             canonical = os.path.join(result_dir, run_id + ".benchmark-v3.jsonl")
+            log_dir = os.path.join(result_dir, run_id + ".logs")
             args = SimpleNamespace(
-                agent=sys.executable + " -c 'print(\"FLAG{smoke-no-proof}\")' {dir}",
+                agent="/usr/bin/python3 -c 'print(\"FLAG{smoke-no-proof}\")' {dir}",
                 suite=None, corpus="synthetic", id="stack-basic-01",
                 run_id=run_id, ablation="A0", timeout=20,
                 model_id="python-negative-smoke", reasoning_effort="none",
@@ -412,20 +761,58 @@ class ModeBLocalSmokeTests(unittest.TestCase):
                     self.assertEqual(RATBENCH.cmd_eval(args), 0)
                 with open(canonical, encoding="utf-8") as fh:
                     row = json.loads(fh.readline())
+                with open(legacy, encoding="utf-8") as fh:
+                    legacy_row = json.loads(fh.readline())
                 RATBENCH.validate(row, "rat.benchmark-result/v3")
+                self.assertEqual(legacy_row["outcome"], "solve-claimed")
+                self.assertFalse(legacy_row["verified_solve"])
                 self.assertEqual(row["outcome"], "solve-claimed")
                 self.assertEqual(row["oracle"]["failure_class"], "claim-without-completion")
                 self.assertFalse(row["metrics"]["correctness"]["verified_solve"])
                 self.assertTrue(row["metrics"]["correctness"]["false_solved"])
                 self.assertIsNone(row["metrics"]["context"]["input_tokens"])
                 self.assertIsNone(row["metrics"]["tools"]["tool_calls"])
+                with open(os.path.join(log_dir, "manifest.jsonl"), encoding="utf-8") as fh:
+                    log = json.loads(fh.readline())
+                with open(os.path.join(log_dir, log["path"]), "rb") as fh:
+                    captured = fh.read()
+                self.assertIn(b"FLAG{smoke-no-proof}", captured)
+                self.assertEqual(log["sha256"], "sha256:" + hashlib.sha256(captured).hexdigest())
+                self.assertEqual((log["challenge_id"], log["attempt"], log["truncated"]),
+                                 ("stack-basic-01", 1, False))
             finally:
                 for filename in (legacy, canonical):
                     if os.path.exists(filename):
                         os.unlink(filename)
+                shutil.rmtree(log_dir, ignore_errors=True)
 
 
 class BenchmarkProvenanceTests(unittest.TestCase):
+    def test_report_rejects_missing_or_duplicate_advertised_attempts(self):
+        provenance = _provenance()
+        provenance["execution"].update({"attempts_per_entry": 2,
+                                        "challenge_ids": ["fixture-01"]})
+        first = {"benchmark_run_id": "B-grid", "challenge_id": "fixture-01",
+                 "attempt": 1, "provenance": provenance}
+        second = {**first, "attempt": 2}
+        RATBENCH._assert_v2_run_provenance([first, second])
+        with self.assertRaisesRegex(ValueError, "incomplete or duplicate attempt grid"):
+            RATBENCH._assert_v2_run_provenance([first])
+        with self.assertRaisesRegex(ValueError, "incomplete or duplicate attempt grid"):
+            RATBENCH._assert_v2_run_provenance([first, first])
+
+    def test_attempt_grid_provenance_requires_ids_and_count_together(self):
+        doc = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-grid", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00", agent_rc=1,
+            flag_claimed=False, completion={"verified": False},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            provenance=_provenance())
+        doc["provenance"]["execution"]["attempts_per_entry"] = 2
+        with self.assertRaisesRegex(Exception, "attempt grid"):
+            RATBENCH.validate(doc, "rat.benchmark-result/v3")
+
     def test_provenance_hashes_exact_execution_set_and_agent_template(self):
         entries = [_suite_entry("heldout-01", "private")]
         args = SimpleNamespace(
@@ -443,7 +830,10 @@ class BenchmarkProvenanceTests(unittest.TestCase):
         self.assertEqual(doc["agent"]["command_digest"], RATBENCH._command_digest(args.agent))
         self.assertEqual(doc["agent"]["model_id"], "gpt-test")
         self.assertEqual(doc["agent"]["reasoning_effort"], "high")
-        self.assertEqual(doc["execution"], {"timeout_seconds": 321, "observer_execve_trace": True})
+        self.assertEqual(doc["execution"], {"timeout_seconds": 321,
+                                            "observer_execve_trace": True,
+                                            "attempts_per_entry": 1,
+                                            "challenge_ids": ["heldout-01"]})
         self.assertEqual(doc["environment"], environment)
         self.assertEqual(doc["toolchain"], toolchain)
         RATBENCH.validate({
@@ -637,6 +1027,26 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertNotIn("routing", doc)
         RATBENCH.validate(doc, "rat.benchmark-result/v3")
 
+    def test_v3_report_keeps_internal_completion_and_external_oracle_separate(self):
+        base = RATBENCH._mode_b_v2_record(
+            ENTRY, run_id="B-report", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00",
+            finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=0, flag_claimed=False,
+            completion={"verified": True, "verification_id": "v1"},
+            events=[], primitive_pass_at=None, artifact_count=0,
+            challenge_oracle_pass=None,
+        )
+        externally_checked = json.loads(json.dumps(base))
+        externally_checked["challenge_id"] = "other"
+        externally_checked["metrics"]["correctness"]["completion_verified"] = False
+        externally_checked["metrics"]["correctness"]["verified_solve"] = False
+        externally_checked["metrics"]["correctness"]["challenge_oracle_pass"] = True
+        externally_checked["outcome"] = "failed"
+        report = RATBENCH._render_v2_leaderboard([base, externally_checked])
+        self.assertIn("| Completion pass | Oracle pass | Oracle coverage |", report)
+        self.assertIn("| B-report | A0 | 2 | 1 | 1 | 1/2 |", report)
+
     def test_routing_projection_rejects_incoherent_revision_count(self):
         doc = RATBENCH._mode_b_v2_record(
             ENTRY, run_id="B-test", ablation_id="A2",
@@ -773,7 +1183,7 @@ class ModeBV2RecordTests(unittest.TestCase):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v3")), 0)
             with open(os.path.join(d, "bench", "LEADERBOARD.v3.md"), encoding="utf-8") as fh:
                 leaderboard = fh.read()
-            self.assertIn("| T | A0 | 2 | 1 | 0 | 1 | 0 | 50.0% |", leaderboard)
+            self.assertIn("| T | A0 | 2 | 1 | 0 | 0/2 | 0 | 1 | 0 | 50.0% |", leaderboard)
             self.assertIn("5000ms (1/2)", leaderboard)
             self.assertIn("4 (1/2)", leaderboard)
             self.assertIn("1 (1/2)", leaderboard)

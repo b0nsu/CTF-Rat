@@ -161,6 +161,10 @@ def _symbolic_engine_issue(primitive, view):
             and producer.get("engine") == "symsolve"
             and value.get("engine") == "symsolve"
             and value.get("engine_build_digest") == build_digest
+            and type(value.get("expected_exit_code")) is int
+            and 0 <= value["expected_exit_code"] <= 255
+            and type(value.get("target_returncode")) is int
+            and value["target_returncode"] == value["expected_exit_code"]
             and isinstance(build_digest, str)
             and _ENGINE_DIGEST.fullmatch(build_digest)
             and identity_ok):

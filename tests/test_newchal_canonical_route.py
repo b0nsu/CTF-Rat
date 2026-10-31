@@ -3,6 +3,7 @@
 The scaffold is exercised with a stub toolchain so the test is independent
 of pwntools, angr, Ghidra, local libc, and an actual CTF binary.
 """
+import json
 import os
 import pathlib
 import shutil
@@ -40,6 +41,17 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
                 'from pathlib import Path\n'
                 'def materialize_for_solve(source, destination, **kwargs):\n'
                 '    Path(destination).write_text("{}\\n")\n', encoding="utf-8")
+            shutil.copy2(ROOT / "bin/ratlib/schema.py", module_dir / "schema.py")
+
+            route_base = {"schema": "rat.route-result/v2", "signals": [],
+                          "dimensions": {key: [] for key in ("vulnerability_surfaces", "program_shapes",
+                                                         "obstacles", "constraints")},
+                          "unresolved": [], "next": [{"query": "rat query func", "target": "./chall",
+                                                       "evidence": [], "rule": "fixture"}],
+                          "capabilities": {}, "leads": [], "decision": None,
+                          "commitment": "provisional", "skill": None, "diagnostics": []}
+            degraded_route = dict(route_base, commitment="unknown", next=[],
+                                  diagnostics=[{"code": "analysis_failed"}])
 
             self._executable(bin_dir / "ctfguard", "#!/bin/sh\nexit 0\n")
             self._executable(bin_dir / "libcgate", "#!/bin/sh\nexit 0\n")
@@ -49,9 +61,9 @@ class NewchalCanonicalRouteTests(unittest.TestCase):
                              "#!/bin/sh\n"
                              "printf '%s\\n' \"$@\" > \"$RAT_ARGS\"\n"
                              "if [ \"$ROUTE_ANALYSIS_FAILED\" = 1 ]; then\n"
-                             "  echo '{\"commitment\":\"unknown\",\"diagnostics\":[{\"code\":\"analysis_failed\"}]}'\n"
+                             "  echo '" + json.dumps(degraded_route, separators=(",", ":")) + "'\n"
                              "else\n"
-                             "  echo '{\"commitment\":\"provisional\",\"diagnostics\":[]}'\n"
+                             "  echo '" + json.dumps(route_base, separators=(",", ":")) + "'\n"
                              "fi\n"
                              "if [ \"$ROUTE_RC\" -ne 0 ]; then echo 'route unavailable' >&2; fi\n"
                              "exit \"$ROUTE_RC\"\n")

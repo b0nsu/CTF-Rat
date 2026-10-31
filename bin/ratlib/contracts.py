@@ -14,16 +14,27 @@ PROOF_MODES={
  "pwn-control-state":{"tool":"gdbq","kind":"pwn.reg"},
  "pwn-memory-control":{"tool":"gdbq","kind":"pwn.memory-control"},
  "pwn-control-target":{"tool":"gdbq","kind":"pwn.memory-word"},
+ "pwn-control-transfer":{"tool":"gdbq","kind":"pwn.control-target"},
  "rev-solution-input":{"tool":"symsolve","kind":"rev.solution.input"},
  "rev-success-oracle":{"tool":"gdbq","kind":"rev.solution.oracle"},
  "rev-concrete-replay":{"tool":"gdbq","kind":"rev.solution.replay"},
 }
-_GDB_BREAK=re.compile(r"(?:0x[0-9a-fA-F]+|[A-Za-z_.$][A-Za-z0-9_.$]*)\Z")
+# A raw address, a bare symbol, or a symbol + hex offset.  The symbol+offset
+# form lets the producer break at a call-site inside a PIE function while GDB
+# resolves the symbol in its own run session, so the breakpoint is valid under
+# ASLR ON without reusing a stale cross-session address.
+_GDB_BREAK=re.compile(r"(?:0x[0-9a-fA-F]+|[A-Za-z_.$][A-Za-z0-9_.$]*(?:\+0x[0-9a-fA-F]+)?)\Z")
 _GDB_EXPR=re.compile(r"(?:\$[A-Za-z][A-Za-z0-9]*|0x[0-9a-fA-F]+)(?:[+-](?:0x[0-9a-fA-F]+|[0-9]+))?\Z")
 _HEX_BYTES=re.compile(r"(?:[0-9a-fA-F]{2})+\Z")
 _PROOF_MEASURE_BEGIN="RAT_PROOF_MEASURE_BEGIN"
 _PROOF_MEASURE_END="RAT_PROOF_MEASURE_END"
 _PROOF_ADDRESS_PREFIX="RAT_PROOF_ADDRESS="
+# A: primary input, B: control input (different bytes), C: primary input repeated.
+# The A/C pair proves the target is a deterministic function of the input (so an
+# uncontrolled external source such as a counter file that advances every run is
+# rejected), while the A/B pair proves the input actually changes the target.
+_TRANSFER_LABELS=("A","B","C")
+_TRANSFER_INPUTS={"A":"input","B":"control","C":"input"}
 
 def _proof_error(message):
  raise ValueError("proof observation: "+message)
@@ -37,7 +48,9 @@ def _proof_input_command(path):
 def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
                              proof=None, proof_input=None, proof_break=None,
                              proof_address=None, proof_marker=None,
-                             proof_target=None, proof_expect=None):
+                             proof_target=None, proof_expect=None,
+                             proof_control_input=None, proof_target_register=None,
+                             proof_aslr=None):
  """Build a bounded verifier invocation for a semantic proof observation.
 
  Arbitrary user GDB commands are never accepted in proof mode.  PWN/REV runtime
@@ -51,6 +64,8 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
   _proof_error("%s requires tool %s" % (proof,spec["tool"]))
  if not direct_subject or not os.path.isfile(direct_subject):
   _proof_error("proof mode requires an existing --direct-subject")
+ if proof_aslr is not None and (not proof.startswith("pwn-") or proof_aslr not in {"on","off"}):
+  _proof_error("--proof-aslr requires a PWN proof mode and on/off")
  if proof=="rev-solution-input":
   if not base_args or os.path.realpath(base_args[0])!=os.path.realpath(direct_subject):
    _proof_error("rev-solution-input requires symsolve args to start with --direct-subject")
@@ -60,11 +75,21 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
  if base_args:
   _proof_error("gdbq proof modes do not accept arbitrary trailing gdbq commands")
  if not proof_input: _proof_error("%s requires --proof-input" % proof)
- commands=[]
+ commands=(["set disable-randomization "+("off" if proof_aslr=="on" else "on")]
+           if proof_aslr is not None else [])
  if proof.startswith("pwn-"):
   if not proof_break or not _GDB_BREAK.fullmatch(proof_break):
    _proof_error("%s requires a safe --proof-break symbol/address" % proof)
-  commands=["break "+("*" if proof_break.startswith("0x") else "")+proof_break,_proof_input_command(proof_input)]
+  # A raw address breaks with `break *ADDR`.  A symbol (optionally with a hex
+  # offset) breaks with `break *(symbol+off)` / `break symbol` so GDB resolves
+  # the live symbol address in this session -- ASLR-safe, no cross-session reuse.
+  if proof_break.startswith("0x"):
+   break_command="break *"+proof_break
+  elif "+" in proof_break:
+   break_command="break *("+proof_break+")"
+  else:
+   break_command="break "+proof_break
+  commands.extend([break_command, _proof_input_command(proof_input)])
   if proof=="pwn-control-state":
    commands.extend(["echo "+_PROOF_MEASURE_BEGIN+"\\n",
                     "info registers rip rsp rbp",
@@ -80,6 +105,37 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
                     'printf "'+_PROOF_ADDRESS_PREFIX+'0x%lx\\n", (unsigned long)('+proof_address+')',
                     "x/%dbx %s" % (size,proof_address),
                     "echo "+_PROOF_MEASURE_END+"\\n"])
+  elif proof=="pwn-control-transfer":
+   if not proof_control_input or not os.path.isfile(proof_control_input):
+    _proof_error("pwn-control-transfer requires --proof-control-input")
+   if not re.fullmatch(r"\$r(?:ax|bx|cx|dx|si|di|8|9|10|11|12|13|14|15)",proof_target_register or ""):
+    _proof_error("pwn-control-transfer requires a safe x86-64 --proof-target-register")
+   if _digest_file(proof_input)==_digest_file(proof_control_input):
+    _proof_error("control inputs must have different bytes")
+   # Each run stops at the same breakpoint.  The instruction and target are
+   # measured before stepping, and the new PC is measured immediately after.
+   # Run A uses the primary input, B the control input, C the primary input
+   # again.  The first `run` is issued by the shared gdbq proof preamble above.
+   for index,label in enumerate(_TRANSFER_LABELS):
+    if index:
+     source=proof_input if _TRANSFER_INPUTS[label]=="input" else proof_control_input
+     commands.append(_proof_input_command(source))
+    # Absolute PC/target are recorded for the OFF single-step reachability
+    # check, but under ASLR ON they are re-randomized every run.  The symbolic
+    # identity of the call-site and the target (via `info symbol`) is image-base
+    # invariant, so the A/B/C comparison below is normalized on the symbol, not
+    # the absolute address.  Markers bracket each `info symbol` line so the
+    # parser extracts exactly the sym text for the measured expression.
+    commands.extend([
+     "echo RAT_PROOF_TRANSFER_"+label+"_BEGIN\\n",
+     'printf "RAT_PROOF_PC_BEFORE=0x%lx\\n", (unsigned long)$rip',
+     'printf "RAT_PROOF_TARGET=0x%lx\\n", (unsigned long)('+proof_target_register+')',
+     "echo RAT_PROOF_PCSYM_BEGIN\\n", "info symbol $rip", "echo RAT_PROOF_PCSYM_END\\n",
+     "echo RAT_PROOF_TGTSYM_BEGIN\\n", "info symbol "+proof_target_register,
+     "echo RAT_PROOF_TGTSYM_END\\n",
+     "x/i $rip", "si",
+     'printf "RAT_PROOF_PC_AFTER=0x%lx\\n", (unsigned long)$rip',
+     "echo RAT_PROOF_TRANSFER_"+label+"_END\\n"])
   else:
    if not proof_address or not _GDB_EXPR.fullmatch(proof_address):
     _proof_error("pwn-control-target requires a safe --proof-address")
@@ -173,7 +229,7 @@ def _parse_memory_bytes(text, measured_address):
  for line in text.splitlines():
   if ":" not in line: continue
   address,tail=line.split(":",1)
-  match=re.fullmatch(r"\s*(0x[0-9a-fA-F]+)\s*",address)
+  match=re.fullmatch(r"\s*(0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?\s*",address)
   if not match: continue
   if first_address is None: first_address=int(match.group(1),16)
   out.extend(int(x,16) for x in re.findall(r"0x([0-9a-fA-F]{2})\b",tail))
@@ -185,7 +241,7 @@ def _parse_memory_word(text, measured_address):
  for line in text.splitlines():
   if ":" not in line: continue
   address,tail=line.split(":",1)
-  address_match=re.fullmatch(r"\s*(0x[0-9a-fA-F]+)\s*",address)
+  address_match=re.fullmatch(r"\s*(0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?\s*",address)
   value_match=re.search(r"^\s*(0x[0-9a-fA-F]+)\b",tail)
   if address_match and value_match:
    if int(address_match.group(1),16)!=measured_address:
@@ -193,8 +249,45 @@ def _parse_memory_word(text, measured_address):
    return int(value_match.group(1),16)
  return None
 
+def _parse_transfer_block(text,label,register):
+ begin="RAT_PROOF_TRANSFER_"+label+"_BEGIN"
+ end="RAT_PROOF_TRANSFER_"+label+"_END"
+ if text.count(begin)!=1 or text.count(end)!=1 or text.index(end)<=text.index(begin):
+  _proof_error("transfer capture has missing or repeated run markers")
+ block=text.split(begin,1)[1].split(end,1)[0]
+ def field(name):
+  values=re.findall(r"(?m)^"+name+r"(0x[0-9a-fA-F]+)\s*$",block)
+  if len(values)!=1: _proof_error("transfer capture has no unique "+name)
+  return int(values[0],16)
+ def symbol(kind):
+  marker_begin="RAT_PROOF_"+kind+"_BEGIN"
+  marker_end="RAT_PROOF_"+kind+"_END"
+  if block.count(marker_begin)!=1 or block.count(marker_end)!=1 or block.index(marker_end)<=block.index(marker_begin):
+   _proof_error("transfer capture has missing or repeated "+kind+" markers")
+  inner=block.split(marker_begin,1)[1].split(marker_end,1)[0]
+  # GDB `info symbol ADDR` -> "name [+ off] in section .sec [of /path]".
+  # Normalize on the image-base-invariant "name [+ off] in section .sec"; a
+  # missing symbol (stripped binary) cannot anchor this proof.
+  match=re.search(r"(?m)^\s*(\S.*?\s+in section\s+\S+)",inner)
+  if not match:
+   _proof_error("transfer capture has no symbol for the measured "+kind)
+  return re.sub(r"\s+of\s+\S.*$","",match.group(1).strip())
+ before=field("RAT_PROOF_PC_BEFORE=")
+ target=field("RAT_PROOF_TARGET=")
+ after=field("RAT_PROOF_PC_AFTER=")
+ pc_symbol=symbol("PCSYM")
+ target_symbol=symbol("TGTSYM")
+ instructions=re.findall(r"(?m)^\s*(?:=>\s*)?(0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?:\s*(callq?|jmpq?)\s+(?:\*%)?([a-z0-9]+)\s*$",block)
+ if len(instructions)!=1 or int(instructions[0][0],16)!=before or instructions[0][2]!="%s" % register[1:]:
+  _proof_error("breakpoint is not an indirect transfer through the measured register")
+ if after!=target or before==after:
+  _proof_error("single-step PC did not reach the measured control target")
+ return {"pc_before":before,"target":target,"pc_after":after,"instruction":instructions[0][1],
+         "pc_symbol":pc_symbol,"target_symbol":target_symbol}
+
 def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None,
-                      proof_target=None, proof_expect=None):
+                      proof_target=None, proof_expect=None,
+                      proof_control_input=None, proof_target_register=None):
  """Validate verifier stdout and return the canonical observation value."""
  doc=_immutable_proof_doc(doc,root)
  expected_tool=(PROOF_MODES.get(proof) or {}).get("tool")
@@ -204,6 +297,43 @@ def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None
  text=_proof_debugger(doc,root) if proof.startswith("pwn-") else _proof_stdout(doc,root)
  if proof.startswith("pwn-") and not re.search(r"(?m)^Breakpoint \d+,",text):
   _proof_error("GDB did not stop at the requested proof breakpoint")
+ if proof=="pwn-control-transfer":
+  declared=(doc.get("parameters") or {}).get("proof") or {}
+  register=declared.get("target_register")
+  if not isinstance(register,str) or not re.fullmatch(r"\$r(?:ax|bx|cx|dx|si|di|8|9|10|11|12|13|14|15)",register):
+   _proof_error("immutable invocation has no safe target register")
+  if proof_target_register is not None and register!=proof_target_register:
+   _proof_error("target register differs from immutable invocation")
+  input_digest=declared.get("input_digest")
+  control_digest=declared.get("control_input_digest")
+  inputs={item.get("digest") for item in doc.get("inputs",[]) if isinstance(item,dict)}
+  if (not input_digest or not control_digest or input_digest==control_digest or
+      input_digest not in inputs or control_digest not in inputs):
+   _proof_error("control input digests are missing or identical")
+  if proof_control_input is not None and _digest_file(proof_control_input)!=control_digest:
+   _proof_error("control input differs from immutable invocation")
+  if len(re.findall(r"(?m)^Breakpoint \d+,",text))!=3:
+   _proof_error("transfer capture did not stop three times at breakpoint")
+  first=_parse_transfer_block(text,"A",register)
+  second=_parse_transfer_block(text,"B",register)
+  repeat=_parse_transfer_block(text,"C",register)
+  # Normalize on the image-base-invariant symbol identity, not the absolute
+  # address: under ASLR ON the call-site and target addresses are re-randomized
+  # on every run, but the symbol of the measured call-site and of the selected
+  # target are stable.  This keeps the deterministic/differential checks valid
+  # whether randomization is off (addresses stable) or on (symbols stable).
+  if first["pc_symbol"]!=second["pc_symbol"] or first["pc_symbol"]!=repeat["pc_symbol"]:
+   _proof_error("transfer runs did not stop at the same transfer instruction")
+  # Repeating the primary input must reproduce the same target symbol; else the
+  # target is driven by uncontrolled external state (e.g. a counter file), not
+  # by the input, and the differential below cannot be attributed to the input.
+  if first["target_symbol"]!=repeat["target_symbol"]:
+   _proof_error("primary input did not deterministically reproduce the target")
+  if first["target_symbol"]==second["target_symbol"]:
+   _proof_error("input change did not alter target at the same transfer instruction")
+  return {"input_digest":input_digest,"control_input_digest":control_digest,
+          "break":declared.get("break"),"target_register":register,
+          "first":first,"second":second,"repeat":repeat}
  if proof=="pwn-control-state":
   regs=_parse_registers(_proof_measurement_block(text))
   if "rip" not in regs or "rsp" not in regs:
@@ -248,7 +378,8 @@ def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None
 
 def record_proof_observation(doc, *, root, direct_subject, proof,
                              proof_address=None, proof_marker=None,
-                             proof_target=None, proof_expect=None):
+                             proof_target=None, proof_expect=None,
+                             proof_control_input=None, proof_target_register=None):
  """Record one validated canonical proof observation backed by a direct envelope."""
  spec=PROOF_MODES.get(proof)
  if not spec: _proof_error("unknown proof mode %r" % proof)
@@ -265,7 +396,8 @@ def record_proof_observation(doc, *, root, direct_subject, proof,
   _proof_error("verifier subject does not match current binary")
  value=parse_proof_value(proof,doc,root,proof_address=proof_address,
                          proof_marker=proof_marker,proof_target=proof_target,
-                         proof_expect=proof_expect)
+                         proof_expect=proof_expect,proof_control_input=proof_control_input,
+                         proof_target_register=proof_target_register)
  stream=Stream(os.path.dirname(root))
  for oid,existing in stream.view().get("observations",{}).items():
   if existing.get("kind")==spec["kind"] and digest in existing.get("evidence",[]):
@@ -284,7 +416,9 @@ def record_proof_observation(doc, *, root, direct_subject, proof,
              "binary_digest":policy.get("subject_digest")},
   "kind":spec["kind"],"value":value,"evidence":[digest],
   "quality":{"level":"direct"},"validity":{"state":"active"},
-  "extensions":{"proof_mode":proof,"invocation_id":immutable.get("invocation_id")},
+  "extensions":{"proof_mode":proof,"invocation_id":immutable.get("invocation_id"),
+                "scenario":{"input_digest":((immutable.get("parameters") or {}).get("proof") or {}).get("input_digest"),
+                            "break":((immutable.get("parameters") or {}).get("proof") or {}).get("break")}},
  }
  stream.append("observation.recorded",payload)
  stored=stream.view()["observations"][observation_id]
@@ -413,8 +547,10 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
   fd,capture_path=tempfile.mkstemp(prefix="inferior-",dir=os.path.join(root,"tmp"))
   os.close(fd)
   runs=[i for i,arg in enumerate(actual_argv) if str(arg).startswith("run < ")]
-  if len(runs)!=1: _proof_error("gdb proof capture requires one generated run command")
-  actual_argv[runs[0]] += " > "+shlex.quote(capture_path)+" 2>&1"
+  expected_runs=3 if proof_mode=="pwn-control-transfer" else 1
+  if len(runs)!=expected_runs: _proof_error("gdb proof capture has wrong generated run count")
+  for index,run_index in enumerate(runs):
+   actual_argv[run_index] += (" >> " if index else " > ")+shlex.quote(capture_path)+" 2>&1"
  result=run(actual_argv,timeout_seconds=timeout,spool_dir=os.path.join(root,"tmp"))
  artifacts=[_capture_artifact(result.stdout,"stdout",root),
             _capture_artifact(result.stderr,"stderr",root)]

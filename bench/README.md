@@ -15,6 +15,7 @@ Every entry declares:
 - `capabilities`: unique kebab-case tags describing the capability exercised, not a claimed exploit result.
 - `redistributable`: whether the challenge artifact itself may be committed.
 - optional `verify.claim_pattern`: a challenge-specific regex used only to classify an agent stdout flag-shaped string as a **solve claim**. It never satisfies the completion gate and never turns a claim into a verified solve.
+- optional `verify.expected_response_sha256`: a lowercase `sha256:<64 hex>` digest of the exact expected response selected by `claim_pattern`. Mode B compares the agent's answer against this operator-held digest after a complete run. The result is recorded in `challenge_oracle_pass`, independently of the internal completion gate. Ambiguous, absent, or mismatched responses fail this oracle. The digest and suite stay outside the agent runtime export.
 
 The committed suite is checked by `tests/test_bench_suite_manifest.py` using `ratlib.bench_suite.validate_suite`. Invalid IDs, duplicate entries, path escapes, invalid corpus values, malformed capability tags, invalid claim regexes, and entries without a source or binary are rejected.
 
@@ -43,7 +44,7 @@ For non-redistributable material, create an ignored `bench/local-suite.json` (or
 }
 ```
 
-Place `chall.bin` locally under that directory; `bench/.gitignore` excludes `artifacts/**/*.bin`, local suite manifests, and inherited `.rat` state. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules. Agent execution requires `sandbox-exec` on macOS or `bwrap` on Linux. The operator checkout is hidden from the agent, with only `.venv` and `.venv-angr` readable for tool execution. If neither sandbox is available, evaluation fails closed.
+Place `chall.bin` locally under that directory; `bench/.gitignore` excludes new artifact directories, local suite manifests, and generated results. Existing tracked public fixtures remain tracked. Review redistribution rights before explicitly adding any new fixture. Do not commit flags, known-good inputs, prior `.rat` state, or other answer material into an agent-visible runtime fixture. Mode B exports only the challenge runtime artifacts allowed by the existing answer-free workspace rules. Agent execution requires `sandbox-exec` on macOS or `bwrap` on Linux. The operator checkout is hidden from the agent, with only `.venv` and `.venv-angr` readable for tool execution. If neither sandbox is available, evaluation fails closed.
 
 The sandbox restricts filesystem access to the operator checkout. It does not isolate network access; the agent CLI still needs its model API connection. Use a private held-out corpus for unseen-solve claims.
 
@@ -91,10 +92,53 @@ python3 bin/ratbench eval \
   --ablation A0 \
   --model-id '<model label>' \
   --reasoning-effort '<effort label>' \
+  --attempts 3 \
   --agent '<agent-cli using {dir}>'
 ```
 
 Use a separate run ID when measurement conditions change. Do not mix synthetic fixtures with real/private entries in a solve-rate comparison.
+
+### Exposing an external agent CLI (e.g. opencode)
+
+The Mode B sandbox deliberately hides the operator home and credentials, so an
+agent CLI that keeps its binary and model credentials under `$HOME` cannot run
+without being explicitly exposed. Use the opt-in flags (all default off; the
+default home/credential isolation is unchanged unless you pass them):
+
+- `--agent-expose PATH[:rw]` — bind a host path into the sandbox (`:rw` only
+  where the CLI must write, e.g. a session DB); repeatable. A missing path
+  fails closed.
+- `--agent-home DIR` — point `HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME` at the
+  real home the exposed CLI reads config/credentials from.
+- `--agent-data-dir DIR` — for OpenCode, create a fresh data directory for each
+  attempt under this scratch root, copy `auth.json` from `--agent-home`, and
+  delete the attempt's session data afterward. This avoids exposing the
+  operator's existing OpenCode session history.
+- `--agent-bin-dir DIR` — add an exposed dir to the sandbox `PATH`.
+
+opencode example (one entry shown; raise `--attempts`/suite for a real run):
+
+```sh
+CTF_HOME="$PWD" python3 bin/ratbench eval \
+  --suite <local-suite>.json --corpus private \
+  --run-id B-<name>-001 --ablation A0 \
+  --model-id gpt-5.6-luna --reasoning-effort none --timeout 600 --attempts 3 \
+  --agent-expose "$HOME/.opencode" \
+  --agent-expose "$HOME/.config/opencode" \
+  --agent-home "$HOME" --agent-data-dir /tmp/ratbench-opencode-data \
+  --agent-bin-dir "$HOME/.opencode/bin" \
+  --agent 'opencode run "<challenge prompt referencing {dir}>"'
+```
+
+Only the exposed paths become visible; the rest of the home stays hidden. This
+pierces the credential isolation, so use it only with a CLI you trust. Report
+with `python3 bin/ratbench report --schema v3`.
+
+On a kernel that restricts unprivileged user namespaces (Ubuntu 24.04+ default,
+`kernel.apparmor_restrict_unprivileged_userns=1`), `bwrap` fails with "setting
+up uid map: Permission denied"; clear it first (needs sudo), e.g.
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (reverts on
+reboot), then verify with `bwrap --ro-bind /usr /usr --tmpfs / -- /usr/bin/true`.
 
 ## Benchmark-v2 provenance
 
@@ -104,11 +148,19 @@ Current Mode B producers attach a `provenance` object to every `rat.benchmark-re
 - selected corpus class(es);
 - agent executable name and SHA-256 of the exact agent command template (the raw command is not stored);
 - optional `--model-id` and `--reasoning-effort` labels;
-- timeout and whether observer-owned `execve` tracing was available;
+- timeout, attempts per entry, selected challenge IDs, and whether observer-owned `execve` tracing was available;
 - OS, architecture, and Python runtime identity;
 - CTF-Rat revision and schema-bundle identity.
 
+Mode B also retains the bounded, combined agent stdout/stderr bytes in the ignored
+`bench/results/<run-id>.logs/` directory. Its `manifest.jsonl` joins each log to
+`challenge_id` and `attempt` and records SHA-256, captured byte count, timeout,
+and output truncation. These are raw agent responses, including failed attempts;
+they are not an independent challenge oracle. Keep this directory private because
+agent output may contain flags or other challenge material.
+
 If `CTF_RAT_REVISION` is set it is authoritative; otherwise a clean git checkout records `HEAD`, a dirty checkout appends a content-derived dirty digest, and exports without git metadata fall back to `worktree`. `ratbench report --schema v3` fails closed if rows under the same `benchmark_run_id` contain mixed provenance, including across ablations, rather than aggregating incomparable attempts.
+For new Mode B rows, the report also checks the advertised challenge ID × attempt grid and rejects missing or duplicate rows. Historical rows without this provenance remain readable.
 
 Live benchmark-v3 rows also record `oracle.failure_class` as an observer-derived, coarse outcome category: `agent-timeout`, `claim-without-completion`, `agent-nonzero-exit`, `no-verified-completion`, or `null` on verified completion. This is **not** an exploit root-cause diagnosis; the canonical completion gate and `oracle.reason` remain authoritative. This additive field does not change the benchmark schema, CLI, or solve criteria.
 
@@ -119,7 +171,7 @@ Live Mode B rows attach an optional top-level `routing` object derived from the 
 The projection records:
 
 - `first_dimensions`, `first_action`, and `first_commitment`;
-- total route assessments and actual decision revisions;
+- total route assessments and adjacent recommended-decision changes (including a change to or from null); skill/commitment/fingerprint-only changes do not increment `decision_revision_count`;
 - the first route-specific skill that was locked, if any.
 
 An attempt that never ran the routing front door reports `route_assessment_count=0` and leaves all first-route fields `null`; it must not fabricate an `unknown` route after the fact. This makes instrumented routing runs directly inspectable without treating a route label as solve correctness.
@@ -169,12 +221,14 @@ For routing studies, prefer revision-based ablation over hidden runtime switches
 1. run the hard-route baseline revision on one held-out corpus with a unique `benchmark_run_id`;
 2. run the active-triage revision on the same corpus/model/reasoning effort/environment/timeout/toolchain except for the intended CTF-Rat revision;
 3. label the rows consistently (for example baseline `A0`, active-triage `A1`) while relying on `provenance.toolchain.ctf_rat_revision` as the authoritative implementation identity;
-4. compare `verified_solve` and latency/tool metrics on both runs; compare the detailed `routing` projection (`first_dimensions`, `first_action`, commitment, decision revisions, first skill lock) only when both revisions carry the instrumentation described above.
+4. compare internal `completion_verified` and latency/tool metrics on both runs; compare independent `challenge_oracle_pass` only where the same external challenge oracle was actually executed. Compare the detailed `routing` projection (`first_dimensions`, `first_action`, commitment, decision revisions, first skill lock) only when both revisions carry the instrumentation described above.
 
 Do not reuse one `benchmark_run_id` across different revisions: provenance validation intentionally fails closed on mixed measurement conditions. Synthetic Mode A route accuracy may guard compatibility, but it is not evidence that one routing architecture solves real challenges better.
 
 ## Measurement rule
 
 Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v3 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
+
+The [baseline execution contract](../docs/audits/REMEDIATION_BASELINE_2026-10-23.md) records the additional artifact, independent oracle, attempt, and cache conditions. The v3 leaderboard shows internal completion and independently measured oracle pass with its coverage in separate columns. Current Mode B runs a fresh workspace for each entry. Its independent oracle field stays `null` unless the local suite pins an exact expected-response digest; an unconfigured run must not be read as an external solve-rate measurement. This hash comparison checks the answer text, not exploit replay or whether a public answer was memorized.
 
 Public `real` entries are reproducible competition artifacts, but they are **not automatically held out** from an internet-enabled agent: public source or writeups may be reachable outside the answer-free workspace. Use public real entries for reproducible integration/performance runs, and use a private held-out corpus (or an explicitly network-controlled agent environment) for claims about unseen solve rate.

@@ -884,7 +884,7 @@ def render_func(rev, target):
     L.append("callers: %d" % f.get("ncallers", 0))
     L.append("calls  : " + (", ".join(f.get("calls", [])) or "-"))
     L.append("strings: " + ("; ".join(_q(s) for s in f.get("strings", [])) or "-"))
-    L.append("→ 본문: decomp <bin> %s" % f["name"])
+    L.append("→ 본문: decomp %s %#x" % (rev.get("bin", "<bin>"), f.get("addr", 0)))
     return "\n".join(L)
 
 
@@ -967,8 +967,9 @@ def compute_function_card(rev, target):
             "detector_version": INTERESTING_DETECTOR_VERSION,
         },
         "unresolved": unresolved,
-        "next": ("verify the loaded raw-code stage and mapping before runtime analysis"
-                 if rev.get("load_spec") else "decomp %s %s" % (rev.get("bin", "?"), name)),
+        "next": ([] if rev.get("load_spec") else [{
+            "query": "decomp", "target": "%s %#x" % (rev.get("bin", "?"), f.get("addr", 0))
+        }]),
         "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"), "engine": rev.get("engine")},
     }
 

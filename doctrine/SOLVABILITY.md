@@ -42,7 +42,8 @@ primitive + 남은 템플릿 조각 전부 확보?
 전부 예 → 확신. 조각 하나 빠짐 → STANDARD(작업 필요) 또는 blocker.
 
 ### L4 stop-loss (이탈 규칙 — call/round 단위가 1차, 분은 참고)
-- 1차 예산(객관): primitive 실증까지 **probe 3라운드**(= 새 신호를 노리는 tool/query 시도 묶음 3회). 여기서 라운드 경계는 `rat route`/`rat query`가 append하는 `governor.checked`로 관측된다 — `ratlib.governor.check_progress`가 최근 5회 연속 no-novelty면 stuck을 반환하고, 이는 곧 stop-loss 트리거다.
+- primitive 실증까지 probe 3라운드를 예산으로 사용한다. 라운드는 새 신호를 노리는 시도 묶음이며, 시작·결과를 작업 기록에 명시해 센다. `governor.checked`는 라운드 경계나 3라운드 예산을 자동 집행하는 이벤트가 아니다.
+- governor는 별도로 계측된 route/brief/query 호출의 novelty를 검사한다. 최근 5개의 계측 호출이 연속 no-novelty이면 stuck을 반환하며, 이는 stop-loss 트리거다. 계측되지 않은 도구 실행까지 모두 센다는 뜻은 아니다.
 - 벽시계(easy≈20분/hard≈30분)는 위 call 예산이 관측 불가할 때만 쓰는 **보조 상한**이다.
 - 초과 & primitive 없음 → 다운그레이드, 다음 챌린지(rabbit-hole 방지). 막힌 지점을 `state no`/`state failclass`로 기록 후 이탈, 나중에 재방문.
 
