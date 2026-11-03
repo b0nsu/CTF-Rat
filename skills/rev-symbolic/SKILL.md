@@ -6,7 +6,7 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-ctf.md
 - `revq --interesting` finds a checker-like function, but it does *not* call `memcmp`/`strcmp` directly — the compare is preceded by arithmetic/bitwise transforms on the input, or crypto-hint tokens (xor/aes/base64/crc/...) appear near it.
 
 ## FIRST ACTION
-- `symsolve.py <bin> --find-str <success> --avoid-str <fail> --stdin <n> --printable` — let angr solve the transform instead of hand-deriving it.
+- `symsolve <bin> --find-str <success> --avoid-str <fail> --stdin <n> --printable` using the repo's native-angr runtime.
 - If the transform is a small custom encoding rather than real crypto, hand-derivation from `decomp <bin> <func>` is often faster than symbolic execution; try both, keep whichever concrete-verifies first.
 
 ## PIVOT
@@ -18,5 +18,5 @@ hot-path only — full technique catalog: `knowledge/ctf-reverse/patterns-ctf.md
 
 ## VERIFY
 - typed STATE v2 PASS (`state primitive pass <rat.primitive/v1 doc.json>` — per `doctrine/PRIMITIVE_GATE.md`, ≥3 active+direct SELF observations) is required before declaring SOLVED, in addition to concrete-verify below.
-- `symsolve.py` concrete-verify (recovered input re-run through the real binary, not just the solver's symbolic state) is the only acceptable evidence for SOLVED here.
+- `symsolve` concrete-verify (recovered input re-run through the real binary, not just the solver's symbolic state) is the only acceptable evidence for SOLVED here.
 - A symbolic solution that only satisfies angr's model without concrete-verify is a hypothesis, not a primitive PASS.

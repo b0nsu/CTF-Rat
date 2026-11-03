@@ -26,7 +26,7 @@ PRIMITIVE_EXAMPLE = {
     "self_evidence": [],
     "constraints": [
         "PASS requires >=3 distinct active direct SELF observations",
-        "control-flow/v2: control-target relation is currently unsupported; register/marker/word captures cannot PASS",
+        "control-flow/v2: use pwn-control-state, pwn-memory-control and pwn-control-transfer for one input/breakpoint scenario",
     ],
     "side_effects": [],
     "remote_equivalent": True, "producer": {"tool": "pwnstage", "version": "1"}, "revision": 1,
@@ -284,7 +284,12 @@ def main():
     if a[0] == "delta":
         import argparse
         p=argparse.ArgumentParser(prog="state delta"); p.add_argument("--after"); p.add_argument("--until"); p.add_argument("--max-bytes",type=int,default=32768); ns=p.parse_args(a[1:])
-        def cur(v): return json.loads(v) if v else None
+        def cur(v):
+            if v is None: return None
+            try: value=json.loads(v)
+            except json.JSONDecodeError as exc: raise ValueError("invalid JSON cursor") from exc
+            if not isinstance(value,dict): raise ValueError("cursor must be a JSON object")
+            return value
         try:
             ev=stream_for(fpath).delta(cur(ns.after),cur(ns.until))
             print(bounded_delta_bytes(ev, ns.max_bytes).decode())

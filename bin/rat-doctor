@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from ratlib.angr_runtime import configured_python
+from ratlib.ghidra import resolve_analyze_headless
 
 TOOLS = {
     "file": ("file",), "binutils": ("readelf", "objdump"), "gdb": ("gdb",),
@@ -110,7 +111,11 @@ def main(argv=None):
     if not os.path.isfile(args.binary):
         print("rat-doctor: binary is missing or not a regular file", file=sys.stderr); return 4
     fmt = format_info(args.binary)
-    capabilities = {name: executable(commands) for name, commands in TOOLS.items()}
+    capabilities = {name: executable(commands) for name, commands in TOOLS.items()
+                    if name != "ghidra"}
+    ghidra = resolve_analyze_headless()
+    capabilities["ghidra"] = executable((ghidra,)) if ghidra else {
+        "status": "unavailable", "path": None, "version": None}
     capabilities["qemu"] = executable((QEMU_BY_ARCH[fmt["architecture"]],)) if fmt["architecture"] in QEMU_BY_ARCH else {
         "status": "unavailable", "path": None, "version": None,
         "reason": "no qemu-user mapping for artifact architecture",

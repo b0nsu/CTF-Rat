@@ -1,12 +1,12 @@
 # pwn-kernel
 
-hot-path only — full technique catalog: `knowledge/ctf-skills/kernel.md` (+`kernel-techniques.md`, `kernel-bypass.md`); environment tooling in `kernel/` (`k_*`).
+hot-path only — full technique catalog: `knowledge/ctf-skills/kernel.md` (+`kernel-techniques.md`, `kernel-bypass.md`); environment tooling in `bin/` (`k_*`), with kernel-specific instructions and GDB configuration in `kernel/`.
 
 ## SIGNALS
 - Kernel-space imports/symbols (`copy_from_user`, `copy_to_user`, `kmalloc`, `kfree`, `module_init`/`module_exit`), a `.ko` module, or a bundled `vmlinux`/boot image alongside the challenge.
 
 ## FIRST ACTION
-- Use `kernel/k_*` tooling (`k_run_qemu`, `k_dump_heap`, `k_kallsyms`/`k_raw_kallsyms`, `k_repack`) to stand up the actual target environment before reading the module statically — kernel exploits are environment-first, not just static-RE-first.
+- Use `bin/k_*` tooling (`k_run_qemu`, `k_dump_heap`, `k_kallsyms`/`k_raw_kallsyms`, `k_repack`) to stand up the actual target environment before reading the module statically — kernel exploits are environment-first, not just static-RE-first.
 - `k_kallsyms` to confirm KASLR state and known symbol addresses before hypothesizing a technique.
 
 ## PIVOT

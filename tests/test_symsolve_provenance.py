@@ -37,7 +37,7 @@ class SymsolveProvenanceTests(unittest.TestCase):
                 target.write(b"fixture binary")
 
             observation_id = symsolve.record_concrete_observation(
-                root, binary, b"verified marker", {"stdin": "4142"})
+                root, binary, b"verified marker", {"stdin": "4142"}, 0)
             view = Stream(root).view()
             observation = view["observations"][observation_id]
             self.assertEqual(observation["kind"], "rev.symsolve.concrete-verify")
@@ -46,6 +46,8 @@ class SymsolveProvenanceTests(unittest.TestCase):
             self.assertEqual(observation["quality"]["level"], "heuristic")
             capture = json.loads(get(observation["evidence"][0], root=Stream(root).root))
             self.assertEqual(capture["output_hex"], b"verified marker".hex())
+            self.assertEqual(capture["target_returncode"], 0)
+            self.assertEqual(capture["expected_exit_code"], 0)
 
             primitives = view["primitives"]
             self.assertEqual(len(primitives), 1)
@@ -97,7 +99,7 @@ class SymsolveProvenanceTests(unittest.TestCase):
             before = stream.view()["primitives"]["prim_existing"]
 
             observation_id = symsolve.record_concrete_observation(
-                root, binary, b"verified marker", {"stdin": "4142"})
+                root, binary, b"verified marker", {"stdin": "4142"}, 0)
 
             primitive = Stream(root).view()["primitives"]["prim_existing"]
             self.assertEqual(primitive["status"], "pass")
@@ -129,7 +131,8 @@ class SymsolveProvenanceTests(unittest.TestCase):
                 "subject": {"kind": "binary", "sha256": subject_digest},
                 "kind": "rev.symsolve.concrete-verify",
                 "value": {"verdict": "pass", "engine": "symsolve",
-                          "engine_build_digest": engine_digest},
+                          "engine_build_digest": engine_digest,
+                          "target_returncode": 0, "expected_exit_code": 0},
                 "evidence": [report_digest], "quality": {"level": "heuristic"},
                 "validity": {"state": "active"},
             }

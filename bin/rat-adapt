@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """P1 adapter for legacy recon/revq/gdbq/symsolve commands."""
-import argparse, json, os, sys
+import argparse, hashlib, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from ratlib.contracts import PROOF_MODES, execute, prepare_proof_invocation, record_proof_observation
 p=argparse.ArgumentParser(); p.add_argument("--root", help="artifact-store directory (normally <challenge>/.rat), not the challenge root"); p.add_argument("--input",action="append",default=[]); p.add_argument("--timeout",type=float,default=60)
@@ -9,8 +9,11 @@ p.add_argument("--direct-subject",help="path (must be one of --input) this invoc
     "opts the run into direct-evidence issuance when it is a real measurement mode of a trusted "
     "verifier build (see ratlib.state_v2.direct_measurement_policy). Cite the printed "
     "extensions.envelope_digest as an observation's evidence to mint 'direct' quality (PRIMITIVE_GATE.md).")
-p.add_argument("--proof",choices=sorted(PROOF_MODES),help="validate verifier output and record a direct observation; target-word captures do not prove control flow")
+p.add_argument("--proof",choices=sorted(PROOF_MODES),help="validate verifier output and record a direct observation")
 p.add_argument("--proof-input",help="concrete stdin file for generated gdbq proof runs")
+p.add_argument("--proof-control-input",help="second concrete stdin file for pwn-control-transfer")
+p.add_argument("--proof-target-register",help="x86-64 register used by an indirect call/jump")
+p.add_argument("--proof-aslr",choices=["on","off"],help="set GDB inferior ASLR for PWN proof runs")
 p.add_argument("--proof-break",help="safe symbol/address where PWN proof runs stop before inspection")
 p.add_argument("--proof-address",help="safe register/address expression for memory/target proof")
 p.add_argument("--proof-marker",help="expected attacker marker bytes as hex for pwn-memory-control")
@@ -19,6 +22,12 @@ p.add_argument("--proof-expect",help="expected program output for REV oracle/rep
 p.add_argument("tool",choices=["recon","revq","gdbq","symsolve"]); p.add_argument("args",nargs=argparse.REMAINDER)
 a=p.parse_args(); home=os.path.dirname(os.path.realpath(__file__))
 paths={"recon":os.path.join(home,"recon"),"revq":os.path.join(home,"revq"),"gdbq":os.path.join(home,"gdbq"),"symsolve":os.path.join(home,"symsolve")}
+def file_digest(path):
+    if not path: return None
+    digest=hashlib.sha256()
+    with open(path,"rb") as stream:
+        for chunk in iter(lambda:stream.read(65536),b""): digest.update(chunk)
+    return "sha256:"+digest.hexdigest()
 args=list(a.args)
 # Compatibility surface used by PRIMITIVE_GATE.md: gdbq itself consumes
 # `gdbq <binary> <gdb-command>...`; rat-adapt accepts `gdbq --batch file.gdb`
@@ -34,18 +43,26 @@ if os.path.basename(os.path.realpath(root)) != ".rat" and os.path.isdir(os.path.
 inputs=list(a.input)
 if a.proof_input and a.proof_input not in inputs:
     inputs.append(a.proof_input)
+if a.proof_control_input and a.proof_control_input not in inputs:
+    inputs.append(a.proof_control_input)
 try:
     argv=prepare_proof_invocation(
         a.tool,paths[a.tool],args,direct_subject=a.direct_subject,proof=a.proof,
         proof_input=a.proof_input,proof_break=a.proof_break,
         proof_address=a.proof_address,proof_marker=a.proof_marker,
-        proof_target=a.proof_target,proof_expect=a.proof_expect)
+        proof_target=a.proof_target,proof_expect=a.proof_expect,
+        proof_control_input=a.proof_control_input,proof_target_register=a.proof_target_register,
+        proof_aslr=a.proof_aslr)
     parameters={"args":a.args}
     if a.proof:
         parameters["proof"]={
             "mode":a.proof,"input":a.proof_input,"break":a.proof_break,
             "address":a.proof_address,"marker":a.proof_marker,
             "target":a.proof_target,"expect":a.proof_expect,
+            "control_input":a.proof_control_input,"target_register":a.proof_target_register,
+            "aslr":a.proof_aslr,
+            "input_digest":file_digest(a.proof_input),
+            "control_input_digest":file_digest(a.proof_control_input),
         }
     result=execute(argv,root=root,input_paths=inputs,parameters=parameters,
                    timeout=a.timeout,direct_subject=a.direct_subject,fresh=a.fresh)
@@ -53,7 +70,8 @@ try:
         proof_record=record_proof_observation(
             result,root=root,direct_subject=a.direct_subject,proof=a.proof,
             proof_address=a.proof_address,proof_marker=a.proof_marker,
-            proof_target=a.proof_target,proof_expect=a.proof_expect)
+            proof_target=a.proof_target,proof_expect=a.proof_expect,
+            proof_control_input=a.proof_control_input,proof_target_register=a.proof_target_register)
         result["extensions"]={**(result.get("extensions") or {}),
                               "proof_observation":proof_record}
 except ValueError as exc:

@@ -8,6 +8,7 @@ verification; import presence is never promoted into a PASS primitive here.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 
 from .route import (
     FORMAT as FORMAT_IMPORTS, HEAP as HEAP_IMPORTS, INPUT as INPUT_IMPORTS,
@@ -28,13 +29,20 @@ def _fact_map(profile):
 
 
 def _binary_digest(profile):
+    canonical = (profile or {}).get("binary_digest")
+    if canonical is not None:
+        return canonical if isinstance(canonical, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", canonical) else None
     for item in (profile or {}).get("inputs", []) or []:
-        if isinstance(item, Mapping) and item.get("role") == "binary" and item.get("digest"):
-            return item["digest"]
+        if isinstance(item, Mapping) and item.get("role") == "binary":
+            value = item.get("digest")
+            if isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+                return value
     for key in ("binary_sha256", "sha256"):
         value = (profile or {}).get(key)
-        if isinstance(value, str) and value:
-            return value if value.startswith("sha256:") else "sha256:" + value
+        if isinstance(value, str):
+            digest = value if value.startswith("sha256:") else "sha256:" + value
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                return digest
     return None
 
 

@@ -145,7 +145,7 @@ class ProfileElfProtections(unittest.TestCase):
  """R0-1: ELF identification must not depend on `file`'s path prefix, PIE must
  come from the ELF header Type (not a 'DYN' substring of DYNAMIC), imports must
  be only normalized UND dynamic symbols, and miss/hit must agree."""
- SRC='#include <string.h>\n#include <stdio.h>\nint main(int c,char**v){char b[64];if(c>1)strcpy(b,v[1]);puts(b);gets(b);return 0;}\n'
+ SRC='#include <string.h>\n#include <stdio.h>\n#include <unistd.h>\nint main(int c,char**v){char b[64]={0};if(c>1)strcpy(b,v[1]);puts(b);read(0,b,128);return 0;}\n'
  def setUp(self):
   self.d=tempfile.TemporaryDirectory(); self.work=pathlib.Path(self.d.name)
   self.src=self.work/"r.c"; self.src.write_text(self.SRC)
@@ -169,12 +169,12 @@ class ProfileElfProtections(unittest.TestCase):
   self.assertIn("elf-header",doc["summary"]["coverage"])
   self.assertEqual(facts.get("elf.pie"),False)  # ET_EXEC with DYNAMIC seg is not PIE
   self.assertEqual(facts.get("elf.nx"),True)
-  self.assertIn("gets",prof["imports"]); self.assertIn("strcpy",prof["imports"])
+  self.assertIn("read",prof["imports"]); self.assertIn("strcpy",prof["imports"])
   # imports are clean UND symbols, free of readelf noise and version suffixes
   self.assertNotIn("ELF64",prof["imports"])
   self.assertFalse(any("@" in i for i in prof["imports"]))
   self.assertFalse(any(i.endswith(".c") for i in prof["imports"]))
-  self.assertEqual(sorted({s["target"] for s in prof["signals"]}),["gets","strcpy"])
+  self.assertEqual(sorted({s["target"] for s in prof["signals"]}),["read","strcpy"])
  def test_pie_elf_profiled_with_pie_true(self):
   exe=self._compile("pie","-fPIE","-pie")
   _,prof=self._profile(exe,"--no-cache")

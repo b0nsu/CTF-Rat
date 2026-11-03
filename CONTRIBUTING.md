@@ -20,6 +20,12 @@ knowledge live together so they stay in sync.
 ## Workflow
 
 - Branch off `dev`, not `main`. `main` only receives reviewed, CI-green PRs.
+- For an exceptional release branch based directly on `main`, record why `dev`
+  could not be used. After that release is merged, preserve the old `dev` tip,
+  compare its remaining changes with the new `main`, and rebuild `dev` from
+  `main` with only changes still intended for a future PR. Review the resulting
+  diff and run CI before opening another `dev`-based PR so release changes are
+  not proposed a second time.
 - Keep PRs scoped to one change (one tool, one bug, one doc fix). Large
   unrelated diffs are hard to review and hard to revert.
 - If you touch a tool under `bin/` or `solve/_template/rev/`, run its

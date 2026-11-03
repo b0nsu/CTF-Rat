@@ -16,7 +16,7 @@
 | `OPERATOR_COMPLETED` | 사람이 후속 작업과 결과를 별도로 확인함 |
 
 `pkshare`의 기본 출력은 `HANDOFF.md`다. `WRITEUP.md`와 `SUBMISSION.md`는 운영자가
-서명한 구조화 attestation을 각각 `--solved --attestation <json>` 또는
+확인한 구조화 attestation을 각각 `--solved --attestation <json>` 또는
 `--submission --attestation <json>`으로 제공한 경우에만 생성한다. 기존 문서는
 기본적으로 덮어쓰지 않으며, 기계 생성본을 의도적으로 재생성할 때만 `--force`를 쓴다.
 
@@ -44,6 +44,8 @@
 
 완료 문서에는 다음 구조의 JSON이 필요하다. `evidence` digest는 현재 artifact 또는 v2
 observation에서 실제로 참조 가능한 값이어야 한다.
+이 JSON은 서명되지 않으며 작성자 신원을 인증하지 않는다. 운영자 확인은 별도로 받아야 하고,
+검사기는 문서 구조·시간대 형식·현재 사용 가능한 증거 참조를 확인한다.
 
 ```json
 {

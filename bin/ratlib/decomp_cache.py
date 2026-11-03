@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -117,7 +120,8 @@ def load_meta(cache: str):
         return None
 
 
-def validate(cache: str, binary: str, ghidra_home: str, script_dir: str) -> tuple[bool, str]:
+def validate(cache: str, binary: str, ghidra_home: str, script_dir: str,
+             register: bool = True) -> tuple[bool, str]:
     meta = load_meta(cache)
     if not meta:
         return False, "legacy"
@@ -131,11 +135,13 @@ def validate(cache: str, binary: str, ghidra_home: str, script_dir: str) -> tupl
     current = payload_digest(cache)
     if not isinstance(expected, str) or current is None or current != expected:
         return False, "corrupt"
-    _register_index(cache, prov, binary, envelope_digest=current)
+    if register:
+        _register_index(cache, prov, binary, envelope_digest=current)
     return True, "hit"
 
 
-def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, status: str, diagnostics: str = "") -> None:
+def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str,
+               status: str, diagnostics: str = "", register: bool = True) -> None:
     prov = provenance(binary, ghidra_home, script_dir)
     index = os.path.join(cache, "_index.txt")
     total = 0
@@ -182,8 +188,57 @@ def write_meta(cache: str, binary: str, ghidra_home: str, script_dir: str, statu
         os.replace(tmp, os.path.join(cache, ".rat-cache.json"))
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
-    if payload["status"] == "complete":
+    if payload["status"] == "complete" and register:
         _register_index(cache, prov, binary, envelope_digest=sealed)
+
+
+def publish_stage(stage: str, cache: str, binary: str, ghidra_home: str,
+                  script_dir: str) -> None:
+    """Publish a sealed sibling generation; restore the old cache on any error."""
+    if (os.path.islink(stage) or os.path.islink(cache)
+            or os.path.dirname(os.path.abspath(stage)) != os.path.dirname(os.path.abspath(cache))
+            or not os.path.basename(stage).startswith(os.path.basename(cache) + ".stage.")):
+        raise ValueError("stage must be a non-symlink sibling of the cache")
+    if validate(stage, binary, ghidra_home, script_dir, register=False) != (True, "hit"):
+        raise ValueError("staged cache is not complete and sealed")
+    if validate(cache, binary, ghidra_home, script_dir, register=False) != (True, "hit"):
+        raise ValueError("canonical cache is not sealed")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    exchanged = False
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                              ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        rc = renameat2(-100, os.fsencode(stage), -100, os.fsencode(cache), 2)
+        if rc == 0:
+            exchanged = True
+        elif ctypes.get_errno() not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            raise OSError(ctypes.get_errno(), "atomic cache exchange failed")
+    if not exchanged:
+        backup = cache + ".backup." + uuid.uuid4().hex
+        os.rename(cache, backup)
+        try:
+            os.rename(stage, cache)
+        except BaseException:
+            os.rename(backup, cache)
+            raise
+        try:
+            if validate(cache, binary, ghidra_home, script_dir) != (True, "hit"):
+                raise ValueError("published cache failed validation")
+        except BaseException:
+            os.rename(cache, stage)
+            os.rename(backup, cache)
+            raise
+        shutil.rmtree(backup)
+        return
+    try:
+        if validate(cache, binary, ghidra_home, script_dir) != (True, "hit"):
+            raise ValueError("published cache failed validation")
+    except BaseException:
+        renameat2(-100, os.fsencode(stage), -100, os.fsencode(cache), 2)
+        raise
+    shutil.rmtree(stage)
 
 
 def record_invocation(cache: str, binary: str, ghidra_home: str, script_dir: str,
@@ -263,6 +318,12 @@ def main(argv=None) -> int:
         sp.add_argument("cache"); sp.add_argument("binary"); sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
         if name == "write":
             sp.add_argument("status", choices=("complete", "partial")); sp.add_argument("--diagnostic", default="")
+            sp.add_argument("--no-register", action="store_true")
+        if name == "validate":
+            sp.add_argument("--no-register", action="store_true")
+    sp = sub.add_parser("publish")
+    sp.add_argument("stage"); sp.add_argument("cache"); sp.add_argument("binary")
+    sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
     sp = sub.add_parser("invocation")
     sp.add_argument("cache"); sp.add_argument("binary"); sp.add_argument("ghidra_home"); sp.add_argument("script_dir")
     sp.add_argument("cache_state", choices=("hit", "miss", "bypass"))
@@ -277,14 +338,20 @@ def main(argv=None) -> int:
     if a.cmd == "key":
         print(cache_key(provenance(a.binary, a.ghidra_home, a.script_dir))); return 0
     if a.cmd == "validate":
-        valid, reason = validate(a.cache, a.binary, a.ghidra_home, a.script_dir)
+        valid, reason = validate(a.cache, a.binary, a.ghidra_home, a.script_dir,
+                                 register=not a.no_register)
         print(reason); return 0 if valid else {"legacy": 10, "stale": 11, "partial": 12, "corrupt": 13}[reason]
     if a.cmd == "invocation":
         record_invocation(a.cache, a.binary, a.ghidra_home, a.script_dir,
                           a.cache_state, a.status, a.operation, a.requested,
                           a.started_at, a.started_ns, a.exit_code, a.result_class)
         return 0
-    write_meta(a.cache, a.binary, a.ghidra_home, a.script_dir, a.status, a.diagnostic); return 0
+    if a.cmd == "publish":
+        publish_stage(a.stage, a.cache, a.binary, a.ghidra_home, a.script_dir)
+        return 0
+    write_meta(a.cache, a.binary, a.ghidra_home, a.script_dir, a.status,
+               a.diagnostic, register=not a.no_register)
+    return 0
 
 
 if __name__ == "__main__":

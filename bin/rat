@@ -74,6 +74,8 @@ def _brief(value, limit=6):
     return str(value)
 
 def _render_next(items):
+    if isinstance(items, (str, dict)):
+        items = [items]
     lines = []
     for n in items:
         if isinstance(n, dict):
@@ -1108,7 +1110,7 @@ def cmd_query_oracle(args):
                              "message": "candidates truncated at item boundary (budget_bytes=%d); counts are exact" % budget})
     if oracle["auto_connect"]:
         r = oracle["resolved"]
-        heuristics["next"] = [{"query": "symsolve.py --find %#x --avoid %#x" % (r["success"]["addr"], r["failure"]["addr"]), "target": binary}]
+        heuristics["next"] = [{"query": "symsolve --find %#x --avoid %#x" % (r["success"]["addr"], r["failure"]["addr"]), "target": binary}]
     status = "ok" if oracle["auto_connect"] and not truncated else "partial"
     doc = _query_envelope("oracle", status=status, facts=facts, heuristics=heuristics, artifacts=[],
                            coverage={"complete": oracle["auto_connect"] and not truncated, "scope": "binary-strings+xrefs",

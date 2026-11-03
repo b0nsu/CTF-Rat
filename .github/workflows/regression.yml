@@ -19,6 +19,7 @@ jobs:
           cache: pip
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb bubblewrap
       - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - run: python3 -m pip install --disable-pip-version-check 'jsonschema>=4,<5'
       # tool selftests (pure logic, no angr — see bin/revq "Mac selftest 격리")
       - run: python3 bin/rat selftest
       - run: python3 bin/revq selftest
@@ -61,6 +62,7 @@ jobs:
           cache: pip
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y gdb gcc sqlite3 bubblewrap
       - run: python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - run: python3 -m pip install --disable-pip-version-check 'jsonschema>=4,<5'
       - run: python3 -m venv .venv-angr
       - run: .venv-angr/bin/python -m pip install --disable-pip-version-check -r requirements-deep.txt
       - run: .venv-angr/bin/python -c "import angr; from angr.engines import unicorn; assert unicorn._UC_NATIVE is not None"

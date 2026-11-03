@@ -1,5 +1,7 @@
 # Native symbolic engine, isolated from the pwntools environment.
 angr==9.2.223
+# angr 9.2.223 imports with pycparser 3.11; 3.12 breaks its CLexer call path.
+pycparser==3.11
 # pyvex 9.2.223 uses ConstBitStream, which bitstring 5 removed.
 bitstring==4.4.0
 unicorn==2.1.4

@@ -42,18 +42,10 @@ The canonical field contract is `doctrine/WRITEUP_FORMAT.md`.
 
 ## Output shape
 
-Use the sections from `doctrine/WRITEUP_FORMAT.md`:
-
-1. Status and scope
-2. Artifacts and environment
-3. Summary
-4. Analysis timeline
-5. Primitive gate evidence
-6. Local reproduction
-7. Rejected routes
-8. Constraints and operator handoff
-9. Reusable knowledge
-10. AI and automation disclosure
+Use the canonical Korean headings and field contract from `doctrine/WRITEUP_FORMAT.md`.
+For `HANDOFF.md`, fill its five minimal sections; extended sections are optional.
+For `WRITEUP.md` or `SUBMISSION.md`, include the full extended sections and required operator attestation.
+The `(minimal)` / `(extended)` labels explain the template and are omitted from actual document headings.
 
 Keep raw terminal output in evidence artifacts and quote only the observations needed to verify
 the conclusion. A complete exploit-to-flag script is not part of the default local handoff.

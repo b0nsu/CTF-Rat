@@ -410,11 +410,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="pwngadget", description="bounded ROP-gadget search + cache")
     ap.add_argument("binary")
     ap.add_argument("query", nargs="?")
-    ap.add_argument("--arch", default="x86-64")
+    ap.add_argument("--arch", help="binary architecture; inferred from ELF e_machine when omitted")
     ap.add_argument("--max", type=int, default=20)
     ap.add_argument("--presets", action="store_true")
     ap.add_argument("--format", choices=("text", "json"), default="text")
     args = ap.parse_args(argv)
+    if args.arch is None:
+        args.arch = _detect_arch(args.binary)
+        if args.arch is None:
+            ap.error("cannot infer binary architecture; provide --arch")
     if args.presets:
         return cmd_presets(args.binary, args.arch, args.max, args.format)
     if not args.query:

@@ -87,6 +87,37 @@ class WriteupPipelineTests(unittest.TestCase):
         }))
         return path
 
+    def test_minimal_handoff_headings_are_accepted_but_completed_doc_needs_extended(self):
+        content = "\n".join([
+            "# Minimal fixture",
+            "## 상태와 범위",
+            "- 상태: ANALYZING",
+            "- 문서 유형: handoff",
+            "- 상태 원본: `STATE v2`",
+            "## Artifact와 환경",
+            "- SHA-256: " + DIGEST,
+            "## 핵심 요약",
+            "진행 중",
+            "## Gate Status",
+            "검증 전",
+            "## 제약과 운영자 인계",
+            "추가 분석 필요",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "HANDOFF.md")
+            path.write_text(content, encoding="utf-8")
+            result = subprocess.run([sys.executable, str(CHECK), str(path), "--strict"],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            completed = pathlib.Path(directory, "WRITEUP.md")
+            completed.write_text(content.replace("ANALYZING", "OPERATOR_COMPLETED")
+                                 .replace("문서 유형: handoff", "문서 유형: writeup"), encoding="utf-8")
+            result = subprocess.run([sys.executable, str(CHECK), str(completed), "--strict"],
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing section: 풀이과정", result.stdout)
+            self.assertIn("completed document requires operator attestation section", result.stdout)
+
     def test_flag_word_does_not_infer_solved(self):
         with tempfile.TemporaryDirectory() as directory:
             self.write_state(directory, [{"t": "init", "chal": "fixture"}, {"t": "ok", "text": "supplied fake flag file inspected locally"}])

@@ -117,9 +117,21 @@ def _benchmark_provenance(d):
     for key in ("model_id","reasoning_effort"):
         if agent[key] is not None and (not isinstance(agent[key],str) or not agent[key]): raise ValidationError("invalid benchmark agent %s" % key)
     execution=d["execution"]
-    if not isinstance(execution,Mapping) or set(execution)!={"timeout_seconds","observer_execve_trace"}: raise ValidationError("invalid benchmark provenance execution")
+    if (not isinstance(execution,Mapping) or
+        not {"timeout_seconds","observer_execve_trace"} <= set(execution) or
+        set(execution)-{"timeout_seconds","observer_execve_trace","attempts_per_entry","challenge_ids"}): raise ValidationError("invalid benchmark provenance execution")
     if not isinstance(execution["timeout_seconds"],int) or isinstance(execution["timeout_seconds"],bool) or execution["timeout_seconds"] < 1: raise ValidationError("invalid benchmark timeout")
     if not isinstance(execution["observer_execve_trace"],bool): raise ValidationError("invalid benchmark observer flag")
+    if "attempts_per_entry" in execution and (type(execution["attempts_per_entry"]) is not int or
+                                               not 1 <= execution["attempts_per_entry"] <= 100):
+        raise ValidationError("invalid benchmark attempts_per_entry")
+    if ("attempts_per_entry" in execution) != ("challenge_ids" in execution):
+        raise ValidationError("benchmark attempt grid requires both count and challenge_ids")
+    if "challenge_ids" in execution:
+        ids=execution["challenge_ids"]
+        if (not isinstance(ids,list) or not ids or
+            any(not isinstance(item,str) or not item for item in ids) or
+            ids != sorted(set(ids))): raise ValidationError("invalid benchmark challenge_ids")
     environment=d["environment"]
     if not isinstance(environment,Mapping) or set(environment)!={"os","arch","runtime"} or any(not isinstance(environment[k],str) or not environment[k] for k in environment): raise ValidationError("invalid benchmark environment")
     toolchain=d["toolchain"]

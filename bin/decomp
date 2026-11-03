@@ -2,17 +2,7 @@
 CTF_HOME="${CTF_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")/.." && pwd)}"
 # decomp <binary> [func] — Ghidra headless 1회 전체 디컴파일 캐시 후 함수별 조회 (context 폭발 방지)
 set -euo pipefail
-GHIDRA="${GHIDRA_HOME:-}"
-if [ -z "$GHIDRA" ]; then
-  for cand in /opt/ghidra_*_PUBLIC "${HOME:-}/ctf-tools"/ghidra_*_PUBLIC \
-    /opt/homebrew/opt/ghidra/libexec /usr/local/opt/ghidra/libexec; do
-    if [ -x "$cand/support/analyzeHeadless" ]; then GHIDRA="$cand"; break; fi
-  done
-fi
-if [ -z "$GHIDRA" ] && command -v analyzeHeadless >/dev/null 2>&1; then
-  GHIDRA="$(cd -- "$(dirname -- "$(command -v analyzeHeadless)")/.." && pwd)"
-fi
-GHIDRA="${GHIDRA:-/opt/ghidra_11.2.1_PUBLIC}"
+GHIDRA="$(python3 "$CTF_HOME/bin/ratlib/ghidra.py" --cache-home 2>/dev/null || true)"
 if [ -z "${JAVA_HOME:-}" ] && ! java -version >/dev/null 2>&1; then
   for jdk in /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
     /usr/local/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home; do
@@ -120,8 +110,9 @@ PY
 reseal_decomp_cache(){
   # DecompOne mutates both _index.txt and one .c payload.  A successful mutation
   # must become a new complete cache generation before we serve it as canonical.
-  python3 "$META_TOOL" write "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" complete >/dev/null 2>&1 || return 1
-  python3 "$META_TOOL" validate "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null 2>&1
+  local staged="$1"
+  python3 "$META_TOOL" write "$staged" "$BIN" "$GHIDRA" "$SCRIPTDIR" complete --no-register >/dev/null 2>&1 || return 1
+  python3 "$META_TOOL" validate "$staged" "$BIN" "$GHIDRA" "$SCRIPTDIR" --no-register >/dev/null 2>&1
 }
 
 check_import_scope(){
@@ -256,18 +247,23 @@ else
       check_import_scope
       echo "[*] '$FUNC' 함수 캐시 없음; Ghidra one-shot create/decompile 시도 $(printf '0x%x' "$addr")" >&2
       proj="$(mktemp -d)"
-      one_log="$CACHE/.ghidra-one-$(printf '%x' "$addr").log"
+      stage="$(mktemp -d "${CACHE}.stage.XXXXXX")"
+      cp -a "$CACHE/." "$stage/"
+      one_log="${CACHE}.one-$(printf '%x' "$addr").log"
       if "$TIMEOUT" --signal=TERM --kill-after=1 "${TIMEOUT_SEC}s" "$GHIDRA/support/analyzeHeadless" "$proj" p -import "$BIN" \
-          -scriptPath "$SCRIPTDIR" -postScript DecompOne.java "$CACHE" "$(printf '%x' "$addr")" \
+          -scriptPath "$SCRIPTDIR" -postScript DecompOne.java "$stage" "$(printf '%x' "$addr")" \
           -deleteProject >"$one_log" 2>&1; then
         rm -rf "$proj"
-        IFS=$'\t' read -r one_status one_file one_addr one_vma < <(python3 "$CTF_HOME/bin/ratlib/decomp_lookup.py" "$BIN" "$CACHE" "FUN_$(printf '%x' "$addr")")
+        IFS=$'\t' read -r one_status one_file one_addr one_vma < <(python3 "$CTF_HOME/bin/ratlib/decomp_lookup.py" "$BIN" "$stage" "FUN_$(printf '%x' "$addr")")
         if [ "$one_status" = hit ]; then
           if grep -qE 'Control flow encountered bad instruction data|Bad instruction|halt_baddata' "$one_file"; then
             echo "[!] Ghidra one-shot 결과 품질 낮음; disassembly fallback 사용" >&2
-          elif reseal_decomp_cache; then
-            emit_file "$one_file"
-            exit 0
+          elif reseal_decomp_cache "$stage"; then
+            if python3 "$META_TOOL" publish "$stage" "$CACHE" "$BIN" "$GHIDRA" "$SCRIPTDIR" >/dev/null 2>&1; then
+              IFS=$'\t' read -r one_status one_file one_addr one_vma < <(python3 "$CTF_HOME/bin/ratlib/decomp_lookup.py" "$BIN" "$CACHE" "FUN_$(printf '%x' "$addr")")
+              if [ "$one_status" = hit ]; then emit_file "$one_file"; exit 0; fi
+            fi
+            echo "[!] Ghidra one-shot cache 교체 실패; 이전 sealed cache 유지" >&2
           else
             echo "[!] Ghidra one-shot cache integrity 재봉인 실패; disassembly fallback 사용" >&2
           fi
@@ -275,6 +271,7 @@ else
       else
         rm -rf "$proj"
       fi
+      rm -rf "$stage"
       echo "[!] Ghidra one-shot 실패; disassembly fallback 사용 (log: $one_log)" >&2
     fi
     start=$((file_vma > 96 ? file_vma - 96 : 0))

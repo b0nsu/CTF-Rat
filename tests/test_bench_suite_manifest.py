@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -27,6 +28,22 @@ class BenchSuiteManifestTests(unittest.TestCase):
         real = [entry for entry in self.suite["entries"] if entry["corpus"] == "real"]
         self.assertTrue(real)
         self.assertTrue(all(entry.get("binary") and entry.get("fetch") for entry in real))
+
+    def test_expected_response_oracle_requires_exact_digest_and_pattern(self):
+        doc = copy.deepcopy(self.suite)
+        entry = doc["entries"][0]
+        entry["verify"]["expected_response_sha256"] = "sha256:" + hashlib.sha256(b"FLAG{answer}").hexdigest()
+        entry["verify"]["claim_pattern"] = r"FLAG\{[^}]+\}"
+        validate_suite(doc)
+        for bad in ("sha256:bad", "sha256:" + "A" * 64, True):
+            with self.subTest(bad=bad):
+                entry["verify"]["expected_response_sha256"] = bad
+                with self.assertRaisesRegex(SuiteValidationError, "expected_response_sha256"):
+                    validate_suite(doc)
+        entry["verify"]["expected_response_sha256"] = "sha256:" + hashlib.sha256(b"FLAG{answer}").hexdigest()
+        del entry["verify"]["claim_pattern"]
+        with self.assertRaisesRegex(SuiteValidationError, "claim_pattern is required"):
+            validate_suite(doc)
 
     def test_suite_digest_is_stable_and_content_sensitive(self):
         first = suite_digest(self.suite)

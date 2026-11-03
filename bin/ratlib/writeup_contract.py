@@ -18,6 +18,9 @@ REQUIRED_SECTIONS = (
     "재사용 가능한 지식",
     "AI·자동화 사용",
 )
+MINIMAL_SECTIONS = (
+    "상태와 범위", "Artifact와 환경", "핵심 요약", "Gate Status", "제약과 운영자 인계",
+)
 VALID_STATUSES = {"ANALYZING", "PRIMITIVE_PASS", "BLOCKED", "OPERATOR_COMPLETED"}
 DOCUMENT_FILES = {
     "handoff": "HANDOFF.md",
