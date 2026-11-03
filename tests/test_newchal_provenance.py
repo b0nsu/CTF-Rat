@@ -57,9 +57,9 @@ class NewchalProvenanceTests(unittest.TestCase):
                                      env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                 solve = home / "solve/fixture"
-                route = json.loads((solve / "route.json").read_text())
+                route = json.loads((solve / ".scaffold/route.json").read_text())
                 self.assertEqual(route["schema"], "rat.route-result/v2")
-                self.assertIn("diagnostic on stderr", (solve / "route.stderr.log").read_text())
+                self.assertIn("diagnostic on stderr", (solve / ".scaffold/route.stderr.log").read_text())
                 self.assertNotIn("ROUTE UNKNOWN", (solve / "state.md").read_text())
                 self.assertEqual((solve / "original/chall").read_bytes(), original_binary)
                 self.assertEqual((solve / "original/libc.so.6").read_bytes(), original_libc)
@@ -83,6 +83,65 @@ class NewchalProvenanceTests(unittest.TestCase):
 
     def test_failed_pwninit_preserves_originals_and_uses_base_binary(self):
         self._run(9)
+
+    def test_route_output_names_preserve_main_and_additional_artifacts(self):
+        with tempfile.TemporaryDirectory(prefix="newchal-route-names-") as folder:
+            root = Path(folder)
+            home = root / "home"
+            bindir = home / "bin"
+            bindir.mkdir(parents=True)
+            (bindir / "ratlib").symlink_to(ROOT / "bin/ratlib", target_is_directory=True)
+            shutil.copy2(ROOT / "bin/newchal", bindir / "newchal")
+            template = home / "solve/_template"
+            template.mkdir(parents=True)
+            (template / "state.md").write_text("# fixture\n")
+            route_doc = {"schema": "rat.route-result/v2", "signals": [],
+                         "dimensions": {key: [] for key in ("vulnerability_surfaces", "program_shapes",
+                                                        "obstacles", "constraints")},
+                         "unresolved": [], "next": [], "capabilities": {}, "leads": [],
+                         "decision": None, "commitment": "unknown", "skill": None,
+                         "diagnostics": []}
+            for name, body in (("ctfguard", "exit 0"), ("libcgate", "exit 0"),
+                               ("rat", "echo '" + json.dumps(route_doc) + "'\n"
+                                "echo 'route diagnostic' >&2")):
+                tool = bindir / name
+                tool.write_text("#!/bin/sh\n" + body + "\n")
+                tool.chmod(0o755)
+            env = os.environ | {"CTF_HOME": str(home)}
+            for artifact_name in ("route.json", "route.stderr.log"):
+                for role in ("main", "extra"):
+                    case = (role + "_" + artifact_name).replace(".", "_")
+                    binary = root / (artifact_name if role == "main" else "chall")
+                    shutil.copy2("/bin/true", binary)
+                    payload = binary.read_bytes()
+                    args = [str(bindir / "newchal"), case, str(binary)]
+                    extra_payload = b"additional artifact with route output name"
+                    if role == "extra":
+                        extra = root / artifact_name
+                        extra.write_bytes(extra_payload)
+                        args += ["--artifact", "extra=" + str(extra)]
+                    run = subprocess.run(args, env=env, capture_output=True,
+                                         text=True, timeout=60)
+                    self.assertEqual(run.returncode, 0, (case, run.stdout, run.stderr))
+                    solve = home / "solve" / case
+                    manifest = json.loads((solve / "run.json").read_text())
+                    self.assertEqual((solve / binary.name).read_bytes(), payload)
+                    self.assertEqual((solve / "original" / binary.name).read_bytes(), payload)
+                    expected_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+                    self.assertEqual(manifest["artifact_provenance"]["binary"]["original"]["sha256"],
+                                     expected_digest)
+                    self.assertEqual(manifest["artifact_provenance"]["binary"]["working"]["sha256"],
+                                     expected_digest)
+                    if role == "extra":
+                        self.assertEqual((solve / artifact_name).read_bytes(), extra_payload)
+                        extra_input = next(item for item in manifest["inputs"]
+                                           if item["name"] == artifact_name)
+                        self.assertEqual(extra_input["sha256"],
+                                         "sha256:" + hashlib.sha256(extra_payload).hexdigest())
+                    self.assertEqual(json.loads((solve / ".scaffold/route.json").read_text()),
+                                     route_doc)
+                    self.assertIn("route diagnostic",
+                                  (solve / ".scaffold/route.stderr.log").read_text())
 
 
 if __name__ == "__main__":

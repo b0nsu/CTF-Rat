@@ -116,7 +116,7 @@ class NewchalReservedNameTests(unittest.TestCase):
             base = Path(temporary)
             home, tools = self._kit(base)
             env = {**os.environ, "CTF_HOME": str(home)}
-            for reserved in ("exploit.py", "run.json", "state.md", "Dockerfile", "libc.so.6"):
+            for reserved in ("exploit.py", "run.json", "state.md", "Dockerfile", "libc.so.6", "original"):
                 binary = base / reserved
                 binary.write_bytes(b"\x7fELFfixture")
                 name = "resv_" + reserved.replace(".", "_")
@@ -163,6 +163,23 @@ class NewchalReservedNameTests(unittest.TestCase):
                 env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("colliding", result.stderr)
+
+    def test_additional_artifact_cannot_claim_original_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            home, tools = self._kit(base)
+            binary = base / "chall"
+            binary.write_bytes(b"\x7fELFfixture")
+            extra = base / "original"
+            extra.write_bytes(b"source artifact")
+            result = subprocess.run(
+                ["bash", str(tools / "newchal"), "reserved_extra", str(binary),
+                 "--artifact", "extra=%s" % extra],
+                env={**os.environ, "CTF_HOME": str(home)}, capture_output=True,
+                text=True, timeout=30)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("colliding", result.stderr)
+            self.assertFalse((home / "solve/reserved_extra").exists())
 
 
 if __name__ == "__main__":

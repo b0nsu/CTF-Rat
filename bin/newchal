@@ -122,7 +122,7 @@ if [ -n "$LIBC" ]; then LIBC_ABS="$(resolve_path "$LIBC")"; fi
 # artifact must not claim one of these, or scaffolding would silently overwrite
 # the operator's binary (or vice versa). libc.so.6 is reserved because --libc is
 # copied to that fixed name.
-RESERVED_NAMES=("run.json" "exploit.py" "state.md" "Dockerfile" "libc.so.6")
+RESERVED_NAMES=("run.json" "exploit.py" "state.md" "Dockerfile" "libc.so.6" "original")
 for reserved in "${RESERVED_NAMES[@]}"; do
   if [ "$BN" = "$reserved" ]; then
     echo "[newchal:err] main artifact basename collides with reserved scaffold file: $BN" >&2
@@ -139,7 +139,7 @@ if [ -n "$LIBC_ABS" ] && [ "$BN" = "libc.so.6" ]; then
 fi
 # Validate additional inputs before writing to solve/.
 EXTRA_FILES=()
-EXTRA_NAMES=("$(basename "$BIN_ABS")" "$(basename "$BIN_ABS")_patched" "libc.so.6" "run.json" "exploit.py" "state.md" "Dockerfile")
+EXTRA_NAMES=("$(basename "$BIN_ABS")" "$(basename "$BIN_ABS")_patched" "libc.so.6" "run.json" "exploit.py" "state.md" "Dockerfile" "original")
 for spec in ${EXTRA_SPECS[@]+"${EXTRA_SPECS[@]}"}; do
   if [[ "$spec" != *=* ]]; then
     echo "[newchal:err] --artifact requires role=path" >&2; exit 2
@@ -322,8 +322,15 @@ else
   # The first user-facing classification must come from the canonical
   # evidence-first router, not the independent legacy recon tier heuristic.
   echo "=== rat route (provisional evidence) ==="
-  ROUTE_RESULT="$D/route.json"
-  ROUTE_DIAGNOSTICS="$D/route.stderr.log"
+  # This directory cannot collide with a validated input basename, which must
+  # begin with an ASCII letter or digit. Keep route outputs away from artifacts.
+  [ ! -L .scaffold ] || { echo "[newchal:err] scaffold directory must not be a symlink" >&2; exit 5; }
+  mkdir -p -- .scaffold
+  ROUTE_RESULT="$D/.scaffold/route.json"
+  ROUTE_DIAGNOSTICS="$D/.scaffold/route.stderr.log"
+  for output in "$ROUTE_RESULT" "$ROUTE_DIAGNOSTICS"; do
+    [ ! -L "$output" ] || { echo "[newchal:err] route output must not be a symlink: $output" >&2; exit 5; }
+  done
   if "$CTF/bin/rat" route "./$BN" --format json >"$ROUTE_RESULT" 2>"$ROUTE_DIAGNOSTICS"; then
     cat -- "$ROUTE_RESULT" | tee -a state.md
     if [ -s "$ROUTE_DIAGNOSTICS" ]; then tee -a state.md < "$ROUTE_DIAGNOSTICS" >&2; fi

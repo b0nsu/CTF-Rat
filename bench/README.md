@@ -135,10 +135,13 @@ pierces the credential isolation, so use it only with a CLI you trust. Report
 with `python3 bin/ratbench report --schema v3`.
 
 On a kernel that restricts unprivileged user namespaces (Ubuntu 24.04+ default,
-`kernel.apparmor_restrict_unprivileged_userns=1`), `bwrap` fails with "setting
-up uid map: Permission denied"; clear it first (needs sudo), e.g.
-`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (reverts on
-reboot), then verify with `bwrap --ro-bind /usr /usr --tmpfs / -- /usr/bin/true`.
+`kernel.apparmor_restrict_unprivileged_userns=1`), `bwrap` can fail with "setting
+up uid map: Permission denied". Prefer an isolated VM or dedicated development
+environment with user namespaces enabled. As an exceptional host-wide change,
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` relaxes the host's
+security policy until reboot. If you choose it, restore the original setting
+after testing and verify the sandbox with
+`bwrap --ro-bind /usr /usr --tmpfs / -- /usr/bin/true`.
 
 ## Benchmark-v2 provenance
 
@@ -229,6 +232,16 @@ Do not reuse one `benchmark_run_id` across different revisions: provenance valid
 
 Synthetic fixtures are regression tests, not evidence of real solve rate. Compare architecture changes on the same held-out corpus, model, reasoning effort, environment, timeout, and tool versions. Use benchmark-v3 output for verified solve and latency/tool metrics; leave unavailable telemetry as `null` rather than substituting zero. Provenance improves reproducibility but does not manufacture unavailable dependency/tool-version telemetry. A real/private baseline is not considered measured until the local artifacts and the external Mode B agent CLI actually execute under this protocol.
 
-The [baseline execution contract](../docs/audits/REMEDIATION_BASELINE_2026-10-23.md) records the additional artifact, independent oracle, attempt, and cache conditions. The v3 leaderboard shows internal completion and independently measured oracle pass with its coverage in separate columns. Current Mode B runs a fresh workspace for each entry. Its independent oracle field stays `null` unless the local suite pins an exact expected-response digest; an unconfigured run must not be read as an external solve-rate measurement. This hash comparison checks the answer text, not exploit replay or whether a public answer was memorized.
+For a comparable baseline, pin the challenge artifacts and their digests, the
+suite projection, independent challenge oracle, model, prompt, timeout,
+toolchain, runtime environment, and cache condition before running. Use fresh
+run IDs and retain failed attempts along with their bounded agent logs. The v3
+leaderboard shows internal completion and independently measured oracle pass
+with its coverage in separate columns. Current Mode B creates a fresh workspace
+for each attempt and records a cold cache; it does not support a warm-cache
+comparison. Its independent oracle field stays `null` unless the local suite
+pins an exact expected-response digest. An unconfigured run is not an external
+solve-rate measurement. This hash comparison checks answer text, not exploit
+replay or whether a public answer was memorized.
 
 Public `real` entries are reproducible competition artifacts, but they are **not automatically held out** from an internet-enabled agent: public source or writeups may be reachable outside the answer-free workspace. Use public real entries for reproducible integration/performance runs, and use a private held-out corpus (or an explicitly network-controlled agent environment) for claims about unseen solve rate.
