@@ -104,7 +104,7 @@ class FrontdoorRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source, binary = root / "chall.c", root / "chall"
-            source.write_text('#include <stdio.h>\nint main(void){char b[8]; gets(b); puts(b);}\n')
+            source.write_text('#include <stdio.h>\n#include <string.h>\nint main(int c,char**v){char b[8]={0};if(c>1)strcpy(b,v[1]);puts(b);}\n')
             subprocess.run(["gcc", "-no-pie", "-o", str(binary), str(source)],
                            check=True, capture_output=True)
             digest = "sha256:" + hashlib.sha256(binary.read_bytes()).hexdigest()
