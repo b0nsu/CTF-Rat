@@ -182,6 +182,7 @@ Config precedence: CLI > env vars (`CTFD_URL` / `CTFD_TOKEN`) > dotenv (`--env`,
 revq <bin>                     # summary + INTERESTING (check-routine candidates) + EVASION (anti-debug/packing)
 revq <bin> --func <name>       # single-function neighborhood card (saves context before decompiling)
 decomp <bin> <func>             # Bash executable: Ghidra headless decompile cache
+decomp-local <bin> <addr>       # experimental Ghidra -noanalysis one-function import (partial)
 mod2solve system.json           # solve matrix @ x = target modulo 2**bits; verify against original inputs
 symsolve <bin> --find-str Correct --stdin 16 --printable      # recover input, re-run the real binary to verify
 vmlift --disasm|--run|--solve [blob]                          # toy-VM scaffold; adapt to target semantics first
@@ -189,6 +190,14 @@ vmlift --disasm|--run|--solve [blob]                          # toy-VM scaffold;
 
 > [!TIP]
 > `revq` addresses = angr's load base (PIE `0x400000`) → feed them straight into `symsolve --find <addr>`.
+
+For inputs above 2 MiB, `revq BIN --func SYMBOL` and `rat query func BIN SYMBOL`
+analyze the ELF symbol range only. A numeric address requires `--func-size BYTES`;
+these results are `partial` because global callers and xrefs are incomplete.
+Full CFGFast runs in a bounded child process (120 seconds/2 GiB by default;
+explicit large-input overrides use 300 seconds/4 GiB). The separate
+`decomp-local` path also reports partial coverage. See `bench/README.md` for
+the measured fixtures and reproducible commands.
 
 `decomp` is a Bash script: invoke `bin/decomp <bin> <func>` directly or with
 `bash bin/decomp <bin> <func>`. Python tools such as `revq` accept
