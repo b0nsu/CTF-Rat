@@ -119,6 +119,8 @@ class VM:
     def step(self):
         op = self.code[self.pc]
         _name, nopnd = self.spec.get(op, (None, 0))
+        if nopnd and self.pc + 1 >= len(self.code):
+            raise VMError("truncated operand @%#x" % self.pc)
         opnd = self.code[self.pc + 1] if nopnd else None
         self.pc += 1 + nopnd
 
