@@ -74,13 +74,26 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
         # distinct cache files and distinct results.
         blob = Path(self.tmp.name) / "blob-arch"
         blob.write_bytes(self.large.read_bytes())
-        common = ["--func", "0x400000", "--func-size", "64",
+        # Target a REAL .text address of the (no-pie) fixture, not the ELF-header
+        # region: decoding actual x86 code yields a function under both arches, so
+        # the test exercises the cache key rather than an arch's ability to form a
+        # function out of arbitrary header bytes.  main's VMA == its file-mapped
+        # address here (no-pie, base 0x400000).
+        main_addr = None
+        for line in subprocess.check_output(["nm", str(self.small)], text=True).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == "main" and parts[1] in ("T", "t"):
+                main_addr = hex(int(parts[0], 16))
+        self.assertIsNotNone(main_addr, "control binary has no main symbol")
+        common = ["--func", main_addr, "--func-size", "96",
                   "--base", "0x400000", "--entry", "0x400000", "--format", "json"]
-        subprocess.run([str(BIN / "revq"), str(blob), "--arch", "i386", *common],
-                       capture_output=True, text=True, timeout=60, check=True)
-        amd64 = subprocess.run([str(BIN / "revq"), str(blob), "--arch", "amd64", *common],
-                               capture_output=True, text=True, timeout=60, check=True)
-        doc_amd64 = json.loads(amd64.stdout)
+        r_i386 = subprocess.run([str(BIN / "revq"), str(blob), "--arch", "i386", *common],
+                                capture_output=True, text=True, timeout=60)
+        r_amd64 = subprocess.run([str(BIN / "revq"), str(blob), "--arch", "amd64", *common],
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(r_i386.returncode, 0, r_i386.stderr[-400:])
+        self.assertEqual(r_amd64.returncode, 0, r_amd64.stderr[-400:])
+        doc_amd64 = json.loads(r_amd64.stdout)
         # Each arch wrote its own cache file; a shared key would leave only one and
         # the amd64 query would have been served the cached i386 analysis.
         cache_files = sorted(blob.parent.glob(blob.name + ".func-*.revq.json"))
