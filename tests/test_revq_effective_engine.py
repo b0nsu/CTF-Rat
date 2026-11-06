@@ -2,12 +2,18 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN = os.path.join(ROOT, "bin")
+# bin/revq imports `from ratlib...` at module top, so bin must be importable even
+# when this module is loaded in isolation (not just in a full-suite run where
+# another test already put it on sys.path).
+if BIN not in sys.path:
+    sys.path.insert(0, BIN)
 
 
 def _load_revq():

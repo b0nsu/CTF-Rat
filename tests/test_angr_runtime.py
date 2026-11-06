@@ -36,7 +36,21 @@ class AngrRuntimeTests(unittest.TestCase):
                 angr_runtime.reexec_for_angr(str(script), ["--arg", "value with spaces"])
             self.assertEqual(execv.call_args.args[:2], (
                 str(interpreter), [str(interpreter), os.path.realpath(script), "--arg", "value with spaces"]))
-            self.assertEqual(execv.call_args.args[2]["RAT_ANGR_REEXEC_TARGET"], os.path.realpath(interpreter))
+            self.assertEqual(execv.call_args.args[2]["RAT_ANGR_REEXEC_TARGET"],
+                             "%d:%s" % (os.getpid(), os.path.realpath(interpreter)))
+
+    def test_inherited_reexec_marker_does_not_skip_child_process(self):
+        with tempfile.TemporaryDirectory() as root:
+            interpreter = pathlib.Path(root, "python")
+            interpreter.symlink_to(sys.executable)
+            marker = "111:%s" % os.path.realpath(interpreter)
+            with patch.dict(os.environ, {"RAT_ANGR_REEXEC_TARGET": marker}), \
+                 patch.object(angr_runtime, "configured_python", return_value=str(interpreter)), \
+                 patch.object(angr_runtime.os, "getpid", return_value=222), \
+                 patch.object(angr_runtime.os, "execve") as execv:
+                angr_runtime.reexec_for_angr("child.py", [])
+            self.assertEqual(execv.call_args.args[2]["RAT_ANGR_REEXEC_TARGET"],
+                             "222:%s" % os.path.realpath(interpreter))
 
     def test_reexec_skips_current_interpreter(self):
         with patch.object(angr_runtime, "configured_python", return_value=os.path.abspath(sys.executable)), \

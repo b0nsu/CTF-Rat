@@ -1,0 +1,538 @@
+{
+  "analysis_complete": true,
+  "analysis_status": "complete",
+  "engine": "angr",
+  "function_count": 33,
+  "functions": [
+    {
+      "addr": 4198400,
+      "call_sites": [
+        {
+          "api": "UnresolvableCallTarget",
+          "block_address": 4198420,
+          "instruction_address": 4198420,
+          "length_argument": null,
+          "target_address": 6295640,
+          "target_kind": "resolved"
+        }
+      ],
+      "calls": [
+        "UnresolvableCallTarget"
+      ],
+      "name": "_init",
+      "nblocks": 3,
+      "ncallers": 0,
+      "ninstr": 8,
+      "size": 27,
+      "strings": []
+    },
+    {
+      "addr": 4198432,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401020",
+      "nblocks": 1,
+      "ncallers": 7,
+      "ninstr": 2,
+      "size": 12,
+      "strings": []
+    },
+    {
+      "addr": 4198444,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40102c",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 4,
+      "strings": []
+    },
+    {
+      "addr": 4198448,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401030",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198462,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40103e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198464,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401040",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198478,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40104e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198480,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401050",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198494,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40105e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198496,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401060",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198510,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40106e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198512,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401070",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198526,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40107e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198528,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401080",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198542,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40108e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198544,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401090",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 3,
+      "size": 14,
+      "strings": []
+    },
+    {
+      "addr": 4198558,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_40109e",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 2,
+      "strings": []
+    },
+    {
+      "addr": 4198672,
+      "call_sites": [
+        {
+          "api": "__libc_start_main",
+          "block_address": 4198672,
+          "instruction_address": 4198703,
+          "length_argument": null,
+          "target_address": 5242880,
+          "target_kind": "resolved"
+        }
+      ],
+      "calls": [
+        "__libc_start_main"
+      ],
+      "name": "_start",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 12,
+      "size": 37,
+      "strings": []
+    },
+    {
+      "addr": 4198709,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401135",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 1,
+      "strings": []
+    },
+    {
+      "addr": 4198710,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401136",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 10,
+      "strings": []
+    },
+    {
+      "addr": 4198720,
+      "call_sites": [],
+      "calls": [],
+      "name": "_dl_relocate_static_pie",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 2,
+      "size": 5,
+      "strings": []
+    },
+    {
+      "addr": 4198725,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401145",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 2,
+      "size": 11,
+      "strings": []
+    },
+    {
+      "addr": 4198736,
+      "call_sites": [],
+      "calls": [],
+      "name": "deregister_tm_clones",
+      "nblocks": 5,
+      "ncallers": 2,
+      "ninstr": 10,
+      "size": 33,
+      "strings": []
+    },
+    {
+      "addr": 4198769,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_401171",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 2,
+      "size": 15,
+      "strings": []
+    },
+    {
+      "addr": 4198784,
+      "call_sites": [],
+      "calls": [],
+      "name": "register_tm_clones",
+      "nblocks": 4,
+      "ncallers": 2,
+      "ninstr": 14,
+      "size": 49,
+      "strings": []
+    },
+    {
+      "addr": 4198833,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_4011b1",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 2,
+      "size": 15,
+      "strings": []
+    },
+    {
+      "addr": 4198848,
+      "call_sites": [
+        {
+          "api": "deregister_tm_clones",
+          "block_address": 4198861,
+          "instruction_address": 4198865,
+          "length_argument": null,
+          "target_address": 4198736,
+          "target_kind": "resolved"
+        }
+      ],
+      "calls": [
+        "deregister_tm_clones"
+      ],
+      "name": "__do_global_dtors_aux",
+      "nblocks": 4,
+      "ncallers": 2,
+      "ninstr": 10,
+      "size": 32,
+      "strings": []
+    },
+    {
+      "addr": 4198879,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_4011df",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 1,
+      "size": 1,
+      "strings": []
+    },
+    {
+      "addr": 4198881,
+      "call_sites": [],
+      "calls": [],
+      "name": "sub_4011e1",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 2,
+      "size": 15,
+      "strings": []
+    },
+    {
+      "addr": 4198896,
+      "call_sites": [],
+      "calls": [],
+      "name": "frame_dummy",
+      "nblocks": 1,
+      "ncallers": 1,
+      "ninstr": 2,
+      "size": 6,
+      "strings": []
+    },
+    {
+      "addr": 4198902,
+      "call_sites": [
+        {
+          "api": "puts",
+          "block_address": 4198902,
+          "instruction_address": 4198920,
+          "length_argument": null,
+          "target_address": 4198560,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "fflush",
+          "block_address": 4198925,
+          "instruction_address": 4198935,
+          "length_argument": null,
+          "target_address": 4198624,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "exit",
+          "block_address": 4198940,
+          "instruction_address": 4198945,
+          "length_argument": null,
+          "target_address": 4198656,
+          "target_kind": "resolved"
+        }
+      ],
+      "calls": [
+        "exit",
+        "fflush",
+        "puts"
+      ],
+      "name": "win",
+      "nblocks": 3,
+      "ncallers": 1,
+      "ninstr": 11,
+      "size": 48,
+      "strings": [
+        "FLAG{synthetic-stack-overflow}"
+      ]
+    },
+    {
+      "addr": 4198950,
+      "call_sites": [
+        {
+          "api": "setvbuf",
+          "block_address": 4198950,
+          "instruction_address": 4198987,
+          "length_argument": null,
+          "target_address": 4198640,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "fgets",
+          "block_address": 4198992,
+          "instruction_address": 4199011,
+          "length_argument": null,
+          "target_address": 4198592,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "strcspn",
+          "block_address": 4199028,
+          "instruction_address": 4199045,
+          "length_argument": null,
+          "target_address": 4198576,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "strcmp",
+          "block_address": 4199050,
+          "instruction_address": 4199072,
+          "length_argument": {
+            "reason": "comparison API has no length argument",
+            "status": "not_applicable"
+          },
+          "target_address": 4198608,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "win",
+          "block_address": 4199081,
+          "instruction_address": 4199081,
+          "length_argument": null,
+          "target_address": 4198902,
+          "target_kind": "resolved"
+        },
+        {
+          "api": "puts",
+          "block_address": 4199086,
+          "instruction_address": 4199096,
+          "length_argument": null,
+          "target_address": 4198560,
+          "target_kind": "resolved"
+        }
+      ],
+      "calls": [
+        "fgets",
+        "puts",
+        "setvbuf",
+        "strcmp",
+        "strcspn",
+        "win"
+      ],
+      "name": "main",
+      "nblocks": 11,
+      "ncallers": 1,
+      "ninstr": 39,
+      "size": 158,
+      "strings": [
+        "nope",
+        "open-sesame"
+      ]
+    },
+    {
+      "addr": 4199108,
+      "call_sites": [],
+      "calls": [],
+      "name": "_fini",
+      "nblocks": 1,
+      "ncallers": 0,
+      "ninstr": 4,
+      "size": 13,
+      "strings": []
+    }
+  ],
+  "input_sha256": "sha256:2733f6ab4b22ac3f72c00f7735f46027e61ca268e0ea5a6adefcb1fdd5c9a00f",
+  "oracle": {
+    "ambiguous": false,
+    "auto_connect": false,
+    "failure_candidates": [],
+    "resolved": null,
+    "success_candidates": []
+  },
+  "schema": "rat.revq-semantics/v1",
+  "strings": [
+    {
+      "addr": 4202504,
+      "val": "FLAG{synthetic-stack-overflow}",
+      "xrefs": [
+        {
+          "addr": 4198910,
+          "func": "win"
+        }
+      ]
+    },
+    {
+      "addr": 4202537,
+      "val": "open-sesame",
+      "xrefs": [
+        {
+          "addr": 4199059,
+          "func": "main"
+        }
+      ]
+    },
+    {
+      "addr": 4202549,
+      "val": "nope",
+      "xrefs": [
+        {
+          "addr": 4199086,
+          "func": "main"
+        }
+      ]
+    }
+  ]
+}

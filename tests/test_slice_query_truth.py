@@ -74,6 +74,20 @@ class SliceTruthTests(unittest.TestCase):
         self.assertEqual(doc["status"], "partial")
         self.assertFalse(doc["coverage"]["complete"])
 
+    def test_size_refusal_survives_frontdoor_projection(self):
+        doc = self._project({
+            "status": "partial",
+            "summary": {"analysis_kind": "data", "coverage": "refused"},
+            "diagnostics": [{"message": "input exceeds CFGFast soft limit", "severity": "warning"}],
+            "inputs": [],
+            "artifacts": [],
+            "provenance": {"cache": {"hit": False}},
+        })
+        self.assertEqual(doc["status"], "partial")
+        self.assertEqual(doc["coverage"]["producer_coverage"], "refused")
+        self.assertEqual(doc["coverage"]["omitted"]["analysis"], "refused")
+        self.assertEqual(doc["diagnostics"][0]["code"], "analysis_unavailable")
+
     def test_future_multi_indirect_count_is_incomplete(self):
         doc = self._project({
             "status": "ok",

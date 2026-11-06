@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Experimental Ghidra one-function path with -noanalysis import.
+
+Usage: decomp-local BIN ADDRESS [--timeout SEC] [--format json|text]
+ADDRESS is revq/angr's loader address (PIE rebased at 0x400000). The result
+always reports partial whole-program coverage, even on successful decompile.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ratlib.decomp_lookup import binary_kind
+from ratlib.ghidra import resolve_analyze_headless
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def result(binary: Path, address: int, timeout: int, refresh: bool) -> dict:
+    ghidra = resolve_analyze_headless()
+    if not ghidra:
+        return {"schema": "rat.decomp-local/v1", "status": "dependency_missing",
+                "diagnostics": ["Ghidra analyzeHeadless unavailable"], "content": None}
+    script = Path(__file__).resolve().parent / "ghidra_scripts" / "DecompLocal.java"
+    props = Path(ghidra).parents[1] / "Ghidra" / "application.properties"
+    version = next((line.split("=", 1)[1].strip() for line in props.read_text().splitlines()
+                    if line.startswith("application.version=")), "unknown")
+    kind = binary_kind(str(binary))
+    if kind not in {"elf", "elf-pie"}:
+        return {"schema": "rat.decomp-local/v1", "status": "error",
+                "diagnostics": ["local noanalysis path currently requires ELF"], "content": None}
+    identity = {"input_sha256": digest(binary), "address": address, "mapping": kind,
+                "engine": "Ghidra", "engine_version": version,
+                "script_sha256": digest(script), "policy": "noanalysis-one-function-v1"}
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    cache = binary.parent / ".rat" / "decomp-local" / (key + ".json")
+    if cache.is_file() and not refresh:
+        try:
+            cached = json.loads(cache.read_text())
+            if cached.get("identity") == identity and cached.get("status") == "partial":
+                cached["cache_state"] = "hit"
+                return cached
+        except (OSError, ValueError):
+            pass
+    # Persist the Ghidra project per binary (keyed by its content hash) under .rat
+    # so a second function of the SAME binary re-opens it with -process instead of
+    # paying the -import cost again.  The per-(binary,address) result cache above
+    # still short-circuits repeat queries for the same function; this only helps
+    # DIFFERENT functions of one binary.  The project is a derived artifact (the
+    # result cache is authoritative), so a stale/locked project is discarded and
+    # rebuilt rather than trusted.  Single-user assumption: no concurrent runs on
+    # the same binary (Ghidra locks the project; a lock → fall back to re-import).
+    # Ghidra's ProjectLocator rejects any path element starting with '.', so the
+    # persistent project cannot live under .rat/.  Keep it in a sibling, non-dotted
+    # cache dir keyed by the binary hash (the authoritative result cache stays in
+    # .rat/decomp-local/).
+    project_root = binary.parent / "rat-ghidra-projects" / ("proj-" + identity["input_sha256"].split(":")[-1][:16])
+    # analyzeHeadless names an imported program after the file's basename; -process
+    # must use that same name to re-open it.
+    program_name = binary.name
+
+    def _ghidra_command(output, reuse):
+        if reuse:
+            # Re-open the already-imported program; no -import, no -deleteProject.
+            return [ghidra, str(project_root), "p", "-process", program_name,
+                    "-noanalysis", "-scriptPath", str(script.parent),
+                    "-postScript", script.name, str(output), format(address, "x"),
+                    "pie" if kind == "elf-pie" else "native"]
+        # Import once and KEEP the project for later functions of the same binary.
+        return [ghidra, str(project_root), "p", "-import", str(binary),
+                "-noanalysis", "-scriptPath", str(script.parent),
+                "-postScript", script.name, str(output), format(address, "x"),
+                "pie" if kind == "elf-pie" else "native"]
+
+    def _run_ghidra_capture(command, env, wait):
+        with tempfile.TemporaryFile() as log:
+            proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                    env=env, start_new_session=True)
+            timed_out = False
+            try:
+                proc.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 2048))
+            tail = log.read(2048).decode("utf-8", "replace")
+        return proc.returncode, timed_out, tail
+
+    import shutil as _shutil
+    with tempfile.TemporaryDirectory(prefix="rat-ghidra-local-") as directory:
+        base = Path(directory)
+        output = base / "output"
+        output.mkdir()
+        project_root.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.setdefault("XDG_CONFIG_HOME", str(base / "ghidra-config"))
+        env.setdefault("JAVA_TOOL_OPTIONS", "-Xmx2g -XX:-TieredCompilation")
+
+        reuse = (project_root / "p.gpr").is_file()
+        command = _ghidra_command(output, reuse)
+        rc, timed_out, tail = _run_ghidra_capture(command, env, timeout)
+        content_file = output / "function.c"
+        if (reuse and not timed_out and (rc != 0 or not content_file.is_file())):
+            # The promised lock/stale-project fallback: a -process run that fails
+            # (held lock from a killed earlier run, corrupt project) discards the
+            # derived project and re-imports from scratch exactly once.  The result
+            # cache is authoritative, so throwing the project away is safe.
+            _shutil.rmtree(project_root, ignore_errors=True)
+            project_root.mkdir(parents=True, exist_ok=True)
+            command = _ghidra_command(output, reuse=False)
+            rc, timed_out, tail = _run_ghidra_capture(command, env, timeout)
+        if timed_out or rc != 0 or not content_file.is_file():
+            return {"schema": "rat.decomp-local/v1",
+                    "status": "timeout" if timed_out else "error", "identity": identity,
+                    "cache_state": "miss", "content": None, "command": command,
+                    "diagnostics": ["Ghidra noanalysis one-function path failed", tail]}
+        scope_text = (output / "scope.txt").read_text()
+        scope = dict(line.split("=", 1) for line in scope_text.splitlines() if "=" in line)
+        doc = {"schema": "rat.decomp-local/v1", "status": "partial",
+               "identity": identity, "cache_state": "miss", "scope": scope,
+               "coverage": {"function": "decompiled", "whole_program": False,
+                            "xref": "incomplete", "callgraph": "incomplete"},
+               "content": content_file.read_text(errors="replace"),
+               "diagnostics": ["-noanalysis import; other functions and global xrefs were not analyzed"]}
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(doc, ensure_ascii=False, sort_keys=True) + "\n")
+        return doc
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("address", type=lambda value: int(value, 0))
+    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--format", choices=("json", "text"), default="json")
+    args = parser.parse_args()
+    if not args.binary.is_file() or args.timeout <= 0 or args.address < 0:
+        parser.error("existing binary, positive timeout and nonnegative address required")
+    doc = result(args.binary.resolve(), args.address, args.timeout, args.refresh)
+    if args.format == "json":
+        print(json.dumps(doc, ensure_ascii=False, sort_keys=True))
+    elif doc.get("content") is not None:
+        print(doc["content"])
+        print("[partial: noanalysis function scope]", file=sys.stderr)
+    else:
+        print("; ".join(doc["diagnostics"]), file=sys.stderr)
+    return 0 if doc["status"] == "partial" else 124 if doc["status"] == "timeout" else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

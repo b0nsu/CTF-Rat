@@ -8,7 +8,7 @@ rat-verify, state, ratlib.cache). Legacy CLIs are unchanged and still work
 standalone -- this is an additional canonical entrypoint, not a replacement.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.machinery, importlib.util, json, os, re, subprocess, sys, time
+import argparse, hashlib, importlib.machinery, importlib.util, json, os, re, signal, subprocess, sys, time
 from datetime import datetime, timezone
 
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -220,7 +220,7 @@ def _load_revq_module():
         _REVQ_MODULE = mod
     return _REVQ_MODULE
 
-def _gather_revq(binary, fast, store, load_spec=None):
+def _gather_revq(binary, fast, store, load_spec=None, func_target=None, func_size=None):
     if inspect_kernel(binary)["kind"] in {"bzimage", "linux-boot-image"}:
         raise RuntimeError("Linux boot image: extract vmlinux before ELF analysis (Linux scripts/extract-vmlinux)")
     mod = _load_revq_module()
@@ -229,7 +229,8 @@ def _gather_revq(binary, fast, store, load_spec=None):
     # error when loaded in-process so one binary's degradation can't kill rat.
     try:
         rev = mod.load_or_extract(binary, "binutils" if fast else "angr", False,
-                                  index_root=store, load_spec=load_spec)
+                                  index_root=store, load_spec=load_spec,
+                                  func_target=func_target, func_size=func_size)
     except SystemExit as exc:
         raise RuntimeError("revq extraction failed (exit %s)" % exc.code) from exc
     return mod, rev
@@ -266,6 +267,37 @@ def _record_revq_invocation(mod, binary, fast, store, rev, started_at,
 
 # ---- legacy tool delegation (subprocess capture -- these tools only print, never return a doc) ----
 def _run_subprocess(argv, timeout=120):
+    if argv and os.path.basename(argv[0]) == "rat-slice":
+        # rat-slice performs CFGFast in its own process. Enforce both wall time
+        # and address space here; subprocess.run(timeout=...) only caps time.
+        from ratlib.runner import ResourceLimits, run as run_bounded
+        explicit = os.environ.get("RAT_ALLOW_LARGE") in {"1", "true", "yes"}
+        budget = 300 if explicit else timeout
+        memory = (4 if explicit else 2) * 1024 * 1024 * 1024
+        try:
+            result = run_bounded(argv, timeout_seconds=budget,
+                                 limits=ResourceLimits(cpu_seconds=int(budget),
+                                                       address_space_bytes=memory),
+                                 preview_bytes=16 * 1024 * 1024,
+                                 max_output_bytes=16 * 1024 * 1024,
+                                 env={key: os.environ[key] for key in
+                                      ("CTF_HOME", "RAT_ALLOW_LARGE", "RAT_ANGR_PYTHON")
+                                      if key in os.environ})
+            if result.timed_out or result.resource_limited:
+                return 124, "", "angr slice timeout (%ds budget)" % budget
+            # Native CFGFast over the RLIMIT_AS cap dies with SIGSEGV (NULL from a
+            # C allocation), not only SIGKILL/exit 71; treat it as the memory limit
+            # too, matching revq._extract_angr_bounded.  A real analysis crash that
+            # survives --allow-large stays visible via the honest message.
+            if result.signal in {signal.SIGKILL, signal.SIGSEGV} or result.exit_code == 71:
+                detail = (" (worker SIGSEGV; if it persists under --allow-large it is "
+                          "an analysis bug, not the cap)" if result.signal == signal.SIGSEGV else "")
+                return 70, "", "angr slice resource_limit (%.0f GiB)%s" % (memory / 1024 ** 3, detail)
+            return (result.exit_code,
+                    result.stdout.preview.decode("utf-8", "replace"),
+                    result.stderr.preview.decode("utf-8", "replace"))
+        except OSError as exc:
+            return 3, "", str(exc)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return proc.returncode, proc.stdout, proc.stderr
@@ -330,6 +362,44 @@ def _gather_profile(binary, store):
 # real solving progress and report false-stuck. Anchor on the binary directly.
 def _state_dir(binary):
     return os.path.dirname(os.path.realpath(binary))
+
+def _attach_function_candidates(result, binary, store):
+    """When angr refused an oversized/stripped ELF, surface binutils-discovered
+    function-start candidates and a ready-to-run bounded analysis command.
+
+    The binutils path is not size gated, so it runs even when angr refused. It is
+    best-effort: any failure leaves the route result unchanged (the dead-end
+    diagnostic already stands).
+    """
+    try:
+        mod, fallback = _gather_revq(binary, True, store)
+    except Exception:
+        return
+    candidates = (fallback or {}).get("function_candidates") or []
+    if not candidates:
+        return
+    # High-confidence first (endbr64 > call-target > prologue), then by address.
+    rank = {"high": 0, "medium": 1, "low": 2}
+    ordered = sorted(candidates, key=lambda c: (rank.get(c.get("confidence"), 3), c["addr"]))
+    top = ordered[:5]
+    result.setdefault("next", [])
+    for cand in top:
+        result["next"].append({
+            "query": "revq --func",
+            "target": "%s %#x --func-size <N>" % (binary, cand["addr"]),
+            "evidence": ["function-start-candidate:%s" % cand.get("source", "?")],
+            "rule": "angr refused the whole-program lift; a discovered function "
+                    "start supplies a bounded-region target",
+        })
+    result.setdefault("diagnostics", []).append({
+        "code": "function_candidates", "severity": "info",
+        "message": ("angr refused the whole-program lift; binutils found %d function-start "
+                    "candidate(s). Analyze one bounded region with "
+                    "`revq %s --func <addr> --func-size <N>` (top: %s)"
+                    % (len(candidates), binary,
+                       ", ".join("%#x(%s)" % (c["addr"], c.get("confidence", "?")) for c in top))),
+    })
+
 
 def _route_with_feedback(binary, profile, rev, interesting):
     digest = _file_sha256(binary)
@@ -456,6 +526,41 @@ def _query_error(query, code, message, exit_code):
                            provenance={"cache": {"hit": False}})
     return doc, exit_code
 
+
+def _revq_error_response(query, exc, args_format):
+    """Map a revq AngrAnalysisError to a precise query error code.
+
+    revq raises typed kinds (size_limit/scope_required/timeout/resource_limit);
+    flattening them all to `dependency_missing` tells the user a dependency is
+    missing when the real cause is a size cap, a missing --func-size, or a
+    budget. Keep the same mapping every revq-backed query subcommand uses so one
+    root cause yields one machine code regardless of the subcommand.
+    """
+    kind = getattr(exc, "kind", None)
+    if kind == "size_limit":
+        code = "analysis_unavailable"
+    elif kind == "scope_required":
+        code = "input_required"
+    elif kind in {"timeout", "resource_limit"}:
+        code = kind
+    else:
+        code = "dependency_missing"
+    exit_code = (EXIT_INPUT if code == "input_required" else EXIT_DEPENDENCY)
+    return _emit(*_query_error(query, code, str(exc), exit_code), args_format)
+
+
+def _bounded_function_size(value):
+    # Mirror of revq._bounded_function_size (same 1..65536 bound); kept local so
+    # a plain `rat` invocation / `rat --help` does not import the revq module just
+    # to build the parser.  If the bound changes, change it in both front doors.
+    try:
+        size = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--func-size must be 1..65536") from exc
+    if not 1 <= size <= 65536:
+        raise argparse.ArgumentTypeError("--func-size must be 1..65536")
+    return size
+
 def _record_query_feedback(binary, doc):
     """Keep an analyzed card usable but never resolve probes with stale input."""
     try:
@@ -518,7 +623,8 @@ def cmd_route(args):
                                 revq_started_at, revq_started_monotonic, "route")
     except Exception as exc:
         rev, interesting = None, None
-        revq_error = {"code": "analysis_failed",
+        revq_error = {"code": ("analysis_unavailable" if getattr(exc, "kind", None) == "size_limit"
+                               else getattr(exc, "kind", "analysis_failed")),
                       "message": "revq analysis unavailable: %s: %s" % (type(exc).__name__, str(exc) or "no detail")}
     result = _route_with_feedback(binary, profile, rev, interesting)
     result["input_digest"] = _file_sha256(binary)
@@ -529,6 +635,17 @@ def cmd_route(args):
         })
     if revq_error:
         result.setdefault("diagnostics", []).append(revq_error)
+        if revq_error["code"] == "analysis_unavailable":
+            need = ("rev 함수 범위를 정하려면 ELF 함수 심볼 또는 확인된 시작 주소와 "
+                    "--func-size BYTES가 필요합니다")
+            if need not in result["unresolved"]:
+                result["unresolved"].append(need)
+            # angr refused this (large) input, but the binutils path is not size
+            # gated and discovers function-start candidates on a stripped binary.
+            # Surface the top few with a ready-to-run bounded analysis command so
+            # the oversized/stripped case has a concrete next action instead of a
+            # dead end.
+            _attach_function_candidates(result, binary, store)
     result["capabilities"] = {**result["capabilities"], **caps}
     if rev and rev.get("analysis_status") in {"partial", "complete-with-warnings"}:
         result.setdefault("diagnostics", []).append({
@@ -891,7 +1008,7 @@ def cmd_query_graph(args):
         graph = project_graph(rev, interesting=mod.compute_interesting(rev),
                               budget_bytes=args.budget_bytes, max_nodes=args.max_nodes)
     except Exception as exc:
-        return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+        return _revq_error_response(query, exc, args.format)
     _record_revq_invocation(mod, binary, args.fast, store, rev,
                             started_at, started_monotonic, "graph",
                             requested={"budget_bytes": args.budget_bytes, "max_nodes": args.max_nodes})
@@ -924,9 +1041,10 @@ def cmd_query_func(args):
         mod, rev = _gather_revq(binary, args.fast, store,
                                  load_spec=normalize_blob_spec(binary, arch=getattr(args, "arch", None),
                                         base=getattr(args, "base", None),
-                                        entry=getattr(args, "entry", None)))
+                                        entry=getattr(args, "entry", None)),
+                                 func_target=name, func_size=getattr(args, "func_size", None))
     except Exception as exc:
-        return _emit(*_query_error(query, "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+        return _revq_error_response(query, exc, args.format)
     card = mod.compute_function_card(rev, name)
     if card is None:
         return _emit(*_query_error(query, "input_invalid", "function '%s' not found" % name, EXIT_INPUT), args.format)
@@ -1089,7 +1207,7 @@ def cmd_query_oracle(args):
                                         base=getattr(args, "base", None),
                                         entry=getattr(args, "entry", None)))
     except Exception as exc:
-        return _emit(*_query_error("oracle", "dependency_missing", str(exc), EXIT_DEPENDENCY), args.format)
+        return _revq_error_response("oracle", exc, args.format)
     oracle = mod.compute_oracle(rev)
     _record_revq_invocation(mod, binary, args.fast, store, rev,
                             revq_started_at, revq_started_monotonic, "oracle")
@@ -1155,7 +1273,8 @@ def cmd_query_slice(args):
     try:
         slice_doc = json.loads(out)
     except Exception:
-        return _emit(*_query_error("slice", "timeout" if code == 124 else "input_invalid",
+        reason = "timeout" if code == 124 else "resource_limit" if "resource_limit" in err else "input_invalid"
+        return _emit(*_query_error("slice", reason,
                                    err or "rat-slice produced no output", EXIT_INPUT), args.format)
     if slice_doc.get("status") == "error":
         msgs = [d.get("message", "") for d in slice_doc.get("diagnostics", [])] or ["rat-slice reported error"]
@@ -1172,18 +1291,23 @@ def cmd_query_slice(args):
     diagnostics = []
     for d in slice_doc.get("diagnostics", []):
         msg = d.get("message", "")
-        code_tag = "dependency_missing" if "angr dependency missing" in msg else "partial"
+        code_tag = ("analysis_unavailable" if s.get("coverage") == "refused" else
+                    "dependency_missing" if "angr dependency missing" in msg else "partial")
         diagnostics.append({"code": code_tag, "severity": d.get("severity", "warning"), "message": msg})
     if slice_doc.get("status") == "ok":
         diagnostics.append({"code": "partial", "severity": "warning",
                             "message": "bounded VEX/CFG survey only; source-to-target value flow has not been proven"})
+    coverage = {"complete": complete,
+                "scope": "backward-data-dependency depth=%s (bounded VEX/CFG survey)" % (s.get("interproc") or {}).get("depth"),
+                "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
+                            "unresolved_indirect_calls": s.get("unresolved_indirect_calls"),
+                            "source_to_target_proof": "not-available"}}
+    if s.get("coverage"):
+        coverage["producer_coverage"] = s["coverage"]
+        coverage["omitted"]["analysis"] = s["coverage"]
     doc = _query_envelope("slice", status=status, facts=facts, heuristics=heuristics,
                            artifacts=slice_doc.get("artifacts", []),
-                           coverage={"complete": complete,
-                                     "scope": "backward-data-dependency depth=%s (bounded VEX/CFG survey)" % (s.get("interproc") or {}).get("depth"),
-                                     "omitted": {"unresolved_aliases": s.get("unresolved_aliases"),
-                                                 "unresolved_indirect_calls": s.get("unresolved_indirect_calls"),
-                                                 "source_to_target_proof": "not-available"}},
+                           coverage=coverage,
                            diagnostics=diagnostics,
                            provenance={"binary_sha256": (slice_doc.get("inputs") or [{}])[0].get("digest"),
                                        "cache": (slice_doc.get("provenance") or {}).get("cache", {})})
@@ -1287,6 +1411,8 @@ def build_parser():
     pf = qsub.add_parser("func", help="one function's callers/callees/strings, budget-bounded")
     pf.add_argument("binary"); pf.add_argument("name"); pf.add_argument("--store")
     pf.add_argument("--fast", action="store_true"); pf.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    pf.add_argument("--func-size", type=_bounded_function_size, metavar="BYTES",
+                    help="explicit bounded range for a numeric function address")
     for flag in ("arch", "base", "entry"):
         pf.add_argument("--" + flag, help="explicit raw-code loader hint")
     pf.add_argument("--format", choices=("text", "json"), default="text")

@@ -9,4 +9,5 @@ suite.*.json
 # New challenge fixtures require an explicit rights review before `git add -f`.
 # Existing tracked synthetic/public fixture files remain tracked.
 artifacts/
+fixtures/large-size/
 *.o

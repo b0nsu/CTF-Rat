@@ -314,10 +314,30 @@ def _data_slice_scan_registers(project,func,target,max_blocks=16):
 def _parse_addr(value):
     try: return int(value,0)
     except (TypeError,ValueError): return None
+
+ANGR_SOFT_LIMIT_BYTES=2*1024*1024
+def angr_size_refusal(binary):
+    """Diagnostic when a full-program CFGFast would be unsafe, else None.
+
+    Measured on this host: 0.96MB ~85s/532MB RSS, 3.9MB >10min/1.3GB.  The
+    refusal is a bounded-analysis contract, not a silent downgrade: callers
+    report status=partial with this diagnostic.  RAT_ALLOW_LARGE=1 overrides.
+    """
+    if os.environ.get("RAT_ALLOW_LARGE") in {"1","true","yes"}: return None
+    try: size=os.path.getsize(binary)
+    except OSError: return None
+    if size<=ANGR_SOFT_LIMIT_BYTES: return None
+    return ("input %.1fMB exceeds the %.1fMB full-program CFGFast soft limit; "
+            "refusing instead of hanging/OOM (set RAT_ALLOW_LARGE=1 to override)"
+            %(size/1024/1024,ANGR_SOFT_LIMIT_BYTES/1024/1024))
+
 def _data_slice(a,r,started,profile):
     target=_parse_addr(a.backward_addr)
     if target is None:
         return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data"},status="error",code=EXIT_INPUT,diagnostics=["--backward requires an address"],started=started),a)
+    too_large=angr_size_refusal(a.binary)
+    if too_large:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":"data","coverage":"refused"},status="partial",diagnostics=[too_large],started=started),a)
     try:
         import angr
         project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
@@ -373,6 +393,9 @@ def slice_(a):
         return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":mode,"coverage":"unavailable"},status="partial",diagnostics=["angr dependency missing; no synthetic slice emitted"],started=started),a)
     if mode=="data":
         return _data_slice(a,r,started,profile)
+    too_large=angr_size_refusal(a.binary)
+    if too_large:
+        return emit(envelope("rat-slice",a.binary,a,{"analysis_kind":mode,"coverage":"refused"},status="partial",diagnostics=[too_large],started=started),a)
     try:
         project=angr.Project(a.binary,auto_load_libs=False); cfg=project.analyses.CFGFast(normalize=True)
         funcs=list(cfg.kb.functions.values())
