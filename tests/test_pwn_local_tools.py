@@ -1,5 +1,6 @@
 import json
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -99,6 +100,38 @@ class LocalPwnToolTests(unittest.TestCase):
         result = self.tool("pwnropcheck", "--chain", "0x100000000", "--bits", "32", "--json", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("outside the selected word size", "\n".join(json.loads(result.stdout)["errors"]))
+
+    def test_pwnropcheck_accepts_numeric_json_chain_list(self):
+        # Regression: the call:/data:/gadget: prefix parser ran `":" in value` on
+        # every non-dict entry, raising TypeError on a JSON list of numeric
+        # addresses (a documented --file input).  Numeric entries must parse as
+        # bare gadgets, not crash.
+        main = json.loads(self.tool("pwncalc", "--json", "elf-offset", "--elf", str(self.binary), "--symbol", "main").stdout)["result"]["offset"]
+        chain = pathlib.Path(self.temp.name) / "chain_numeric.json"
+        chain.write_text(json.dumps([main, 0]))
+        result = self.tool("pwnropcheck", "--file", str(chain), "--map", "%s@0" % self.binary, "--json", check=False)
+        self.assertNotIn("not iterable", result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual([e["kind"] for e in report["entries"]], ["gadget", "gadget"])
+        self.assertEqual(report["entries"][0]["value"], main)
+
+    def test_pwnlibc_index_build_accepts_runtime_libc_filename(self):
+        # Regression: the eligibility regex excluded libc_docker.so.6 -- the exact
+        # runtime-libc filename bin/libcgate emits -- so index build over a
+        # directory holding only it exited 4.  It must be indexed while unrelated
+        # libraries (libcrypto, libc++) stay excluded.
+        libc_dir = pathlib.Path(self.temp.name) / "runtime-libc"
+        libc_dir.mkdir()
+        src = pathlib.Path("/lib/x86_64-linux-gnu/libc.so.6")
+        if not src.is_file():
+            self.skipTest("system libc.so.6 unavailable")
+        shutil.copy(src, libc_dir / "libc_docker.so.6")
+        (libc_dir / "libcrypto.so.1.1").write_bytes(b"\x7fELF not a libc")
+        db = libc_dir / "db.json"
+        result = self.tool("pwnlibc", "index", "build", "--libc-dir", str(libc_dir), "--db", str(db), check=False)
+        self.assertEqual(result.returncode, 0, result.stderr[-300:])
+        entries = json.loads(db.read_text())["entries"]
+        self.assertEqual([e["path"] for e in entries], ["libc_docker.so.6"])
 
     def test_pwncrash_reproduces_local_core_evidence(self):
         # stack_overflow.c is a plain return-address overwrite: `ret` transfers

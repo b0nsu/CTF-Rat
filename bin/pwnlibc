@@ -77,6 +77,12 @@ def _readelf_symbols(path):
         m = _SYM_LINE.match(line)
         if not m:
             continue
+        # readelf -sW columns: Num Value Size Type Bind Vis Ndx Name. An imported
+        # stub (Ndx == UND) is recorded at value 0 and must NOT be indexed as a real
+        # offset, or an unrelated leak false-resolves against this lib.
+        fields = line.split()
+        if len(fields) >= 8 and fields[6] == "UND":
+            continue
         val, name = m.group(1), m.group(2)
         name = name.split("@")[0]  # strip @GLIBC_2.x versioning
         if name in want and name not in syms:
@@ -205,8 +211,8 @@ def cmd_index_build(args):
     entries = []
     for fn in sorted(os.listdir(libc_dir)):
         p = os.path.join(libc_dir, fn)
-        if not os.path.isfile(p) or not re.search(r"libc.*\.so", fn):
-            continue
+        if not os.path.isfile(p) or not re.match(r"libc(?:[-_]\w|\.so)", fn):
+            continue  # libc.so.6 / libc-2.31.so / libc_docker.so.6, not libcrypto/libc++/libcap
         e = _index_one(p)
         if e:
             entries.append(e)
@@ -242,6 +248,8 @@ def _candidate_base(entry, leaks):
         if off is None:
             return None  # this libc lacks a symbol we leaked -> cannot be it
         b = addr - off
+        if b < 0:
+            return None  # a leak smaller than the symbol offset is not a valid base
         if b & 0xfff:
             return None  # base must be page-aligned
         if base is None:

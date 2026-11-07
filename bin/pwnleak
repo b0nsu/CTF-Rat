@@ -28,6 +28,8 @@ def canonical(value: int, bits: int, arch: str) -> bool:
 
 
 def repeated_marker(value: int, bits: int) -> bool:
+    if value < 0 or value >= (1 << bits):
+        return False  # a token wider than --bits is not a marker for this width
     raw = value.to_bytes(bits // 8, "little", signed=False)
     useful = raw.rstrip(b"\x00")
     if len(useful) >= 4 and len(set(useful)) == 1:
@@ -191,7 +193,7 @@ def main(argv=None) -> int:
                     detail.strip(),
                 ))
         return 0 if items else 1
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, OverflowError) as exc:
         print("pwnleak: %s" % exc, file=sys.stderr)
         return 2
 
