@@ -14,6 +14,7 @@ p.add_argument("--proof-input",help="concrete stdin file for generated gdbq proo
 p.add_argument("--proof-control-input",help="second concrete stdin file for pwn-control-transfer")
 p.add_argument("--proof-target-register",help="x86-64 register used by an indirect call/jump")
 p.add_argument("--proof-aslr",choices=["on","off"],help="set GDB inferior ASLR for PWN proof runs")
+p.add_argument("--proof-session",action="store_true",help="interpret proof input files as bounded leak-to-payload strategies")
 p.add_argument("--proof-break",help="safe symbol/address where PWN proof runs stop before inspection")
 p.add_argument("--proof-address",help="safe register/address expression for memory/target proof")
 p.add_argument("--proof-marker",help="expected attacker marker bytes as hex for pwn-memory-control")
@@ -52,7 +53,7 @@ try:
         proof_address=a.proof_address,proof_marker=a.proof_marker,
         proof_target=a.proof_target,proof_expect=a.proof_expect,
         proof_control_input=a.proof_control_input,proof_target_register=a.proof_target_register,
-        proof_aslr=a.proof_aslr)
+        proof_aslr=a.proof_aslr,proof_session=a.proof_session)
     parameters={"args":a.args}
     if a.proof:
         parameters["proof"]={
@@ -64,6 +65,14 @@ try:
             "input_digest":file_digest(a.proof_input),
             "control_input_digest":file_digest(a.proof_control_input),
         }
+        if a.proof_session:
+            from pathlib import Path
+            parameters["proof"].update({
+                "session":True,
+                "session_strategy_hex":Path(a.proof_input).read_bytes().hex(),
+                "session_control_strategy_hex":Path(a.proof_control_input).read_bytes().hex() if a.proof_control_input else None,
+                "session_helper_digest":file_digest(os.path.join(home,"ratlib","proof_session.py")),
+            })
     result=execute(argv,root=root,input_paths=inputs,parameters=parameters,
                    timeout=a.timeout,direct_subject=a.direct_subject,fresh=a.fresh)
     if a.proof:

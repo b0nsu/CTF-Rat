@@ -86,15 +86,20 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids, *, root=
  if not contract: return
  ext=payload.get("extensions") or {}
  declared=ext.get("proof_contract")
- # Current local writers canonicalize known classes with proof_contract before
- # validation. A missing declaration can therefore only come from an older
- # stored/replayed event produced before this policy existed; keep that history
- # readable. Once declared, the version and coverage are fail-closed.
- if "proof_contract" not in ext:
-  if current: raise ValueError("historical PASS requires current proof revalidation before consumption")
-  return
- if not current and declared == payload["class"] + "/v1": return
- if declared!=contract["version"]:
+ # Local writers canonicalize known classes with proof_contract before
+ # validation, so a missing or down-declared ("<class>/v1") contract reaches
+ # here only on the replay/import path (validate_history never canonicalizes).
+ # We keep genuine pre-policy history readable, but the backward-compat skip
+ # must NOT let an imported PASS escape the per-class slot coverage that the
+ # local path enforces: PRIMITIVE_GATE.md requires the contract to be checked
+ # on replay/consume too.  So we only relax the VERSION check for a missing or
+ # "/v1" declaration; the slot coverage below still runs.  A real pre-policy
+ # PASS whose observations cover every slot passes; an under-covered import
+ # (e.g. three identical pwn.reg observations) is rejected as missing slots.
+ relaxed_version=(not current and (declared is None or declared == payload["class"] + "/v1"))
+ if declared is None and current:
+  raise ValueError("historical PASS requires current proof revalidation before consumption")
+ if not relaxed_version and declared!=contract["version"]:
   raise ValueError("PASS primitive class %s requires proof_contract %s" %
                    (payload.get("class"),contract["version"]))
  missing=[]
@@ -130,6 +135,9 @@ def _validate_primitive_proof_coverage(payload, observations, self_ids, *, root=
       doc=json.loads(get(digest,root=root))
       doc["extensions"]={**(doc.get("extensions") or {}),"envelope_digest":digest}
       declared=(doc.get("parameters") or {}).get("proof") or {}
+      expected_kind="session-strategy/v1" if declared.get("session") else None
+      if scenario.get("input_kind")!=expected_kind:
+       raise ValueError("control-flow proof mixes concrete input and session strategy")
       if (declared.get("mode")!=modes[slot] or
           declared.get("input_digest")!=scenario["input_digest"] or
           declared.get("break")!=scenario["break"] or

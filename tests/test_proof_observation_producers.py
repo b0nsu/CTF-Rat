@@ -194,6 +194,32 @@ class ProofParserTests(unittest.TestCase):
             )
             self.assertEqual(value["marker_hex"], "41424344")
 
+            # The first address and byte sequence alone are insufficient: the
+            # second row must begin exactly where the first ends (first row
+            # consumes 2 bytes from 0x...08, so the next row must start at
+            # 0x...0a).  Both a *skipped* row (a gap or a far jump forward) and
+            # an *overlapping* / backward row (an address <= the current end,
+            # which would double-count or reorder bytes) must be rejected so a
+            # non-contiguous capture can never be concatenated into a false
+            # marker match.
+            for second_address in (
+                    0x7FFFFFFFE00B,   # gap: one byte skipped
+                    0x7FFFFFFFE100,   # far jump forward
+                    0x7FFFFFFFE008,   # overlap: repeats the first row's start
+                    0x7FFFFFFFE009,   # overlap: starts one byte before the end
+                    0x7FFFFFFFE000):  # backward: precedes the measured address
+                discontinuous = ("Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
+                                 "RAT_PROOF_ADDRESS=0x7fffffffe008\n"
+                                 "0x7fffffffe008:\t0x41\t0x42\n"
+                                 f"0x{second_address:x}:\t0x43\t0x44\n"
+                                 "RAT_PROOF_MEASURE_END\n")
+                with self.subTest(second_address=second_address), self.assertRaisesRegex(
+                        ValueError, "not contiguous"):
+                    parse_proof_value(
+                        "pwn-memory-control",
+                        direct_gdbq_doc(str(root), subject, discontinuous),
+                        str(root), proof_address="$rsp+8", proof_marker="41424344")
+
             target = ("Breakpoint 1, stop_here ()\nRAT_PROOF_MEASURE_BEGIN\n"
                       "RAT_PROOF_ADDRESS=0x7fffffffe008\n"
                       "0x7fffffffe008:\t0x0000000000401234\n"

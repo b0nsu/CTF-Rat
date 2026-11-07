@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -128,33 +129,69 @@ class PrimitiveProofContractTests(unittest.TestCase):
             self.assertEqual(passed["status"], "pass")
             self.assertNotIn("proof_contract", passed.get("extensions", {}))
 
-    def test_pre_contract_canonical_history_without_declaration_still_replays(self):
-        with tempfile.TemporaryDirectory() as root:
-            stream = Stream(root)
-            direct_observation(stream, "obs_reg", "pwn.reg")
-            direct_observation(stream, "obs_marker", "pwn.marker")
-            direct_observation(stream, "obs_target", "pwn.control-target")
-            revise_primitive(
-                stream,
-                primitive_doc("p", "legacy-custom", "candidate", [], 1),
-            )
-            revise_primitive(
-                stream,
-                primitive_doc(
-                    "p",
-                    "legacy-custom",
-                    "pass",
-                    ["obs_reg", "obs_marker", "obs_target"],
-                    2,
-                ),
-            )
-            events = stream.read()
-            for event in events:
-                if event["type"] == "primitive.revised":
-                    event["payload"]["class"] = "control-flow"
-                    event["payload"].get("extensions", {}).pop("proof_contract", None)
-            view = validate_history(events, root, artifact_root=stream.root)
-            self.assertEqual(view["primitives"]["p"]["status"], "pass")
+    def _import_relabelled_control_flow_pass(self, mutate_payload):
+        """Build a locally-valid PASS for a contract-free class, then relabel it
+        to control-flow on the import path and apply ``mutate_payload`` to the
+        proof_contract declaration.  Returns the validate_history result or
+        raises whatever it raises.  The observations are three distinct direct
+        measurements that do NOT cover the control-flow slots (all slot-less for
+        control-target semantics), i.e. a payload the LOCAL path would reject as
+        missing proof slots once proof_contract is injected."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        stream = Stream(root)
+        direct_observation(stream, "obs_reg", "pwn.reg")
+        direct_observation(stream, "obs_marker", "pwn.marker")
+        direct_observation(stream, "obs_target", "pwn.control-target")
+        revise_primitive(stream, primitive_doc("p", "legacy-custom", "candidate", [], 1))
+        revise_primitive(stream, primitive_doc(
+            "p", "legacy-custom", "pass",
+            ["obs_reg", "obs_marker", "obs_target"], 2))
+        events = stream.read()
+        for event in events:
+            if event["type"] == "primitive.revised":
+                event["payload"]["class"] = "control-flow"
+                mutate_payload(event["payload"])
+        return validate_history(events, root, artifact_root=stream.root)
+
+    def test_imported_control_flow_pass_without_contract_is_coverage_checked(self):
+        # F1 regression: an imported control-flow PASS that omits proof_contract
+        # must NOT bypass per-class slot coverage on the replay path.  The three
+        # observations do not satisfy the control-target semantic slot, so the
+        # import is rejected exactly as the local path would reject it -- the
+        # backward-compat skip no longer waives coverage for a contracted class.
+        def strip_contract(payload):
+            payload.get("extensions", {}).pop("proof_contract", None)
+        with self.assertRaises(ValueError) as caught:
+            self._import_relabelled_control_flow_pass(strip_contract)
+        self.assertIn("missing proof slots", str(caught.exception))
+
+    def test_imported_control_flow_pass_with_v1_downgrade_is_coverage_checked(self):
+        # F2 regression: declaring the pre-policy "control-flow/v1" contract on
+        # an imported PASS must not opt out of slot coverage either.
+        def downgrade_contract(payload):
+            payload["extensions"] = {"proof_contract": "control-flow/v1"}
+        with self.assertRaises(ValueError) as caught:
+            self._import_relabelled_control_flow_pass(downgrade_contract)
+        self.assertIn("missing proof slots", str(caught.exception))
+
+    def test_contract_free_legacy_class_still_replays_without_declaration(self):
+        # Genuine pre-policy history for a class with NO proof contract keeps the
+        # generic three-direct gate and replays without a proof_contract (the
+        # backward-compat path that the coverage tightening must preserve).
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        stream = Stream(root)
+        direct_observation(stream, "obs_reg", "pwn.reg")
+        direct_observation(stream, "obs_marker", "pwn.marker")
+        direct_observation(stream, "obs_target", "pwn.control-target")
+        revise_primitive(stream, primitive_doc("p", "legacy-custom", "candidate", [], 1))
+        revise_primitive(stream, primitive_doc(
+            "p", "legacy-custom", "pass",
+            ["obs_reg", "obs_marker", "obs_target"], 2))
+        events = stream.read()  # class stays legacy-custom, no proof contract
+        view = validate_history(events, root, artifact_root=stream.root)
+        self.assertEqual(view["primitives"]["p"]["status"], "pass")
 
     def test_wrong_explicit_contract_version_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:

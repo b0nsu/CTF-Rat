@@ -50,7 +50,7 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
                              proof_address=None, proof_marker=None,
                              proof_target=None, proof_expect=None,
                              proof_control_input=None, proof_target_register=None,
-                             proof_aslr=None):
+                             proof_aslr=None, proof_session=False):
  """Build a bounded verifier invocation for a semantic proof observation.
 
  Arbitrary user GDB commands are never accepted in proof mode.  PWN/REV runtime
@@ -75,6 +75,32 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
  if base_args:
   _proof_error("gdbq proof modes do not accept arbitrary trailing gdbq commands")
  if not proof_input: _proof_error("%s requires --proof-input" % proof)
+ session_strategy=None
+ if proof_session:
+  if proof not in {"pwn-control-transfer","pwn-control-state","pwn-memory-control"}:
+   _proof_error("session strategies require a supported control-flow proof mode")
+  from .proof_session import load_strategy
+  session_strategy=load_strategy(proof_input)
+  session_control_strategy=None
+  if proof=="pwn-control-transfer":
+   if not proof_control_input: _proof_error("session transfer requires a control strategy")
+   session_control_strategy=load_strategy(proof_control_input)
+   expected={**session_strategy,"offset":session_strategy["control_offset"],
+             "control_offset":session_strategy["offset"]}
+   if session_control_strategy!=expected: _proof_error("control strategy must swap only the primary/control offsets")
+ def _session_strategy(path):
+  # The run's payload is derived from the very strategy file bound to this run
+  # (the control run uses the control file), never a label special-case.
+  return session_control_strategy if path==proof_control_input else session_strategy
+ def start_run(path,label):
+  if session_strategy is None: return [_proof_input_command(path)]
+  package_dir=os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+  setup="import sys; sys.path.insert(0, "+repr(package_dir)+"); from ratlib.proof_session import Session; import gdb"
+  return ["python "+setup,
+          "python _rat_session=Session("+repr(_session_strategy(path))+", "+repr(label)+")",
+          "python gdb.execute(_rat_session.command())", "python _rat_session.note_pid()"]
+ def finish_run():
+  return ["continue", "python _rat_session.finish()"] if session_strategy is not None else []
  commands=(["set disable-randomization "+("off" if proof_aslr=="on" else "on")]
            if proof_aslr is not None else [])
  if proof.startswith("pwn-"):
@@ -89,7 +115,7 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
    break_command="break *("+proof_break+")"
   else:
    break_command="break "+proof_break
-  commands.extend([break_command, _proof_input_command(proof_input)])
+  commands.extend([break_command, *start_run(proof_input,"A")])
   if proof=="pwn-control-state":
    commands.extend(["echo "+_PROOF_MEASURE_BEGIN+"\\n",
                     "info registers rip rsp rbp",
@@ -101,6 +127,16 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
     _proof_error("pwn-memory-control requires even-length --proof-marker hex")
    size=len(proof_marker)//2
    if not 1<=size<=64: _proof_error("pwn-memory-control marker must be 1..64 bytes")
+   # In session mode the measurement must cover the *whole* leak-derived payload
+   # (marker prefix + 8 target bytes + suffix), not just the fixed marker: the
+   # dynamic target bytes are what tie the measured memory to this session's
+   # leak, so a decoy buffer that merely repeats the fixed marker cannot match.
+   if session_strategy is not None:
+    size=(len(session_strategy["prefix_hex"])//2 + 8
+          + len(session_strategy["suffix_hex"])//2)
+    if bytes.fromhex(proof_marker)!=bytes.fromhex(session_strategy["prefix_hex"]):
+     _proof_error("session memory-control marker must equal the strategy prefix")
+    if not 1<=size<=256: _proof_error("session payload length outside 1..256 bytes")
    commands.extend(["echo "+_PROOF_MEASURE_BEGIN+"\\n",
                     'printf "'+_PROOF_ADDRESS_PREFIX+'0x%lx\\n", (unsigned long)('+proof_address+')',
                     "x/%dbx %s" % (size,proof_address),
@@ -119,7 +155,7 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
    for index,label in enumerate(_TRANSFER_LABELS):
     if index:
      source=proof_input if _TRANSFER_INPUTS[label]=="input" else proof_control_input
-     commands.append(_proof_input_command(source))
+     commands.extend(start_run(source,label))
     # Absolute PC/target are recorded for the OFF single-step reachability
     # check, but under ASLR ON they are re-randomized every run.  The symbolic
     # identity of the call-site and the target (via `info symbol`) is image-base
@@ -136,6 +172,7 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
      "x/i $rip", "si",
      'printf "RAT_PROOF_PC_AFTER=0x%lx\\n", (unsigned long)$rip',
      "echo RAT_PROOF_TRANSFER_"+label+"_END\\n"])
+    commands.extend(finish_run())
   else:
    if not proof_address or not _GDB_EXPR.fullmatch(proof_address):
     _proof_error("pwn-control-target requires a safe --proof-address")
@@ -146,6 +183,7 @@ def prepare_proof_invocation(tool_name, tool_path, base_args, *, direct_subject,
                     'printf "'+_PROOF_ADDRESS_PREFIX+'0x%lx\\n", (unsigned long)('+proof_address+')',
                     "x/gx "+proof_address,
                     "echo "+_PROOF_MEASURE_END+"\\n"])
+  if proof!="pwn-control-transfer": commands.extend(finish_run())
  elif proof in {"rev-success-oracle","rev-concrete-replay"}:
   if not isinstance(proof_expect,str) or not proof_expect:
    _proof_error("%s requires non-empty --proof-expect" % proof)
@@ -225,16 +263,26 @@ def _parse_registers(text):
 
 def _parse_memory_bytes(text, measured_address):
  out=[]
- first_address=None
+ saw_address=False
  for line in text.splitlines():
   if ":" not in line: continue
   address,tail=line.split(":",1)
   match=re.fullmatch(r"\s*(0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?\s*",address)
   if not match: continue
-  if first_address is None: first_address=int(match.group(1),16)
-  out.extend(int(x,16) for x in re.findall(r"0x([0-9a-fA-F]{2})\b",tail))
- if first_address!=measured_address:
-  _proof_error("memory response address does not match requested expression")
+  address_value=int(match.group(1),16)
+  if address_value!=measured_address+len(out):
+   # The first row must begin exactly at the requested/measured address; a
+   # later row must continue from the prior row's end.  Distinguish the two so
+   # a wrong start ("address does not match") is not reported as a mid-sequence
+   # gap, while skips/overlaps in subsequent rows stay "not contiguous".
+   if not out:
+    _proof_error("memory response first address does not match requested expression")
+   _proof_error("memory response addresses are not contiguous from requested expression")
+  values=re.findall(r"0x([0-9a-fA-F]{2})\b",tail)
+  if not values: _proof_error("memory response row has no bytes")
+  out.extend(int(x,16) for x in values)
+  saw_address=True
+ if not saw_address: _proof_error("memory response has no byte rows")
  return bytes(out)
 
 def _parse_memory_word(text, measured_address):
@@ -295,6 +343,40 @@ def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None
  if tool!=expected_tool and not (expected_tool=="symsolve" and tool=="symsolve.py"):
   _proof_error("proof mode does not match verifier producer")
  text=_proof_debugger(doc,root) if proof.startswith("pwn-") else _proof_stdout(doc,root)
+ declared=(doc.get("parameters") or {}).get("proof") or {}
+ session_value={}
+ if declared.get("session"):
+  from .proof_session import decode_strategy, parse_sessions
+  helper_digest=_digest_file(os.path.join(os.path.dirname(__file__),"proof_session.py"))
+  if declared.get("session_helper_digest")!=helper_digest:
+   _proof_error("session helper build differs; remeasure")
+  def _session_hex(field):
+   # A present-but-null field makes dict.get(...,"") return None, so
+   # bytes.fromhex would raise a bare TypeError that rat-adapt's ValueError
+   # handler misses.  Reject a non-string envelope cleanly as a proof error.
+   value=declared.get(field, "")
+   if not isinstance(value,str): _proof_error("session %s must be a hex string" % field)
+   try: return bytes.fromhex(value)
+   except ValueError: _proof_error("session %s is not valid hex" % field)
+  raw=_session_hex("session_strategy_hex")
+  if "sha256:"+hashlib.sha256(raw).hexdigest()!=declared.get("input_digest"):
+   _proof_error("session strategy differs from bound input digest")
+  strategy=decode_strategy(raw)
+  labels=_TRANSFER_LABELS if proof=="pwn-control-transfer" else ("A",)
+  strategies=strategy
+  if proof=="pwn-control-transfer":
+   control_raw=_session_hex("session_control_strategy_hex")
+   if "sha256:"+hashlib.sha256(control_raw).hexdigest()!=declared.get("control_input_digest"):
+    _proof_error("session control strategy digest mismatch")
+   control_strategy=decode_strategy(control_raw)
+   if control_strategy!={**strategy,"offset":strategy["control_offset"],"control_offset":strategy["offset"]}:
+    _proof_error("session control strategy changes more than target offset")
+   # Each run is re-verified against the file whose bytes drove it: the control
+   # run (label B) against the control strategy, A and C against the primary.
+   strategies={label:(control_strategy if _TRANSFER_INPUTS[label]=="control" else strategy)
+               for label in _TRANSFER_LABELS}
+  records=parse_sessions(text,strategies,labels)
+  session_value={"sessions":records,"input_kind":"session-strategy/v1"}
  if proof.startswith("pwn-") and not re.search(r"(?m)^Breakpoint \d+,",text):
   _proof_error("GDB did not stop at the requested proof breakpoint")
  if proof=="pwn-control-transfer":
@@ -317,6 +399,15 @@ def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None
   first=_parse_transfer_block(text,"A",register)
   second=_parse_transfer_block(text,"B",register)
   repeat=_parse_transfer_block(text,"C",register)
+  if session_value:
+   for transfer,record in zip((first,second,repeat),session_value["sessions"]):
+    # Which run uses the control strategy's offset is defined once in
+    # _TRANSFER_INPUTS, not re-hardcoded to label "B" here, so the two cannot
+    # drift if the label set ever changes.
+    is_control=_TRANSFER_INPUTS.get(record["label"])=="control"
+    expected_target=record["leak"]+strategy["control_offset" if is_control else "offset"]
+    if transfer["target"]!=expected_target:
+     _proof_error("measured transfer target differs from session payload")
   # Normalize on the image-base-invariant symbol identity, not the absolute
   # address: under ASLR ON the call-site and target addresses are re-randomized
   # on every run, but the symbol of the measured call-site and of the selected
@@ -333,19 +424,36 @@ def parse_proof_value(proof, doc, root, *, proof_address=None, proof_marker=None
    _proof_error("input change did not alter target at the same transfer instruction")
   return {"input_digest":input_digest,"control_input_digest":control_digest,
           "break":declared.get("break"),"target_register":register,
-          "first":first,"second":second,"repeat":repeat}
+          "first":first,"second":second,"repeat":repeat,**session_value}
  if proof=="pwn-control-state":
+  # The RIP/RSP measurement is taken at the pre-transfer breakpoint, so it
+  # cannot reflect the payload's effect on control the way the transfer target
+  # does.  In session mode the same-session guarantee carried here is that this
+  # control-state was measured in a run where the session's own leak-derived
+  # payload was delivered and the oracle fired (enforced by parse_sessions);
+  # the attacker->control causality is proven by the control-transfer slot.
   regs=_parse_registers(_proof_measurement_block(text))
   if "rip" not in regs or "rsp" not in regs:
    _proof_error("control-state output is missing RIP/RSP")
-  return {"rip":regs["rip"],"rsp":regs["rsp"],"rbp":regs.get("rbp")}
+  return {"rip":regs["rip"],"rsp":regs["rsp"],"rbp":regs.get("rbp"),**session_value}
  if proof=="pwn-memory-control":
   marker=bytes.fromhex(proof_marker)
   block=_proof_measurement_block(text)
   measured=_parse_memory_bytes(block,_parse_measured_address(block))
   if measured[:len(marker)]!=marker:
    _proof_error("measured memory does not match the attacker marker")
-  return {"address":proof_address,"marker_hex":proof_marker.lower(),"bytes":len(marker)}
+  if session_value:
+   # Same-session linkage: the measured memory must be the *entire* payload this
+   # session derived from its own leak -- marker prefix AND the leak-derived
+   # target bytes -- not merely a buffer that repeats the fixed marker.  The
+   # command reads the full payload length, so a decoy that matches only the
+   # marker prefix (zero/garbage in the dynamic target slot) is rejected here.
+   payload=bytes.fromhex(session_value["sessions"][0]["payload_hex"])
+   if not payload.startswith(marker):
+    _proof_error("session marker is not the leak-derived payload prefix")
+   if measured!=payload:
+    _proof_error("measured memory is not the session leak-derived payload")
+  return {"address":proof_address,"marker_hex":proof_marker.lower(),"bytes":len(measured),**session_value}
  if proof=="pwn-control-target":
   block=_proof_measurement_block(text)
   measured=_parse_memory_word(block,_parse_measured_address(block))
@@ -420,6 +528,8 @@ def record_proof_observation(doc, *, root, direct_subject, proof,
                 "scenario":{"input_digest":((immutable.get("parameters") or {}).get("proof") or {}).get("input_digest"),
                             "break":((immutable.get("parameters") or {}).get("proof") or {}).get("break")}},
  }
+ if ((immutable.get("parameters") or {}).get("proof") or {}).get("session"):
+  payload["extensions"]["scenario"]["input_kind"]="session-strategy/v1"
  stream.append("observation.recorded",payload)
  stored=stream.view()["observations"][observation_id]
  if stored.get("quality",{}).get("level")!="direct":
@@ -541,7 +651,8 @@ def execute(tool_argv, *, root=None, input_paths=(), parameters=None, timeout=60
  capture_path=None
  actual_argv=list(tool_argv)
  proof_mode=(parameters.get("proof") or {}).get("mode")
- if proof_mode in PROOF_MODES and (PROOF_MODES[proof_mode].get("tool")=="gdbq"):
+ if (proof_mode in PROOF_MODES and (PROOF_MODES[proof_mode].get("tool")=="gdbq")
+     and not (parameters.get("proof") or {}).get("session")):
   if os.path.basename(tool_path)!="gdbq": _proof_error("inferior capture requires gdbq")
   os.makedirs(os.path.join(root,"tmp"),exist_ok=True)
   fd,capture_path=tempfile.mkstemp(prefix="inferior-",dir=os.path.join(root,"tmp"))

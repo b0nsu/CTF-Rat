@@ -13,7 +13,9 @@ different programs and timeouts:
   breakpoint; that tests debugger resolution, not an attacker-obtained leak.
   A stale absolute address is ``proof-blocked`` -- distinct from a
   produced-then-crashing exploit.  This keeps proof absence and exploit failure
-  as separate stages.
+  as separate stages. Successful cases must pass the typed primitive gate with
+  three distinct direct SELF observations, not just produce a transfer record.
+  This still does not join the two layers into a same-session leak proof.
 """
 import argparse
 import hashlib
@@ -25,10 +27,12 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bin"))
 
 
 SOURCE = r'''
@@ -114,7 +118,10 @@ char payload[16];
 __attribute__((noinline)) void one(void) { asm volatile("nop"); }
 __attribute__((noinline)) void two(void) { asm volatile("nop"); }
 __attribute__((noinline)) void transfer(void (*f)(void)) {
-    asm volatile("mov %0, %%rax; call *%%rax" : : "r"(f) : "rax", "memory");
+    // Keep an attacker marker address available across ASLR sessions so the
+    // memory-control producer can measure it via a register-relative address.
+    asm volatile("lea payload(%%rip), %%rsi; mov %0, %%rax; call *%%rax"
+                 : : "r"(f) : "rax", "rsi", "memory");
 }
 int main(void) {
     if (read(0, payload, 9) != 9) return 2;
@@ -134,22 +141,45 @@ def _transfer_breakpoint(binary):
 
 
 def _gate_observe(path, binary, breakpoint, aslr, first, second):
-    """Drive the real control-flow/v2 producer; return (ok, stage, detail)."""
-    cmd = [str(ROOT / "bin" / "rat-adapt"), "--root", str(path / ".rat"),
-           "--input", str(binary), "--direct-subject", str(binary),
-           "--proof", "pwn-control-transfer", "--proof-input", str(first),
-           "--proof-control-input", str(second), "--proof-break", breakpoint,
-           "--proof-target-register", "$rax", "--proof-aslr", aslr, "gdbq"]
-    run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if run.returncode == 0:
+    """Drive all proof slots and the real PASS gate; return (ok, stage, detail)."""
+    from ratlib.state_v2 import Stream, environment_fingerprint, revise_primitive, _file_digest
+
+    evidence = []
+    for mode, options in (
+        ("pwn-control-transfer", ["--proof-control-input", str(second),
+                                  "--proof-target-register", "$rax"]),
+        ("pwn-control-state", []),
+        ("pwn-memory-control", ["--proof-address", "$rsi",
+                                "--proof-marker", first.read_bytes().hex()]),
+    ):
+        cmd = [str(ROOT / "bin" / "rat-adapt"), "--root", str(path / ".rat"),
+               "--input", str(binary), "--direct-subject", str(binary),
+               "--proof", mode, "--proof-input", str(first),
+               "--proof-break", breakpoint, "--proof-aslr", aslr, *options, "gdbq"]
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        (path / (mode + ".json")).write_text(json.dumps({
+            "argv": cmd, "returncode": run.returncode,
+            "stdout": run.stdout, "stderr": run.stderr}, indent=2) + "\n")
+        if run.returncode != 0:
+            return False, "proof-blocked", (run.stderr.strip().splitlines()[-1]
+                                            if run.stderr.strip() else "gate refused")
         try:
             observation = json.loads(run.stdout)["extensions"]["proof_observation"]
+            evidence.append(observation["observation_id"])
         except (ValueError, KeyError) as exc:  # pragma: no cover - defensive
             return False, "proof-blocked", "proof output not parseable: %s" % exc
-        return True, None, observation["observation_id"]
-    # A refusal to mint the canonical observation is a blocked proof, not a run
-    # that executed and crashed.  rat-adapt reports the gate reason on stderr.
-    return False, "proof-blocked", run.stderr.strip().splitlines()[-1] if run.stderr.strip() else "gate refused"
+    stream = Stream(str(path))
+    candidate = {"primitive_id": "aslr-control", "class": "control-flow", "status": "candidate",
+                 "self_evidence": [], "input_digest": _file_digest(str(binary)),
+                 "environment_digest": environment_fingerprint(), "revision": 1}
+    revise_primitive(stream, candidate)
+    try:
+        revise_primitive(stream, {**candidate, "status": "pass", "revision": 2,
+                                  "self_evidence": evidence})
+    except ValueError as exc:
+        return False, "proof-blocked", "typed PASS refused: %s" % exc
+    primitive = stream.view()["primitives"]["aslr-control"]
+    return True, None, {"primitive": primitive, "evidence_dir": str(path / ".rat")}
 
 
 def gate_measure(directory):
@@ -284,10 +314,15 @@ class ASLRProofGateExperiment(unittest.TestCase):
         # control-flow/v2 proof is produced -> success, no failure stage.
         self.assertTrue(off["success"], off)
         self.assertIsNone(off["failure_stage"], off)
+        self.assertEqual(off["detail"]["primitive"]["status"], "pass")
+        self.assertEqual(len(set(off["detail"]["primitive"]["self_evidence"])), 3)
         # ASLR ON + GDB symbol resolution: the symbol-relative call-site is
         # resolved inside the producer's own session.
         self.assertTrue(stable["success"], stable)
         self.assertIsNone(stable["failure_stage"], stable)
+        self.assertEqual(stable["detail"]["primitive"]["status"], "pass")
+        self.assertEqual(stable["detail"]["primitive"]["extensions"]["proof_contract"],
+                         "control-flow/v2")
         # ASLR ON + limited information: a stale cross-session address no longer
         # resolves, so the proof itself cannot be produced.  It must be
         # proof-blocked, never exploit-failed -- the gate refused before any
