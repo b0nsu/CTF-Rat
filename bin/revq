@@ -36,9 +36,12 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import signal
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -51,7 +54,7 @@ from ratlib.evasion import (
     has_current_contract as _has_current_evasion_contract,
     render_legacy as _render_legacy_evasion,
 )
-from ratlib.runner import run
+from ratlib.runner import run, ResourceLimits
 from ratlib.kernel_identity import inspect as inspect_kernel, SCHEMA as KERNEL_IDENTITY_SCHEMA
 from ratlib.wasm import is_wasm, inspect as inspect_wasm
 
@@ -125,6 +128,14 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+class AngrAnalysisError(RuntimeError):
+    """An actionable angr failure that in-process callers can preserve."""
+
+    def __init__(self, message, kind="analysis_failed"):
+        super().__init__(message)
+        self.kind = kind
+
+
 def info(msg):
     print("[revq] " + msg, file=sys.stderr)
 
@@ -154,6 +165,47 @@ def cache_path(binpath):
     return binpath + ".revq.json"
 
 
+# angr CFGFast cost grows sharply with input size (measured on this host:
+# 0.15MB ~1s/171MB RSS, 0.96MB ~85s/532MB, 3.9MB >10min/1.3GB). Refuse the
+# full-program lift above the default cap instead of swapping/OOM-killing the
+# caller; a cached revmap still short-circuits the guard.
+DEFAULT_MAX_ANGR_INPUT_MB = 2
+
+
+def _angr_size_guard(binpath, max_bytes, allow_large):
+    """Fail closed on oversized angr inputs, with explicit escape hatches.
+
+    The `rat` front door (route/brief/query func|graph) loads revq in-process
+    and has no --allow-large/--max-input-mb flags of its own, so without an env
+    hatch a >cap binary loses ALL rev analysis there with no reachable override.
+    Honor RAT_ALLOW_LARGE here exactly as analysis.py:angr_size_refusal does for
+    the slice path, so both angr entry points share one override contract.
+    """
+    if allow_large or os.environ.get("RAT_ALLOW_LARGE") in {"1", "true", "yes"}:
+        return
+    limit = DEFAULT_MAX_ANGR_INPUT_MB * 1024 * 1024 if max_bytes is None else int(max_bytes)
+    if limit <= 0:
+        return
+    try:
+        size = os.path.getsize(binpath)
+    except OSError:
+        return
+    if size <= limit:
+        return
+    raise AngrAnalysisError(
+        "입력이 angr 기본 상한을 넘음: %.1fMB > %.1fMB "
+        "(CFGFast는 전체 프로그램을 IR로 올려 크기에 대해 급격히 느려짐; "
+        "실측 0.96MB≈85초, 3.9MB>10분)\n"
+        "  대안: (a) --fast  binutils 엔진(xref 없음; stripped면 함수 목록도 없음)\n"
+        "        (b) --max-input-mb N  상한 상향 (revq CLI)\n"
+        "        (c) --func <symbol>  심볼 범위만 분석; 주소는 --func-size BYTES 필요\n"
+        "        (d) --allow-large  가드 해제(별도 300초/4GiB 예산; revq CLI)\n"
+        "        (e) RAT_ALLOW_LARGE=1  env로 가드 해제 (rat route/brief/query)"
+        % (size / 1024 / 1024, limit / 1024 / 1024),
+        kind="size_limit",
+    )
+
+
 def annotate_counts(rev):
     """Expose exact/visible/truncated function counts without conflating aliases."""
     funcs = rev.get("functions", [])
@@ -171,7 +223,9 @@ def annotate_counts(rev):
         "functions_visible": len(canonical),
         "functions_truncated": 0,
         "functions_exact": exact,
-        "scope": ("Wasm defined function bodies (no CFG)" if rev.get("engine") == "wasm-structure"
+        "function_candidates_total": len(rev.get("function_candidates", [])),
+        "scope": ("bounded function region and discovered stubs" if rev.get("function_scope") else
+                  "Wasm defined function bodies (no CFG)" if rev.get("engine") == "wasm-structure"
                   else "discovered non-PLT functions" if rev.get("engine") == "angr"
                   else "defined text symbols only"),
         "aliases": {key: names for key, names in aliases.items() if len(names) > 1},
@@ -197,7 +251,8 @@ def _engine_analysis_status(diagnostics):
     return "complete-with-warnings" if diagnostics else "complete"
 
 
-def _extract_angr_impl(binpath, diagnostics, load_spec=None):
+def _extract_angr_impl(binpath, diagnostics, load_spec=None, cfg_options=None,
+                       string_ref_probe=False):
     """CFGFast + xrefs 로 revmap 추출. angr 는 여기서만 import (Mac selftest 격리)."""
     try:
         import angr  # noqa: F401
@@ -210,10 +265,11 @@ def _extract_angr_impl(binpath, diagnostics, load_spec=None):
     from ratlib.raw_loader import project as raw_project
     proj = raw_project(binpath, load_spec)
     obj = proj.loader.main_object
-    cfg = proj.analyses.CFGFast(
-        cross_references=True, data_references=True, normalize=True,
-        show_progressbar=False,
-    )
+    options = {"cross_references": True, "data_references": True,
+               "normalize": True, "show_progressbar": False}
+    if cfg_options:
+        options.update(cfg_options)
+    cfg = proj.analyses.CFGFast(**options)
     funcs_mgr = cfg.kb.functions
     callgraph = getattr(cfg.kb, "callgraph", None)
     platform = _detect_platform(sh(["file", binpath]))
@@ -234,10 +290,17 @@ def _extract_angr_impl(binpath, diagnostics, load_spec=None):
         imports = sorted(obj.plt.keys())
 
     functions = []
+    method_string_refs = []
     all_functions = list(funcs_mgr.values())
     for f in all_functions:
         if f.is_simprocedure or f.is_plt:
             continue
+        if string_ref_probe:
+            try:
+                method_string_refs.extend({"func": f.name, "addr": int(addr)}
+                                          for addr, _content in f.string_references())
+            except Exception:
+                pass
         call_sites = _func_call_sites(proj, f, funcs_mgr, obj.arch.name, platform)
         calls = sorted({site["api"] for site in call_sites if site.get("api")})
         fstrs = sorted({srec["val"] for srec in strings
@@ -277,7 +340,7 @@ def _extract_angr_impl(binpath, diagnostics, load_spec=None):
 
     sec_names = [s.name for s in getattr(obj, "sections", []) if getattr(s, "name", None)]
     evasion = _file_evasion_projection(binpath, imports, strings, sec_names)
-    return {
+    result = {
         "schema": SCHEMA,
         "engine": "angr",
         "arch": obj.arch.name,
@@ -293,9 +356,13 @@ def _extract_angr_impl(binpath, diagnostics, load_spec=None):
         **evasion,
         "platform": platform,
     }
+    if string_ref_probe:
+        result["string_reference_probe"] = sorted(method_string_refs,
+                                                  key=lambda item: (item["addr"], item["func"]))
+    return result
 
 
-def extract_angr(binpath, load_spec=None):
+def extract_angr(binpath, load_spec=None, cfg_options=None, string_ref_probe=False):
     """Capture bounded engine diagnostics across extraction and restore logging."""
     diagnostics = []
     class Capture(logging.Handler):
@@ -315,6 +382,9 @@ def extract_angr(binpath, load_spec=None):
         logger.propagate = False
         logger.addHandler(handler)
     try:
+        if cfg_options is not None or string_ref_probe:
+            return _extract_angr_impl(binpath, diagnostics, load_spec, cfg_options,
+                                      string_ref_probe)
         return (_extract_angr_impl(binpath, diagnostics) if load_spec is None else
                 _extract_angr_impl(binpath, diagnostics, load_spec))
     finally:
@@ -322,6 +392,157 @@ def extract_angr(binpath, load_spec=None):
             logger.removeHandler(handler)
             logger.setLevel(level)
             logger.propagate = propagate
+
+
+def _extract_angr_bounded(binpath, load_spec, allow_large, scope=None):
+    """Run full CFGFast outside the caller with time and address-space caps."""
+    from ratlib.angr_runtime import configured_python
+    python = configured_python() or sys.executable
+    explicit = allow_large or os.environ.get("RAT_ALLOW_LARGE") in {"1", "true", "yes"}
+    timeout = 300 if explicit else 120
+    memory = (4 if explicit else 2) * 1024 * 1024 * 1024
+    limits = ResourceLimits(cpu_seconds=timeout, address_space_bytes=memory,
+                            file_size_bytes=128 * 1024 * 1024)
+    worker = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "ratlib", "angr_worker.py")
+    with tempfile.TemporaryDirectory(prefix="rat-revq-angr-") as directory:
+        output = os.path.join(directory, "revmap.json")
+        result = run([python, worker, os.path.realpath(binpath), output,
+                      json.dumps(load_spec, sort_keys=True),
+                      json.dumps(scope, sort_keys=True)],
+                     timeout_seconds=timeout, limits=limits, preview_bytes=16 * 1024,
+                     max_output_bytes=64 * 1024,
+                     env={"CTF_HOME": os.environ.get("CTF_HOME") or
+                          os.path.dirname(os.path.dirname(os.path.realpath(__file__)))},
+                     tool_version="revq-angr-worker-v1")
+        stderr = result.stderr.preview.decode("utf-8", "replace")
+        if result.timed_out or result.resource_limited:
+            raise AngrAnalysisError("angr CFGFast timeout (%ds budget)" % timeout,
+                                    kind="timeout")
+        if result.exit_code != 0:
+            # The worker runs under an explicit RLIMIT_AS.  Python allocations over
+            # it raise MemoryError (the worker emits RAT_ANGR_WORKER_OOM); native
+            # CFGFast allocations (pyvex/unicorn) over it instead get a NULL and
+            # crash the worker with SIGSEGV, which is NOT a MemoryError/SIGKILL and
+            # was being mislabelled analysis_failed -- hiding that raising the
+            # budget (--allow-large / RAT_ALLOW_LARGE) is the actual remedy.  Treat
+            # a worker SIGSEGV as the memory limit too; the message stays honest so
+            # a genuine analysis crash that survives --allow-large is still visible.
+            if ("RAT_ANGR_WORKER_OOM" in stderr or "MemoryError" in stderr
+                    or result.signal in {signal.SIGKILL, signal.SIGXFSZ, signal.SIGSEGV}):
+                detail = (" (worker crashed with SIGSEGV; if it persists under "
+                          "--allow-large it is an analysis bug, not the cap)"
+                          if result.signal == signal.SIGSEGV else "")
+                raise AngrAnalysisError("angr CFGFast memory limit (%.0f GiB)%s" %
+                                        (memory / 1024 ** 3, detail), kind="resource_limit")
+            raise AngrAnalysisError("angr worker failed (exit %s): %s" %
+                                    (result.exit_code, stderr[-600:]), kind="analysis_failed")
+        try:
+            with open(output, encoding="utf-8") as stream:
+                return json.load(stream)
+        except (OSError, ValueError) as exc:
+            raise AngrAnalysisError("angr worker returned no valid revmap: %s" % exc) from exc
+
+
+def _resolve_function_scope(binpath, target, size_override, load_spec):
+    """Resolve one mapped function without running CFGFast in the caller."""
+    from ratlib.raw_loader import project as raw_project
+    try:
+        import angr  # noqa: F401
+    except ImportError as exc:
+        raise AngrAnalysisError(
+            "angr 미설치: 함수 범위 해석에 angr가 필요합니다 (SETUP.md의 .venv-angr) "
+            "또는 --fast(binutils)/Ghidra 경로를 사용하세요",
+            kind="dependency_missing") from exc
+    proj = raw_project(binpath, load_spec)
+    obj = proj.loader.main_object
+    addr = parse_int(target)
+    symbol = None
+    if addr is None:
+        symbol = obj.get_symbol(target) if hasattr(obj, "get_symbol") else None
+        if symbol is None or not getattr(symbol, "is_function", False):
+            raise AngrAnalysisError("함수 '%s' 심볼 없음; 시작 주소와 --func-size를 지정하세요" % target,
+                                    kind="scope_required")
+        addr = int(symbol.rebased_addr)
+    if size_override is not None:
+        size = size_override
+        quality = "operator-range"
+    elif symbol is not None and int(getattr(symbol, "size", 0)) > 0:
+        size = int(symbol.size)
+        quality = "elf-symbol-range"
+    else:
+        raise AngrAnalysisError("주소 함수는 --func-size BYTES가 필요합니다 (전체 범위 추측 금지)",
+                                kind="scope_required")
+    if size <= 0 or size > 65536:
+        raise AngrAnalysisError("함수 범위는 1..65536 bytes여야 합니다", kind="scope_required")
+    try:
+        proj.loader.memory.load(addr, 1)
+        proj.loader.memory.load(addr + size - 1, 1)
+    except Exception as exc:
+        raise AngrAnalysisError("함수 범위가 로드된 매핑 밖입니다", kind="scope_required") from exc
+    return {"addr": addr, "end": addr + size, "size": size,
+            "name": target if symbol is not None else None,
+            "range_quality": quality, "coverage": "bounded-function-region",
+            "whole_program_facts": False}
+
+
+def _load_or_extract_local(binpath, target, size_override, refresh, load_spec, allow_large):
+    try:
+        import angr
+    except ImportError as exc:
+        raise AngrAnalysisError(
+            "angr 미설치: 함수 단위 분석에 angr가 필요합니다 (SETUP.md의 .venv-angr) "
+            "또는 --fast(binutils)/Ghidra 경로를 사용하세요",
+            kind="dependency_missing") from exc
+    scope = _resolve_function_scope(binpath, target, size_override, load_spec)
+    digest = sha256(binpath)
+    # load_spec changes how the raw bytes are decoded (arch/base/entry), but a raw
+    # blob's addr/end come from the operator-supplied target+size, so they are
+    # identical across arches.  Omitting load_spec here let a second query with a
+    # different --arch hit the first arch's cached analysis.  Bind it into the key
+    # and re-check it on every hit so i386 and amd64 never share a cache entry.
+    key = hashlib.sha256(json.dumps({
+        "input_sha256": digest, "scope": {"addr": scope["addr"], "end": scope["end"]},
+        "engine": "angr", "angr_version": angr.__version__, "schema": SCHEMA,
+        "load_spec": load_spec,
+        "options": "cfgfast-local-region-v1-crossrefs-datarefs-normalized",
+    }, sort_keys=True).encode()).hexdigest()[:24]
+    cp = binpath + ".func-" + key + ".revq.json"
+    if not refresh and os.path.isfile(cp):
+        try:
+            with open(cp, encoding="utf-8") as stream:
+                rev = json.load(stream)
+            if (rev.get("sha256") == digest and rev.get("function_scope") == scope
+                    and rev.get("load_spec") == load_spec
+                    and rev.get("schema") == SCHEMA and _has_current_evasion_contract(rev)):
+                rev["cache_state"] = "hit"
+                return annotate_counts(rev)
+        except (OSError, ValueError):
+            pass
+    rev = _extract_angr_bounded(binpath, load_spec, allow_large, scope)
+    if scope["name"]:
+        for func in rev.get("functions", []):
+            if func.get("addr") == scope["addr"]:
+                previous = func.get("name")
+                func["name"] = scope["name"]
+                for string in rev.get("strings", []):
+                    for xref in string.get("xrefs", []):
+                        if xref.get("func") == previous:
+                            xref["func"] = scope["name"]
+    rev.update(bin=binpath, sha256=digest, generated_at=now_iso(), cache_state="miss",
+               function_scope=scope, analysis_complete=False, analysis_status="partial")
+    if load_spec:
+        rev["load_spec"] = load_spec
+    rev.setdefault("analysis_diagnostics", []).append({
+        "severity": "warning", "source": "revq",
+        "message": "single function region only; callers, outside calls and global xrefs are incomplete"})
+    annotate_counts(rev)
+    try:
+        with open(cp, "w", encoding="utf-8") as stream:
+            json.dump(rev, stream)
+    except OSError:
+        pass
+    return rev
 
 
 def extract_wasm(binpath):
@@ -580,6 +801,138 @@ def _detect_platform(ftype):
     return "?"
 
 
+# ─────────────────── stripped 함수-시작 자동 발견 (Nucleus 경량판) ───────────────────
+# 결정론적 바이트 스윕: angr/Ghidra를 호출하지 않고 .text 바이트만 선형 스캔한다.
+# 결과는 확정 함수가 아니라 후보이며(근거 source + confidence 태깅), CFG/xref/크기를
+# 주장하지 않는다. stripped 대용량 바이너리에서 `revq --func <addr> --func-size`가 쓸
+# 시작 주소 후보를 공급하는 것이 목적이다. 외부 프로세스·게이트 무관(순수 파이썬).
+FUNC_CANDIDATE_CAP = 4096
+_TEXT_SCAN_MAX_BYTES = 16 * 1024 * 1024  # .text가 이보다 크면 스윕을 건너뛴다(상한)
+
+# 근거별 confidence (보수적): endbr64 > call-target > prologue > entry/plt.
+_CANDIDATE_CONFIDENCE = {"endbr64": "high", "call-target": "medium",
+                         "prologue": "low", "entry": "medium", "plt": "low"}
+_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+def _readelf_sections(binpath):
+    """[(name, vma, file_off, size, flags)] from `readelf -SW` (deterministic)."""
+    out = []
+    for line in sh(["readelf", "-SW", binpath]).splitlines():
+        # "  [16] .text   PROGBITS  <vma> <off> <size> <es> <flg> ..."
+        m = re.match(r"\s*\[\s*\d+\]\s+(\.\S+)\s+\S+\s+([0-9a-fA-F]+)\s+"
+                     r"([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+\S+\s+([A-Z]*)", line)
+        if m:
+            out.append((m.group(1), int(m.group(2), 16), int(m.group(3), 16),
+                        int(m.group(4), 16), m.group(5)))
+    return out
+
+
+def _elf_entry(binpath):
+    for line in sh(["readelf", "-hW", binpath]).splitlines():
+        m = re.search(r"Entry point address:\s*0x([0-9a-fA-F]+)", line)
+        if m:
+            return int(m.group(1), 16)
+    return None
+
+
+def _discover_function_candidates(binpath, arch, pie=False):
+    """Return function-start candidates for a (typically stripped) ELF.
+
+    Collects, with a source tag per address: entry point, .plt/.plt.sec starts,
+    x86 function prologues swept over .text, and near-call (E8 rel32) targets
+    that land inside .text. Deterministic and bounded.
+
+    Addresses are returned in the SAME loader-virtual-address space that
+    ``revq --func <addr>`` consumes, so a candidate can be fed straight back in:
+    angr rebases a PIE to 0x400000, so a PIE file VMA is shifted by that base;
+    a non-PIE already carries loader VMAs in its headers.  ``address_space`` is
+    recorded on each candidate to make this explicit.
+    """
+    if arch not in {"amd64", "i386"}:
+        return []
+    load_base = 0x400000 if pie else 0
+    sections = _readelf_sections(binpath)
+    text = next((s for s in sections if s[0] == ".text"), None)
+    if text is None or text[3] <= 0 or text[3] > _TEXT_SCAN_MAX_BYTES:
+        return []
+    _name, text_vma, text_off, text_size, _flg = text
+    try:
+        with open(binpath, "rb") as stream:
+            stream.seek(text_off)
+            blob = stream.read(text_size)
+    except OSError:
+        return []
+    if len(blob) < text_size:
+        text_size = len(blob)
+    text_end = text_vma + text_size
+
+    # file-VMA -> strongest source seen; the stored key stays in file-VMA space
+    # for the sweep, and load_base is applied once at emit time.
+    found = {}
+
+    def add(addr, source):
+        if not text_vma <= addr < text_end:
+            return
+        prev = found.get(addr)
+        if prev is None or _CONFIDENCE_RANK[_CANDIDATE_CONFIDENCE[source]] > \
+                _CONFIDENCE_RANK[_CANDIDATE_CONFIDENCE[prev]]:
+            found[addr] = source
+
+    entry = _elf_entry(binpath)
+    if entry is not None:
+        add(entry, "entry")
+    for name, vma, _o, size, _f in sections:
+        if name in {".plt", ".plt.sec", ".plt.got"} and size > 0:
+            add(vma, "plt")
+
+    # endbr64 (F3 0F 1E FA) and push rbp; mov rbp,rsp prologues.  A function that
+    # begins with endbr64 is commonly followed by the push rbp prologue; that
+    # push is NOT a second function start, so record where an endbr64 lands and
+    # suppress a prologue candidate in the few bytes right after it.
+    endbr_at = set()
+    i = 0
+    n = len(blob)
+    while i < n - 3:
+        b = blob[i]
+        if b == 0xF3 and blob[i + 1:i + 4] == b"\x0f\x1e\xfa":
+            add(text_vma + i, "endbr64")
+            endbr_at.add(i)
+            i += 4
+            continue
+        if b == 0x55:  # push rbp
+            is_prologue = ((arch == "amd64" and blob[i + 1:i + 4] == b"\x48\x89\xe5")
+                           or (arch == "i386" and blob[i + 1:i + 3] == b"\x89\xe5"))
+            # Suppress the prologue if an endbr64 sits in the preceding few bytes
+            # (same function's body, not a new start).
+            shadowed = any((i - k) in endbr_at for k in range(1, 8))
+            if is_prologue and not shadowed:
+                add(text_vma + i, "prologue")
+        i += 1
+
+    # near call E8 rel32 whose target lands in .text.
+    j = 0
+    while j < n - 4:
+        if blob[j] == 0xE8:
+            rel = int.from_bytes(blob[j + 1:j + 5], "little", signed=True)
+            target = text_vma + j + 5 + rel
+            add(target, "call-target")
+            j += 5
+            continue
+        j += 1
+
+    ordered = sorted(found.items())
+    truncated = len(ordered) > FUNC_CANDIDATE_CAP
+    ordered = ordered[:FUNC_CANDIDATE_CAP]
+    candidates = [{"addr": addr + load_base, "source": source,
+                   "confidence": _CANDIDATE_CONFIDENCE[source],
+                   "address_space": "loader-virtual-address"}
+                  for addr, source in ordered]
+    if truncated and candidates:
+        candidates[-1]["truncated"] = True
+    return candidates
+
+
 # ─────────────────────────── 엔진 B: binutils (빠름, xref 없음) ───────────────────────────
 def extract_binutils(binpath):
     """readelf/nm/strings 로 빠른 map. stripped 면 함수 목록 빈약 + xref 없음."""
@@ -621,15 +974,31 @@ def extract_binutils(binpath):
 
     sec_names = re.findall(r"\]\s+(\.\S+)", sh(["readelf", "-SW", binpath]))
     evasion = _file_evasion_projection(binpath, imports, strings, sec_names)
-    return {
+    # Symbols give the authoritative function list; when they are absent (stripped)
+    # or sparse, a deterministic prologue/call-target sweep supplies START-ADDRESS
+    # candidates so `revq --func <addr> --func-size` has something to aim at.  These
+    # are candidates, not confirmed functions: no CFG/xref/size is claimed.
+    candidates = []
+    if len(functions) < 8:
+        candidates = _discover_function_candidates(binpath, arch, pie=pie)
+    result = {
         "schema": SCHEMA, "engine": "binutils", "arch": arch, "pie": pie,
         "stripped": stripped, "functions": functions, "strings": strings,
         "imports": imports,
+        "function_candidates": candidates,
         "analysis_complete": False,
         "functions_filtered": 0,
         **evasion,
         "platform": _detect_platform(sh(["file", binpath])),
     }
+    if candidates:
+        result.setdefault("analysis_diagnostics", []).append({
+            "severity": "info", "source": "revq",
+            "message": ("symbols absent/sparse; %d function-start candidates from a "
+                        "deterministic prologue/call sweep (not confirmed functions). "
+                        "Analyze one with: revq %s --func <addr> --func-size <N>"
+                        % (len(candidates), binpath))})
+    return result
 
 
 # ─────────────────────────── 분석: interesting-function ───────────────────────────
@@ -948,6 +1317,9 @@ def compute_function_card(rev, target):
         unresolved.append({"kind": "compare_length", "detail": "%d comparison lengths remain unresolved" % len(unresolved_lengths)})
     if rev.get("engine") != "angr":
         unresolved.append({"kind": "engine_limited", "detail": "binutils engine: calls/xrefs may be incomplete"})
+    if rev.get("function_scope"):
+        unresolved.append({"kind": "function_scope", "detail":
+                           "single function region only; callers, outside calls and global xrefs are incomplete"})
     if rev.get("load_spec"):
         unresolved.append({"kind": "operator_blob_map", "detail": "raw-code mapping is operator-supplied; runtime stage and load address are unverified"})
     if callers_truncated or callees_truncated or strings_truncated:
@@ -970,7 +1342,8 @@ def compute_function_card(rev, target):
         "next": ([] if rev.get("load_spec") else [{
             "query": "decomp", "target": "%s %#x" % (rev.get("bin", "?"), f.get("addr", 0))
         }]),
-        "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"), "engine": rev.get("engine")},
+        "provenance": {"binary_sha256": rev.get("sha256"), "revmap_schema": rev.get("schema"),
+                       "engine": rev.get("engine"), "scope": rev.get("function_scope")},
     }
 
 
@@ -1089,7 +1462,9 @@ def _persist_invocation(binpath, cur_sha, want_engine, refresh, rev, cache_key,
         pass
 
 
-def load_or_extract(binpath, want_engine, refresh, index_root=None, load_spec=None):
+def load_or_extract(binpath, want_engine, refresh, index_root=None, load_spec=None,
+                    max_angr_bytes=None, allow_large=False, func_target=None,
+                    func_size=None):
     wasm = is_wasm(binpath)
     if wasm:
         if load_spec:
@@ -1147,9 +1522,35 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None, load_spec=No
                "evasion_signal_schema": EVASION_SIGNAL_SCHEMA,
                "evasion_signals": [], "evasion": []}
     else:
-        rev = (extract_wasm(binpath) if wasm else
-               extract_binutils(binpath) if want_engine == "binutils" else
-               extract_angr(binpath, load_spec))
+        if wasm:
+            rev = extract_wasm(binpath)
+        elif want_engine == "binutils":
+            rev = extract_binutils(binpath)
+        else:
+            limit = (DEFAULT_MAX_ANGR_INPUT_MB * 1024 * 1024 if max_angr_bytes is None
+                     else max_angr_bytes)
+            explicit_large = allow_large or os.environ.get("RAT_ALLOW_LARGE") in {"1", "true", "yes"}
+            if (func_target and not explicit_large and limit > 0
+                    and os.path.getsize(binpath) > limit):
+                return _load_or_extract_local(binpath, func_target, func_size,
+                                              refresh, load_spec, allow_large)
+            _angr_size_guard(binpath, max_angr_bytes, allow_large)
+            try:
+                enlarged_budget = (allow_large or max_angr_bytes == 0 or
+                                   (max_angr_bytes is not None and
+                                    max_angr_bytes > DEFAULT_MAX_ANGR_INPUT_MB * 1024 * 1024))
+                rev = _extract_angr_bounded(binpath, load_spec, enlarged_budget)
+            except AngrAnalysisError:
+                raise
+            except SystemExit:
+                raise
+            except Exception as exc:
+                # e.g. angr's simprocedure prototype assertion on some libcs:
+                # surface a typed failure instead of a raw traceback.
+                detail = str(exc).strip() or "(메시지 없음)"
+                raise AngrAnalysisError(
+                    "angr 분석 실패(%s): %s — --fast(binutils) 또는 Ghidra로 우회하세요"
+                    % (type(exc).__name__, detail)) from exc
     if load_spec:
         rev["load_spec"] = load_spec
     rev["bin"] = binpath
@@ -1172,12 +1573,38 @@ def load_or_extract(binpath, want_engine, refresh, index_root=None, load_spec=No
     return rev
 
 
+def _nonnegative_megabytes(value):
+    try:
+        megabytes = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("상한은 0 이상의 유한한 MB 값이어야 합니다") from exc
+    if not math.isfinite(megabytes) or megabytes < 0 or not math.isfinite(megabytes * 1024 * 1024):
+        raise argparse.ArgumentTypeError("상한은 0 이상의 유한한 MB 값이어야 합니다")
+    return megabytes
+
+
+def _bounded_function_size(value):
+    try:
+        size = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("함수 범위는 1..65536 bytes여야 합니다") from exc
+    if not 1 <= size <= 65536:
+        raise argparse.ArgumentTypeError("함수 범위는 1..65536 bytes여야 합니다")
+    return size
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="revq", add_help=True,
                                 description="rev 정적 배치 (함수/문자열/xref/interesting)")
     p.add_argument("binary", nargs="?", help="분석할 ELF (또는 'selftest')")
     p.add_argument("--fast", action="store_true", help="binutils 엔진(빠름, xref 없음)")
     p.add_argument("--refresh", action="store_true", help="캐시 무시 재추출")
+    p.add_argument("--max-input-mb", type=_nonnegative_megabytes, default=None,
+                   metavar="MB", help="angr 엔진 입력 크기 상한(기본 %dMB, 0=무제한)" % DEFAULT_MAX_ANGR_INPUT_MB)
+    p.add_argument("--allow-large", action="store_true",
+                   help="angr 입력 크기 가드 해제(별도 300초/4GiB 예산)")
+    p.add_argument("--func-size", type=_bounded_function_size, metavar="BYTES",
+                   help="주소 기반 --func의 명시적 분석 범위(최대 65536 bytes)")
     p.add_argument("--arch", help="explicit raw blob architecture: i386/amd64/arm/aarch64")
     p.add_argument("--base", help="explicit raw blob load base, e.g. 0x10000")
     p.add_argument("--entry", help="explicit raw blob entry, e.g. 0x10000")
@@ -1221,8 +1648,24 @@ def main(argv):
         build_parser().error(str(exc))
     if blob_spec and args.fast:
         build_parser().error("--fast cannot analyze an explicit raw blob mapping")
+    if args.func_size is not None and not args.func:
+        build_parser().error("--func-size requires --func")
     requested_engine = "binutils" if args.fast else "angr"
-    rev = load_or_extract(args.binary, requested_engine, args.refresh, load_spec=blob_spec)
+    max_angr_bytes = None
+    if args.max_input_mb is not None:
+        max_angr_bytes = (max(1, int(args.max_input_mb * 1024 * 1024))
+                          if args.max_input_mb else 0)
+    try:
+        rev = load_or_extract(args.binary, requested_engine, args.refresh, load_spec=blob_spec,
+                              max_angr_bytes=max_angr_bytes, allow_large=args.allow_large,
+                              func_target=args.func, func_size=args.func_size)
+    except AngrAnalysisError as exc:
+        if exc.kind in {"timeout", "resource_limit"}:
+            print("RAT_STATUS=%s RAT_EXIT=%s" %
+                  (exc.kind, 124 if exc.kind == "timeout" else 70), file=sys.stderr)
+        elif exc.kind == "size_limit":
+            print("RAT_STATUS=partial RAT_EXIT=1", file=sys.stderr)
+        die(str(exc), 124 if exc.kind == "timeout" else 70 if exc.kind == "resource_limit" else 1)
     operation = "summary"
     requested = None
 
@@ -1232,6 +1675,14 @@ def main(argv):
             print(json.dumps(funcs_json(rev, args.sort, args.limit), indent=2, ensure_ascii=False))
         else:
             print(render_funcs(rev, args.sort, args.limit))
+    elif args.func:
+        operation = "func"
+        requested = args.func
+        card = compute_function_card(rev, args.func)
+        if card is None:
+            print("[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % args.func)
+            return 1
+        print(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
     elif args.format == "json":
         operation = "json"
         print(json.dumps(rev, indent=2, ensure_ascii=False))
@@ -1253,14 +1704,6 @@ def main(argv):
     elif args.oracle:
         operation = "oracle"
         print(json.dumps(compute_oracle(rev), ensure_ascii=False, separators=(",", ":")))
-    elif args.func:
-        operation = "func"
-        requested = args.func
-        card = compute_function_card(rev, args.func)
-        if card is None:
-            print("[!] 함수 '%s' 없음. 목록: revq <bin> --funcs" % args.func)
-            return 1
-        print(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
     elif args.xrefs:
         operation = "xrefs"
         requested = args.xrefs

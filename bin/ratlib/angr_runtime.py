@@ -36,8 +36,11 @@ def reexec_for_angr(script, argv):
         # A plain symlink to Python can set sys.executable to its target.  An
         # identity check alone would re-exec forever in that case.
         marker = "RAT_ANGR_REEXEC_TARGET"
-        if os.environ.get(marker) == os.path.realpath(python):
+        # The marker belongs to this process's exec, not to subprocesses that
+        # inherit its environment and start under their own shebang Python.
+        target = "%d:%s" % (os.getpid(), os.path.realpath(python))
+        if os.environ.get(marker) == target:
             return
         env = os.environ.copy()
-        env[marker] = os.path.realpath(python)
+        env[marker] = target
         os.execve(python, [python, os.path.realpath(script), *argv], env)

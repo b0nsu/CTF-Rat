@@ -45,6 +45,13 @@ def _data_slice(a):
                                        status="partial", diagnostics=["angr dependency missing; no synthetic slice emitted"],
                                        started=started), a)
 
+    too_large = base.angr_size_refusal(a.binary)
+    if too_large:
+        return base.emit(base.envelope("rat-slice", a.binary, a,
+                                       {"analysis_kind": "data", "coverage": "refused"},
+                                       status="partial", diagnostics=[too_large],
+                                       started=started), a)
+
     try:
         project = angr.Project(a.binary, auto_load_libs=False)
         cfg = project.analyses.CFGFast(normalize=True)

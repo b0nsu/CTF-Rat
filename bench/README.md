@@ -2,6 +2,55 @@
 
 `bench/suite.json` defines the canonical manifest shape for synthetic, integration, real, and private/held-out benchmark entries. Do not create a second benchmark database for real challenges. For non-redistributable local evaluation, use an ignored local suite with the same schema and pass it through the existing `ratbench --suite` interface.
 
+## Large binary analysis path (2026-11-06)
+
+The reproducible local inputs live in `bench/fixtures/large-size/` and are
+generated, not committed. `make_size_fixtures.py` creates exact 2 MiB boundary
+cases, stripped cases, and a semantic `Correct`/`Wrong` checker. Its large files
+are zero-padded, so they test the file-size guard but **not** CFGFast cost as
+code grows. `make_dense_fixtures.py` creates real code-heavy 1 MiB and 4 MiB
+ELFs for timeout and memory measurements. Both generators record SHA-256 values
+in local manifests.
+
+```sh
+python3 bench/make_size_fixtures.py
+python3 bench/make_dense_fixtures.py
+python3 bench/capture_revq_baseline.py \
+  --binary bench/fixtures/large-size/semantic \
+  --output bench/baselines/large-binary-semantic.json
+python3 bench/cfgfast_options.py \
+  --binary bench/fixtures/large-size/semantic \
+  --baseline bench/baselines/large-binary-semantic.json \
+  --output bench/results/cfgfast-semantic.json
+python3 bench/run_large_binary_matrix.py
+```
+
+`profile_large_binary.py` records command, input digest, versions (angr,
+Ghidra, JDK), CPU/RAM, declared revq cache condition, wall time, timeout,
+exit code, and sampled peak RSS across the **process tree**. Cold means revq
+`--refresh`; warm means a following cache hit. OS page cache is uncontrolled.
+Use `--timeout` for every new input. The profiler kills descendants in new
+sessions on timeout.
+
+The 2026-11-06 semantic experiment (`semantic`, SHA-256 prefix `ba0ff8dc`)
+found no lost string xrefs or call sites when either CFGFast option was disabled
+in this small fixture. Disabling `normalize` changed one recovered function's
+size and instruction count. `Function.string_references()` yielded four extra
+address/function pairs and no instruction addresses. The production defaults
+therefore remain `cross_references=True`, `normalize=True`; this experiment
+does not establish equivalence on other binaries or a useful speedup.
+
+For a single large function, `revq BIN --func main` and
+`rat query func BIN main` use the ELF symbol's address and size as a bounded
+CFGFast region. For a numeric address, pass `--func-size BYTES` (1–65536);
+stripped binaries need that confirmed start/range. Results are marked partial:
+callers, outside calls, and global xrefs are incomplete. The function cache key
+includes input hash, address/end, angr version, schema and CFG options.
+`decomp-local BIN 0xADDRESS` is the separate Ghidra `-noanalysis` experiment;
+it reports partial whole-program coverage and caches by input, address,
+Ghidra version and script digest. `decomp` retains its existing full-import
+behavior. No file-size-only automatic Ghidra routing is enabled.
+
 ## Corpus classes
 
 - `synthetic` — repository-authored deterministic fixtures; safe to commit.
@@ -243,5 +292,14 @@ comparison. Its independent oracle field stays `null` unless the local suite
 pins an exact expected-response digest. An unconfigured run is not an external
 solve-rate measurement. This hash comparison checks answer text, not exploit
 replay or whether a public answer was memorized.
+
+The v3 report's `Oracle conflicts` column counts eligible attempts whose measured
+`challenge_oracle_pass=false` contradicts an internal completion or a solve claim.
+This includes internally completed runs that the historical `false_solved` metric
+does not count. The columns can overlap; do not add them as disjoint failures.
+An ordinary failed attempt is not an oracle conflict, and `null` means unmeasured.
+Reject a candidate change with any oracle conflict. Compare independent oracle
+pass rates only on the same challenge set and oracle configuration, retaining
+coverage alongside the result; an unmeasured run cannot establish non-regression.
 
 Public `real` entries are reproducible competition artifacts, but they are **not automatically held out** from an internet-enabled agent: public source or writeups may be reachable outside the answer-free workspace. Use public real entries for reproducible integration/performance runs, and use a private held-out corpus (or an explicitly network-controlled agent environment) for claims about unseen solve rate.

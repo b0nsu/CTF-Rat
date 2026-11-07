@@ -316,7 +316,7 @@ def route_result(d):
     elif assessment is not None:
         raise ValidationError("uncommitted route cannot have skill assessment")
 
-_QUERY_DIAGNOSTIC_CODES = {"input_invalid","dependency_missing","timeout","partial","stale_cache","ambiguous","verification_fail",
+_QUERY_DIAGNOSTIC_CODES = {"input_invalid","input_required","dependency_missing","timeout","resource_limit","partial","stale_cache","ambiguous","verification_fail",
                            "source_invalid","source_stale","budget_omitted","budget_too_small","analysis_unavailable","card_limit"}
 def query_result(d):
     _need(d,("schema","query","status","facts","heuristics","artifacts","coverage","diagnostics","provenance"))
@@ -368,7 +368,7 @@ def brief_card(d):
     if not isinstance(d["truncated"],list): raise ValidationError("invalid truncated")
     if not isinstance(d["side_effects"],list): raise ValidationError("invalid side_effects")
 
-_BENCH_OUTCOMES = {"route-miss","solved","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
+_BENCH_OUTCOMES = {"route-miss","solved","oracle-smoke","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
 def bench_result(d):
     _need(d,("schema","mode","run_id","id","outcome","wall_ms"))
     if d["mode"] not in {"A","B"}: raise ValidationError("invalid bench mode")
