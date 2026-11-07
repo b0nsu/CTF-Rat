@@ -368,7 +368,7 @@ def brief_card(d):
     if not isinstance(d["truncated"],list): raise ValidationError("invalid truncated")
     if not isinstance(d["side_effects"],list): raise ValidationError("invalid side_effects")
 
-_BENCH_OUTCOMES = {"route-miss","solved","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
+_BENCH_OUTCOMES = {"route-miss","solved","oracle-smoke","route-ok-verify-skipped","verify-fail","solve-claimed","fail"}
 def bench_result(d):
     _need(d,("schema","mode","run_id","id","outcome","wall_ms"))
     if d["mode"] not in {"A","B"}: raise ValidationError("invalid bench mode")
