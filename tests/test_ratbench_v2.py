@@ -1047,6 +1047,80 @@ class ModeBV2RecordTests(unittest.TestCase):
         self.assertIn("| Completion pass | Oracle pass | Oracle coverage |", report)
         self.assertIn("| B-report | A0 | 2 | 1 | 1 | 1/2 |", report)
 
+    def test_oracle_conflicts_include_false_completion_but_exclude_unknown_and_failure(self):
+        cases = [
+            # completion, claim, oracle, conflict
+            (True, True, False, True),
+            (True, False, False, True),
+            (False, True, False, True),
+            (False, False, False, False),
+            (True, True, None, False),
+            (False, True, None, False),
+            (True, True, True, False),
+            (False, True, True, False),
+        ]
+        rows = []
+        for index, (completed, claimed, oracle, conflict) in enumerate(cases):
+            with self.subTest(completed=completed, claimed=claimed, oracle=oracle):
+                row = RATBENCH._mode_b_v2_record(
+                    {**ENTRY, "id": "case-%d" % index}, run_id="B-conflicts", ablation_id="A0",
+                    started_at="2026-08-29T00:00:00+00:00",
+                    finished_at="2026-08-29T00:00:01+00:00",
+                    agent_rc=0, flag_claimed=claimed, completion={"verified": completed},
+                    events=[], primitive_pass_at=None, artifact_count=0,
+                    challenge_oracle_pass=oracle)
+                RATBENCH.validate(row, "rat.benchmark-result/v3")
+                self.assertEqual(RATBENCH._oracle_conflict(row), conflict)
+                rows.append(row)
+        # Excluded attempts must not inflate either conflicts or coverage.
+        excluded = json.loads(json.dumps(rows[0]))
+        excluded["eligible"] = False
+        report = RATBENCH._render_v2_leaderboard(rows + [excluded])
+        self.assertIn("| False solved | Oracle conflicts |", report)
+        self.assertIn("| B-conflicts | A0 | 8 | 4 | 2 | 6/8 | 3 | 3 |", report)
+        # Historical oracle_pass is not proof of an independent oracle.
+        legacy = json.loads(json.dumps(rows[0]))
+        legacy["metrics"]["correctness"] = {
+            "verified_solve": True, "false_solved": False, "oracle_pass": False}
+        RATBENCH.validate(legacy, "rat.benchmark-result/v3")
+        self.assertFalse(RATBENCH._oracle_conflict(legacy))
+
+    def test_leaderboard_false_solved_and_oracle_conflicts_columns_are_distinct(self):
+        # Regression for a column-position blind spot: the conflicts test above
+        # happens to make False-solved == Oracle-conflicts (both 3), so a swap of
+        # those two adjacent columns would pass unnoticed.  Build rows where the
+        # two totals DIFFER and pin each column's value in the rendered row.
+        #   - row A: completed+claimed, oracle measured False  -> oracle_conflict,
+        #            but NOT false_solved (false_solved needs claim AND not verified)
+        #   - row B: not completed + claimed, oracle unmeasured -> false_solved,
+        #            but NOT oracle_conflict (no measured external failure)
+        row_conflict_only = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "conflict-only"}, run_id="B-distinct", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=0, flag_claimed=True, completion={"verified": True},
+            events=[], primitive_pass_at=None, artifact_count=0, challenge_oracle_pass=False)
+        row_false_only = RATBENCH._mode_b_v2_record(
+            {**ENTRY, "id": "false-only"}, run_id="B-distinct", ablation_id="A0",
+            started_at="2026-08-29T00:00:00+00:00", finished_at="2026-08-29T00:00:01+00:00",
+            agent_rc=0, flag_claimed=True, completion={"verified": False},
+            events=[], primitive_pass_at=None, artifact_count=0, challenge_oracle_pass=None)
+        # A second conflict-only row (distinct challenge_id) makes the two totals
+        # unequal: Oracle conflicts = 2, False solved = 1, so a column swap flips them.
+        row_conflict_two = json.loads(json.dumps(row_conflict_only))
+        row_conflict_two["challenge_id"] = "conflict-only-2"
+        for row in (row_conflict_only, row_conflict_two, row_false_only):
+            RATBENCH.validate(row, "rat.benchmark-result/v3")
+        self.assertTrue(RATBENCH._oracle_conflict(row_conflict_only))
+        self.assertFalse(RATBENCH._oracle_conflict(row_false_only))
+        report = RATBENCH._render_v2_leaderboard(
+            [row_conflict_only, row_conflict_two, row_false_only])
+        # Columns: Run | Ablation | Eligible | Completion pass | Oracle pass |
+        #          Oracle coverage | False solved | Oracle conflicts | ...
+        # Completion pass = 2 (two conflict rows verified), Oracle pass = 0,
+        # Oracle coverage = 2/3 (two measured-False oracles), False solved = 1,
+        # Oracle conflicts = 2.  A False-solved/Oracle-conflicts swap breaks this.
+        self.assertIn("| B-distinct | A0 | 3 | 2 | 0 | 2/3 | 1 | 2 |", report)
+
     def test_routing_projection_rejects_incoherent_revision_count(self):
         doc = RATBENCH._mode_b_v2_record(
             ENTRY, run_id="B-test", ablation_id="A2",
@@ -1183,7 +1257,7 @@ class ModeBV2RecordTests(unittest.TestCase):
                 self.assertEqual(RATBENCH.cmd_report(SimpleNamespace(suite=None, schema="v3")), 0)
             with open(os.path.join(d, "bench", "LEADERBOARD.v3.md"), encoding="utf-8") as fh:
                 leaderboard = fh.read()
-            self.assertIn("| T | A0 | 2 | 1 | 0 | 0/2 | 0 | 1 | 0 | 50.0% |", leaderboard)
+            self.assertIn("| T | A0 | 2 | 1 | 0 | 0/2 | 0 | 0 | 1 | 0 | 50.0% |", leaderboard)
             self.assertIn("5000ms (1/2)", leaderboard)
             self.assertIn("4 (1/2)", leaderboard)
             self.assertIn("1 (1/2)", leaderboard)
