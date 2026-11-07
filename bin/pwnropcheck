@@ -98,9 +98,12 @@ def chain(args) -> tuple[list[dict], int]:
             # SysV AMD64 call-alignment check can fire for comma-separated chains,
             # not only for explicit JSON entries. A bare token stays a gadget.
             kind, token = "gadget", value
-            if ":" in value and value.split(":", 1)[0] in {"gadget", "call", "data"}:
+            # Only a string token can carry a prefix; a JSON list of numeric
+            # addresses passes ints straight through to integer().
+            if isinstance(value, str) and ":" in value and value.split(":", 1)[0] in {"gadget", "call", "data"}:
                 kind, token = value.split(":", 1)
-            address, name = integer(token.strip()), None
+            address = integer(token.strip() if isinstance(token, str) else token)
+            name = None
         if kind not in {"gadget", "call", "data"}:
             raise ValueError("entry %d has invalid kind" % index)
         entries.append({"index": index, "kind": kind, "value": address, "name": name})

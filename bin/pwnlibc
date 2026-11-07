@@ -211,8 +211,8 @@ def cmd_index_build(args):
     entries = []
     for fn in sorted(os.listdir(libc_dir)):
         p = os.path.join(libc_dir, fn)
-        if not os.path.isfile(p) or not re.match(r"libc(?:-\d|\.so)", fn):
-            continue  # match libc.so.6 / libc-2.31.so, not libcrypto/libc++ etc
+        if not os.path.isfile(p) or not re.match(r"libc(?:[-_]\w|\.so)", fn):
+            continue  # libc.so.6 / libc-2.31.so / libc_docker.so.6, not libcrypto/libc++/libcap
         e = _index_one(p)
         if e:
             entries.append(e)
