@@ -168,13 +168,37 @@ def _attach_symbolic_primitive(stream, binary_digest, environment_digest,
     """Attach solver provenance without promoting candidate evidence to PASS."""
     view = stream.view()
     primitives = view.get("primitives", {})
+    observations = view.get("observations", {})
+    _PWN_CLASSES = {"control-flow"}
+
+    def _adoptable(p):
+        # A primitive is safe to stamp with rev-symbolic provenance only if it is
+        # NOT a genuine foreign (pwn / other-engine) solve. Adopting such a PASS
+        # would silently rewrite its provenance and corrupt the engine-provenance
+        # the completion gate and the "pwn.* > provisional rev" precedence rely on.
+        if (p.get("extensions", {}) or {}).get("solve_origin") not in (None, "rev-symbolic"):
+            return False
+        if p.get("class") in _PWN_CLASSES:
+            return False
+        if (p.get("producer", {}) or {}).get("engine") not in (None, "symsolve"):
+            return False
+        for oid in p.get("self_evidence", []) or []:
+            kind = (observations.get(oid, {}) or {}).get("kind")
+            if isinstance(kind, str) and kind.startswith("pwn."):
+                return False
+        return True
+
     tagged = [p for p in primitives.values()
               if p.get("input_digest") == binary_digest
               and p.get("extensions", {}).get("solve_origin") == "rev-symbolic"
               and p.get("status") in {"candidate", "pass"}]
     matching = [p for p in primitives.values()
                 if p.get("input_digest") == binary_digest
-                and p.get("status") in {"candidate", "pass"}]
+                and p.get("status") in {"candidate", "pass"}
+                and _adoptable(p)]
+    # Reuse the single rev-symbolic primitive if present; otherwise adopt a single
+    # ADOPTABLE (generic / non-pwn / same-engine) primitive. A foreign pwn PASS is
+    # never adopted (see _adoptable).
     existing = tagged[0] if len(tagged) == 1 else (
         matching[0] if not tagged and len(matching) == 1 else None)
     if existing is None:
@@ -261,9 +285,11 @@ def solve(args):
 
     if args.arg is not None:
         argv.append(mk_sym("argv1", args.arg))
+    file_target_path = None
     if args.file is not None:
         fpath, fn = parse_file_spec(args.file)
         fn = fn or 32
+        file_target_path = fpath
         content = mk_sym("file", fn)
         simfile = angr.SimFile(fpath, content=content, size=fn)
         state_kwargs["fs"] = {fpath: simfile}
@@ -363,7 +389,8 @@ def solve(args):
     if not args.no_verify and (find_strs or avoid_strs):
         ok, detail, target_returncode = concrete_verify(
             args.binary, symbols, found, find_strs, avoid_strs,
-            expected_exit_code=args.expect_exit_code)
+            expected_exit_code=args.expect_exit_code,
+            file_target_path=file_target_path)
         cv_detail = detail if isinstance(detail, str) else repr(detail)
         if ok is None:
             cv_status = "skipped"
@@ -522,17 +549,24 @@ def _run_bounded(run_args, stdin_val, timeout):
 
 
 def concrete_verify(binpath, symbols, found, find_strs, avoid_strs,
-                    expected_exit_code=0):
+                    expected_exit_code=0, file_target_path=None):
     """복원 입력을 실제 바이너리에 넣어 재실행 → 목표 문자열 실제 출력 확인.
     h4c.team 실패원인 ⑤(정적/모델 과신) 대응. 반환: (True|False|None, 상세, returncode).
     None = 이 호스트에서 실행 불가(교차 아키텍처 등)로 스킵."""
-    stdin_val = argv1 = None
+    stdin_val = argv1 = file_val = None
     for label, bv, _n in symbols:
         val = found.solver.eval(bv, cast_to=bytes)
         if label == "stdin":
             stdin_val = val
         elif label == "argv1":
             argv1 = val
+        elif label == "file":
+            file_val = val
+    # A --file solve MUST re-run against the SOLVED file bytes, not whatever
+    # happens to be on disk: otherwise the "executable oracle" is unfaithful and
+    # can false-pass on a pre-existing/stale/missing file (banner strings etc).
+    if file_target_path is not None and file_val is None:
+        return None, "file-input solve produced no concrete file content", None
     # 상대경로면 execvp 가 PATH 검색해 실패 → 절대경로로 고정.
     run_args = [os.path.abspath(binpath)] + ([argv1.decode("latin-1")] if argv1 is not None else [])
     # PE 는 Linux 직접 실행 불가 → wine 있으면 그걸로, 없으면 스킵.
@@ -542,10 +576,35 @@ def concrete_verify(binpath, symbols, found, find_strs, avoid_strs,
             run_args = ["wine"] + run_args
         else:
             return None, "PE — wine 미설치로 재실행 스킵 (SETUP: apt install wine64)", None
+    # Materialize the solved file content at the symbolic path for the re-run,
+    # then restore the original on-disk state (back up an existing file, remove a
+    # file we created). Written relative to the same cwd the SimFile used.
+    restore = None
+    if file_target_path is not None:
+        try:
+            existed = os.path.exists(file_target_path)
+            backup = open(file_target_path, "rb").read() if existed else None
+            with open(file_target_path, "wb") as _fh:
+                _fh.write(file_val)
+        except OSError as e:
+            return None, "재실행 스킵(파일 입력 기록 실패: %s)" % type(e).__name__, None
+        def restore(_p=file_target_path, _existed=existed, _backup=backup):
+            try:
+                if _existed:
+                    with open(_p, "wb") as _fh:
+                        _fh.write(_backup)
+                else:
+                    os.unlink(_p)
+            except OSError:
+                pass
     try:
-        out, truncated, returncode = _run_bounded(run_args, stdin_val, timeout=10)
-    except Exception as e:
-        return None, "재실행 스킵(%s)" % type(e).__name__, None
+        try:
+            out, truncated, returncode = _run_bounded(run_args, stdin_val, timeout=10)
+        except Exception as e:
+            return None, "재실행 스킵(%s)" % type(e).__name__, None
+    finally:
+        if restore is not None:
+            restore()
     if truncated:
         return None, "concrete output cap exceeded; execution was not fully observed", returncode
     if returncode != expected_exit_code or returncode < 0:

@@ -109,6 +109,60 @@ class SymsolveProvenanceTests(unittest.TestCase):
             self.assertEqual(primitive["extensions"]["solve_origin"], "rev-symbolic")
             self.assertEqual(primitive["extensions"]["engine_observation_id"], observation_id)
 
+    def test_concrete_success_never_adopts_a_foreign_pwn_pass(self):
+        # Regression: record_concrete_observation must NOT rewrite the provenance of
+        # a genuine pwn PASS (pwn.* evidence) into rev-symbolic. Doing so corrupts the
+        # engine-provenance the completion gate and "pwn.* > provisional rev" rely on.
+        symsolve = load_symsolve()
+        with tempfile.TemporaryDirectory() as root:
+            binary = os.path.join(root, "subject.bin")
+            with open(binary, "wb") as target:
+                target.write(b"fixture binary")
+            binary_digest = "sha256:" + hashlib.sha256(b"fixture binary").hexdigest()
+
+            stream = Stream(root)
+            self_evidence = []
+            for index in range(3):
+                evidence = direct_evidence_envelope(
+                    root=stream.root, producer="gdbq",
+                    measurement=("pwn measurement %d" % index).encode(),
+                    subject_digest=binary_digest,
+                )
+                observation_id = "obs_pwn_%d" % index
+                stream.append("observation.recorded", {
+                    "observation_id": observation_id,
+                    "kind": "pwn.reg",  # marks this as a pwn (not rev) measurement
+                    "quality": {"level": "direct"},
+                    "validity": {"state": "active"},
+                    "evidence": [evidence],
+                })
+                self_evidence.append(observation_id)
+
+            pwn = {
+                "primitive_id": "prim_pwn_control",
+                "status": "candidate", "self_evidence": [],
+                "input_digest": binary_digest,
+                "environment_digest": CANONICAL_ENVIRONMENT,
+            }
+            revise_primitive(stream, pwn)
+            revise_primitive(stream, {**pwn, "status": "pass", "self_evidence": self_evidence})
+            before = stream.view()["primitives"]["prim_pwn_control"]
+
+            symsolve.record_concrete_observation(
+                root, binary, b"verified marker", {"stdin": "4142"}, 0)
+
+            view = Stream(root).view()
+            after = view["primitives"]["prim_pwn_control"]
+            # The pwn PASS is left completely untouched (no new revision, no stamp).
+            self.assertEqual(after["revision"], before["revision"])
+            self.assertNotEqual((after.get("producer") or {}).get("engine"), "symsolve")
+            self.assertNotEqual((after.get("extensions") or {}).get("solve_origin"), "rev-symbolic")
+            # A separate rev-symbolic primitive carries the symsolve provenance instead.
+            rev = [p for p in view["primitives"].values()
+                   if (p.get("extensions") or {}).get("solve_origin") == "rev-symbolic"]
+            self.assertEqual(len(rev), 1)
+            self.assertNotEqual(rev[0]["primitive_id"], "prim_pwn_control")
+
     def test_plaintext_state_append_can_forge_sanctioned_observation(self):
         """Document the unsigned local STATE trust boundary with an executable case."""
         with tempfile.TemporaryDirectory() as root:

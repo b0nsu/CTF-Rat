@@ -382,8 +382,16 @@ def first_verified_solve_ts(state_dir):
     return None
 
 def index_backends(root):
-    """Distinct reusable cache artifacts per backend from the canonical index."""
+    """Distinct reusable cache artifacts per backend from the canonical index.
+
+    Read-only: this telemetry aggregator must never create or migrate the cache
+    index in a store it only reads (that would mutate a frozen/archived evidence
+    store). If the sqlite index does not already exist, report nothing.
+    """
     try:
+        import os
+        if not os.path.isfile(os.path.join(root, "indexes", "cache.sqlite3")):
+            return {}
         from .cache import Cache
         return Cache(root).stats().get("by_backend", {})
     except Exception:

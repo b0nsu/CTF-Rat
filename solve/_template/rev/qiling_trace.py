@@ -102,7 +102,9 @@ def trace(args):
         return 0 if hit else 1
     if args.calls:
         print("  call/instr hook 이벤트: %d" % len(calls))
-    return 0
+    # A hung/aborted emulation must not report success via exit 0 when there is no
+    # --find-str oracle to key on; reflect the clean-completion flag in the code.
+    return 0 if done["ok"] else 2
 
 
 class _MemPipe:
