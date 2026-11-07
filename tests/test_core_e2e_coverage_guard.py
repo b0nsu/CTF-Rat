@@ -104,7 +104,12 @@ class CoreE2ECoverageGuard(unittest.TestCase):
 
     def test_guard_detects_a_skipped_e2e_class(self):
         from tests.test_proof_session import SessionProofE2E
-        if not (_linux_x86_64() and not _missing_tools(CORE_TOOLS)):
+        # Gate on the SAME predicate the guard uses (REQUIRED_TOOLS, incl. setarch),
+        # not the CORE_TOOLS subset: on a host with gcc/gdb but no setarch the guard
+        # itself skips, leaving result.failures empty, which would red-build the
+        # assertion below on exactly the partial-toolchain host
+        # test_partial_toolchain_skips_instead_of_failing is meant to support.
+        if not (_linux_x86_64() and not _missing_tools(REQUIRED_TOOLS)):
             self.skipTest("core toolchain unavailable")
         # The guard asserts inside `with self.subTest(...)`, so a failure there is
         # captured by the active subTest outcome collector and recorded on the
