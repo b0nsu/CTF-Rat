@@ -3,11 +3,26 @@ import json
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 BIN = pathlib.Path(__file__).resolve().parents[1] / "bin"
+sys.path.insert(0, str(BIN))
+
+
+def _angr_reachable():
+    # The front doors re-exec into .venv-angr; the size-guard DIAGNOSTIC (the
+    # actionable --max-input-mb / "refused" message) is only produced when angr is
+    # actually reachable.  With no angr the honest blocker is "angr unavailable",
+    # so the guard-specific assertions below do not apply -- skip them there.
+    try:
+        from ratlib.angr_runtime import configured_python
+        import importlib.util
+        return bool(configured_python()) or importlib.util.find_spec("angr") is not None
+    except Exception:
+        return False
 
 
 class LargeInputGateTests(unittest.TestCase):
@@ -23,6 +38,7 @@ class LargeInputGateTests(unittest.TestCase):
         return subprocess.run([str(BIN / args[0]), *map(str, args[1:])],
                               capture_output=True, text=True, timeout=20)
 
+    @unittest.skipUnless(_angr_reachable(), "size-guard diagnostic requires angr reachable")
     def test_route_preserves_actionable_size_diagnostic(self):
         result = self.run_tool("rat", "route", self.binary, "--format", "json")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -32,6 +48,7 @@ class LargeInputGateTests(unittest.TestCase):
         self.assertTrue(any(item.get("code") == "analysis_unavailable" for item in diagnostics))
         self.assertTrue(any("--func-size" in item for item in doc["unresolved"]))
 
+    @unittest.skipUnless(_angr_reachable(), "size-guard diagnostic requires angr reachable")
     def test_slice_frontdoor_reports_size_refusal(self):
         result = self.run_tool("rat", "query", "slice", self.binary,
                                "--backward", "0x0", "--format", "json")

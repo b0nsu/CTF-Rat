@@ -14,6 +14,21 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
+sys.path.insert(0, str(BIN))
+
+
+def _angr_reachable():
+    # revq's bounded-function path re-execs into .venv-angr; without a reachable
+    # angr these tests can only observe the clean dependency_missing error, not the
+    # analysis behavior they assert, so they skip (the non-angr regression lane).
+    try:
+        from ratlib.angr_runtime import configured_python
+        return bool(configured_python()) or importlib.util.find_spec("angr") is not None
+    except Exception:
+        return False
+
+
+ANGR = _angr_reachable()
 
 
 def revq_module():
@@ -42,6 +57,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_function_region_matches_full_main_and_marks_partial(self):
         full = subprocess.run([str(BIN / "revq"), str(self.small), "--refresh", "--format", "json"],
                               capture_output=True, text=True, timeout=30, check=True)
@@ -65,6 +81,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
         self.assertEqual(json.loads(cached.stdout), card)
         self.assertEqual(cache_files[0].stat().st_mtime_ns, before)
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_raw_blob_cache_is_keyed_by_arch(self):
         # Regression: the function-region cache key omitted load_spec.  A raw blob
         # queried over the same address range first with --arch i386 and then with
@@ -115,6 +132,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
                  blob.parent.glob(blob.name + ".func-*.revq.json")}
         self.assertEqual(before, after, "amd64 re-query must hit cache, not rewrite")
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_numeric_scope_requires_explicit_size(self):
         result = subprocess.run([str(BIN / "revq"), str(self.large), "--func", "0x401000"],
                                 capture_output=True, text=True, timeout=20)
@@ -122,6 +140,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
         self.assertIn("--func-size", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_size_refusal_explicit_full_override_and_cache_hit(self):
         fresh = Path(self.tmp.name) / "override-case"
         fresh.write_bytes(self.large.read_bytes())
@@ -136,6 +155,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
         self.assertIn("캐시 사용", cached.stderr)
         self.assertEqual(json.loads(cached.stdout)["counts"], json.loads(explicit.stdout)["counts"])
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_rat_function_frontdoor_keeps_partial_coverage(self):
         result = subprocess.run([str(BIN / "rat"), "query", "func", str(self.large), "main",
                                  "--format", "json"], capture_output=True, text=True,
@@ -145,6 +165,7 @@ class LargeBinaryAnalysisPathTests(unittest.TestCase):
         self.assertFalse(doc["coverage"]["complete"])
         self.assertIn("function_scope", doc["coverage"]["omitted"]["unresolved"])
 
+    @unittest.skipUnless(ANGR, "bounded angr analysis requires angr reachable")
     def test_rat_query_func_scope_required_returns_clean_error_not_crash(self):
         # Regression: _revq_error_response mapped scope_required -> input_required,
         # a code the query-result schema's allow-list did not contain, so _emit's

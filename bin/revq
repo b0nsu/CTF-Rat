@@ -447,7 +447,13 @@ def _extract_angr_bounded(binpath, load_spec, allow_large, scope=None):
 def _resolve_function_scope(binpath, target, size_override, load_spec):
     """Resolve one mapped function without running CFGFast in the caller."""
     from ratlib.raw_loader import project as raw_project
-    import angr
+    try:
+        import angr  # noqa: F401
+    except ImportError as exc:
+        raise AngrAnalysisError(
+            "angr 미설치: 함수 범위 해석에 angr가 필요합니다 (SETUP.md의 .venv-angr) "
+            "또는 --fast(binutils)/Ghidra 경로를 사용하세요",
+            kind="dependency_missing") from exc
     proj = raw_project(binpath, load_spec)
     obj = proj.loader.main_object
     addr = parse_int(target)
@@ -481,7 +487,13 @@ def _resolve_function_scope(binpath, target, size_override, load_spec):
 
 
 def _load_or_extract_local(binpath, target, size_override, refresh, load_spec, allow_large):
-    import angr
+    try:
+        import angr
+    except ImportError as exc:
+        raise AngrAnalysisError(
+            "angr 미설치: 함수 단위 분석에 angr가 필요합니다 (SETUP.md의 .venv-angr) "
+            "또는 --fast(binutils)/Ghidra 경로를 사용하세요",
+            kind="dependency_missing") from exc
     scope = _resolve_function_scope(binpath, target, size_override, load_spec)
     digest = sha256(binpath)
     # load_spec changes how the raw bytes are decoded (arch/base/entry), but a raw
