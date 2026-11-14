@@ -51,6 +51,7 @@ from ratlib.evasion import (
     SIGNAL_SCHEMA as EVASION_SIGNAL_SCHEMA,
     classify as classify_evasion_signals,
     entropy as _entropy,
+    entropy_stream as _entropy_stream,
     has_current_contract as _has_current_evasion_contract,
     render_legacy as _render_legacy_evasion,
 )
@@ -106,7 +107,7 @@ def _file_evasion_projection(binpath, imports, strings, sections):
     """Return typed evasion observations plus the one-way legacy rendering."""
     try:
         with open(binpath, "rb") as f:
-            ent = _entropy(f.read())
+            ent = _entropy_stream(f)
     except Exception:
         ent = None
     signals = classify_evasion_signals(imports, [s["val"] for s in strings], ent, sections)
