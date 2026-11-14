@@ -20,6 +20,17 @@ ANTI_DEBUG_STR = re.compile(
 )
 
 
+def _entropy_from_counts(freq, total):
+    if not total:
+        return 0.0
+    value = 0.0
+    for count in freq:
+        if count:
+            p = count / total
+            value -= p * math.log2(p)
+    return value
+
+
 def entropy(data):
     """Return Shannon entropy in bits/byte (0..8)."""
     if not data:
@@ -28,12 +39,7 @@ def entropy(data):
     for byte in data:
         freq[byte] += 1
     n = len(data)
-    value = 0.0
-    for count in freq:
-        if count:
-            p = count / n
-            value -= p * math.log2(p)
-    return value
+    return _entropy_from_counts(freq, n)
 
 
 def entropy_stream(stream, chunk_size=1024 * 1024):
@@ -54,14 +60,7 @@ def entropy_stream(stream, chunk_size=1024 * 1024):
         total += len(chunk)
         for byte, count in Counter(chunk).items():
             freq[byte] += count
-    if total == 0:
-        return 0.0
-    value = 0.0
-    for count in freq:
-        if count:
-            p = count / total
-            value -= p * math.log2(p)
-    return value
+    return _entropy_from_counts(freq, total)
 
 
 def classify(imports, strings, file_entropy, sections):
