@@ -51,10 +51,10 @@ class EvasionSignalTests(unittest.TestCase):
     def test_entropy_stream_matches_full_buffer_on_chunk_boundaries(self):
         payloads = [
             b"",
-            b"\\x00" * 17,
+            b"\x00" * 17,
             bytes(range(256)),
             bytes(range(256)) * 17 + b"trailing",
-            (bytes(range(256)) * 4097) + b"\\xff",
+            (bytes(range(256)) * 4097) + b"\xff",
         ]
         for data in payloads:
             with self.subTest(size=len(data)):
