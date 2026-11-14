@@ -1,0 +1,80 @@
+# Strix-informed solve-continuity baseline (PR 0)
+
+Status: **SOURCE AUDIT / UNMEASURED**. Tracking: [#133](https://github.com/b0nsu/CTF-Rat/issues/133), under [#132](https://github.com/b0nsu/CTF-Rat/issues/132). This document is a measurement protocol, **not** a benchmark result or a claim that Strix outperforms CTF-Rat.
+
+## Frozen source reference
+
+- CTF-Rat source branch: `dev`, commit `14f1ba121cb4a77f7c048272ad8e50c0faa6b729` (2026-11-07).
+- Strix reference: `https://github.com/usestrix/strix`. Its agent/runtime source and test behavior require a separately pinned commit and code-level audit **before** asserting implementation equivalence. Do not compare only README capability claims.
+- All benchmark runs must separately record exact working-tree SHA, suite digest, model, effort, runtime/tool/dependency versions, environment and timeout, cache condition, and execution mode.
+
+## Source-first inventory
+
+| Component | Current status | Source-backed observation | Audit question |
+| --- | --- | --- | --- |
+| Governor | EXISTING | `bin/ratlib/governor.py`: `recommend` prioritizes environment recheck, active direct PASS primitive, refutation, then unresolved discriminator; `check_progress` detects novelty stalls | Do agent actions follow its advice after a verified primitive, or perform avoidable re-triage? |
+| Governor regression | EXISTING | `tests/test_governor_continuation.py` covers PASS-vs-unknown order, invalidation, direct/derived quality, consumed primitive | Is the missing behavior in the caller or only in real-workload evidence coverage? |
+| Scout result reuse | EXISTING | `bin/ratlib/orchestration.py::reusable_scout_result` matches phase/attempt/lineage/run/checkpoint/contract/inputs/dependencies and validates artifact digests | Which repeated queries are outside exact reuse, and were they necessary new experiments? |
+| Durable task controls | EXISTING | `orchestration.py` stores task records and emits STATE events with status/budget/lineage/checkpoint | Are there discarded intermediate artifacts or repeated recovery after task changes? |
+| Session metrics | PARTIAL | `bin/ratlib/metrics.py` has envelope-scoped duplicate/cache counters and optional `execve` trace counters | Distinguish measured envelope calls, process calls, and model-side actions; **missing coverage is unknown, not zero** |
+| Benchmark suite | EXISTING | `bin/ratlib/bench_suite.py` validates `rat.bench-suite/v2`; `bench/suite.json` defines the corpus | Which entries exercise real post-primitive continuation and external oracle checks? |
+| Measured Strix-vs-CTF-Rat improvement | UNKNOWN | No paired runs collected here | Do not state performance wins without matched fixtures and verified oracle outputs |
+
+## A0 reproducible measurement protocol
+
+1. Freeze `dev` SHA, `bench/suite.json` digest, authorized local fixture set, model/effort, timeout, dependencies and tooling. Keep controlled cold/warm cache runs separate.
+2. Run existing unit-level invariants first:
+   ```sh
+   python3 -m unittest tests.test_governor_continuation tests.test_scout_reuse
+   python3 bin/ratbench selftest
+   ```
+3. Run `ratbench eval` in the already-supported real-solve mode, following `bin/ratbench --help` and `bench/README.md` for this pinned version. Preserve full invocation and result/trace artifacts. **Do not substitute router/Mode A score for verified solve rate.**
+4. For each solve trace, record: challenge/oracle outcome (external oracle if available), internal completion gate, first valid primitive, first concrete verifier invocation, verified-solve timestamp, model token/context usage, tool calls, duplicate calls, per-scout evidence/artifact digest and process/lineage ID. Report metrics unavailable to the collector as `null`, with measurement coverage.
+5. Independently replay `governor.recommend` over recorded STATE prefixes at decision points. Compare suggested vs actual next action; categorize `verification-ready-but-retriaged`, `legitimate-discriminator`, `stale-premise`, `environment-recheck`, `failed-verifier`, and `unknown/uncaptured`. Recommendation agreement by itself is **not** a success metric.
+6. Audit cross-task repeated work using the *full* operation fingerprint, exact artifact digest, inputs, tool build/dependency versions, checkpoint and lineage. Count avoidable duplication only after confirming no new evidence, changed environment, or independent measurement requirement.
+7. Compare A0 vs any later A1/A2/A3 **one change at a time**, on the identical locked fixture/model/effort/runtime/cache matrix. Report distribution and per-challenge outcomes, not only aggregate mean.
+
+## Required output per run
+
+```json
+{
+  "source_commit": "14f1ba121cb4a77f7c048272ad8e50c0faa6b729",
+  "suite_digest": null,
+  "model": null,
+  "reasoning_effort": null,
+  "environment_digest": null,
+  "cache_condition": null,
+  "verified_solve": null,
+  "challenge_oracle_pass": null,
+  "internal_completion_verified": null,
+  "false_solved": null,
+  "time_to_first_valid_primitive_sec": null,
+  "time_from_primitive_to_verifier_sec": null,
+  "time_to_verified_solve_sec": null,
+  "input_tokens": null,
+  "output_tokens": null,
+  "peak_context_tokens": null,
+  "tool_calls": null,
+  "duplicate_tool_calls": null,
+  "cache_requests": null,
+  "cache_hits": null,
+  "subagent_count": null,
+  "repeated_scout_queries": null,
+  "governor_action_mismatch_count": null,
+  "collector_coverage": {}
+}
+```
+
+Null means **unmeasured**; never treat it as zero, PASS or a successful oracle result. This is a reporting checklist, not a proposed new schema or state store.
+
+## Gate for downstream changes
+
+- **PROCEED #134** only after evidence shows consequential redundant cross-task lookup **not already served** by exact Scout reuse.
+- **PROCEED #135** only after proving a real cost from reconstructing solve dependencies; reuse existing task/STATE/compact projections.
+- **PROCEED #136** only after showing consequential agent recommendation/action mismatches or post-primitive stalls; retain deterministic validation and do not weaken PASS/SOLVED.
+- **REJECT / NO-GAP** when existing runtime already satisfies the requirement or instrumentation is insufficient to identify a cause.
+- Always require false SOLVED = 0; cite actual external oracle outcome separately from internal completion.
+
+## Limitations and rollback
+
+No live model solve or matched Strix run has been performed for this source audit. No changes to runtime, STATE, cache, schema, verifier or routing are proposed in PR 0. If later instrumentation is added, keep it read-only and revert independently. Authorized local/fixture targets only.
