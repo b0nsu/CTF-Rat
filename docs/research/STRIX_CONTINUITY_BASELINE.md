@@ -78,3 +78,12 @@ Null means **unmeasured**; never treat it as zero, PASS or a successful oracle r
 ## Limitations and rollback
 
 No live model solve or matched Strix run has been performed for this source audit. No changes to runtime, STATE, cache, schema, verifier or routing are proposed in PR 0. If later instrumentation is added, keep it read-only and revert independently. Authorized local/fixture targets only.
+
+## PR 0 CI regression evidence (2026-11-14)
+
+- GitHub Actions run: https://github.com/b0nsu/CTF-Rat/actions/runs/43583706811
+- Workflow `operational-regression`, job `regression` (job ID `132413635072`): **success**.
+- Confirmed successful steps include `python3 bin/rat selftest`, `python3 bin/ratbench selftest`, `python3 bin/ratbench run --corpus synthetic`, `python3 -m unittest discover -s tests -p 'test_*.py'`, `tests/e2e_artifact_handoff.py`, `tests/e2e_analysis.py --category core`, and four `tests/e2e_orchestration.py` scenarios.
+- The `analysis-deep` job was **skipped**, not passed.
+- These CI steps establish regression compatibility for this documentation-only PR; they **do not** establish real-solve baseline, Strix parity, token improvements, or oracle-verified solves. The `ratbench eval` real-solve experiment is still outstanding.
+- Local clone/test attempt was blocked by DNS resolution of `github.com`; GitHub-hosted CI is the available test evidence for this PR.
