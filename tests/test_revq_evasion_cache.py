@@ -92,6 +92,22 @@ class RevqEvasionCacheTests(unittest.TestCase):
             self.assertEqual(second["cache_state"], "hit")
             self.assertEqual(second["evasion_signals"], persisted["evasion_signals"])
 
+    def test_file_entropy_projection_handles_large_file(self):
+        revq = load_revq_module()
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = os.path.join(tempdir, "large")
+            with open(binary, "wb") as stream:
+                stream.write(bytes(range(256)) * 8192)
+            projection = revq._file_evasion_projection(binary, [], [], [])
+            self.assertEqual(projection["evasion_signal_schema"], revq.EVASION_SIGNAL_SCHEMA)
+            self.assertEqual(
+                [item["kind"] for item in projection["evasion_signals"]],
+                ["high-entropy"],
+            )
+            self.assertEqual(
+                projection["evasion_signals"][0]["value"]["entropy"], 8.0
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,11 @@
+import io
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bin"))
 
-from ratlib.evasion import SIGNAL_SCHEMA, classify, entropy, has_current_contract, render_legacy
+from ratlib.evasion import SIGNAL_SCHEMA, classify, entropy, entropy_stream, has_current_contract, render_legacy
 
 
 class EvasionSignalTests(unittest.TestCase):
@@ -46,6 +47,33 @@ class EvasionSignalTests(unittest.TestCase):
     def test_entropy_bounds(self):
         self.assertEqual(entropy(b"\x00" * 16), 0.0)
         self.assertGreater(entropy(bytes(range(256))), 7.9)
+
+    def test_entropy_stream_matches_full_buffer_on_chunk_boundaries(self):
+        payloads = [
+            b"",
+            b"\x00" * 17,
+            bytes(range(256)),
+            bytes(range(256)) * 17 + b"trailing",
+            (bytes(range(256)) * 4097) + b"\xff",
+        ]
+        for data in payloads:
+            with self.subTest(size=len(data)):
+                self.assertEqual(entropy_stream(io.BytesIO(data), chunk_size=113), entropy(data))
+
+    def test_entropy_stream_never_issues_unbounded_read(self):
+        class BoundedReader(io.BytesIO):
+            def read(self, size=-1):
+                if size < 1 or size > 64:
+                    raise AssertionError("unbounded stream read: %s" % size)
+                return super().read(size)
+
+        data = bytes(range(256)) * 41
+        self.assertEqual(entropy_stream(BoundedReader(data), chunk_size=64), entropy(data))
+
+    def test_entropy_stream_rejects_invalid_chunk_size(self):
+        for size in (0, -1, True, 1.5, "64"):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                entropy_stream(io.BytesIO(b"data"), chunk_size=size)
 
 
 if __name__ == "__main__":

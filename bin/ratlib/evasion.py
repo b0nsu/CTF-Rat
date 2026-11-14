@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 
 SIGNAL_SCHEMA = "rat.evasion-signals/v1"
 ENTROPY_THRESHOLD = 7.2
@@ -19,6 +20,17 @@ ANTI_DEBUG_STR = re.compile(
 )
 
 
+def _entropy_from_counts(freq, total):
+    if not total:
+        return 0.0
+    value = 0.0
+    for count in freq:
+        if count:
+            p = count / total
+            value -= p * math.log2(p)
+    return value
+
+
 def entropy(data):
     """Return Shannon entropy in bits/byte (0..8)."""
     if not data:
@@ -27,12 +39,28 @@ def entropy(data):
     for byte in data:
         freq[byte] += 1
     n = len(data)
-    value = 0.0
-    for count in freq:
-        if count:
-            p = count / n
-            value -= p * math.log2(p)
-    return value
+    return _entropy_from_counts(freq, n)
+
+
+def entropy_stream(stream, chunk_size=1024 * 1024):
+    """Compute exact whole-stream Shannon entropy with bounded input reads.
+
+    Frequency counts are aggregated across chunks; unlike sampling this
+    preserves the same signal semantics as entropy(stream.read()) without
+    allocating a buffer proportional to the artifact size.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    freq = [0] * 256
+    total = 0
+    while True:
+        chunk = stream.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        for byte, count in Counter(chunk).items():
+            freq[byte] += count
+    return _entropy_from_counts(freq, total)
 
 
 def classify(imports, strings, file_entropy, sections):
