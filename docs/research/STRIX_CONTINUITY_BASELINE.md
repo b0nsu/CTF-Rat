@@ -96,9 +96,9 @@ The existing `bench/README.md` describes the canonical, answer-free materializat
 
 ```sh
 PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real
-python3 bin/ratbench eval --suite bench/suite.json --corpus real \\
-  --run-id B-real-A0-001 --ablation A0 --model-id '<actual-model>' \\
-  --reasoning-effort '<actual-effort>' --attempts 3 --timeout 600 \\
+python3 bin/ratbench eval --suite bench/suite.json --corpus real \
+  --run-id B-real-A0-001 --ablation A0 --model-id '<actual-model>' \
+  --reasoning-effort '<actual-effort>' --attempts 3 --timeout 600 \
   --agent '<configured agent CLI with {dir}>'
 python3 bin/ratbench report --schema v3
 ```
@@ -107,4 +107,4 @@ python3 bin/ratbench report --schema v3
 
 **Measurement decision:** #133 remains open; do not start #134–#136 runtime behavior changes solely because CI passes. First obtain a Mode B trace and independent oracle coverage (where possible) or explicitly mark the oracle dimension unavailable. This is an environment/measurement gap, not proof of a solver-runtime defect.
 
-**Current head CI:** `2624eb1034f362da12e4611112a5ab73feadcb17` passed `operational-regression` run [43583984421](https://github.com/b0nsu/CTF-Rat/actions/runs/43583984421) on 2026-11-14; this is regression evidence, not a real-solve result.
+**Latest observed PR-head CI (2026-11-14):** `597d928d4ac9616a3b1e54eed2f479a7afbf34a2` passed `operational-regression` run [43588883999](https://github.com/b0nsu/CTF-Rat/actions/runs/43588883999). The `regression` job passed and `analysis-deep` was skipped by its branch/event condition. This is regression evidence, not a real-solve result.
