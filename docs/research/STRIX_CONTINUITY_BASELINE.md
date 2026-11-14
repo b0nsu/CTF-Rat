@@ -87,3 +87,24 @@ No live model solve or matched Strix run has been performed for this source audi
 - The `analysis-deep` job was **skipped**, not passed.
 - These CI steps establish regression compatibility for this documentation-only PR; they **do not** establish real-solve baseline, Strix parity, token improvements, or oracle-verified solves. The `ratbench eval` real-solve experiment is still outstanding.
 - Local clone/test attempt was blocked by DNS resolution of `github.com`; GitHub-hosted CI is the available test evidence for this PR.
+
+## Real-corpus feasibility audit (2026-11-14)
+
+The committed `bench/suite.json` already defines **two** `real` entries: `google-ctf-2017-inst-prof` and `google-ctf-2024-notobfuscated`. Both specify `verify.kind=rat-verify-pass` and a claim regex, but **neither** specifies `verify.expected_response_sha256`. Consequently a successful internal completion gate alone cannot establish independent answer-oracle success for either entry; `challenge_oracle_pass` must remain unavailable unless an independent oracle is configured. The presence of the corpus is not itself a measured solve.
+
+The existing `bench/README.md` describes the canonical, answer-free materialization preflight and Mode B CLI. A reproducible operator-side sequence, **not executed in this audit**, is:
+
+```sh
+PYTHONPATH=bin python3 -m ratlib.bench_artifacts bench/suite.json --corpus real
+python3 bin/ratbench eval --suite bench/suite.json --corpus real \\
+  --run-id B-real-A0-001 --ablation A0 --model-id '<actual-model>' \\
+  --reasoning-effort '<actual-effort>' --attempts 3 --timeout 600 \\
+  --agent '<configured agent CLI with {dir}>'
+python3 bin/ratbench report --schema v3
+```
+
+**Execution blocker:** this GitHub-connector session has no verified sandboxed agent CLI/model credentials or materialized binary fixture environment, so a real Mode B agent solve cannot be run here. The regression workflow runs Mode A synthetic and tests, not Mode B. Do not invent model, token, cache, time-to-flag, or oracle outcomes. Run the commands only in an authorized isolated operator environment with functional `bwrap` and agent credentials, and preserve result artifacts privately. Do not copy answer material into the agent export.
+
+**Measurement decision:** #133 remains open; do not start #134–#136 runtime behavior changes solely because CI passes. First obtain a Mode B trace and independent oracle coverage (where possible) or explicitly mark the oracle dimension unavailable. This is an environment/measurement gap, not proof of a solver-runtime defect.
+
+**Current head CI:** `2624eb1034f362da12e4611112a5ab73feadcb17` passed `operational-regression` run [43583984421](https://github.com/b0nsu/CTF-Rat/actions/runs/43583984421) on 2026-11-14; this is regression evidence, not a real-solve result.
